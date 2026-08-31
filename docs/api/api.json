@@ -5291,10 +5291,13 @@
             "type": "string"
           },
           "ver_major": {
-            "description": "Major version number.",
+            "description": "Major version number, or `null` for an explicit UUID tail segment.",
             "format": "int32",
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14407,7 +14410,7 @@
         "description": "A submission of one or more entities.\n\n`items` and not `entities`: the operation result, the discovery page and\n`Page<T>` all call their array `items`, so this is the house word for \"the\narray in this envelope\". It is also the name v1 does *not* use, which keeps\nthe T24a promotion a loud break rather than one that turns on the element\nshape.",
         "properties": {
           "dry_run": {
-            "description": "Run every check and commit nothing. Part of the request fingerprint, so\nreusing one `Idempotency-Key` for a dry run and then a commit is a\nconflict, not a replay of the dry-run result.",
+            "description": "Reserved for T20 rollback-only evaluation. `true` is synchronously refused\nuntil dry runs are implemented. The field is already part of the request\nfingerprint, so a future dry run and commit cannot share one idempotency\nidentity.",
             "type": [
               "boolean",
               "null"
@@ -14433,7 +14436,7 @@
             "description": "The authored document."
           },
           "expected_resource_version": {
-            "description": "Optimistic precondition. **Omit** to require that the identifier does not\nexist; a literal `0` is refused. `>= 1` is the version to match.",
+            "description": "Optimistic precondition. **Omit** to require that the identifier does not\nexist; a literal `0` is refused. Positive versions are reserved for T11\nrevisions and are synchronously refused until revisions are implemented.",
             "format": "int64",
             "type": [
               "integer",
@@ -43732,7 +43735,21 @@
                 }
               }
             },
-            "description": "Replay of an operation that is already terminal"
+            "description": "Replay of an operation that is already terminal",
+            "headers": {
+              "Idempotency-Replayed": {
+                "description": "Whether this submission replayed an existing operation",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Location": {
+                "description": "URI of the admission operation",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "202": {
             "content": {
@@ -43742,7 +43759,27 @@
                 }
               }
             },
-            "description": "Accepted; poll the operation at the returned Location"
+            "description": "Accepted; poll the operation at the returned Location",
+            "headers": {
+              "Idempotency-Replayed": {
+                "description": "Whether this submission replayed an existing operation",
+                "schema": {
+                  "type": "boolean"
+                }
+              },
+              "Location": {
+                "description": "URI of the admission operation",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Retry-After": {
+                "description": "Suggested delay in seconds before polling the operation",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "400": {
             "content": {

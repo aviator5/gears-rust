@@ -23,8 +23,9 @@ pub struct GtsIdSegmentDto {
     pub namespace: String,
     /// Type name component of the segment.
     pub type_name: String,
-    /// Major version number.
-    pub ver_major: u32,
+    /// Major version number, or `null` for an explicit UUID tail segment.
+    #[schema(required = true)]
+    pub ver_major: Option<u32>,
 }
 
 impl From<&GtsIdSegment> for GtsIdSegmentDto {
@@ -34,7 +35,7 @@ impl From<&GtsIdSegment> for GtsIdSegmentDto {
             package: segment.package().to_owned(),
             namespace: segment.namespace().to_owned(),
             type_name: segment.type_name().to_owned(),
-            ver_major: segment.ver_major_opt().unwrap_or(0),
+            ver_major: segment.ver_major_opt(),
         }
     }
 }
@@ -249,7 +250,7 @@ mod tests {
         assert_eq!(dto.segments[0].package, "core");
         assert_eq!(dto.segments[0].namespace, "events");
         assert_eq!(dto.segments[0].type_name, "user_created");
-        assert_eq!(dto.segments[0].ver_major, 1);
+        assert_eq!(dto.segments[0].ver_major, Some(1));
         assert_eq!(dto.description, Some("A user created event".to_owned()));
     }
 
@@ -323,13 +324,13 @@ mod tests {
         assert_eq!(dto.segments[0].package, "core");
         assert_eq!(dto.segments[0].namespace, "models");
         assert_eq!(dto.segments[0].type_name, "product");
-        assert_eq!(dto.segments[0].ver_major, 1);
+        assert_eq!(dto.segments[0].ver_major, Some(1));
         // Instance segment from different vendor "globex"
         assert_eq!(dto.segments[1].vendor, "globex");
         assert_eq!(dto.segments[1].package, "retail");
         assert_eq!(dto.segments[1].namespace, "instances");
         assert_eq!(dto.segments[1].type_name, "prod1");
-        assert_eq!(dto.segments[1].ver_major, 1);
+        assert_eq!(dto.segments[1].ver_major, Some(1));
     }
 
     #[test]
@@ -343,6 +344,21 @@ mod tests {
         assert_eq!(json["namespace"], "invoices");
         assert_eq!(json["type_name"], "invoice");
         assert_eq!(json["ver_major"], 2);
+    }
+
+    #[test]
+    fn a_uuid_tail_has_no_synthetic_major_version() {
+        let full_id = format!(
+            "{}550e8400-e29b-41d4-a716-446655440000",
+            gts_id!("acme.core.models.user.v1~")
+        );
+        let dto = GtsIdSegmentDto::from(&seg(&full_id, 1));
+
+        assert_eq!(dto.ver_major, None);
+        assert_eq!(
+            serde_json::to_value(dto).unwrap()["ver_major"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -457,7 +473,8 @@ pub struct SubmitEntityDto {
     /// The authored document.
     pub content: serde_json::Value,
     /// Optimistic precondition. **Omit** to require that the identifier does not
-    /// exist; a literal `0` is refused. `>= 1` is the version to match.
+    /// exist; a literal `0` is refused. Positive versions are reserved for T11
+    /// revisions and are synchronously refused until revisions are implemented.
     #[serde(default)]
     pub expected_resource_version: Option<i64>,
     /// ADR-0004 `force`: waive one cross-minor compatibility check. Refused where
@@ -478,9 +495,10 @@ pub struct SubmitEntityDto {
 pub struct SubmitEntitiesRequest {
     #[schema(min_items = 1)]
     pub items: Vec<SubmitEntityDto>,
-    /// Run every check and commit nothing. Part of the request fingerprint, so
-    /// reusing one `Idempotency-Key` for a dry run and then a commit is a
-    /// conflict, not a replay of the dry-run result.
+    /// Reserved for T20 rollback-only evaluation. `true` is synchronously refused
+    /// until dry runs are implemented. The field is already part of the request
+    /// fingerprint, so a future dry run and commit cannot share one idempotency
+    /// identity.
     #[serde(default)]
     pub dry_run: Option<bool>,
 }

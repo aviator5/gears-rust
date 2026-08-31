@@ -37,9 +37,9 @@ utoipa = { workspace = true, features = ["time"] }
 axum = { workspace = true, features = ["macros"] }
 uuid = { workspace = true, features = ["v5"] }
 thiserror = { workspace = true }
-# SHA-256 for the request fingerprint and the idempotency scope hash (T7). The
-# FIPS-validated implementation the platform installs at bootstrap, rather than
-# the `sha2` crate DE0708 bans -- see `domain/admission/fingerprint.rs`.
+# SHA-256 for request/idempotency fingerprints and the persisted resolution
+# identity. The FIPS-validated implementation the platform installs at bootstrap,
+# rather than the `sha2` crate DE0708 bans -- see `domain/admission/fingerprint.rs`.
 aws-lc-rs = { workspace = true }
 parking_lot = { workspace = true }
 lru = "0.18.2"

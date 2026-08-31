@@ -244,6 +244,8 @@ pub struct ResponseSpec {
     pub description: String,
     /// Schema of the response body (if any).
     pub schema: Option<ResponseSchema>,
+    /// Headers that may be returned with this response.
+    pub headers: Vec<ResponseHeaderSpec>,
 }
 
 impl ResponseSpec {
@@ -253,6 +255,30 @@ impl ResponseSpec {
     #[must_use]
     pub fn schema_name(&self) -> Option<&str> {
         self.schema.as_ref().map(ResponseSchema::schema_name)
+    }
+}
+
+/// Header declared on one API response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseHeaderSpec {
+    pub name: String,
+    pub description: Option<String>,
+    /// JSON Schema scalar type (`string`, `integer`, `number`, or `boolean`).
+    pub header_type: String,
+}
+
+impl ResponseHeaderSpec {
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        header_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: Some(description.into()),
+            header_type: header_type.into(),
+        }
     }
 }
 
@@ -1218,6 +1244,7 @@ where
             content_type: "application/json",
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1247,6 +1274,7 @@ where
             content_type: "",
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1275,6 +1303,7 @@ where
             content_type: "application/json",
             description: description.into(),
             schema: Some(ResponseSchema::Ref { schema_name: name }),
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1313,6 +1342,7 @@ where
             content_type: "application/json",
             description: description.into(),
             schema: Some(ResponseSchema::Array { items_schema_name }),
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1348,6 +1378,7 @@ where
             content_type,
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1371,6 +1402,7 @@ where
             content_type: "text/html",
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1399,6 +1431,7 @@ where
             schema: Some(ResponseSchema::Ref {
                 schema_name: problem_name,
             }),
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1426,6 +1459,7 @@ where
             content_type: "text/event-stream",
             description: description.into(),
             schema: Some(ResponseSchema::Ref { schema_name: name }),
+            headers: Vec::new(),
         });
         OperationBuilder {
             spec: self.spec,
@@ -1448,6 +1482,37 @@ where
     A: AuthState,
     L: LicenseState,
 {
+    /// Declare a header on the most recently added response with `status`.
+    ///
+    /// # Panics
+    /// Panics when no response with that status has been declared, or when the
+    /// response already has a header with the same case-insensitive name.
+    pub fn response_header(mut self, status: http::StatusCode, header: ResponseHeaderSpec) -> Self {
+        let status = status.as_u16();
+        let response = self
+            .spec
+            .responses
+            .iter_mut()
+            .rev()
+            .find(|response| response.status == status)
+            .unwrap_or_else(|| {
+                panic!(
+                    "cannot declare response header '{}' for undeclared status {status}",
+                    header.name
+                )
+            });
+        assert!(
+            !response
+                .headers
+                .iter()
+                .any(|existing| existing.name.eq_ignore_ascii_case(&header.name)),
+            "response {status} already declares header '{}'",
+            header.name
+        );
+        response.headers.push(header);
+        self
+    }
+
     /// Add a JSON response (additional).
     pub fn json_response(
         mut self,
@@ -1459,6 +1524,7 @@ where
             content_type: "application/json",
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         self
     }
@@ -1474,6 +1540,7 @@ where
             content_type: "",
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         self
     }
@@ -1494,6 +1561,7 @@ where
             content_type: "application/json",
             description: description.into(),
             schema: Some(ResponseSchema::Ref { schema_name: name }),
+            headers: Vec::new(),
         });
         self
     }
@@ -1518,6 +1586,7 @@ where
             content_type: "application/json",
             description: description.into(),
             schema: Some(ResponseSchema::Array { items_schema_name }),
+            headers: Vec::new(),
         });
         self
     }
@@ -1545,6 +1614,7 @@ where
             content_type,
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         self
     }
@@ -1560,6 +1630,7 @@ where
             content_type: "text/html",
             description: description.into(),
             schema: None,
+            headers: Vec::new(),
         });
         self
     }
@@ -1580,6 +1651,7 @@ where
             schema: Some(ResponseSchema::Ref {
                 schema_name: problem_name,
             }),
+            headers: Vec::new(),
         });
         self
     }
@@ -1599,6 +1671,7 @@ where
             content_type: "text/event-stream",
             description: description.into(),
             schema: Some(ResponseSchema::Ref { schema_name: name }),
+            headers: Vec::new(),
         });
         self
     }
@@ -1670,6 +1743,7 @@ where
                 schema: Some(ResponseSchema::Ref {
                     schema_name: problem_name.clone(),
                 }),
+                headers: Vec::new(),
             });
         }
 
@@ -1722,6 +1796,7 @@ where
             schema: Some(ResponseSchema::Ref {
                 schema_name: problem_name,
             }),
+            headers: Vec::new(),
         });
 
         self
