@@ -171,8 +171,12 @@ pub struct WorkerSettings {
     pub operation_timeout: Duration,
     /// Revalidation attempts before an item is terminalized as `failed` (D4).
     ///
-    /// **Accepted, not enforced in P0.** Nothing revalidates yet: the guard that
-    /// rolls back and retries is the revision-vector comparison, which is **T15**.
+    /// **Enforced** (T15) — `worker::process_item` evaluates and commits inside a
+    /// loop bounded by this value, going round whenever the commit-time
+    /// revision-vector guard finds that the state the evaluation rested on has
+    /// moved. Exhaustion records `revalidation_exhausted` on the item.
+    ///
+    /// Attempts, not retries: `1` means one evaluation and no second chance.
     pub max_revalidation_attempts: u32,
 }
 
@@ -401,6 +405,16 @@ impl TypesRegistryConfig {
                 "worker.family_lock_timeout must be positive".to_owned(),
             ));
         }
+        // Enforced since T15. Zero would give the revalidation loop no attempts at
+        // all, and `process_item` would terminalize every item as
+        // `revalidation_exhausted` without evaluating it once.
+        if self.worker.max_revalidation_attempts == 0 {
+            return Err(ConfigError::Worker(
+                "worker.max_revalidation_attempts must be positive: 0 refuses every candidate \
+                 without evaluating it"
+                    .to_owned(),
+            ));
+        }
         Ok(RegistrationPolicy::compile(&self.registration_policy)?)
     }
 
@@ -412,7 +426,8 @@ impl TypesRegistryConfig {
     /// gets no closure bound at all has no way to find that out — that is the defect,
     /// not the missing enforcement, which is scheduled. Each field's docstring says
     /// which task binds it. (`activation_write_set` was on this list until T14
-    /// enforced it, which is the transition the list exists to make visible.)
+    /// enforced it and `worker.max_revalidation_attempts` until T15, which is the
+    /// transition the list exists to make visible.)
     ///
     /// Comparison is against the default rather than against presence, because
     /// `#[serde(default)]` erases the difference. That errs towards silence — an
@@ -437,9 +452,6 @@ impl TypesRegistryConfig {
         }
         if self.worker.operation_timeout != worker.operation_timeout {
             keys.push("worker.operation_timeout");
-        }
-        if self.worker.max_revalidation_attempts != worker.max_revalidation_attempts {
-            keys.push("worker.max_revalidation_attempts");
         }
         keys
     }

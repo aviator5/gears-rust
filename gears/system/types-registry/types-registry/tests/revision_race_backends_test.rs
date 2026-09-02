@@ -53,6 +53,7 @@ use common::{
 use types_registry::domain::admission::unit::{
     EvaluatedOutcome, EvaluatedUnit, RevisionCommit, commit_revision,
 };
+use types_registry::domain::admission::vector::RevisionVector;
 use types_registry::domain::admission::worker::{ItemFailure, WorkerError};
 use types_registry::domain::artifacts::{MaterializedArtifacts, content_hash};
 use types_registry::domain::enums::{EntityKind, OwnershipScope};
@@ -116,6 +117,15 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
         // No `$ref`, no `x-gts-ref`, one identifier segment: the fixture body
         // implies no edge of any kind.
         edges: Vec::new(),
+        // The vector a real evaluation of this fixture would record, spelled out:
+        // the closure over the candidate's own identifier resolves to the candidate
+        // and nothing else, and nothing references it, so both halves are empty
+        // (T15). The commit's guard re-derives exactly this and finds no drift,
+        // which is what keeps this file about the two branches it is named for.
+        vector: RevisionVector {
+            roots: vec![parsed.id().to_owned()],
+            entries: Vec::new(),
+        },
     }
 }
 

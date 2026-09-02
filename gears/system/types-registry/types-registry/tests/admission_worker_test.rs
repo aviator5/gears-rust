@@ -21,7 +21,7 @@ use uuid::Uuid;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::unit::{commit_creation, evaluate};
-use types_registry::domain::admission::worker::WorkerError;
+use types_registry::domain::admission::worker::{WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::artifacts::resolution_fingerprint;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -37,7 +37,7 @@ use types_registry::infra::storage::entity::{
 use types_registry::infra::storage::repo::{EntityRepo, OperationRepo, TypeSchemaRepo};
 
 mod common;
-use common::{allow_all, run_operation, stores, test_db};
+use common::{allow_all, stores, test_db};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
@@ -115,6 +115,7 @@ async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         operation_id,
         LATER,
     )
@@ -241,6 +242,7 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &worker_provider(&first_db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         first,
         LATER,
     )
@@ -272,6 +274,7 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &worker_provider(&second_db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         second,
         LATER,
     )
@@ -321,6 +324,7 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
         &item.gts_id,
         &payload,
         item.id,
+        common::limits().activation_write_set,
     )
     .await
     .expect("evaluation")
@@ -355,7 +359,15 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
             let unit = unit.clone();
             let stores = Arc::clone(&stores);
             Box::pin(async move {
-                commit_creation(stores.as_ref(), tx, &allow_all(), &unit, LATER).await
+                commit_creation(
+                    stores.as_ref(),
+                    tx,
+                    &allow_all(),
+                    &unit,
+                    common::limits().activation_write_set,
+                    LATER,
+                )
+                .await
             })
         })
         .await;
@@ -415,6 +427,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         first,
         LATER,
     )
@@ -430,6 +443,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         second,
         LATER,
     )
@@ -443,6 +457,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         second,
         LATER,
     )
@@ -494,6 +509,7 @@ async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         operation_id,
         LATER,
     )
@@ -550,6 +566,7 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         first,
         LATER,
     )
@@ -567,6 +584,7 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         second,
         LATER,
     )
@@ -612,6 +630,7 @@ async fn an_unresolvable_reference_is_an_item_failure_not_a_worker_error() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         operation_id,
         LATER,
     )
@@ -652,6 +671,7 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         first,
         LATER,
     )
@@ -679,6 +699,7 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         second,
         LATER,
     )
@@ -719,6 +740,7 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         operation_id,
         LATER,
     )
@@ -731,6 +753,7 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         operation_id,
         LATER,
     )
@@ -768,6 +791,7 @@ async fn an_unknown_operation_is_an_error() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         Uuid::new_v4(),
         LATER,
     )
@@ -798,6 +822,7 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         operation_id,
         LATER,
     )
@@ -867,6 +892,7 @@ async fn a_ref_outside_the_chain_is_admitted() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         first,
         LATER,
     )
@@ -887,6 +913,7 @@ async fn a_ref_outside_the_chain_is_admitted() {
         &worker_provider(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         second,
         LATER,
     )

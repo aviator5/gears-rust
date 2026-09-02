@@ -8,6 +8,7 @@ use toolkit_db::secure::ScopeError;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use super::vector::VectorDrift;
 use crate::domain::gts_store::StoreBuildError;
 
 /// An infrastructure failure. Retryable by construction: nothing here is a
@@ -94,6 +95,23 @@ pub enum WorkerError {
     /// would recompute the same refusal.
     #[error("the revision was refused after its writes began: {0}")]
     RefusedAfterWrite(ItemFailure),
+    /// The commit-time revision-vector guard found that something the evaluation
+    /// rested on has moved (D4, SPEC §8.1 step 4.3).
+    ///
+    /// Carried as an error for the same reason as [`Self::RefusedAfterWrite`] and
+    /// with the opposite meaning. That one is terminal; this one is the *least*
+    /// terminal thing the worker can be told: the candidate has not been judged at
+    /// all, because the state it was judged against is gone. The error position is
+    /// what rolls the transaction back, and `process_item` answers it by
+    /// revalidating from scratch — bounded by `worker.max_revalidation_attempts`,
+    /// after which the item is terminalized as `revalidation_exhausted`.
+    ///
+    /// Not classified as a database retry: `retryable_db_err` reads it as `None`,
+    /// because re-running the *same* transaction would compare the same stale
+    /// vector and drift identically. The retry that helps is a new evaluation, and
+    /// that lives a level up.
+    #[error("the evaluation is stale and must be redone: {0}")]
+    RevalidationRequired(VectorDrift),
     #[error("storage failure during admission: {0}")]
     Storage(#[from] ScopeError),
     #[error("database failure during admission: {0}")]

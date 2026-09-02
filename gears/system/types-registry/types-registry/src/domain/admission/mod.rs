@@ -17,6 +17,7 @@ mod errors;
 pub mod fingerprint;
 pub mod refresh;
 pub mod unit;
+pub mod vector;
 pub mod worker;
 
 use serde_json::Value;

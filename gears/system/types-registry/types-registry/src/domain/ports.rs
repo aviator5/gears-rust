@@ -582,6 +582,24 @@ pub trait TypeSchemaStore: Send + Sync {
         entity_id: i64,
     ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError>;
 
+    /// The current-state rows of many entities in one read, `entity_id`-sorted.
+    ///
+    /// Rows for entities with no `type_schema` row are simply absent, so the result
+    /// is not positionally aligned with `entity_ids`; callers key on
+    /// `CurrentTypeSchemaRow::entity_id`.
+    ///
+    /// The batched sibling of [`Self::find_current_schema`]. Both the revision
+    /// vector (T15) and the reverse-impact refresh (T14) need every dependent's
+    /// `resolution_fingerprint` at once, and both run inside the commit
+    /// transaction, where a round trip per dependent is time spent holding the
+    /// candidate's row.
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError>;
+
     async fn insert_schema_revision(
         &self,
         tx: &DbTx<'_>,

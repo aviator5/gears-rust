@@ -483,6 +483,71 @@ async fn current_documents_reads_the_current_revision_only(
     assert_eq!(single_doc.raw_schema, only);
 }
 
+/// The batched current-state read the revision vector rechecks against (T15).
+///
+/// Two things a real backend decides. `resolution_fingerprint` is `BYTEA` here and
+/// `BINARY` there and typeless `BLOB` on `SQLite`, so a byte-identical round trip
+/// through an `IN (…)` read is only demonstrable on a container — and the whole
+/// guard rests on comparing those bytes for equality. And an entity with no
+/// `type_schema` row must be **absent** rather than an error or a null row: the
+/// walk reaches Instances, and the vector records them with no fingerprint.
+async fn current_schemas_reads_every_named_entity_that_has_one(
+    db: &Provider,
+    family_id: i64,
+    backend: &str,
+) {
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+
+    let first_id = gts_id!("acme.crm.vector_a.type.v1~");
+    let second_id = gts_id!("acme.crm.vector_b.type.v1~");
+    let bare_id = gts_id!("acme.crm.vector_c.type.v1~");
+    let mut inserted = Vec::new();
+    for id in [first_id, second_id, bare_id] {
+        inserted.push(
+            EntityRepo::insert(&conn, &scope, new_entity(id, family_id))
+                .await
+                .expect("insert")
+                .expect("the identifier is free"),
+        );
+    }
+
+    let body = r#"{"$schema":"http://json-schema.org/draft-07/schema#","title":"vector"}"#;
+    for (row, id) in inserted.iter().take(2).zip([first_id, second_id]) {
+        let item = seed_operation_item(&conn, id, 1, NOW).await;
+        seed_type_schema_revision(&conn, row.id, 1, item, body, NOW).await;
+        seed_current_type_schema(&conn, row.id, 1, body, NOW).await;
+    }
+
+    let ids: Vec<i64> = inserted.iter().map(|row| row.id).collect();
+    let states = TypeSchemaRepo::current_states(&conn, &scope, &ids)
+        .await
+        .expect("current states");
+
+    assert_eq!(
+        states.iter().map(|row| row.entity_id).collect::<Vec<_>>(),
+        ids[..2].to_vec(),
+        "one row per entity that has one, entity_id-sorted, and the third simply \
+         absent on {backend}"
+    );
+    for row in &states {
+        assert_eq!(
+            row.resolution_fingerprint,
+            vec![0x11],
+            "the fingerprint must round-trip byte-identically on {backend}: the \
+             guard compares it for equality and nothing else"
+        );
+    }
+
+    assert!(
+        TypeSchemaRepo::current_states(&conn, &scope, &[])
+            .await
+            .expect("empty read")
+            .is_empty(),
+        "an empty id set is an empty read, not a full scan, on {backend}"
+    );
+}
+
 /// The two revision writes, on a real backend — neither demonstrable on `SQLite`.
 ///
 /// `update_current` rebinds `resolution_fingerprint` in an `UPDATE`: a binary column
@@ -854,6 +919,7 @@ async fn assert_repo_primitives_behave(db: &Provider, backend: &str) {
     closure_walks_a_chain(db, family.id, backend).await;
     reverse_impact_walks_back_up_a_chain(db, family.id, backend).await;
     current_documents_reads_the_current_revision_only(db, family.id, backend).await;
+    current_schemas_reads_every_named_entity_that_has_one(db, family.id, backend).await;
     a_revision_moves_the_pointer_and_can_report_unchanged(db, family.id, backend).await;
     snapshot_read_does_not_see_a_mid_read_commit(db, family.id, backend).await;
 

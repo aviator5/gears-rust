@@ -229,6 +229,13 @@ impl From<WorkerError> for CanonicalError {
             WorkerError::RefusedAfterWrite(failure) => {
                 opaque_internal(&failure.to_string(), "admission")
             }
+            // Also exhaustiveness only: `process_item` catches this one and
+            // revalidates, and after `worker.max_revalidation_attempts` it records a
+            // `revalidation_exhausted` failure on the item. Reaching a handler means
+            // the retry loop stopped answering it.
+            WorkerError::RevalidationRequired(drift) => {
+                opaque_internal(&drift.to_string(), "admission")
+            }
             WorkerError::Storage(inner) => opaque_internal(&inner, "storage write"),
             WorkerError::Db(inner) => opaque_internal(&inner, "database write"),
         }

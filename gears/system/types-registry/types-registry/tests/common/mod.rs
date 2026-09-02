@@ -130,30 +130,14 @@ pub fn limits() -> types_registry::config::Limits {
     types_registry::config::Limits::default()
 }
 
-/// Test entry point with the documented worker defaults. Production has no
-/// default-configured worker path: it must pass the deployment settings and the
-/// configured limits.
-pub async fn run_operation(
-    stores: &Arc<dyn types_registry::domain::ports::Stores>,
-    db: &DBProvider<types_registry::domain::admission::worker::WorkerError>,
-    scope: &AccessScope,
-    limits: &types_registry::config::Limits,
-    operation_id: uuid::Uuid,
-    now: time::OffsetDateTime,
-) -> Result<
-    types_registry::domain::admission::worker::OperationOutcome,
-    types_registry::domain::admission::worker::WorkerError,
-> {
-    types_registry::domain::admission::worker::run_operation(
-        stores,
-        db,
-        scope,
-        limits,
-        operation_id,
-        now,
-        types_registry::config::WorkerSettings::default(),
-    )
-    .await
+/// P0's configured worker tuning, as the gear reads it from
+/// `TypesRegistryConfig`.
+///
+/// `worker.max_revalidation_attempts` bounds the revalidation loop (T15). A test
+/// that needs a different budget — one attempt, to prove exhaustion terminalizes —
+/// builds its own `WorkerSettings` rather than mutating a shared one.
+pub fn worker_settings() -> types_registry::config::WorkerSettings {
+    types_registry::config::WorkerSettings::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +371,17 @@ pub enum PausePoint {
     /// Inside `commit_creation`, with the family row taken and the three family
     /// rules not yet asked — the window the family advisory lock exists to close.
     CreateOrGet,
+    /// **Before** `commit_revision`'s opening entity read, which is the commit
+    /// transaction's first statement — so the pass is held with its transaction
+    /// open and holding nothing, which is what lets a second connection commit
+    /// underneath it even on `SQLite`. The window the revision-vector guard exists
+    /// to close (T15).
+    ///
+    /// A Type Schema candidate reaches `find_by_gts_id` exactly once per commit
+    /// attempt and never during evaluation — `evaluate` reads an entity by
+    /// identifier only for an Instance's conforming type — so this point is the
+    /// boundary between one attempt's evaluation and its commit.
+    RevisionEntityRead,
 }
 
 /// Every port forwarded to the real adapter, with one call held on a channel.
@@ -473,6 +468,9 @@ impl EntityStore for PausingStores {
         scope: &AccessScope,
         gts_id: &str,
     ) -> Result<Option<EntityRow>, ScopeError> {
+        // Before the read, not after: what the test does while the pass is held has
+        // to be visible to this very statement.
+        self.pause(PausePoint::RevisionEntityRead).await;
         self.inner.find_by_gts_id(tx, scope, gts_id).await
     }
 
@@ -537,6 +535,15 @@ impl TypeSchemaStore for PausingStores {
         let out = self.inner.current_documents(tx, scope, entity_ids).await?;
         self.pause(PausePoint::CurrentDocuments).await;
         Ok(out)
+    }
+
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        self.inner.current_schemas(tx, scope, entity_ids).await
     }
 
     async fn find_current_schema(

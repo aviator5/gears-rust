@@ -27,6 +27,7 @@ use uuid::Uuid;
 use super::errors::{ItemFailure, WorkerError};
 use super::fingerprint::canonical_text;
 use super::refresh::refresh_dependents;
+use super::vector::{self, RevisionVector};
 use crate::domain::artifacts::{MaterializedArtifacts, content_hash, materialize};
 use crate::domain::dependency::{DependencyEdge, extract_edges};
 use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
@@ -94,6 +95,14 @@ pub struct EvaluatedUnit {
     /// the entity lock is exactly that. Resolving the identifiers to rows is the
     /// commit's own job, because that answer changes between the two.
     pub edges: Vec<DependencyEdge>,
+    /// Everything this evaluation's verdict rests on, as the evaluation snapshot
+    /// saw it (D4, T15).
+    ///
+    /// Read in the *same* transaction as the transient store, so the vector and
+    /// the documents that were validated describe one state. The commit re-derives
+    /// it and refuses to write if the two disagree — see
+    /// [`crate::domain::admission::vector`].
+    pub vector: RevisionVector,
 }
 
 /// The commit's result for one item that wrote a revision.
@@ -129,6 +138,10 @@ pub enum RevisionCommit {
 /// when this returns: nothing is retained anywhere, and the next invocation reads
 /// the database again.
 ///
+/// `activation_write_set` bounds the reverse-impact half of the revision vector
+/// (T15) — the same bound the refresh enforces, asked here so an over-bound
+/// candidate is refused before a transaction has written anything.
+///
 /// # Errors
 /// [`WorkerError`] for an infrastructure failure, which the outbox handler must
 /// retry. A content failure is an [`ItemFailure`] in the `Ok(Err(..))` position: an
@@ -140,6 +153,7 @@ pub async fn evaluate(
     gts_id: &str,
     canonical_body: &str,
     operation_item_id: i64,
+    activation_write_set: usize,
 ) -> Result<Result<EvaluatedUnit, ItemFailure>, WorkerError> {
     let id = match GtsId::try_new(gts_id) {
         Ok(id) => id,
@@ -183,7 +197,8 @@ pub async fn evaluate(
     // The conforming type's `(entity_id, revision_no)` is read in the same snapshot as
     // the store: the recorded revision must be the one that validated the value.
     let conforming_type = (!id.is_type()).then(|| id.get_type_id()).flatten();
-    let (store, schema_pair) = {
+    let candidate_id = id.id().to_owned();
+    let (store, schema_pair, vector) = {
         let stores = Arc::clone(stores);
         let scope = scope.clone();
         let conforming_type = conforming_type.clone();
@@ -205,10 +220,28 @@ pub async fn evaluate(
                     }
                     None => None,
                 };
-                Ok((store, pair))
+                // In this transaction, not a later one: the vector must describe the
+                // same state as the documents that are about to be validated, or the
+                // commit's comparison would be measuring a gap that opened *before*
+                // the evaluation rather than after it (D4).
+                let vector = vector::derive_from(
+                    stores.as_ref(),
+                    tx,
+                    &scope,
+                    &candidate_id,
+                    store.roots(),
+                    store.closure_entities(),
+                    activation_write_set,
+                )
+                .await?;
+                Ok((store, pair, vector))
             })
         })
         .await?
+    };
+    let vector = match vector {
+        Ok(vector) => vector,
+        Err(failure) => return Ok(Err(failure)),
     };
 
     let canonical_body = canonical_body.to_owned();
@@ -221,6 +254,7 @@ pub async fn evaluate(
             canonical_body,
             operation_item_id,
             edges,
+            vector,
         )
     })
     .await
@@ -230,6 +264,7 @@ pub async fn evaluate(
 /// Run the CPU-heavy `gts-rust` validation and artifact materialization away from
 /// the async executor. All database reads have completed before this function is
 /// scheduled, so the blocking task owns a closed, in-memory unit store.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_loaded(
     mut store: UnitStore,
     id: &GtsId,
@@ -238,6 +273,7 @@ fn evaluate_loaded(
     canonical_body: String,
     operation_item_id: i64,
     edges: Vec<DependencyEdge>,
+    vector: RevisionVector,
 ) -> Result<Result<EvaluatedUnit, ItemFailure>, WorkerError> {
     let outcome = if id.is_type() {
         let resolved = match store.store_mut().validate_schema(id.id()) {
@@ -289,6 +325,7 @@ fn evaluate_loaded(
         outcome,
         operation_item_id,
         edges,
+        vector,
     }))
 }
 
@@ -351,6 +388,7 @@ pub async fn commit_creation(
     tx: &DbTx<'_>,
     scope: &AccessScope,
     unit: &EvaluatedUnit,
+    activation_write_set: usize,
     now: OffsetDateTime,
 ) -> Result<Result<CommittedUnit, ItemFailure>, WorkerError> {
     if stores
@@ -384,6 +422,24 @@ pub async fn commit_creation(
             now,
         )
         .await?;
+
+    // Step 4.3: the revision vector, re-derived and compared under the family lock
+    // this transaction holds. A creation has no dependents — a `$ref` at an absent
+    // identifier has no resolved form, so nothing can already point here — so what
+    // this catches is a **dependency** that moved, appeared or vanished since the
+    // candidate was resolved against it.
+    if let Err(failure) = vector::guard(
+        stores,
+        tx,
+        scope,
+        &unit.gts_id,
+        &unit.vector,
+        activation_write_set,
+    )
+    .await?
+    {
+        return Ok(Err(failure));
+    }
 
     // The three family rules — kind, minor shape, minor contiguity — in one call,
     // asked of a **new member** only: a revision adds nobody to the family and is
@@ -611,12 +667,27 @@ async fn read_current_content(
     })
 }
 
-/// The `unchanged` half of [`commit_revision`]: re-ask the precondition, then
-/// terminalize the item without allocating a revision.
+/// The `unchanged` outcome: the authored content already equals the current
+/// revision, so there is nothing to write but the item's own result.
 ///
-/// Its own function so the write path in [`commit_revision`] reads as one sequence.
-/// It writes nothing but the item's terminal state, which is why the re-read below
-/// stands in for the compare-and-swap the real revision carries in its `WHERE`.
+/// Its own function because it is a **complete** commit path — it returns rather
+/// than falling through — and because the re-read below is the whole of its
+/// concurrency argument, which is easier to state next to the three statements it
+/// concerns than in the middle of a longer function.
+///
+/// The re-read is not redundant with the caller's entry check. The commit
+/// transaction runs at `READ COMMITTED` ([`commit_write`](crate::domain::ports::commit_write)),
+/// so a concurrent admission can commit between that check and the content read,
+/// and this pass would otherwise answer `unchanged` about content that is no longer
+/// current. A revision closes the same window with its compare-and-swap, whose
+/// precondition is in the `WHERE`; an `unchanged` outcome writes nothing and so has
+/// no `WHERE` to put it in. A re-read that still sees `expected` means the other
+/// admission had not committed yet, so this pass genuinely came first.
+///
+/// # Errors
+/// [`WorkerError::EntityVanished`] if the entity row disappeared between the two
+/// reads, [`WorkerError::ItemAlreadyTerminal`] if an overlapping pass recorded the
+/// outcome first, and a stale precondition as an [`ItemFailure`].
 async fn commit_unchanged(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -667,23 +738,23 @@ async fn commit_unchanged(
 /// the `expected_resource_version` precondition, the immutable revision insert,
 /// the current-state pointer move, and the item outcome.
 ///
-/// # The order of the three statements is the concurrency design
+/// # The order of the statements is the concurrency design
 ///
 /// 1. read the entity, refuse a tombstone, and compare `resource_version` to
 ///    `expected`, so a stale caller gets a message naming both versions rather
 ///    than a bare CAS failure;
-/// 2. read the current revision's authored content, to decide `unchanged`;
-/// 3. **re-ask the precondition** — as a compare-and-swap for a real revision, and
-///    as a plain re-read for an `unchanged` one.
+/// 2. read the current revision's authored content, to decide `unchanged` — which
+///    is a complete path of its own, [`commit_unchanged`], and carries the re-read
+///    that closes the `READ COMMITTED` window for a pass that writes nothing;
+/// 3. the revision-vector guard (T15): re-derive everything the evaluation rested
+///    on and refuse to write if any of it moved;
+/// 4. **re-ask the precondition** as a compare-and-swap, whose `WHERE` closes the
+///    same window by construction, then write.
 ///
-/// Step 3 is not redundant with step 1. The commit transaction runs at
+/// Step 4 is not redundant with step 1. The commit transaction runs at
 /// `READ COMMITTED` ([`commit_write`](crate::domain::ports::commit_write)), so a
-/// concurrent admission can commit between steps 1 and 2 and this pass would
-/// otherwise answer `unchanged` against content that is no longer current. The
-/// compare-and-swap closes that window by construction — its precondition is in the
-/// `WHERE` — and the re-read closes it for `unchanged`, which writes nothing and so
-/// has no `WHERE` to put it in. A re-read that still sees `expected` means the other
-/// admission had not committed yet, so this pass genuinely came first.
+/// concurrent admission can commit between the two, and a check whose result is
+/// separated from the write it guards is not a check at all.
 ///
 /// ponytail: ceiling C6 (SPEC §9) — nothing authorizes this path. The registration
 /// policy is asked of creations only, and P0 has no principal to check in its place,
@@ -763,6 +834,33 @@ pub async fn commit_revision(
         return Err(WorkerError::ResourceVersionExhausted {
             gts_id: unit.gts_id.clone(),
         });
+    }
+
+    // Step 4.3: the revision vector, re-derived from the database and compared —
+    // membership and every column, dependencies and dependents alike. A difference
+    // means this evaluation was computed against a state that is gone, so
+    // `vector::guard` returns `WorkerError::RevalidationRequired`, this transaction
+    // rolls back, and the worker evaluates again.
+    //
+    // **After the `unchanged` branch, not before it.** Step 4.3's place in SPEC
+    // §8.1 is ahead of every write, and an `unchanged` outcome writes none: it
+    // allocates no revision, moves no version and refreshes no dependent, and the
+    // one thing it does decide — "this content already equals the current
+    // revision" — is decided from rows read *inside* this transaction, so no part
+    // of it rests on the evaluation's view. Guarding it could only turn a genuine
+    // no-op re-submit into a revalidation, and after
+    // `worker.max_revalidation_attempts` of those, into a failure.
+    if let Err(failure) = vector::guard(
+        stores,
+        tx,
+        scope,
+        &unit.gts_id,
+        &unit.vector,
+        activation_write_set,
+    )
+    .await?
+    {
+        return Ok(Err(failure));
     }
 
     // One statement carrying the precondition, so there is no window between

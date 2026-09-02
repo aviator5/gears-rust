@@ -46,7 +46,7 @@ use toolkit_macros::domain_model;
 
 use crate::domain::dependency::{extract_edges, reference_targets};
 use crate::domain::enums::EntityKind;
-use crate::domain::ports::Stores;
+use crate::domain::ports::{EntityRow, Stores};
 
 /// One authored document destined for the transient store.
 ///
@@ -69,6 +69,8 @@ pub struct UnitDocument {
 pub struct UnitStore {
     store: GtsStore,
     load_order: Vec<String>,
+    roots: Vec<String>,
+    closure: Vec<EntityRow>,
     missing_candidates: Vec<String>,
     missing_references: Vec<String>,
 }
@@ -94,6 +96,31 @@ impl UnitStore {
     #[must_use]
     pub fn load_order(&self) -> &[String] {
         &self.load_order
+    }
+
+    /// The closure roots this store was read from: the candidate identifiers plus
+    /// their documents' reference targets.
+    ///
+    /// Exposed for the revision vector (T15), which must re-derive the closure at
+    /// commit time from the **same** roots — a set that is a pure function of the
+    /// authored documents and so cannot be recovered from the store's contents,
+    /// which are the closure's *answer*.
+    #[must_use]
+    pub fn roots(&self) -> &[String] {
+        &self.roots
+    }
+
+    /// The entity rows the closure resolved, `gts_id`-sorted, exactly as
+    /// `DependencyStore::closure` returned them.
+    ///
+    /// Also for the revision vector, and for a narrower reason: the vector's
+    /// dependency half *is* this row set, and asking the database for it a second
+    /// time in the same transaction would be a second walk for an answer already in
+    /// hand. Handed out rather than folded in, because the vector is built by
+    /// `admission::vector` from the same function the commit uses.
+    #[must_use]
+    pub fn closure_entities(&self) -> &[EntityRow] {
+        &self.closure
     }
 
     /// Candidate identifiers with no entity row — reported, not fatal. A first
@@ -264,6 +291,11 @@ pub fn build_store(mut documents: Vec<UnitDocument>) -> Result<UnitStore, StoreB
     Ok(UnitStore {
         store,
         load_order,
+        // Empty: this constructor is handed a document set, not a closure to read,
+        // so it has neither roots nor resolved rows of its own. `load_unit_store`
+        // fills both in.
+        roots: Vec::new(),
+        closure: Vec::new(),
         missing_candidates: Vec::new(),
         missing_references: Vec::new(),
     })
@@ -331,6 +363,9 @@ pub async fn load_unit_store(
     roots.dedup();
 
     let closure = stores.closure(tx, scope, &roots).await?;
+    // Kept for `UnitStore::closure_entities`, before the loops below borrow and
+    // consume what they need from it.
+    let closure_entities = closure.entities.clone();
 
     // Authored text lives in a different table per kind, and `entity_kind` is the
     // only thing that says which. Two batched reads, not one per row.
@@ -386,6 +421,8 @@ pub async fn load_unit_store(
     }
 
     let mut unit = build_store(documents)?;
+    unit.roots = roots;
+    unit.closure = closure_entities;
     // One read, split by which root it was. `closure` reports every root with no
     // entity row; which of them is a candidate is this function's own knowledge,
     // so the port needs no second list.

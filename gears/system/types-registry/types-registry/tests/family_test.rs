@@ -31,8 +31,7 @@ use uuid::Uuid;
 use types_registry::config::{TypesRegistryConfig, WorkerSettings};
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::worker::{
-    LOCK_GEAR, OperationOutcome, WorkerError, family_lock_key,
-    run_operation as run_operation_configured,
+    LOCK_GEAR, OperationOutcome, WorkerError, family_lock_key, run_operation,
 };
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
@@ -41,7 +40,7 @@ use types_registry::infra::storage::entity::{dependency, entity, version_family}
 use types_registry::infra::storage::repo::EntityRepo;
 
 mod common;
-use common::{TestDir, allow_all, run_operation, stores, test_db, test_db_file};
+use common::{TestDir, allow_all, stores, test_db, test_db_file};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
@@ -130,6 +129,7 @@ async fn admit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str) -> Operat
         &worker(db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         op,
         LATER,
     )
@@ -440,6 +440,7 @@ async fn a_creation_holds_the_family_lock_across_its_commit() {
             &provider,
             &allow_all(),
             &common::limits(),
+            &common::worker_settings(),
             op,
             LATER,
         )
@@ -535,14 +536,14 @@ async fn family_lock_contention_honours_the_configured_wait_budget() {
         family_lock_timeout: Duration::from_millis(1),
         ..WorkerSettings::default()
     };
-    let error = run_operation_configured(
+    let error = run_operation(
         &stores(),
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &settings,
         operation_id,
         LATER,
-        settings,
     )
     .await
     .expect_err("the held family lock must exhaust the configured budget");
@@ -554,14 +555,14 @@ async fn family_lock_contention_honours_the_configured_wait_budget() {
 
     blocker.release().await.expect("release blocker lock");
 
-    let outcome = run_operation_configured(
+    let outcome = run_operation(
         &stores(),
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &WorkerSettings::default(),
         operation_id,
         LATER,
-        WorkerSettings::default(),
     )
     .await
     .expect("the same operation is recoverable after contention clears");

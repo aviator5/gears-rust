@@ -26,11 +26,11 @@ use toolkit_db::{DBProvider, DbError, DbTx};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use common::{allow_all, run_operation, stores, test_db};
-use types_registry::config::{Limits, TypesRegistryConfig};
+use common::{allow_all, stores, test_db};
+use types_registry::config::{Limits, TypesRegistryConfig, WorkerSettings};
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::refresh::RefreshOutcome;
-use types_registry::domain::admission::worker::{OperationOutcome, WorkerError};
+use types_registry::domain::admission::worker::{OperationOutcome, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
@@ -145,6 +145,7 @@ async fn submit(
 async fn admit_with(
     db: &Provider,
     limits: &Limits,
+    worker_settings: &WorkerSettings,
     key: &str,
     gts_id: &str,
     content: Value,
@@ -158,6 +159,7 @@ async fn admit_with(
         &worker(db),
         &allow_all(),
         limits,
+        worker_settings,
         operation_id,
         LATER,
     )
@@ -176,6 +178,7 @@ async fn admit(
     admit_with(
         db,
         &common::limits(),
+        &common::worker_settings(),
         key,
         gts_id,
         content,
@@ -367,7 +370,16 @@ async fn an_over_bound_write_set_commits_nothing() {
         activation_write_set: 1,
         ..Limits::default()
     };
-    let outcome = admit_with(&db, &tight, "k-base-2", BASE, base_schema("label"), Some(1)).await;
+    let outcome = admit_with(
+        &db,
+        &tight,
+        &common::worker_settings(),
+        "k-base-2",
+        BASE,
+        base_schema("label"),
+        Some(1),
+    )
+    .await;
 
     let item = &outcome.items[0];
     assert_eq!(item.status, OperationItemStatus::Failed, "got {item:?}");

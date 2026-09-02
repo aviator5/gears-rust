@@ -151,6 +151,15 @@ impl TypeSchemaStore for Repos {
         TypeSchemaRepo::find_current(tx, scope, entity_id).await
     }
 
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        TypeSchemaRepo::current_states(tx, scope, entity_ids).await
+    }
+
     async fn insert_schema_revision(
         &self,
         tx: &DbTx<'_>,

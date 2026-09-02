@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::worker::{OperationOutcome, WorkerError};
+use types_registry::domain::admission::worker::{OperationOutcome, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::DependencyKind;
@@ -32,7 +32,7 @@ use types_registry::infra::storage::entity::dependency;
 use types_registry::infra::storage::repo::EntityRepo;
 
 mod common;
-use common::{allow_all, run_operation, stores, test_db};
+use common::{allow_all, stores, test_db};
 
 /// Every identifier here lives in its own `dep` module, and deliberately so: the
 /// family advisory lock's `SQLite` scope is keyed on the DSN, which every test binding
@@ -146,6 +146,7 @@ async fn admit(
         &worker(db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         op,
         LATER,
     )
@@ -177,6 +178,7 @@ async fn try_admit(
         &worker(db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         op,
         LATER,
     )
@@ -461,6 +463,7 @@ async fn a_ref_naming_no_entity_fails_the_candidate() {
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         op,
         LATER,
     )

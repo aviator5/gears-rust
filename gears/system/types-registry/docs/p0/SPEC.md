@@ -88,7 +88,7 @@ correctness core, not scope.
 | D1 | **Async write path per DESIGN** — `202` + operation UUID + polling | `operation` / `operation_item` tables, `toolkit-db` outbox, admission worker. Kept as a contract that does not break when revalidation later becomes genuinely unbounded, even though the P0 worker completes in milliseconds |
 | D2 | **A transient `gts-rust` store per admission unit**, built from the database; reads are served from the database | Resolution, compat, chain validation and derivation need a `GtsStore`, so one is built from the unit's dependency closure and dropped after the unit. Reads need rows, not a store (§8.2), so nothing is held between units. Commit re-verifies under locks |
 | D3 | **Materialize effective artifacts** | `type_schema` current-state row is populated at admission. Read path shape identical to P1, no later backfill of `resolution_fingerprint` |
-| D4 | **Multi-pod** | Commit transaction re-reads `resource_version` of the candidate and the revision vector of everything consumed, and re-derives the reverse-impact set from the database under locks |
+| D4 | **Multi-pod** | Commit transaction re-reads `resource_version` of the candidate and the revision vector of everything consumed, and re-derives the reverse-impact set from the database; a difference rolls back and revalidates within `worker.max_revalidation_attempts` (§8.1 step 4.3, which also records what serializes the rows in place of the row locks the step originally named) |
 | D5 | **Reverse impact by one scoped recursive CTE, refresh by an iterative loop** | `DependencyRepo::reverse_impact` is a single `WITH RECURSIVE` over `dependency` through `SecureCteSelect` (ADR-0001, `toolkit-db`) — no raw SQL — depth-capped at `limits.activation_write_set`, which is also the refusal threshold. The refresh stays a domain loop because the fingerprint-stability stop decides the write set by recomputation, which no closure query can express. See [§D5](#d5-splits-the-traversal-from-the-refresh) |
 | D6 | **The old `TypesRegistryClient` is removed in P0**; every consumer migrates inside this effort | ~50 call sites across 20+ gears move. Forced by two facts: async admission makes the old synchronous `register()` a lie in its own signature, and the old models' `Arc`-linked object graphs cannot cross a wire, so keeping them keeps an out-of-process blocker. Migration is split by gear group — see `plan.md` P5 |
 | D7 | `operation.plane = 1` (platform), `tenant_id = NULL`, `principal_id` a hardcoded constant with a `TODO` | Idempotency scope becomes global — see §9 ceiling C2 |
@@ -380,20 +380,75 @@ the exception both ways: types-registry accepts and admits it itself, inline, wi
    any transaction against it: resolution, compat vs
    baseline, derivation, references, dependent revalidation. Record the target revision,
    the reverse-impact identifier set, and a revision vector (`resource_version`, plus
-   `resolution_fingerprint` where effective content was consumed).
+   `resolution_fingerprint` where effective content was consumed) — together with the
+   **closure roots** the reads were driven from, so step 4.3 re-derives the same question
+   rather than merely re-reading the same rows. The vector's reads run in the **same**
+   transaction as the store build, so the state it records is the state the documents
+   being validated came from; only the validation itself is outside a transaction.
 4. Commit transaction:
    1. enforce the caller precondition — creation requires the identifier absent, update
-      requires `entity.resource_version == expected_resource_version`;
-   2. lock or create every candidate family in canonical order, then lock candidate and
-      revision-vector entity/current rows in canonical identifier order;
-   3. under each update target's entity lock, re-derive the reverse-impact set from the
-      database (worklist, D5) and compare membership **and** the full revision vector;
-      any difference rolls back and restarts validation within the bounded retry policy;
+      requires `entity.resource_version == expected_resource_version`. An update whose
+      authored content equals the current revision's is **`unchanged`** and terminates
+      here: it writes no revision, moves no version and refreshes no dependent, so the
+      guard below does not apply to it and is not asked;
+   2. lock or create every candidate family in canonical order (T12, the advisory lock
+      `types_registry::family:<key>`, taken for a **new member** only — a revision adds
+      nobody to a family and asks none of its rules). Entity and current rows are not
+      separately locked; what serializes them is named below;
+   3. re-derive the revision vector from the database — the dependency closure from the
+      same roots evaluation used, and the reverse-impact set (D5) — and compare
+      **membership and every column**: `resource_version` throughout, plus
+      `resolution_fingerprint` for each dependent, whose artifacts a refresh moves
+      without moving its version. Any difference rolls the transaction back and
+      revalidates from scratch, bounded by `worker.max_revalidation_attempts`;
+      exhaustion terminalizes the item as `failed` with reason
+      `revalidation_exhausted`;
    4. re-test predecessor existence for each minor-bearing candidate;
    5. insert the immutable revision, replace the current-state projection, replace the
       entity's outgoing dependency edges;
    6. refresh affected current effective schemas (bounded by `limits.activation_write_set`);
    7. increment `resource_version`, record the outcome and resulting version.
+
+**Why step 4.2 takes no row locks, and what stands in their place** (ceiling C9). The step was
+written as *"then lock candidate and revision-vector entity/current rows in canonical
+identifier order"*, and P0 does not do that. Two reasons it cannot and one reason it
+need not:
+
+- The secure query API exposes no `FOR UPDATE` (`toolkit-db/src/secure/select.rs`), and
+  `SQLite` has no row locking at all — the outbox reaches its own `FOR UPDATE SKIP
+  LOCKED` through raw dialect SQL, which `11_database_patterns.md` forbids outside
+  migrations. The portable primitive is the advisory lock, and taking one per vector
+  member is up to `activation_write_set + closure` round trips inside the commit
+  transaction, which is disproportionate to what it buys.
+- The **candidate's own** row needs no separate lock: the compare-and-swap on
+  `resource_version` carries its precondition in the `WHERE`, so two revisions of one
+  entity are already serialized by the write.
+- A **vector member** is serialized by the write-write conflict the refresh creates.
+  A concurrent commit that moves a dependency of the candidate runs its own
+  reverse-impact refresh, which writes the candidate's `type_schema` row exactly when
+  the move affects the candidate's artifacts — the same row this commit writes — so the
+  two block on each other in the database. Where the move does *not* affect them, the
+  refresh's fingerprint-stability stop is the proof that the staleness is harmless, and
+  it is the same argument that stops the reverse walk (D5).
+
+  The residual window is between step 4.3's comparison and this transaction's `COMMIT`.
+  A dependency committing inside it refreshes the candidate's artifacts against the
+  revision this transaction is writing, because its refresh statement re-reads under
+  `READ COMMITTED` after this transaction's row lock is released — so the final state is
+  the one a serial order would have produced. What step 4.3 buys on top is that the
+  *evaluation* is never committed against a state it did not see, which is what makes
+  the transient-store design (D2) safe.
+
+Canonical identifier order is kept where it is observable: family keys are sorted and
+deduplicated before the locks are taken (`domain::family::lock_order`), and the vector is
+`(gts_id, role)`-sorted on both sides so the comparison and the drift it reports are
+deterministic rather than row-order dependent.
+
+**The write-set bound is asked twice.** `limits.activation_write_set` bounds the
+reverse-impact read in the vector as well as in the refresh, so an over-bound candidate
+is refused with `activation_write_set_exceeded` at **evaluation**, before a transaction
+has written anything, and the refresh's own refusal (step 4.6) remains as the backstop
+for a set that grew in between.
 
 Deletion has its own short protocol: positive `expected_resource_version`, lock family
 and entity, recheck `ACTIVE` at that version with no direct registered dependents, set
@@ -727,7 +782,8 @@ compatibility rather than deviating from it (§7). C9 records the implementation
 that final state and must be struck before the database path is exposed.
 
 C1, C3 and C4 are **struck** — resolved in P0 rather than deferred. The rows are kept
-because other documents cite the numbers.
+because other documents cite the numbers. C9 was added at T15, when implementing the
+commit-time guard established that step 4.2's row locks are not expressible.
 
 | # | Ceiling | Upgrade path |
 |---|---|---|
@@ -740,6 +796,8 @@ because other documents cite the numbers.
 | C7 | **The validator has no tenant or projection dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and a fixed default-projection marker (§8.5); the SDK cache key likewise carries visibility context and projection as constants. Correct while every read is platform-plane and no `$select` exists, and wrong the moment either arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions and the real projection digest under a new version and refuses to honour a P0 token |
 | C8 | **Platform-plane mutations are internal-only.** Every P0 operation is platform-plane (`plane = 1`), but an in-process gear has no inbound platform-identity validator, api-gateway has no platform listener, and `OperationBuilder` cannot mark a route platform-only (§8.4). Registration and deletion therefore keep `exposed = false`; internal and non-mutating calls retain authentication, because `.anonymous()` without a platform identity would be a regression | A platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity`, a declarative platform-plane route marker, and a platform-principal/PDP decision before mutation dispatch. Only then may mutation routes be exposed. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
 | C9 | **Implementation sequencing only.** T11 makes revisions executable before T14 refreshes reverse impact and T17 compares compatibility. Content revisions **of** minor-bearing Type Schemas remain permanently refused by ADR-0004 — creating one is admissible (§8.1 step 4), editing it is not; during this window every effective `force` also fails closed, and C8 keeps the database mutation path internal | T14 and T17 close the two gaps at Checkpoints 3 and 4, before T24 exposes any consumer. Strike this row when both checkpoints are complete; striking it removes only the temporary `force` refusal, not the ADR-0004 invariant |
+
+| C9 | **The commit takes no entity/current row locks**, deviating from DESIGN §4 step 2 and from §8.1 step 4.2 as originally written. The secure query API exposes no `FOR UPDATE` and `SQLite` has no row locking, so the only portable primitive is the advisory lock, and one per revision-vector member is up to `activation_write_set` round trips inside the commit transaction. What stands in their place is the compare-and-swap on the candidate's own row and the write-write conflict a dependency's own refresh creates on the candidate's `type_schema` row; §8.1 step 4.2 records the argument and the one window it leaves | A `FOR UPDATE` on `SecureSelect` — the outbox already needs it and reaches it through raw dialect SQL — after which step 4.2 is taken literally: family locks, then the vector's entity and current rows in canonical identifier order, on the two backends that have row locks |
 
 Each ceiling gets a `ponytail:`-style source comment naming the bound and the upgrade
 path at the point where it bites.
@@ -974,9 +1032,9 @@ gears:
         page_size_max: 1000
       registration_policy: {}          # closed by default; global `cf` implicit
       worker:
-        family_lock_timeout: 5s         # lock retry budget, below gateway timeout
-        operation_timeout: 5m
-        max_revalidation_attempts: 8
+        family_lock_timeout: 5s        # lock retry budget, below gateway timeout
+        operation_timeout: 5m          # accepted, not enforced until T21
+        max_revalidation_attempts: 8   # the revalidation loop's bound, §8.1 step 4.3
       local_client:
         cache:
           freshness_window: 30s        # DESIGN §3.3; `0s` disables the window
@@ -1299,6 +1357,10 @@ identifier profile refusals, topological order, baseline selection.
 | Activation set over the bound | candidate fails, no partial refresh committed |
 | Duplicate worker invocation on one operation | second invocation is a no-op |
 | Worker re-invoked after a rolled-back unit | revalidates from scratch and commits once |
+| Dependency moved between evaluation and commit | the guard rolls the commit back; the retry re-resolves against the moved dependency and commits once, so the candidate lands at one new revision |
+| Dependent created, or refreshed, after the reverse-impact scan | detected — the first on membership, the second on `resolution_fingerprint` alone, since a refresh moves no `resource_version` |
+| `unchanged` re-submission while a dependency moves | still `unchanged`: an outcome that writes nothing is not guarded, so a genuine no-op cannot be turned into a failure |
+| Revalidation budget exhausted | item terminal `failed` with reason `revalidation_exhausted`, naming the last drift, and nothing written |
 | Restart | every entity and its artifacts identical, byte for byte |
 | Two pods, commit on A | B's first post-commit read sees it (`nfr-multi-pod-correctness`). Under D2 this holds by construction — B reads the database, and no process-local copy can go stale |
 | Second admission after a committed revision | the unit's transient store is rebuilt from the database and sees the new revision without any invalidation step |

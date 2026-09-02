@@ -354,23 +354,17 @@ fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
         );
     }
 
-    for (worker, expected) in [
-        (
-            json!({ "operation_timeout": "30s" }),
-            "worker.operation_timeout",
-        ),
-        (
-            json!({ "max_revalidation_attempts": 3 }),
-            "worker.max_revalidation_attempts",
-        ),
-    ] {
-        let cfg = parse(json!({ "worker": worker.clone() }));
-        assert_eq!(
-            cfg.inert_limit_keys(),
-            vec![expected],
-            "setting {worker} must be reported as inert",
-        );
-    }
+    // One worker key is left on the list: `max_revalidation_attempts` came off it at
+    // T15, which is the transition the list exists to make visible, and
+    // `the_enforced_limits_are_never_reported_as_inert` covers it from the other
+    // side.
+    let worker = json!({ "operation_timeout": "30s" });
+    let cfg = parse(json!({ "worker": worker }));
+    assert_eq!(
+        cfg.inert_limit_keys(),
+        vec!["worker.operation_timeout"],
+        "setting {worker} must be reported as inert",
+    );
 }
 
 /// The keys that *are* enforced are never reported, whatever they are set to —
@@ -378,7 +372,8 @@ fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
 #[test]
 fn the_enforced_limits_are_never_reported_as_inert() {
     let cfg = parse(json!({
-        "limits": { "authored_document": "1MB", "batch_candidates": 7, "activation_write_set": 8 }
+        "limits": { "authored_document": "1MB", "batch_candidates": 7, "activation_write_set": 8 },
+        "worker": { "max_revalidation_attempts": 3 }
     }));
     assert!(cfg.inert_limit_keys().is_empty());
     // And they really are the enforced set, read back as configured.
@@ -387,6 +382,10 @@ fn the_enforced_limits_are_never_reported_as_inert() {
     assert_eq!(
         cfg.limits.activation_write_set, 8,
         "T14 enforces this one: the reverse-impact refusal and the CTE's depth cap"
+    );
+    assert_eq!(
+        cfg.worker.max_revalidation_attempts, 3,
+        "T15 enforces this one: the bound on the revalidation loop"
     );
 }
 
@@ -425,6 +424,19 @@ fn a_zero_enforced_limit_fails_startup() {
             .expect_err(&format!("a zero limit must fail startup: {limits}"));
         assert!(matches!(err, ConfigError::Limits(_)), "got {err}");
     }
+}
+
+/// The same rule on the worker section: a zero attempt budget would terminalize
+/// every candidate as `revalidation_exhausted` without evaluating it once. Reported
+/// as `ConfigError::Worker`, like `worker.family_lock_timeout` — the section the key
+/// lives in, not the kind of bound it is.
+#[test]
+fn a_zero_revalidation_budget_fails_startup() {
+    let cfg = parse(json!({ "worker": { "max_revalidation_attempts": 0 } }));
+    let err = cfg
+        .validate()
+        .expect_err("a zero attempt budget must fail startup");
+    assert!(matches!(err, ConfigError::Worker(_)), "got {err}");
 }
 
 /// The defaults themselves validate. Trivial to state and the one case a

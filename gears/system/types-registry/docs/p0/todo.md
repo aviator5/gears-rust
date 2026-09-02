@@ -1010,12 +1010,13 @@ zero-refusal in `validate()`, alongside the other enforced limits. `resolved_doc
 
 **Two shapes came out of the rebase onto the family lock, not out of T14's design.** `Limits`
 and `WorkerSettings` both travel per item, which puts `process_item` one argument over
-Clippy's threshold, so they travel together as `ItemConfig` — the same reason
-`CommitRequest` exists, and `limits` rides on `CommitRequest` from there. And
-`commit_revision` crossed the 200-line lint once the refresh call joined the tombstone and
-lock rechecks, so its `unchanged` branch is now `commit_unchanged`: a re-read standing in
-for the compare-and-swap a real revision carries in its `WHERE`, which is one idea and
-reads better named.
+Clippy's threshold, so T14 groups them as `ItemConfig` and `limits` rides on
+`CommitRequest` from there — T15 then replaces that grouping with its own borrowed
+`Tuning`, which does the same job for the same reason. And `commit_revision` crossed the
+200-line lint once the refresh call joined the tombstone and lock rechecks, so its
+`unchanged` branch became `commit_unchanged`: a re-read standing in for the
+compare-and-swap a real revision carries in its `WHERE`. T15 had planned that same
+extraction for its own clippy bound and inherits it verbatim.
 
 **Verification:**
 - [x] Gear tests, all three backends — `cargo nextest run -p cf-gears-types-registry`: **550 passed** (544 before the rebase; the six added are the family-lock suites this branch rebased onto); `--features integration` on `repo_backends_test`, `migration_backends_test` and `revision_race_backends_test`: **6 passed** (PostgreSQL + MySQL containers)
@@ -1046,30 +1047,133 @@ store — `unit.rs`'s neighbours, not extraction's. It went to
 
 ---
 
-### - [ ] T15: Revision-vector guard and bounded retry
+### - [x] T15: Revision-vector guard and bounded retry
 
 **Description:** The multi-pod correctness guard (D4): record a revision vector for every
 correctness-relevant dependency and dependent during evaluation, then under the target's
 entity lock re-derive the reverse-impact set from the database and compare both membership
 and the full vector, rolling back and revalidating within a bounded retry policy.
 
+**Membership is re-derived from the recorded *roots*, not re-read from the recorded rows.**
+Comparing versions of the entities evaluation happened to see catches a dependency that
+*moved* and misses one that *appeared* — a transitive dependency pulled in because some
+intermediate entity gained an edge, and the phantom dependent, which is one of the
+criteria. So `RevisionVector` carries the closure roots (the candidate identifier plus its
+document's `$ref` targets, a pure function of the authored document) and the commit re-runs
+`closure` and `reverse_impact` from them. One derivation function serves both sides, or the
+comparison would measure the difference between two readers instead of two states.
+
+**The vector is recorded inside the store-build transaction.** `evaluate` already opens one
+`snapshot_read` around `load_unit_store`; the vector's reads join it. Anywhere later and the
+comparison would be measuring a gap that opened *before* the evaluation rather than after
+it. `UnitStore` grew two accessors for this: `roots()`, because the roots are the closure's
+*question* and cannot be recovered from its answer, and `closure_entities()`, because the
+vector's dependency half **is** that answer — so evaluation calls `vector::derive_from` with
+the rows the store builder already walked, and only the commit side pays for the walk
+(`vector::derive`). One function builds the vector on both sides regardless, which is the
+property the comparison depends on.
+
+**Step 4.2's row locks are not taken, and SPEC now says why** (ceiling **C9**, new at this
+task; `plan.md` P15). The secure
+query API exposes no `FOR UPDATE` and `SQLite` has no row locking, so the portable
+primitive is the advisory lock — one per vector member is up to `activation_write_set`
+round trips inside the commit transaction, which is the cost T14 restructured the reverse
+read to avoid. What serializes the rows instead was already there: the candidate's own row
+by the compare-and-swap that writes it, and a vector member by the write-write conflict its
+own refresh creates on the candidate's `type_schema` row precisely when the move affects
+it. Where it does not, the fingerprint-stability stop is the proof the staleness is inert.
+The family lock is unchanged — still taken for a **new member** only, since a revision asks
+none of the family rules (T12).
+
+**The `unchanged` branch is not guarded, and that is the decision, not an oversight.** It
+writes no revision, moves no version and refreshes no dependent, and the one thing it
+decides is decided from rows read inside its own transaction. Guarding it could only turn a
+genuine no-op re-submission into a revalidation because a *neighbour* moved, and after
+`max_revalidation_attempts` of those, into a failure.
+
+**The retry lives in `process_item`, not in `transaction_with_retry`.** A drift means the
+evaluation is void rather than wrong, so what has to be redone is the whole of step 3 — a
+fresh snapshot, a fresh transient store, fresh validation. Re-running the same transaction
+would compare the same stale vector and drift identically, which is why
+`RevalidationRequired` reads as `None` to `retryable_db_err`.
+
+**`limits.activation_write_set` is now asked twice**, because the vector's reverse-impact
+read is the refresh's read. An over-bound candidate is refused at *evaluation* under the
+same `activation_write_set_exceeded` reason — earlier, cheaper, and invisible to a client;
+T14's refusal stays as the backstop for a set that grew in between.
+
 **Acceptance criteria:**
-- [ ] Vector carries `resource_version` and, where effective content was consumed, `resolution_fingerprint`
-- [ ] A new, removed or moved dependency/dependent rolls the transaction back
-- [ ] Retries are bounded by `worker.max_revalidation_attempts`; exhaustion terminalizes the item as `failed`
-- [ ] Lock order is family → entity/current rows, in canonical identifier order, everywhere
+- [x] Vector carries `resource_version` and, where effective content was consumed,
+  `resolution_fingerprint` — the latter for live Type Schema dependents, whose effective
+  artifacts the refresh consumes to decide whether to rewrite them. `None` for a
+  dependency (only its authored document is read, and that moves only with
+  `resource_version`), for an Instance dependent (`instance` carries no artifacts) and for
+  a tombstone — the two the refresh skips
+- [x] A new, removed or moved dependency/dependent rolls the transaction back —
+  `VectorDrift::{Appeared, Vanished, Moved, Refreshed}`, travelling as
+  `WorkerError::RevalidationRequired`, which is what rolls it back. `Refreshed` is the
+  fourth shape and not a redundant one: a refreshed dependent moves no version
+- [x] Retries are bounded by `worker.max_revalidation_attempts`; exhaustion terminalizes
+  the item as `failed` — reason `revalidation_exhausted`, message naming the last drift.
+  The key moved off `inert_limit_keys` and gained a zero-refusal in `validate()`, as
+  `activation_write_set` did at T14
+- [x] Lock order is family → entity/current rows, in canonical identifier order, everywhere.
+  **The family half holds and the row half is not taken** — SPEC ceiling C9 and
+  `plan.md` P15, with the `ponytail:` comment on `domain::admission::vector`.
+  Canonical order is kept where it is observable: `lock_order` sorts and dedups family
+  keys, and the vector is `(gts_id, role)`-sorted on both sides, which is what makes the
+  comparison one merge walk and the reported drift deterministic
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Test: a dependency mutated between evaluation and commit causes exactly one rollback and one successful retry
-- [ ] Test: a phantom dependent created after the initial scan is detected
-- [ ] Test: two pods against one database — a commit on one is visible to the other's first post-commit read
+- [x] Gear tests, all three backends — `cargo nextest run -p cf-gears-types-registry`:
+  **570 passed** (564 before the rebase onto the family lock); `--features integration` on `repo_backends_test`,
+  `migration_backends_test` and `revision_race_backends_test`: **6 passed**
+  (`PostgreSQL` + `MySQL` containers)
+- [x] Test: a dependency mutated between evaluation and commit causes exactly one rollback
+  and one successful retry —
+  `revalidation_test.rs::a_dependency_mutated_between_evaluation_and_commit_costs_one_\
+rollback_and_one_retry`. "One rollback" is read off the versions (revision 2, not 3);
+  "successful retry" off the artifacts, which inline the base's **new** property — only a
+  fresh evaluation could have produced that, and a committed stale one would still inline
+  the old
+- [x] Test: a phantom dependent created after the initial scan is detected — and detected on
+  *membership*, with no column of any recorded entry changed
+- [x] Test: two pods against one database — a commit on one is visible to the other's first
+  post-commit read. Two `DBProvider`s with their own pools over one database file; B's
+  miss is asserted first, so the hit is a read it actually performed
+- [x] Mutation-tested: with both `vector::guard` calls removed, the six guard tests fail and
+  the three controls (`a_commit_whose_vector_did_not_move_stands`, the `unchanged`
+  re-submission, the two-pod read) still pass — which is the shape that says the suite
+  measures the guard and not the fixtures
+- [x] `make fmt`, `make clippy` (`--all-targets --features integration`) — clean
+
+**Added:** `TR/src/domain/admission/vector.rs` + `vector_tests.rs` (10 tests over the pure
+comparison), `TR/tests/revalidation_test.rs` (9 tests),
+`current_schemas_reads_every_named_entity_that_has_one` in `repo_backends_test.rs`,
+`a_zero_revalidation_budget_fails_startup` in `config_test.rs`,
+`PausePoint::RevisionEntityRead` in `tests/common/mod.rs`.
+
+**One new port, `current_schemas`** — the batched sibling of `find_current_schema`. T14
+declined to add it because *"the alternative is a second batched port whose only caller is
+this loop"*; T15 is the second caller, twice over, and both of its reads run inside a
+transaction. `refresh_dependents` keeps its per-dependent read: moving it would reorder
+reads and writes in tested code for no criterion of this task, and the comment there now
+names T15 as the caller that gave the port its reason.
+
+**Clippy-driven extractions, worth naming because they are also better shapes.**
+`process_item` passed the cognitive-complexity bound once the revalidation loop went in, so
+the success mapping became the pure `committed_outcome`, and `limits` + `worker` became one
+borrowed `Tuning` — which supersedes T14's `ItemConfig`, the same grouping under a name that
+also carries the worker tuning. `commit_unchanged` was T15's third such extraction until the
+rebase: T14 had already reached the 200-line bound on `commit_revision` and cut it the same
+way, so T15 keeps the docstring that states the re-read argument and adds nothing else.
 
 **Dependencies:** T14
-**Files likely touched:** `TR/src/domain/admission/unit.rs`, `TR/src/domain/admission/vector.rs`, `TR/src/infra/storage/repo/`, `TR/src/domain/ports.rs`, `TR/src/infra/storage/store.rs`, `TR/tests/concurrency_test.rs`
-**Scope:** M
-
----
+**Files touched:** `TR/src/domain/admission/{vector,vector_tests}.rs` (new),
+`TR/src/domain/admission/{mod,unit,worker,errors}.rs`, `TR/src/domain/gts_store.rs`,
+`TR/src/domain/ports.rs`, `TR/src/domain/registry_service.rs`,
+`TR/src/infra/storage/{store.rs,repo/type_schema_repo.rs}`, `TR/src/api/rest/error.rs`,
+`TR/src/config.rs`, `TR/tests/*`, `docs/p0/{SPEC,plan}.md`
 
 ### - [ ] T16: Observability for the admission path
 

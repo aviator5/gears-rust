@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::worker::WorkerError;
+use types_registry::domain::admission::worker::{WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -27,7 +27,7 @@ use types_registry::infra::storage::entity::{instance, instance_revision, versio
 use types_registry::infra::storage::repo::EntityRepo;
 
 mod common;
-use common::{allow_all, run_operation, stores, test_db};
+use common::{allow_all, stores, test_db};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
@@ -111,6 +111,7 @@ async fn admit_type_then(
         &worker(db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         type_op,
         LATER,
     )
@@ -123,6 +124,7 @@ async fn admit_type_then(
         &worker(db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         op,
         LATER,
     )
@@ -243,6 +245,7 @@ async fn an_instance_without_its_type_fails_retryably() {
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         op,
         LATER,
     )
@@ -279,6 +282,7 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         type_op,
         LATER,
     )
@@ -296,6 +300,7 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         schema_op,
         LATER,
     )
@@ -315,6 +320,7 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         instance_op,
         LATER,
     )
@@ -374,6 +380,7 @@ async fn a_type_schema_may_not_join_an_instance_family() {
         &worker(&db),
         &allow_all(),
         &common::limits(),
+        &common::worker_settings(),
         schema_op,
         LATER,
     )

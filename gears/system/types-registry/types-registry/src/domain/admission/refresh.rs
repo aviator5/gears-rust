@@ -179,10 +179,13 @@ pub async fn refresh_dependents(
         };
         let artifacts = materialize(&resolved);
 
-        // Read per dependent rather than batched: the write set is bounded and
-        // small (measured max fan-out 27), and the alternative is a second batched
-        // port whose only caller is this loop. A batched read is the change to make
-        // if the bound is ever raised.
+        // Read per dependent rather than batched, still: the write set is bounded
+        // and small (measured max fan-out 27), and this read is interleaved with the
+        // recomputation that decides whether to write. The batched port the earlier
+        // note here called for now exists — `Stores::current_schemas`, which the
+        // revision vector (T15) needed twice — so the change is available if the
+        // bound is ever raised; it is not made here, where it would reorder the
+        // transaction's reads and writes for nothing.
         let current = stores
             .find_current_schema(tx, scope, row.id)
             .await?

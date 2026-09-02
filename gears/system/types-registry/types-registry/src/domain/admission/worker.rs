@@ -37,6 +37,7 @@ pub use super::errors::{ItemFailure, WorkerError};
 use super::unit::{
     CommittedUnit, EvaluatedUnit, RevisionCommit, commit_creation, commit_revision, evaluate,
 };
+use super::vector::VectorDrift;
 use crate::config::{Limits, WorkerSettings};
 use crate::domain::admission::Precondition;
 use crate::domain::enums::{OperationItemStatus, OperationStatus};
@@ -45,6 +46,18 @@ use crate::domain::ports::{OperationItemRow, OperationRow, Stores, commit_write,
 
 /// The advisory-lock namespace every types-registry lock is taken under.
 pub const LOCK_GEAR: &str = "types_registry";
+
+/// The two configuration sections one admission pass obeys, carried together.
+///
+/// They travel as a pair because the functions below want both and neither is a
+/// subset of the other: `limits` are bounds on what a *candidate* may be, `worker`
+/// is tuning on how the *pass* behaves. Borrowed and `Copy`, so passing it costs
+/// two pointers.
+#[derive(Clone, Copy)]
+struct Tuning<'a> {
+    limits: &'a Limits,
+    worker: &'a WorkerSettings,
+}
 
 /// Prefix on the family lock key, so a future lock on some other thing in this
 /// gear cannot collide with a family key that happens to spell the same bytes.
@@ -92,8 +105,15 @@ pub struct ItemOutcome {
 /// `limits` are the operator's configured bounds. Only
 /// [`Limits::activation_write_set`](crate::config::Limits::activation_write_set)
 /// has an enforcement site behind this signature today — the reverse-impact
-/// refresh (T14) — and the whole struct travels rather than that one field so the
-/// siblings need no signature change as their own enforcement lands.
+/// refresh (T14) and the reverse-impact half of the revision vector (T15) — and the
+/// whole struct travels rather than that one field so the siblings need no
+/// signature change as their own enforcement lands.
+///
+/// `worker` is the tuning the pass itself obeys:
+/// [`WorkerSettings::max_revalidation_attempts`](crate::config::WorkerSettings::max_revalidation_attempts)
+/// bounds the revalidation loop in [`process_item`] (T15). It is a second parameter
+/// rather than a field folded into `limits` because the two are different
+/// configuration sections and an operator sets them by their own names.
 ///
 /// # Errors
 /// [`WorkerError`] for an infrastructure failure. A candidate-level refusal is
@@ -103,9 +123,9 @@ pub async fn run_operation(
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
     limits: &Limits,
+    worker: &WorkerSettings,
     operation_id: Uuid,
     now: OffsetDateTime,
-    settings: WorkerSettings,
 ) -> Result<OperationOutcome, WorkerError> {
     // Step 1: the operation and its items under one snapshot. `mark_running` below
     // touches only the operation row, so reading the items before it rather than
@@ -131,13 +151,10 @@ pub async fn run_operation(
         );
     }
 
-    let config = ItemConfig {
-        limits: *limits,
-        settings,
-    };
+    let tuning = Tuning { limits, worker };
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
-        outcomes.push(process_item(stores, db, scope, config, operation_id, &item, now).await?);
+        outcomes.push(process_item(stores, db, scope, tuning, operation_id, &item, now).await?);
     }
 
     mark_completed(stores, db, scope, operation_id, now).await?;
@@ -235,16 +252,6 @@ async fn release_family_locks(
     }
 }
 
-/// The operator-configured inputs one item's admission needs, grouped for the same
-/// reason [`CommitRequest`] is: two independent configuration structs would push
-/// `process_item` past Clippy's argument-count threshold. Both halves are `Copy`,
-/// so this travels by value and no retry borrows across a transaction boundary.
-#[derive(Debug, Clone, Copy)]
-struct ItemConfig {
-    limits: Limits,
-    settings: WorkerSettings,
-}
-
 /// Groups the per-item commit inputs so the transaction boundary stays readable
 /// without crossing Clippy's argument-count threshold.
 struct CommitRequest<'a> {
@@ -328,11 +335,16 @@ async fn commit_evaluated(
             let tx_stores = Arc::clone(&tx_stores);
             Box::pin(async move {
                 match precondition {
-                    Precondition::MustNotExist => {
-                        commit_creation(tx_stores.as_ref(), tx, &tx_scope, unit.as_ref(), now)
-                            .await
-                            .map(|r| r.map(RevisionCommit::Admitted))
-                    }
+                    Precondition::MustNotExist => commit_creation(
+                        tx_stores.as_ref(),
+                        tx,
+                        &tx_scope,
+                        unit.as_ref(),
+                        tx_limits.activation_write_set,
+                        now,
+                    )
+                    .await
+                    .map(|r| r.map(RevisionCommit::Admitted)),
                     Precondition::Version(expected) => {
                         commit_revision(
                             tx_stores.as_ref(),
@@ -360,11 +372,29 @@ async fn commit_evaluated(
 
 /// Evaluate and commit one non-terminal operation item, or report the durable
 /// outcome an overlapping pass already established.
+///
+/// # The revalidation loop is the whole of D4's retry policy
+///
+/// Evaluation runs against rows that may already have moved (`vector`'s module
+/// header), and the commit's revision-vector guard is what makes that safe. When
+/// the guard fires, nothing about the *candidate* has been decided: the state it
+/// was judged against is gone, so the judgement is void rather than wrong. The
+/// only sound answer is to redo the whole of step 3 — a fresh snapshot, a fresh
+/// transient store, fresh validation — which is why the loop is here, outside both
+/// transactions, and not inside `commit_evaluated`'s `transaction_with_retry`
+/// (which would re-run the same transaction against the same stale vector and
+/// drift identically).
+///
+/// The bound is `worker.max_revalidation_attempts`. Exhaustion is terminal: the
+/// item records `revalidation_exhausted` with the last drift, because a candidate
+/// whose neighbourhood moves under it that many times in a row is not going to
+/// commit by being asked again, and leaving the item `running` forever is worse
+/// than a failure the caller can resubmit.
 async fn process_item(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
-    config: ItemConfig,
+    tuning: Tuning<'_>,
     operation_id: Uuid,
     item: &OperationItemRow,
     now: OffsetDateTime,
@@ -378,92 +408,161 @@ async fn process_item(
         .as_deref()
         .ok_or(WorkerError::MissingPayload { item_id: item.id })?;
 
-    // Step 3: evaluation releases its snapshot before CPU-heavy validation.
-    let evaluated = match evaluate(stores, db, scope, &item.gts_id, payload, item.id).await? {
-        Ok(evaluated) => Arc::new(evaluated),
-        Err(failure) => {
-            return record_failure(stores, db, scope, operation_id, item, failure, now).await;
-        }
-    };
+    let attempts = tuning.worker.max_revalidation_attempts;
+    let mut last_drift: Option<VectorDrift> = None;
+    // `1..=n` rather than `0..n` so the number in the log line is the attempt an
+    // operator would count. A configured `0` is refused at boot
+    // (`config::validate`), so the loop always runs at least once.
+    for attempt in 1..=attempts {
+        // Step 3: evaluation releases its snapshot before CPU-heavy validation.
+        let evaluated = match evaluate(
+            stores,
+            db,
+            scope,
+            &item.gts_id,
+            payload,
+            item.id,
+            tuning.limits.activation_write_set,
+        )
+        .await?
+        {
+            Ok(evaluated) => Arc::new(evaluated),
+            Err(failure) => {
+                return record_failure(stores, db, scope, operation_id, item, failure, now).await;
+            }
+        };
 
-    let committed = commit_evaluated(
-        db,
-        stores,
-        scope,
-        CommitRequest {
-            evaluated: &evaluated,
-            item,
-            operation_id,
-            now,
-            limits: config.limits,
-            family_lock_timeout: config.settings.family_lock_timeout,
-        },
-    )
-    .await;
+        let committed = match commit_evaluated(
+            db,
+            stores,
+            scope,
+            CommitRequest {
+                evaluated: &evaluated,
+                item,
+                operation_id,
+                now,
+                limits: *tuning.limits,
+                family_lock_timeout: tuning.worker.family_lock_timeout,
+            },
+        )
+        .await
+        {
+            Ok(committed) => committed,
+            // The competing pass's terminal item is authoritative; this pass rolled
+            // its entity write back with `ItemAlreadyTerminal`.
+            Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
+                return stored_item(stores, db, scope, operation_id, item_id).await;
+            }
+            // A refusal the commit could only reach after it began writing: the
+            // transaction rolled back with it, and the item is terminalized here in
+            // a transaction of its own — the same path an evaluation-stage refusal
+            // takes.
+            Err(WorkerError::RefusedAfterWrite(failure)) => {
+                return record_failure(stores, db, scope, operation_id, item, failure, now).await;
+            }
+            // The guard fired: this transaction wrote nothing and rolled back. Round
+            // again from a fresh snapshot.
+            Err(WorkerError::RevalidationRequired(drift)) => {
+                tracing::info!(
+                    %operation_id,
+                    operation_item_id = item.id,
+                    gts_id = %item.gts_id,
+                    attempt,
+                    max_attempts = attempts,
+                    drift = %drift,
+                    "types_registry revalidating a candidate whose evaluation went stale"
+                );
+                last_drift = Some(drift);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
-    let committed = match committed {
-        Ok(committed) => committed,
-        // The competing pass's terminal item is authoritative; this pass rolled
-        // its entity write back with `ItemAlreadyTerminal`.
-        Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
-            return stored_item(stores, db, scope, operation_id, item_id).await;
-        }
-        // A refusal the commit could only reach after it began writing: the
-        // transaction rolled back with it, and the item is terminalized here in a
-        // transaction of its own — the same path an evaluation-stage refusal takes.
-        Err(WorkerError::RefusedAfterWrite(failure)) => {
-            return record_failure(stores, db, scope, operation_id, item, failure, now).await;
-        }
-        Err(error) => return Err(error),
-    };
+        return match committed {
+            Ok(commit) => Ok(committed_outcome(operation_id, item, commit, attempt)),
+            Err(failure) => {
+                record_failure(stores, db, scope, operation_id, item, failure, now).await
+            }
+        };
+    }
 
-    match committed {
-        Ok(RevisionCommit::Admitted(CommittedUnit {
+    // Every attempt drifted. `last_drift` is `Some` on every path that reaches
+    // here — the loop body's only `continue` sets it — and the fallback exists
+    // because the type says the `Option` can be empty, not because a zero attempt
+    // budget is reachable (`config::validate` refuses one).
+    let drift = last_drift.map_or_else(
+        || "no attempt was made".to_owned(),
+        |drift| drift.to_string(),
+    );
+    let failure = ItemFailure::new(
+        "revalidation_exhausted",
+        format!(
+            "the state this candidate was validated against kept moving: {attempts} \
+             revalidation attempts were exhausted, the last on {drift}"
+        ),
+    );
+    record_failure(stores, db, scope, operation_id, item, failure, now).await
+}
+
+/// The outcome to report for a commit that succeeded, and the log line that goes
+/// with it.
+///
+/// Pure, and outside the revalidation loop's body so the loop reads as the control
+/// flow it is rather than as two long success arms with a `continue` between them.
+fn committed_outcome(
+    operation_id: Uuid,
+    item: &OperationItemRow,
+    commit: RevisionCommit,
+    attempt: u32,
+) -> ItemOutcome {
+    match commit {
+        RevisionCommit::Admitted(CommittedUnit {
             gts_uuid,
             revision_no,
-            resource_version,
-        })) => {
-            tracing::info!(
-                %operation_id,
-                operation_item_id = item.id,
-                gts_id = %item.gts_id,
-                revision_no,
-                resource_version,
-                "types_registry candidate admitted"
-            );
-            Ok(ItemOutcome {
-                gts_id: item.gts_id.clone(),
-                status: OperationItemStatus::Succeeded,
-                gts_uuid: Some(gts_uuid),
-                resource_version: Some(resource_version),
-                revision_no: Some(revision_no),
-                failure: None,
-            })
-        }
-        // Terminal and successful, and deliberately not `Succeeded`: no revision
-        // number was allocated, so reporting one would name a revision that does
-        // not exist (ADR-0005).
-        Ok(RevisionCommit::Unchanged {
-            gts_uuid,
             resource_version,
         }) => {
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
                 gts_id = %item.gts_id,
+                revision_no,
                 resource_version,
+                attempt,
+                "types_registry candidate admitted"
+            );
+            ItemOutcome {
+                gts_id: item.gts_id.clone(),
+                status: OperationItemStatus::Succeeded,
+                gts_uuid: Some(gts_uuid),
+                resource_version: Some(resource_version),
+                revision_no: Some(revision_no),
+                failure: None,
+            }
+        }
+        // Terminal and successful, and deliberately not `Succeeded`: no revision
+        // number was allocated, so reporting one would name a revision that does
+        // not exist (ADR-0005).
+        RevisionCommit::Unchanged {
+            gts_uuid,
+            resource_version,
+        } => {
+            tracing::info!(
+                %operation_id,
+                operation_item_id = item.id,
+                gts_id = %item.gts_id,
+                resource_version,
+                attempt,
                 "types_registry candidate content already current"
             );
-            Ok(ItemOutcome {
+            ItemOutcome {
                 gts_id: item.gts_id.clone(),
                 status: OperationItemStatus::Unchanged,
                 gts_uuid: Some(gts_uuid),
                 resource_version: Some(resource_version),
                 revision_no: None,
                 failure: None,
-            })
+            }
         }
-        Err(failure) => record_failure(stores, db, scope, operation_id, item, failure, now).await,
     }
 }
 
