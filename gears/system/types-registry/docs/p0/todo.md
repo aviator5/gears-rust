@@ -577,7 +577,7 @@ the last `~`, and the immutable schema-revision pair.
 - [x] The transient store carries both kinds: both `UnsupportedKind` refusals are deleted and the dialect gate is keyed on the identifier's `~`. `type_id` is passed to `GtsEntity::new` **explicitly** from `GtsId::get_type_id()` with a `None` config — letting content name the conforming type would allow a value to claim conformance to a type it was not registered under, which is a validation bypass, not a convenience
 - [x] The closure reaches a candidate's derivation chain with **no `dependency` row present** — `closure` seeds its worklist with `GtsId::chain_ids()`, and `missing_roots` is still computed over the original roots so a chain member the seed added is not reported as one. The Phase 1 test is inverted, and its old comment was half wrong: it blamed T13's missing edges, but a derivation base is a pure function of the identifier
 - [x] A family holds one kind — `family_kind_conflict`, checked under the family lock and only for a family that already existed. Distinct from `already_exists` because the identifier *is* free; saying otherwise sends a caller looking for a conflicting entity that does not exist. Both orders are tested
-- [x] No `$ref`/`x-gts-ref` target is expected to resolve yet — `a_ref_outside_the_chain_still_fails` pins it, so T10's chain seed cannot be mistaken for T13 having landed early
+- [x] No `$ref`/`x-gts-ref` target is expected to resolve yet — `a_ref_outside_the_chain_still_fails` pins it, so T10's chain seed cannot be mistaken for T13 having landed early. *(T13 inverted that test and renamed it `a_ref_outside_the_chain_is_admitted`; the boundary it marked is now closed.)*
 - [x] **An admitted Instance reads back with its value.** *Added after the task was marked done — see the correction below.* `GET /v2/entities/{entity_key}` returns either kind's authored document under the single public field `content`. The immutable `revision_no` remains an internal current-pointer and provenance detail; the public entity exposes `resource_version`, which is the token future writes accept. The three `effective_*` artifacts stay absent for an Instance, and that is the contract rather than the same omission: an Instance has no derived state, so there is nothing to materialize
 
 **The read path was missed, and the task's criteria are why.** Every criterion above is about
@@ -848,16 +848,26 @@ under the same `Idempotency-Key`, which `submit`'s `!terminal` branch re-drives.
 ---
 
 ### Checkpoint 2
-- [ ] Revisions and CAS behave; family shape and contiguity hold under concurrency (the kind rule landed with T10)
-- [ ] Gear tests on three backends (see [Commands](#commands))
-- [ ] `make dylint` — full workspace, once for the phase (P13)
-- [ ] Human review
+- [x] Revisions and CAS behave; family shape and contiguity hold under concurrency (the kind rule landed with T10)
+- [x] Gear tests on three backends (see [Commands](#commands))
+- [x] `make dylint` — full workspace, once for the phase (P13)
+- [x] Human review
+
+**The one decision this checkpoint owed: the family lock is wired, not deferred.** T12 first
+raised it as an open gap and left the choice between T15 and a task of its own; the answer was
+neither — it landed straight away, in `5240378e4` and `6b836e247`, which is why T12's note above
+reads as closed. Family validation and creation are serialized under
+`Db::try_lock` with a retry on transient contention, so the two-different-new-members race T12
+described is closed for T10's kind rule at the same time. The same work stops a revision
+resurrecting a tombstoned entity and separates corruption from contention in the worker's error
+vocabulary. T15 therefore inherits bounded retry over the revision vector only — the lock and
+its ordering are already there.
 
 ---
 
 ## Phase 3 — Dependencies and materialization
 
-### - [ ] T13: Dependency edge extraction and writes
+### - [x] T13: Dependency edge extraction and writes
 
 **Description:** Extract the four edge kinds from authored content — `$ref`, `x-gts-ref`
 target, immediate derivation base, Instance conformance — and replace the admitted entity's
@@ -882,26 +892,68 @@ extractor, called over the candidate document *before* the closure read, its tar
 closure roots beside the candidate's `chain_ids()`. Found at the PR #4641 review.
 
 **Acceptance criteria:**
-- [ ] `x-gts-ref` edge targets the exact identifier, or the pattern's longest valid identifier prefix; a pattern naming nothing valid (`gts.*`) and a GTS §9.6 relative pointer create no edge
-- [ ] Admission replaces only the admitted entity's outgoing rows, through the existing `DependencyRepo::replace_outgoing` — written and unit-tested at T4, with no caller until this task
-- [ ] Derivation and conformance are materialized even though derivable from the identifier
-- [ ] Extraction uses `gts-rust`'s extractor, never a local scan
-- [ ] Extraction is exposed as a pure function over authored content, callable without a database — required for unit testing without a fixture DB
-- [ ] `load_unit_store` seeds the closure with the direct reference targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see
-- [ ] For a revision the roots come from the candidate document's references, never from the previous revision's stored edge set: the overlay wins for edges as it already does for documents
-- [ ] A reference target that genuinely does not exist is distinguishable from a candidate that is not stored yet. `DependencyClosure::missing_roots` holds the candidate itself by construction on every first admission, so extracted targets need their own channel — a separate `UnitStore::missing_references` rather than more entries in `missing_candidates`, which T19 must be able to tell apart. `missing_candidates` has no production reader before this task, so the split costs nothing to make now
-- [ ] The `CLOSURE_BOUND` accounting covers the added roots: `ensure_within_bound` already charges the seeded roots before the first hop, and reference targets enlarge that seed
+- [x] `x-gts-ref` edge targets the exact identifier, or the pattern's longest valid identifier prefix; a pattern naming nothing valid (`gts.*`) and a GTS §9.6 relative pointer create no edge
+- [x] Admission replaces only the admitted entity's outgoing rows, through the existing `DependencyRepo::replace_outgoing` — written and unit-tested at T4, with no caller until this task
+- [x] Derivation and conformance are materialized even though derivable from the identifier
+- [x] Extraction uses `gts-rust`'s extractor, never a local scan — **for `$ref`, which is the half where a canonical extractor exists.** See the deviation below: `x-gts-ref` has no extractor in `gts` 0.12.0, so its keyword sites are walked here while `GtsId::try_new` stays the only judge of what a site names
+- [x] Extraction is exposed as a pure function over authored content, callable without a database — `domain::dependency::extract_edges(&GtsId, &Value)`, no clock and no ports in its signature, which is what lets the same call serve both sides of the admission
+- [x] `load_unit_store` seeds the closure with the direct reference targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see
+- [x] For a revision the roots come from the candidate document's references, never from the previous revision's stored edge set: the overlay wins for edges as it already does for documents. **With one honest limit,** stated at `load_unit_store`: the candidate's *stale* rows are still walked, because `closure` cannot tell a candidate root from any other, so a reference a revision dropped may still be loaded. That is inert — resolution follows the document, and an extra registered schema answers no question — while the direction that is not inert holds: a reference the candidate **added** resolves
+- [x] A reference target that genuinely does not exist is distinguishable from a candidate that is not stored yet — `UnitStore::missing_references` beside `missing_candidates`. **No port change was needed.** `closure` already reports every root with no entity row; which of those roots is a candidate is `load_unit_store`'s own knowledge, so the split is one `partition` over the existing result rather than a second list crossing the seam. `missing_candidates` still has no production reader, so T19 inherits both lists and no ambiguity
+- [x] The `CLOSURE_BOUND` accounting covers the added roots: `ensure_within_bound` charges `roots.len()` before the first hop, and the seed *is* that vector — reference targets are pushed into it, not passed beside it, so no accounting change was possible to forget
+
+**The deviation, because a criterion says the opposite.** `$ref` goes through
+`gts::extract_gts_refs`, the canonical definition shared with the resolution that validates
+the candidate. `x-gts-ref` has no equivalent: `XGtsRefValidator` validates patterns and values
+but never reports the sites it visited, and `GtsEntity::gts_refs` — the lenient walker whose own
+documentation offers it "for the dependency graph" — collects *every* identifier-shaped string
+in the document. Using it would invent edges out of `const` data and still miss every wildcard
+pattern, which is not a valid identifier at all. So the keyword sites are walked in
+`domain::dependency`, skipping the same four data-valued keywords `gts::schema_refs` skips, and
+what a site *means* is still GTS's answer: `GtsId::try_new` decides the exact case and the
+longest-prefix case, and nothing here re-implements identifier syntax.
+
+**An Instance carries exactly one edge, and that is a rule rather than an omission.** `$ref`
+and `x-gts-ref` are schema keywords, so the same strings inside a *value* are data.
+Extracting them would invent an edge from a coincidence, and a malformed one would refuse a
+valid value — `an_instance_values_ref_shaped_data_is_data_and_not_an_edge` pins it.
+
+**Where the edges travel.** Extracted in `evaluate`, where the document is already parsed and
+no transaction is open, and carried on `EvaluatedUnit::edges` as target *identifiers*. The
+commit resolves them to rows, because that answer changes between evaluation and commit, and
+skips a target no entity carries: for a `$ref` that case cannot arise — resolution would have
+refused the candidate — and for an `x-gts-ref` pattern it is the specified behaviour (DESIGN
+§3.2). A malformed `$ref` now fails at extraction as `invalid_schema`, the same reason code
+`validate_schema` would reach, so no client sees a new outcome.
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Table-driven test over edge-kind fixtures, including the no-edge cases
-- [ ] Test: re-admission removes an edge the new revision dropped
-- [ ] Test: a new schema whose `$ref` names an existing schema **outside its identifier chain** is admitted — the case that fails today with `invalid_schema`
-- [ ] Test: a revision that adds one reference and drops another resolves against the new set, not the stored one
-- [ ] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 532 on `SQLite`, six consecutive full-suite runs green; `make test-types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the writes go through `replace_outgoing` and the resolution through `find_by_gts_ids`, both already exercised on both container backends by T4's `closure_walks_a_chain`. T13 adds no new SQL shape
+- [x] Table-driven test over edge-kind fixtures, including the no-edge cases — `the_edge_kinds_over_their_fixtures`, four rows (three kinds at once, a reference-free schema, an `x-gts-ref` inside a data-valued keyword, an Instance of a derived type), beside twelve single-rule tests in `dependency_tests.rs`. Genuine RED→GREEN: seven of the fourteen failed against a stub returning no edges, and the three that passed are the no-edge cases — which an empty stub satisfies trivially, so they prove nothing on their own and are recorded here as such
+- [x] Test: re-admission removes an edge the new revision dropped — `a_revision_removes_the_edge_it_dropped_and_adds_the_one_it_gained`, with `a_revision_that_keeps_its_reference_keeps_the_edge` for the other direction, because "replace" could otherwise be read as "clear and forget"
+- [x] Test: a new schema whose `$ref` names an existing schema **outside its identifier chain** is admitted — the case that failed with `invalid_schema`. It was already pinned, inverted, as `admission_worker_test::a_ref_outside_the_chain_still_fails`; that test is now `a_ref_outside_the_chain_is_admitted` and its flip is the RED→GREEN record. `dependency_test.rs` pins the rows the same admission writes
+- [x] Test: a revision that adds one reference and drops another resolves against the new set, not the stored one — `gts_store_test::a_revision_resolves_against_the_reference_it_now_carries`. All three new store tests were verified RED with the one seeding line disabled
+- [x] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence — `a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_candidate`, and end to end `an_x_gts_ref_naming_no_entity_writes_no_row_and_admits` against `a_ref_naming_no_entity_fails_the_candidate`: same absent identifier, two outcomes, because a pattern is satisfiable before anything matches it while a `$ref` is not
+
+**Two existing tests had to be inverted, and both were boundary markers rather than
+regressions.** `admission_worker_test::a_ref_outside_the_chain_still_fails` asserted the gap
+this task closes. `instance_test::an_instance_admits_against_a_type_from_an_earlier_operation`
+asserted an **empty** `dependency` table to prove conformance is identifier-derived; it now
+asserts exactly one row, from the Instance to its type, and reads the type's own empty
+outgoing set to keep making the original point — the resolution above needed no row.
+
+**A pre-existing `SQLite` flake was fixed on the way, in two test fixtures.** The family
+advisory lock's `SQLite` scope is keyed on the DSN, which every test binding
+`sqlite::memory:` shares through a cross-process marker directory (T12's note). So two test
+*binaries* admitting one family key contend across processes — and `family_test`'s
+`a_creation_holds_the_family_lock_across_its_commit` probes that lock with a 1 ms budget and no
+retries, so under a loaded full-suite run it saw the lock held by `instance_test`, which used
+the same `cf.core.example.thing` family. It failed roughly one run in three. `instance_test`
+now owns `cf.core.inst.*` and `dependency_test` `cf.core.dep.*`; six consecutive full-suite runs
+are green. **The mechanism is untouched** — it is the same hazard T12 recorded, and a test that
+needs the real lock cannot avoid it; distinct family keys just remove the interaction.
 
 **Dependencies:** Checkpoint 2
-**Files likely touched:** `TR/src/domain/dependency.rs` (extraction; T14 adds the worklist and the pair takes `TR/src/domain/dependency/` — trigger table above), `TR/src/domain/gts_store.rs` (the read-side seed), `TR/src/infra/storage/repo/`, `TR/src/domain/ports.rs`, `TR/src/infra/storage/store.rs`, `TR/src/infra/storage/entity/dependency.rs`, `TR/tests/dependency_test.rs`, `TR/tests/gts_store_test.rs`
+**Files touched:** `TR/src/domain/{dependency,dependency_tests}.rs` (new), `TR/src/domain/{mod,enums}.rs`, `TR/src/domain/gts_store.rs`, `TR/src/domain/ports.rs`, `TR/src/domain/admission/unit.rs`, `TR/src/infra/storage/store.rs`, `TR/tests/dependency_test.rs` (new), `TR/tests/{gts_store_test,admission_worker_test,instance_test,revision_race_backends_test,common/mod}.rs`, `gears/system/types-registry/docs/p0/SPEC.md` (§8.2 — the closure is seeded from the document as well as the identifier)
 **Scope:** M
 
 ---

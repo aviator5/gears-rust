@@ -27,7 +27,8 @@ use uuid::Uuid;
 use super::errors::{ItemFailure, WorkerError};
 use super::fingerprint::canonical_text;
 use crate::domain::artifacts::{MaterializedArtifacts, content_hash, materialize};
-use crate::domain::enums::{EntityKind, LifecycleStatus, OwnershipScope};
+use crate::domain::dependency::{DependencyEdge, extract_edges};
+use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
 use crate::domain::family::{FamilyKey, admits_new_member, family_key};
 use crate::domain::gts_store::{UnitDocument, UnitStore, load_unit_store};
 use crate::domain::ports::{
@@ -84,6 +85,14 @@ pub struct EvaluatedUnit {
     pub content_hash: Vec<u8>,
     pub outcome: EvaluatedOutcome,
     pub operation_item_id: i64,
+    /// The candidate's outgoing edges, by target **identifier** (T13).
+    ///
+    /// Extracted during evaluation, where the document is already parsed, and
+    /// carried rather than re-extracted at commit: the commit transaction should
+    /// hold no work that a read outside it can do, and re-parsing the body under
+    /// the entity lock is exactly that. Resolving the identifiers to rows is the
+    /// commit's own job, because that answer changes between the two.
+    pub edges: Vec<DependencyEdge>,
 }
 
 /// The commit's result for one item that wrote a revision.
@@ -152,6 +161,18 @@ pub async fn evaluate(
         }
     };
 
+    // Extracted here, where the document is parsed and no transaction is open. A
+    // malformed `$ref` fails the candidate as `invalid_schema` — the same refusal
+    // `validate_schema` would reach below, arrived at before the store is even
+    // built, and under the same reason code so a client branching on it sees one
+    // outcome.
+    let edges = match extract_edges(&id, &content) {
+        Ok(edges) => edges,
+        Err(e) => {
+            return Ok(Err(ItemFailure::new("invalid_schema", e.to_string())));
+        }
+    };
+
     // The store's reads are one snapshot, and the transaction ends with the load:
     // everything after it runs with no transaction open (see the module header).
     let candidates = vec![UnitDocument {
@@ -198,6 +219,7 @@ pub async fn evaluate(
             schema_pair,
             canonical_body,
             operation_item_id,
+            edges,
         )
     })
     .await
@@ -214,6 +236,7 @@ fn evaluate_loaded(
     schema_pair: Option<(i64, i32)>,
     canonical_body: String,
     operation_item_id: i64,
+    edges: Vec<DependencyEdge>,
 ) -> Result<Result<EvaluatedUnit, ItemFailure>, WorkerError> {
     let outcome = if id.is_type() {
         let resolved = match store.store_mut().validate_schema(id.id()) {
@@ -264,7 +287,54 @@ fn evaluate_loaded(
         content_hash,
         outcome,
         operation_item_id,
+        edges,
     }))
+}
+
+/// Replace the admitted entity's outgoing edges, resolving each target identifier
+/// to the row it names.
+///
+/// Only this entity's rows are touched: an admission never rewrites anyone else's
+/// edges, and the delete inside `replace_outgoing` is keyed on `from_entity_id`
+/// alone.
+///
+/// **A target with no entity row writes no row and is not an error.** For a `$ref`
+/// that case cannot arise — resolution would already have refused the candidate. For
+/// an `x-gts-ref` pattern it is the specified behaviour: the edge protects the entity
+/// the pattern *names*, and a pattern naming nothing has nothing to protect (DESIGN
+/// §3.2). Which means a later entity that starts matching the pattern needs no
+/// re-expansion of this edge set — it simply is not one.
+async fn replace_edges(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    entity_id: i64,
+    edges: &[DependencyEdge],
+) -> Result<(), WorkerError> {
+    // Called even for an empty edge set: on a revision that dropped its last
+    // reference, the *delete* is the whole point, and skipping it would leave the
+    // previous revision's rows standing.
+    let targets: Vec<String> = edges.iter().map(|e| e.target.clone()).collect();
+    let rows = stores.find_by_gts_ids(tx, scope, &targets).await?;
+    let resolved: std::collections::HashMap<&str, i64> =
+        rows.iter().map(|r| (r.gts_id.as_str(), r.id)).collect();
+
+    let mut pairs: Vec<(DependencyKind, i64)> = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if let Some(to) = resolved.get(edge.target.as_str()) {
+            pairs.push((edge.kind, *to));
+        } else {
+            tracing::debug!(
+                target_gts_id = %edge.target,
+                kind = ?edge.kind,
+                "types_registry dependency target names no entity; no edge written"
+            );
+        }
+    }
+    stores
+        .replace_outgoing(tx, scope, entity_id, &pairs)
+        .await?;
+    Ok(())
 }
 
 /// Commit one evaluated unit: family, entity, revision, current-state projection,
@@ -457,6 +527,8 @@ pub async fn commit_creation(
                 .await?;
         }
     }
+
+    replace_edges(stores, tx, scope, entity.id, &unit.edges).await?;
 
     // The write is a CAS on the item's status, and its `false` must roll this
     // transaction back rather than be discarded: an overlapping pass already
@@ -775,6 +847,12 @@ pub async fn commit_revision(
             }
         }
     }
+
+    // The authored document decided the edges, so they are replaced on every
+    // revision that wrote one — including a revision whose references did not
+    // change, where the replacement is the same set written again. An `unchanged`
+    // candidate never reaches here: identical content implies an identical edge set.
+    replace_edges(stores, tx, scope, entity.id, &unit.edges).await?;
 
     // Last, and its `false` rolls everything above back — see `commit_creation`.
     if !stores

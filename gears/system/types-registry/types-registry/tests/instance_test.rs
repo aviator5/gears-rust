@@ -33,9 +33,15 @@ const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
 
 /// The conforming type. `name` is required, so a value omitting it really fails.
-const TYPE_ID: &str = gts_id!("cf.core.example.thing.v1~");
+///
+/// Its own `inst` module, not the shared `example` one: the family advisory lock's
+/// `SQLite` scope is keyed on the DSN, which every test binding `sqlite::memory:`
+/// shares through a cross-process marker directory, so two binaries admitting one
+/// family key contend across processes. `family_test` probes that lock with no retry
+/// budget, and used to see it held by this file under a loaded full-suite run.
+const TYPE_ID: &str = gts_id!("cf.core.inst.thing.v1~");
 /// An Instance of it: a full five-token last segment with no `~`.
-const INSTANCE_ID: &str = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1");
+const INSTANCE_ID: &str = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
 
 struct NoDispatch;
 
@@ -242,8 +248,8 @@ async fn an_instance_may_not_join_a_type_schema_family() {
 
     // A Type Schema and an Instance that share a `family_key`: the schema is
     // `…thing.v1~` and the instance is the same identifier without the terminator.
-    let schema_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1~");
-    let instance_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1");
+    let schema_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1~");
+    let instance_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
 
     let type_op = submit(&db, "type-key", TYPE_ID, conforming_schema()).await;
     run_operation(&stores(), &worker(&db), &allow_all(), type_op, LATER)
@@ -291,7 +297,7 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         .expect("families");
     let shared = families
         .iter()
-        .filter(|f| f.family_key.ends_with("example.first"))
+        .filter(|f| f.family_key.ends_with("inst.first"))
         .count();
     assert_eq!(shared, 1, "one family key, not two: {families:?}");
 }
@@ -301,8 +307,8 @@ async fn an_instance_may_not_join_a_type_schema_family() {
 #[tokio::test]
 async fn a_type_schema_may_not_join_an_instance_family() {
     let db = test_db().await;
-    let instance_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1");
-    let schema_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1~");
+    let instance_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
+    let schema_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1~");
 
     let outcome = admit_type_then(&db, "k-instance", instance_id, json!({ "name": "first" }))
         .await
@@ -332,8 +338,10 @@ async fn a_type_schema_may_not_join_an_instance_family() {
     );
 }
 
-/// An Instance admits against a type committed by an **earlier operation**: with an
-/// empty `dependency` table, only the Instance's own identifier reaches it.
+/// An Instance admits against a type committed by an **earlier operation**, reaching
+/// it through its own identifier: the conformance *row* T13 writes is an output of
+/// the admission, never its input, so the type must already be resolvable before any
+/// edge exists.
 #[tokio::test]
 async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
     let db = test_db().await;
@@ -347,7 +355,11 @@ async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
         outcome.items[0].failure,
     );
 
-    // The dependency table is empty: nothing wrote an edge, and nothing needed to.
+    // One edge, and one only: the Instance's conformance. It is materialized despite
+    // being derivable from the identifier, because T14's reverse walk has no
+    // identifier to walk backwards from — and the *type* it points at carries no
+    // outgoing edge of its own, which is what says the resolution above did not need
+    // a row (`dependency_test.rs` owns the edge rules themselves).
     let provider = worker(&db);
     let conn = provider.conn().expect("conn");
     let edges = types_registry::infra::storage::entity::dependency::Entity::find()
@@ -356,9 +368,20 @@ async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
         .all(&conn)
         .await
         .expect("edges");
-    assert!(
-        edges.is_empty(),
-        "a conforming type is identifier-derived, not edge-derived: {edges:?}",
+    let instance_row = EntityRepo::find_by_gts_id(&conn, &allow_all(), INSTANCE_ID)
+        .await
+        .expect("read")
+        .expect("committed");
+    let type_row = EntityRepo::find_by_gts_id(&conn, &allow_all(), TYPE_ID)
+        .await
+        .expect("read")
+        .expect("committed");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(edges[0].from_entity_id, instance_row.id);
+    assert_eq!(edges[0].to_entity_id, type_row.id);
+    assert_eq!(
+        edges[0].kind,
+        types_registry::infra::storage::entity::enums::DependencyKind::InstanceOf,
     );
 
     // And the storage vocabulary agrees with the domain's on the kind.

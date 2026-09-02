@@ -143,7 +143,7 @@ pub enum OperationItemStatus {
 /// `gts-rust` excludes it from resolution. Its edge protects the entity the value
 /// or the constraint names, not constraint satisfiability.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DependencyKind {
     SchemaRef,
     GtsRef,

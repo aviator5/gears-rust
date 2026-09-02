@@ -433,7 +433,16 @@ Two consequences worth naming, because they are the price:
 **The transient store, per admission unit.** The worker builds a `GtsStore` from the
 database rows the unit needs: the candidates, plus the transitive closure of what they
 consume, obtained from the `dependency` table (which D5 already writes and reads). It is
-dropped when the unit ends. Rows are loaded `gts_id`-sorted, so a derived schema never
+dropped when the unit ends.
+
+The closure is seeded from **both** the candidates' identifiers and their documents. The
+identifier supplies the `~`-chain — every derivation base and an Instance's conforming type
+— and the document supplies its `$ref` and `x-gts-ref` targets, which no identifier
+implies. The document half is not an optimization: a candidate's own edge rows are written
+at commit (step 4.5 above), so during the read that validates it they either do not exist
+yet, on a first admission, or still describe the previous revision. A reference target that
+no entity carries is reported apart from a candidate that has no row yet — the second is
+the ordinary state of every creation, the first is a fact about the registry. Rows are loaded `gts_id`-sorted, so a derived schema never
 loads before its base — lexicographic order on GTS chain identifiers already implies
 parent-before-child, since a base identifier is a strict prefix of every identifier
 derived from it, as the existing `switch_to_ready` documents.

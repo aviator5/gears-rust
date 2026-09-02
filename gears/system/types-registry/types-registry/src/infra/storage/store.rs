@@ -16,11 +16,11 @@
 //!
 //! # Not every repository method is a port
 //!
-//! Only the calls the domain makes are here. `list_page`, `mark_deleted`,
-//! `replace_outgoing` and the batch reads stay as inherent methods until a domain
-//! rule needs them: a port method with no domain caller is an abstraction with
-//! nothing to abstract. `compare_and_swap_version` left that list when the revision
-//! commit became its first domain caller.
+//! Only the calls the domain makes are here. `list_page` and `mark_deleted` stay as
+//! inherent methods until a domain rule needs them: a port method with no domain
+//! caller is an abstraction with nothing to abstract. `compare_and_swap_version`
+//! left that list when the revision commit became its first domain caller, and
+//! `replace_outgoing` with `find_by_gts_ids` when edge extraction did (T13).
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -29,7 +29,7 @@ use toolkit_db::secure::{AccessScope, ScopeError};
 use uuid::Uuid;
 
 use crate::domain::admission::fingerprint::ScopeHash;
-use crate::domain::enums::{EntityKind, OwnershipScope};
+use crate::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use crate::domain::family::FamilyKey;
 use crate::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentTypeSchemaRow,
@@ -80,6 +80,15 @@ impl EntityStore for Repos {
         gts_id: &str,
     ) -> Result<Option<EntityRow>, ScopeError> {
         EntityRepo::find_by_gts_id(tx, scope, gts_id).await
+    }
+
+    async fn find_by_gts_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_ids: &[String],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        EntityRepo::find_by_gts_ids(tx, scope, gts_ids).await
     }
 
     async fn find_by_gts_uuid(
@@ -338,5 +347,15 @@ impl DependencyStore for Repos {
         roots: &[String],
     ) -> Result<DependencyClosure, ScopeError> {
         DependencyRepo::closure(tx, scope, roots).await
+    }
+
+    async fn replace_outgoing(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        from_entity_id: i64,
+        edges: &[(DependencyKind, i64)],
+    ) -> Result<(), ScopeError> {
+        DependencyRepo::replace_outgoing(tx, scope, from_entity_id, edges).await
     }
 }

@@ -348,7 +348,7 @@ use async_trait::async_trait;
 use toolkit_db::DbTx;
 use toolkit_db::secure::ScopeError;
 use types_registry::domain::admission::fingerprint::ScopeHash;
-use types_registry::domain::enums::{EntityKind, OwnershipScope};
+use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use types_registry::domain::family::FamilyKey;
 use types_registry::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentTypeSchemaRow,
@@ -462,6 +462,15 @@ impl EntityStore for PausingStores {
         gts_id: &str,
     ) -> Result<Option<EntityRow>, ScopeError> {
         self.inner.find_by_gts_id(tx, scope, gts_id).await
+    }
+
+    async fn find_by_gts_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_ids: &[String],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_ids(tx, scope, gts_ids).await
     }
 
     async fn find_by_gts_uuid(
@@ -724,5 +733,17 @@ impl DependencyStore for PausingStores {
         roots: &[String],
     ) -> Result<DependencyClosure, ScopeError> {
         self.inner.closure(tx, scope, roots).await
+    }
+
+    async fn replace_outgoing(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        from_entity_id: i64,
+        edges: &[(DependencyKind, i64)],
+    ) -> Result<(), ScopeError> {
+        self.inner
+            .replace_outgoing(tx, scope, from_entity_id, edges)
+            .await
     }
 }

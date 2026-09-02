@@ -113,6 +113,9 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
             },
         },
         operation_item_id,
+        // No `$ref`, no `x-gts-ref`, one identifier segment: the fixture body
+        // implies no edge of any kind.
+        edges: Vec::new(),
     }
 }
 

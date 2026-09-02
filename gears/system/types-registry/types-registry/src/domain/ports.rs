@@ -46,8 +46,8 @@ use uuid::Uuid;
 use crate::domain::admission::Precondition;
 use crate::domain::admission::fingerprint::{RequestFingerprint, ScopeHash};
 use crate::domain::enums::{
-    EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
-    OwnershipScope, Plane,
+    DependencyKind, EntityKind, LifecycleStatus, OperationItemStatus, OperationKind,
+    OperationStatus, OwnershipScope, Plane,
 };
 use crate::domain::family::FamilyKey;
 
@@ -481,6 +481,16 @@ pub trait EntityStore: Send + Sync {
         gts_id: &str,
     ) -> Result<Option<EntityRow>, ScopeError>;
 
+    /// Batch exact read. Identifiers with no row are simply absent from the
+    /// result, which is how a caller distinguishes them: an `x-gts-ref` target that
+    /// names no entity is an ordinary outcome, not a failure (DESIGN §3.2).
+    async fn find_by_gts_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_ids: &[String],
+    ) -> Result<Vec<EntityRow>, ScopeError>;
+
     /// Exact read by Registry Reference.
     async fn find_by_gts_uuid(
         &self,
@@ -728,6 +738,20 @@ pub trait DependencyStore: Send + Sync {
         scope: &AccessScope,
         roots: &[String],
     ) -> Result<DependencyClosure, ScopeError>;
+
+    /// Replace one entity's **outgoing** edges, and only that entity's.
+    ///
+    /// Delete-then-insert on `from_entity_id`, so a reference a new revision
+    /// dropped disappears with the same call that records the one it added. The
+    /// edges are a set, and the target ids are the caller's to resolve: a target no
+    /// entity carries has no row to point at.
+    async fn replace_outgoing(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        from_entity_id: i64,
+        edges: &[(DependencyKind, i64)],
+    ) -> Result<(), ScopeError>;
 }
 
 /// Every port in one handle, so a caller wires one value rather than six.

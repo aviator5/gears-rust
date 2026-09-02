@@ -644,7 +644,7 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
     // Inverted at T10: the base is reachable through `GtsId::chain_ids()` with the
     // edge table still empty, so the old comment blaming T13's missing rows was half
     // wrong. The `$ref` here points at the base, which the chain supplies;
-    // `a_ref_outside_the_chain_still_fails` pins what T13 still owns.
+    // `a_ref_outside_the_chain_is_admitted` covers the half T13 owned.
     let outcome = run_operation(
         &stores(),
         &worker_provider(&db),
@@ -813,11 +813,16 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
     assert_eq!(ops[0].status, storage_enums::OperationStatus::Completed);
 }
 
-/// The T13 boundary. A `$ref` **outside** the candidate's own `~`-chain is genuinely
-/// edge-derived, so nothing supplies it until T13 writes `dependency` rows. Fails on
-/// content, not infrastructure: retrying would change nothing.
+/// What T13 closed. A `$ref` **outside** the candidate's own `~`-chain is genuinely
+/// edge-derived: no identifier implies it, and the candidate's own `dependency` rows
+/// are written at commit, so they cannot describe the read that validates it. The
+/// target is therefore seeded from the candidate *document*
+/// (`gts_store::load_unit_store`), and a reference the registry holds resolves.
+///
+/// This test asserted the opposite refusal until T13 — deliberately, as the boundary
+/// marker of the gap. `dependency_test.rs` pins the rows the same admission writes.
 #[tokio::test]
-async fn a_ref_outside_the_chain_still_fails() {
+async fn a_ref_outside_the_chain_is_admitted() {
     let db = test_db().await;
 
     // A committed type that is *not* an ancestor of the candidate.
@@ -848,13 +853,8 @@ async fn a_ref_outside_the_chain_still_fails() {
     let item = &outcome.items[0];
     assert_eq!(
         item.status,
-        domain_enums::OperationItemStatus::Failed,
-        "a cross-chain $ref needs T13's edges: {:?}",
+        domain_enums::OperationItemStatus::Succeeded,
+        "a cross-chain $ref to a committed schema must resolve: {:?}",
         item.failure,
-    );
-    assert_eq!(
-        item.failure.as_ref().map(|f| f.reason.as_ref()),
-        Some("invalid_schema"),
-        "an unresolvable reference is a content failure, not a retryable one",
     );
 }
