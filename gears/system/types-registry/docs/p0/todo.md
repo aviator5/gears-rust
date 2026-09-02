@@ -1073,17 +1073,30 @@ the rows the store builder already walked, and only the commit side pays for the
 (`vector::derive`). One function builds the vector on both sides regardless, which is the
 property the comparison depends on.
 
-**Step 4.2's row locks are not taken, and SPEC now says why** (ceiling **C9**, new at this
-task; `plan.md` P15). The secure
-query API exposes no `FOR UPDATE` and `SQLite` has no row locking, so the portable
-primitive is the advisory lock — one per vector member is up to `activation_write_set`
-round trips inside the commit transaction, which is the cost T14 restructured the reverse
-read to avoid. What serializes the rows instead was already there: the candidate's own row
-by the compare-and-swap that writes it, and a vector member by the write-write conflict its
-own refresh creates on the candidate's `type_schema` row precisely when the move affects
-it. Where it does not, the fingerprint-stability stop is the proof the staleness is inert.
-The family lock is unchanged — still taken for a **new member** only, since a revision asks
-none of the family rules (T12).
+**Step 4.2's row locks over the revision vector are the wrong tool, and the documents now
+say so rather than deferring them** (`plan.md` P15; DESIGN §4 corrected, no ceiling). A lock
+guarantees only that nothing moves *after* it is taken, and the movement that matters
+happens between evaluation and the lock — the phantom dependent appears before any lock
+could be held. So the comparison is required either way and the lock is purely additive:
+it buys waiting instead of rolling back, which is liveness. It costs one round trip per
+vector member inside the commit transaction on a set the bound allows to reach 512, and it
+is the only reason step 4.2's canonical ordering had to extend past families at all. What
+serializes the rows instead was already there: the candidate's own row by the
+compare-and-swap that writes it, and a dependency by the write-write conflict its own
+refresh creates on the candidate's `type_schema` row precisely when the move affects it —
+and where it does not, the fingerprint-stability stop is the proof the staleness is inert.
+The missing `FOR UPDATE` is corroboration, not the reason. The family lock is unchanged —
+still taken for a **new member** only, since a revision asks none of the family rules (T12).
+
+**One per-entity lock does survive the argument, and it is T20's.** DESIGN §4 rested
+deletion's *"no new dependant between the check and the tombstone"* on admission locking
+every dependency target. It does not, and the optimistic mechanism does not reach that case:
+adding an edge moves no `resource_version` and writes only `dependency`, while deletion
+writes the target's `entity` row, so in the order where the edge commits second nothing
+serializes them. The requirement is one lock per **edge target**, taken by both paths after
+their family locks. Recorded on T20 and in SPEC §13; P0 has no deletion path, so nothing is
+exposed meanwhile. **Found by review of this task, not by a test** — which is the honest
+provenance.
 
 **The `unchanged` branch is not guarded, and that is the decision, not an oversight.** It
 writes no revision, moves no version and refreshes no dependent, and the one thing it
@@ -1118,8 +1131,14 @@ T14's refusal stays as the backstop for a set that grew in between.
   The key moved off `inert_limit_keys` and gained a zero-refusal in `validate()`, as
   `activation_write_set` did at T14
 - [x] Lock order is family → entity/current rows, in canonical identifier order, everywhere.
-  **The family half holds and the row half is not taken** — SPEC ceiling C9 and
-  `plan.md` P15, with the `ponytail:` comment on `domain::admission::vector`.
+  **The family half holds; the row half is retired as mistaken rather than deferred** — a
+  lock over the revision vector cannot do the guard's job and costs a round trip per member
+  inside the commit transaction (`plan.md` P15, SPEC §8.1 step 4.2, DESIGN §4 corrected).
+  Canonical order is kept where it is observable and where locks are actually many:
+  `lock_order` sorts and dedups family keys, and the vector is `(gts_id, role)`-sorted on
+  both sides, which is what makes the comparison one merge walk and the reported drift
+  deterministic. The one per-entity lock the argument leaves standing is deletion's, and it
+  is T20's
   Canonical order is kept where it is observable: `lock_order` sorts and dedups family
   keys, and the vector is `(gts_id, role)`-sorted on both sides, which is what makes the
   comparison one merge walk and the reported drift deterministic
@@ -1305,6 +1324,20 @@ stays a pure function over a candidate set.
 ---
 
 ### - [ ] T20: Deletion and Dry Run
+
+**Inherited from T15 — read before designing the deletion protocol.** DESIGN §4 used to
+rest deletion's *"a new dependant cannot appear between the deletion check and the lifecycle
+transition"* on admission locking every dependency target entity. **Admission does not lock
+them**, and T15 established that locking the revision vector is the wrong tool (`plan.md`
+P15). The optimistic guard does not cover this case either: adding an edge moves no
+`resource_version` and writes only `dependency`, while deletion writes the target's `entity`
+row — two different rows, so in the order where the edge commits second nothing serializes
+them, and the *"no direct registered dependants"* recheck is a check-then-act on a predicate
+no compare-and-swap carries. The requirement is **one advisory lock per edge target**, taken
+by admission before `replace_edges` and by deletion before its check, both after their
+family locks and in canonical identifier order. DESIGN §4 and SPEC §8.1 step 4.2 now state
+it as deletion's requirement; SPEC §13 carries the test. Nothing is exposed until this task,
+because P0 has no deletion path.
 
 **`EntityRepo::mark_deleted` already exists**, written and unit-tested at T4 with no caller; this is the task that gives it one.
 

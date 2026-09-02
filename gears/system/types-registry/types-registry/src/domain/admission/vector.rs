@@ -10,16 +10,27 @@
 //! Nothing prevents that, and nothing should — holding read locks across
 //! `gts-rust` validation is what the transient-store design exists to avoid.
 //!
-//! ponytail: ceiling C9 (SPEC §9) — the commit takes **no** entity or current row
-//! locks, which DESIGN §4 step 2 and SPEC §8.1 step 4.2 as originally written both
-//! asked for. `SecureSelect` exposes no `FOR UPDATE` and `SQLite` has no row
-//! locking, so the only portable primitive is the advisory lock, and one per vector
-//! member is up to `activation_write_set` round trips inside the commit
-//! transaction. In their place: the compare-and-swap on the candidate's own row,
-//! and the write-write conflict a dependency's own refresh creates on the
-//! candidate's `type_schema` row — SPEC §8.1 step 4.2 records the argument and the
-//! one window it leaves. Upgrade: a `FOR UPDATE` on `SecureSelect`, after which
-//! step 4.2 is taken literally on the two backends that have row locks.
+//! # And why not a lock over the vector
+//!
+//! SPEC §8.1 step 4.2 once asked for locks on *"candidate and revision-vector
+//! entity/current rows"*. That is not deferred here, it is retired: a lock
+//! guarantees only that nothing moves **after** it is taken, and the movement that
+//! matters happens between evaluation and the lock — a phantom dependent appears
+//! before any lock could be held. The comparison below is therefore required either
+//! way, and a lock would be purely additive, buying a wait instead of a rollback.
+//! It would cost one round trip per vector member *inside* the commit transaction,
+//! on a set `activation_write_set` allows to reach 512, and it is the only reason
+//! step 4.2's canonical ordering ever needed to extend past families. What
+//! serializes those rows instead: the compare-and-swap that writes the candidate's
+//! own row, and — for a dependency — the write-write conflict its mover's own
+//! refresh creates on this candidate's `type_schema` row, precisely when the move
+//! affects it. SPEC §8.1 step 4.2 has the full argument, the one window it leaves
+//! and the liveness cost; `plan.md` P15 has the decision.
+//!
+//! **One per-entity lock does survive that argument and is not taken here:**
+//! deletion needs the target of each new edge serialized, because adding an edge
+//! moves no `resource_version` and writes only `dependency` while deletion writes
+//! the target's `entity` row. That is T20's, with deletion — see `docs/p0/todo.md`.
 //!
 //! What makes it *safe* is that the commit re-derives the same question inside its
 //! own transaction and compares. Two identical vectors mean the evaluation was

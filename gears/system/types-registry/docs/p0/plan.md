@@ -515,42 +515,62 @@ The stored edge kinds are `1 schema_ref, 2 derivation, 3 instance_of`, and
 first release.
 
 
-### P15. The commit-time guard replaces step 4.2's row locks, and does not apply to `unchanged`
+### P15. Locking the revision vector is the wrong tool; one per-entity lock is right, and it is deletion's
 
 SPEC §8.1 step 4.2 asked for two lock levels: the version family, then *"candidate and
-revision-vector entity/current rows in canonical identifier order"*. T15 implements the first
-and **not** the second, and that is a decision rather than a shortfall.
+revision-vector entity/current rows in canonical identifier order"*. T15 implements the first and
+not the second — and the second is not a shortfall to be made up later. It is the wrong mechanism,
+and DESIGN §4 has been corrected rather than deviated from.
 
-**The row locks are not expressible, and they are not what makes the guard sound.** The secure
-query API has no `FOR UPDATE` (`toolkit-db/src/secure/select.rs`) and `SQLite` has no row
-locking at all; the outbox reaches its own `FOR UPDATE SKIP LOCKED` through raw dialect SQL,
-which `11_database_patterns.md` forbids outside migrations. The portable primitive is the
-advisory lock, and one per vector member is up to `activation_write_set` plus the closure in
-round trips *inside* the commit transaction — the cost T14 restructured the reverse read to
-avoid. What stands in their place is two things that were already there: the candidate's own
-row is serialized by the compare-and-swap that writes it, and a vector member is serialized by
-the write-write conflict its own refresh creates on the candidate's `type_schema` row, exactly
-in the case where the move affects the candidate. Where it does not, the refresh's
-fingerprint-stability stop is the proof the staleness is inert — the same argument that stops
-the reverse walk. SPEC §8.1 now records the argument and the one window it leaves, which the
-dependent refresh closes from the other side, and §9 carries it as ceiling **C9** with the
-`FOR UPDATE` upgrade path.
+**A lock cannot do the guard's job.** It guarantees only that nothing moves *after* it is taken,
+and the movement that matters happens between evaluation and the lock — the phantom dependent
+appears before any lock could be held. So the vector comparison is required whether or not rows
+are locked, and the lock is purely additive: what it buys is that a contended admission waits
+instead of rolling back. Liveness, not correctness.
 
-**The `unchanged` outcome is not guarded, deliberately.** Step 4.3 sits ahead of every write,
-and an `unchanged` candidate performs none: no revision, no version move, no refresh. The one
-thing it decides — that the authored content already equals the current revision — is decided
-from rows read inside its own transaction, so no part of it rests on the evaluation's view.
-Guarding it would take a genuine no-op re-submission, make it revalidate because a *neighbour*
-moved, and after `worker.max_revalidation_attempts` such moves turn it into a failure. So the
-guard runs after that branch, and `an_unchanged_resubmission_is_not_refused_by_a_moved_\
-dependency` is what would catch the mistake.
+**And it is expensive in exactly the place this design pays attention to.** One round trip per
+vector member, inside the commit transaction, on a set `activation_write_set` allows to reach 512
+— the cost T14 restructured the reverse read into a single CTE to avoid. It is also the only
+reason step 4.2's canonical ordering needs to extend past families: order matters because the
+locks are many. Remove them and the requirement disappears with them. Optimism is the shape of
+the rest of this design anyway — `resource_version` compare-and-swap, a transient store per unit,
+validation outside any transaction — and registrations are rare against reads, which is the
+regime optimistic detection is for. That the secure API has no `FOR UPDATE` and `SQLite` has no
+row locking is corroboration, not the argument: the argument stands if `FOR UPDATE` arrives
+tomorrow.
 
-**One consequence worth naming:** `limits.activation_write_set` is now asked twice, because
-the vector's reverse-impact read is the same read the refresh does. An over-bound candidate is
+**What holds instead.** The candidate's own row is serialized by the compare-and-swap that writes
+it. A dependency that moves is serialized by the refresh its mover owes the dependants: that
+refresh writes each affected dependant's `type_schema` row, the same row this commit writes, so
+the two block on one another and the later one recomputes against the earlier. Where the change
+leaves a dependant's fingerprint unmoved, nothing is written and nothing was stale. SPEC §8.1
+step 4.2 records the argument, the one window it leaves, and the liveness cost by name.
+
+**One per-entity lock survives the argument, and T15 does not own it.** DESIGN §4 rested
+deletion's *"no new dependant between the check and the tombstone"* on admission locking every
+dependency target. Admission does not, and the optimistic mechanism does not reach this case:
+adding an edge moves no `resource_version` and writes only `dependency`, while deletion writes the
+target's `entity` row, so in the order where the edge commits second nothing serializes them, and
+deletion's dependant check is a check-then-act on a predicate no compare-and-swap carries. The
+requirement is **one lock per edge target**, taken by admission and deletion alike after their
+family locks — cheap, portable, and nothing like a lock over the vector. It is **T20's**, with
+deletion; P0 has no deletion path, so nothing is exposed meanwhile. DESIGN now states it where it
+is needed instead of as a property of admission.
+
+**The `unchanged` outcome is not guarded, deliberately.** Step 4.3 sits ahead of every write, and
+an `unchanged` candidate performs none: no revision, no version move, no refresh. The one thing it
+decides — that the authored content already equals the current revision — is decided from rows
+read inside its own transaction, so no part of it rests on the evaluation's view. Guarding it
+would take a genuine no-op re-submission, make it revalidate because a *neighbour* moved, and
+after `worker.max_revalidation_attempts` such moves turn it into a failure. So the guard runs
+after that branch, and `an_unchanged_resubmission_is_not_refused_by_a_moved_dependency` is what
+would catch the mistake.
+
+**One consequence worth naming:** `limits.activation_write_set` is now asked twice, because the
+vector's reverse-impact read is the same read the refresh does. An over-bound candidate is
 therefore refused at evaluation, before any transaction has written, under the same
-`activation_write_set_exceeded` reason — strictly earlier and cheaper, and invisible to a
-client. T14's refusal stays as the backstop for a set that grew in between.
-
+`activation_write_set_exceeded` reason — strictly earlier and cheaper, and invisible to a client.
+T14's refusal stays as the backstop for a set that grew in between.
 
 ## Dependency graph
 
