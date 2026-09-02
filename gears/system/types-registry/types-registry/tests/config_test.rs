@@ -341,10 +341,6 @@ fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
             "limits.resolution_closure",
         ),
         (
-            json!({ "activation_write_set": 1024 }),
-            "limits.activation_write_set",
-        ),
-        (
             json!({ "page_size_default": 50 }),
             "limits.page_size_default",
         ),
@@ -377,17 +373,21 @@ fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
     }
 }
 
-/// The two keys that *are* enforced are never reported, whatever they are set to —
+/// The keys that *are* enforced are never reported, whatever they are set to —
 /// otherwise the warning would train an operator to ignore it.
 #[test]
 fn the_enforced_limits_are_never_reported_as_inert() {
     let cfg = parse(json!({
-        "limits": { "authored_document": "1MB", "batch_candidates": 7 }
+        "limits": { "authored_document": "1MB", "batch_candidates": 7, "activation_write_set": 8 }
     }));
     assert!(cfg.inert_limit_keys().is_empty());
-    // And they really are the enforced pair, read back as configured.
+    // And they really are the enforced set, read back as configured.
     assert_eq!(cfg.limits.authored_document.bytes(), 1024 * 1024);
     assert_eq!(cfg.limits.batch_candidates, 7);
+    assert_eq!(
+        cfg.limits.activation_write_set, 8,
+        "T14 enforces this one: the reverse-impact refusal and the CTE's depth cap"
+    );
 }
 
 /// A configuration that sets several of them is reported once, in full: an operator
@@ -395,28 +395,29 @@ fn the_enforced_limits_are_never_reported_as_inert() {
 #[test]
 fn several_inert_keys_are_reported_together() {
     let cfg = parse(json!({
-        "limits": { "activation_write_set": 1024, "page_size_max": 500 },
+        "limits": { "resolution_closure": 128, "page_size_max": 500 },
         "worker": { "operation_timeout": "10m" }
     }));
     assert_eq!(
         cfg.inert_limit_keys(),
         vec![
-            "limits.activation_write_set",
+            "limits.resolution_closure",
             "limits.page_size_max",
             "worker.operation_timeout",
         ],
     );
 }
 
-/// Zero is refused for the two limits that *are* enforced, for the same reason as
-/// the page sizes: such a deployment boots and then refuses every request that
-/// reaches it, naming a limit the operator chose without meaning this.
+/// Zero is refused for every limit that *is* enforced, for the same reason as the
+/// page sizes: such a deployment boots and then refuses every request that reaches
+/// it, naming a limit the operator chose without meaning this.
 #[test]
 fn a_zero_enforced_limit_fails_startup() {
     for limits in [
         json!({ "batch_candidates": 0 }),
         json!({ "authored_document": 0 }),
         json!({ "authored_document": "0KB" }),
+        json!({ "activation_write_set": 0 }),
     ] {
         let cfg = parse(json!({ "limits": limits.clone() }));
         let err = cfg

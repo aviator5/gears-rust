@@ -125,9 +125,16 @@ fn worker(db: &Arc<DBProvider<DbError>>) -> DBProvider<WorkerError> {
 
 async fn admit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str) -> OperationOutcome {
     let op = submit(db, key, gts_id).await;
-    run_operation(&stores(), &worker(db), &allow_all(), op, LATER)
-        .await
-        .expect("the worker itself must not fail")
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        &common::limits(),
+        op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail")
 }
 
 /// The item's status and, when it was refused, the machine reason.
@@ -428,9 +435,16 @@ async fn a_creation_holds_the_family_lock_across_its_commit() {
     let stores_handle: Arc<dyn types_registry::domain::ports::Stores> = paused_stores;
     let provider = worker(&db);
     let admission = tokio::spawn(async move {
-        run_operation(&stores_handle, &provider, &allow_all(), op, LATER)
-            .await
-            .expect("the worker itself must not fail")
+        run_operation(
+            &stores_handle,
+            &provider,
+            &allow_all(),
+            &common::limits(),
+            op,
+            LATER,
+        )
+        .await
+        .expect("the worker itself must not fail")
     });
 
     reached
@@ -525,6 +539,7 @@ async fn family_lock_contention_honours_the_configured_wait_budget() {
         &stores(),
         &worker(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
         settings,
@@ -543,6 +558,7 @@ async fn family_lock_contention_honours_the_configured_wait_budget() {
         &stores(),
         &worker(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
         WorkerSettings::default(),

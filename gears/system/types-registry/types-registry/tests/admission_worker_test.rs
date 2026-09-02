@@ -114,6 +114,7 @@ async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
     )
@@ -239,6 +240,7 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &stores(),
         &worker_provider(&first_db),
         &allow_all(),
+        &common::limits(),
         first,
         LATER,
     )
@@ -269,6 +271,7 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &stores(),
         &worker_provider(&second_db),
         &allow_all(),
+        &common::limits(),
         second,
         LATER,
     )
@@ -407,9 +410,16 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
 async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
     let db = test_db().await;
     let first = submit(&db, "k1", CF_TYPE, schema(CF_TYPE)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("first admission");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        &common::limits(),
+        first,
+        LATER,
+    )
+    .await
+    .expect("first admission");
 
     // A second operation for the same identifier fails with `already_exists`.
     let mut body = schema(CF_TYPE);
@@ -419,6 +429,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         second,
         LATER,
     )
@@ -431,6 +442,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         second,
         LATER,
     )
@@ -481,6 +493,7 @@ async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
     )
@@ -532,9 +545,16 @@ async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
 async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revision() {
     let db = test_db().await;
     let first = submit(&db, "k1", CF_TYPE, schema(CF_TYPE)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("first admission");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        &common::limits(),
+        first,
+        LATER,
+    )
+    .await
+    .expect("first admission");
 
     // A second *operation* for the same identifier: a different idempotency key and
     // a different body, so acceptance treats it as a fresh request.
@@ -546,6 +566,7 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         second,
         LATER,
     )
@@ -590,6 +611,7 @@ async fn an_unresolvable_reference_is_an_item_failure_not_a_worker_error() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
     )
@@ -625,9 +647,16 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
     let db = test_db().await;
     let base = gts_id!("cf.core.base.type.v1~");
     let first = submit(&db, "k1", base, schema(base)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("first admission");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        &common::limits(),
+        first,
+        LATER,
+    )
+    .await
+    .expect("first admission");
 
     // A candidate that can only resolve if the first admission is visible.
     let derived = gts_id!("cf.core.base.type.v1~cf.core.ns.premium.v1~");
@@ -649,6 +678,7 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         second,
         LATER,
     )
@@ -688,6 +718,7 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
     )
@@ -699,6 +730,7 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
     )
@@ -735,6 +767,7 @@ async fn an_unknown_operation_is_an_error() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         Uuid::new_v4(),
         LATER,
     )
@@ -764,6 +797,7 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         operation_id,
         LATER,
     )
@@ -828,9 +862,16 @@ async fn a_ref_outside_the_chain_is_admitted() {
     // A committed type that is *not* an ancestor of the candidate.
     let unrelated = gts_id!("cf.core.other.type.v1~");
     let first = submit(&db, "k1", unrelated, schema(unrelated)).await;
-    run_operation(&stores(), &worker_provider(&db), &allow_all(), first, LATER)
-        .await
-        .expect("the unrelated type admits");
+    run_operation(
+        &stores(),
+        &worker_provider(&db),
+        &allow_all(),
+        &common::limits(),
+        first,
+        LATER,
+    )
+    .await
+    .expect("the unrelated type admits");
 
     let candidate = gts_id!("cf.core.base.type.v1~");
     let body = json!({
@@ -845,6 +886,7 @@ async fn a_ref_outside_the_chain_is_admitted() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
+        &common::limits(),
         second,
         LATER,
     )

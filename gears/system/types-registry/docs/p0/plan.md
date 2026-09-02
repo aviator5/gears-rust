@@ -142,9 +142,8 @@ process-wide pull with a per-gear push that works across processes."*
 earlier answer that no retry was needed was conditional on keeping pull.
 
 It also simplifies the cutover. Seeding no longer has to topologically order ~200 entities
-across every gear and detect cycles at startup; types-registry seeds its own small set, and
-cross-gear ordering is handled by the retry DESIGN sanctions: *"acyclic dependencies can
-converge through retry."*
+across every gear at startup; types-registry seeds its own small set, and cross-gear
+ordering is handled by the retry DESIGN sanctions: *"dependencies converge through retry."*
 
 Cost: a `toolkit-gts` and macro change, plus one line in roughly fifteen gears. Benefit:
 ceiling C3 disappears, out-of-process operation is unblocked, and the transparency
@@ -679,8 +678,7 @@ refuses rather than partially committing; admission emits spans and metrics.
 own reason; provenance is persisted on every revision.
 
 **Checkpoint 5** — a batch with a failing dependency commits independent branches and
-blocks the dependent; a cycle with one invalid member commits nothing; Dry Run writes
-nothing.
+blocks everything downstream of it; a circular `$ref` is refused; Dry Run writes nothing.
 
 **Checkpoint 6** — an operation submitted through the outbox reaches `completed` without a
 direct worker call; inventory records carry `owning_gear`; the new trait and its

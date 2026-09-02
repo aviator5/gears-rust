@@ -203,6 +203,7 @@ async fn commit_alone(
                     &allow_all(),
                     unit.as_ref(),
                     expected,
+                    common::limits().activation_write_set,
                     NOW,
                 )
                 .await
@@ -250,7 +251,16 @@ async fn a_paused_unchanged_pass_reports_the_precondition_it_lost(db: &Provider,
                 let unit = Arc::clone(&unit);
                 let stores = Arc::clone(&decorated);
                 Box::pin(async move {
-                    commit_revision(stores.as_ref(), tx, &allow_all(), unit.as_ref(), 1, NOW).await
+                    commit_revision(
+                        stores.as_ref(),
+                        tx,
+                        &allow_all(),
+                        unit.as_ref(),
+                        1,
+                        common::limits().activation_write_set,
+                        NOW,
+                    )
+                    .await
                 })
             })
             .await
@@ -307,7 +317,16 @@ async fn a_paused_revision_loses_the_compare_and_swap(db: &Provider, backend: &s
                 let unit = Arc::clone(&unit);
                 let stores = Arc::clone(&decorated);
                 Box::pin(async move {
-                    commit_revision(stores.as_ref(), tx, &allow_all(), unit.as_ref(), 1, NOW).await
+                    commit_revision(
+                        stores.as_ref(),
+                        tx,
+                        &allow_all(),
+                        unit.as_ref(),
+                        1,
+                        common::limits().activation_write_set,
+                        NOW,
+                    )
+                    .await
                 })
             })
             .await

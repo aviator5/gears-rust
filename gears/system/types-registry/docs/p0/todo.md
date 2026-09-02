@@ -187,7 +187,7 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 - [x] Test: CAS with a stale version affects zero rows and is reported as such
 - [x] Test: list read with a wildcard pattern returns exactly what `GtsId::matches_pattern` accepts, including a case the SQL prefilter admits but the pattern rejects. **Two fixture identifiers had to be fixed first:** `…v1~x.a.type.v1~` does not parse (a chain segment is a full `vendor.package.namespace.type.vMAJOR`), so `matches_pattern` rejected it and the test had been passing for the wrong reason. The `v1~*` expectation was also wrong — a bare segment is an implicit derived-type envelope (GTS spec §3.6), so `…v1~` and `…v1~*` accept the same set, base included
 - [x] Test: keyset paging over a set larger than one page yields every row exactly once, and a row inserted mid-traversal neither duplicates an earlier row nor hides a later one
-- [x] Test: closure read over a chain returns the whole chain and nothing outside it — plus termination on a cycle (valid per ADR-0012, so the `seen` set is a correctness requirement)
+- [x] Test: closure read over a chain returns the whole chain and nothing outside it — plus termination on a row that contradicts acyclicity. The relation is a DAG (ADR-0012), so the `seen` set is what keeps the walk linear in entities rather than in converging paths; termination on a contradicting row is defence in depth, retitled at T14 when the invariant gained a test of its own
 - [x] `cargo test --workspace` (excluding the two macro crates, as `make test-no-macros` does) — passes, so no regression in any other gear
 - [x] PostgreSQL / MySQL repository primitives — **run, and they found two defects.** `tests/repo_backends_test.rs` covers the properties `SQLite` cannot demonstrate: the unique-conflict handling, the keyset cursor's binary collation, and now the same two races **inside a transaction**, which is the only shape production uses. Both container suites pass; see the correction below. Run: `cargo test -p cf-gears-types-registry --features integration --test repo_backends_test`
 
@@ -395,8 +395,9 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 
 **Not done, deliberately:** `insert_current` is an insert rather than an upsert — moving an
 existing pointer is a revision with its own preconditions (T11), and a silent overwrite would
-hide a missing recheck. One item is one unit, in `item_no` order; in-batch references and SCC
-ordering are T19. `run_operation` takes no config, because nothing in T8 reads a limit.
+hide a missing recheck. One item is one unit, in `item_no` order; in-batch references and
+topological ordering are T19. `run_operation` takes no config, because nothing in T8 reads a
+limit — T14 gives it `&Limits`.
 
 **Duplicate delivery is already a no-op**, ahead of T21 asking for it: a completed operation is
 recognized and its stored outcomes returned, and an item already terminal from an earlier pass is
@@ -961,29 +962,87 @@ green.
 
 ---
 
-### - [ ] T14: Reverse-impact worklist and artifact refresh
+### - [x] T14: Reverse-impact traversal and artifact refresh
 
-**Description:** The iterative worklist over direct reverse edges (D5 — a recursive CTE is
-not available, since raw SQL is forbidden outside migrations), with visited-set
-deduplication, fingerprint-stability early stop, the `activation_write_set` bound, and
-refresh of every affected dependent's effective artifacts in the same transaction.
+**Description:** The reverse-impact read over `dependency` and the refresh of every
+affected dependent's effective artifacts in the same transaction as the new revision, with
+the fingerprint-stability stop and the `activation_write_set` bound (D5).
+
+**The traversal is one scoped recursive CTE, and the refresh is a loop.** The task was
+planned as a worklist for both halves on the premise that a recursive CTE needs raw SQL,
+which `11_database_patterns.md` forbids outside migrations. That premise does not hold:
+`toolkit-db`'s ADR-0001 (`SecureCteSelect::recursive_cte`) builds a scoped `WITH RECURSIVE`
+entirely through `sea-query`, scope embedded in both the seed and the recursive member. So
+the traversal became one statement — it runs inside the commit transaction, where round
+trips are paid for in lock contention — and only the refresh stayed a loop, because the
+fingerprint stop decides the write set by *recomputation*, which no closure query can
+express. SPEC §D5 records the split.
 
 **Acceptance criteria:**
-- [ ] Traversal terminates on a cyclic graph
-- [ ] A dependent whose recomputed artifacts are identical stops the branch and does not move `resource_version`
-- [ ] Every affected dependent's artifacts become current in the same transaction as the new revision — no mixed current state
-- [ ] Exceeding `limits.activation_write_set` fails the candidate with a structured reason and commits nothing partial
-- [ ] `ponytail:` comment names the measured max fan-out (27), the bound (512) and the staging upgrade path
+- [x] A dependent whose recomputed artifacts are identical is not written and does not move `resource_version` — nor its `revision_no`, nor `updated_at`. Also verified as *examined*: the early-stop test asserts `examined == 2` beside an empty write set, so an empty impact set cannot make it pass
+- [x] Every affected dependent's artifacts become current in the same transaction as the new revision — the refresh takes the caller's `&DbTx`, and `commit_revision` calls it after `replace_edges`, so a dependent sees this revision's reference set
+- [x] Exceeding `limits.activation_write_set` fails the candidate with a structured reason (`activation_write_set_exceeded`) and commits nothing partial
+- [x] `ponytail:` comment names the measured max fan-out (27), the bound (512) and the staging upgrade path — on `DependencyRepo::reverse_impact`
+- [x] The traversal terminates on a row that contradicts acyclicity. **The criterion was "terminates on a cyclic graph", and the graph cannot be cyclic** — no edge kind can close a cycle (ADR-0012, rewritten here with PRD/DESIGN/`database.sql`): a circular `$ref` has no resolved form and gts-rust refuses it with `Circular $ref detected`, derivation strictly shortens the `~`-chain, and nothing references an Instance. The termination property is kept as defence in depth, since a contradicting row would otherwise hang a commit transaction, and the invariant itself is now pinned where it is enforced
+
+**What made a depth-capped CTE safe.** `recursive_cte` requires a `max_depth` and truncates
+**silently** past it — a dependent left out keeps stale artifacts marked current, the one
+failure this read must not have. The cap is therefore the write-set bound itself, which
+makes truncation unreachable below the refusal: seed rows carry depth `0`, so a dependent at
+shortest distance `d` appears at depth `d - 1`; a hidden dependent would need a path of at
+least `bound + 2` edges, and every one of its `bound + 1` intermediate dependents is nearer
+and so already in the set — which puts the set over the bound, where the refusal has already
+fired. A returned set is complete; an incomplete walk is an error.
+
+**A refusal after the writes began needed its own channel.** `commit_revision` returns
+`Ok(Err(ItemFailure))` for every other candidate refusal, but those are all reached *before*
+a write. This one cannot be: the refresh must see the committed revision. Returning it in the
+`Ok` position would **commit** the revision it refuses, so it travels as
+`WorkerError::RefusedAfterWrite(ItemFailure)` — an error, which rolls the transaction back —
+and `process_item` unwraps it into the same `record_failure` path an evaluation-stage refusal
+takes. Invisible past the worker; `an_over_bound_write_set_commits_nothing` is what would
+have caught the mistake.
+
+**`limits` now reach the worker.** `run_operation` takes `&Limits` and carries it to
+`commit_revision`; `activation_write_set` moved off `inert_limit_keys` and gained a
+zero-refusal in `validate()`, alongside the other enforced limits. `resolved_document` and
+`resolution_closure` stay listed as inert — the struct travels, but nothing consults them.
+
+**Two shapes came out of the rebase onto the family lock, not out of T14's design.** `Limits`
+and `WorkerSettings` both travel per item, which puts `process_item` one argument over
+Clippy's threshold, so they travel together as `ItemConfig` — the same reason
+`CommitRequest` exists, and `limits` rides on `CommitRequest` from there. And
+`commit_revision` crossed the 200-line lint once the refresh call joined the tombstone and
+lock rechecks, so its `unchanged` branch is now `commit_unchanged`: a re-read standing in
+for the compare-and-swap a real revision carries in its `WHERE`, which is one idea and
+reads better named.
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Test: revising a base with N dependents refreshes exactly N `type_schema` rows
-- [ ] Test: cyclic dependency graph terminates
-- [ ] Test: over-bound case commits nothing
+- [x] Gear tests, all three backends — `cargo nextest run -p cf-gears-types-registry`: **550 passed** (544 before the rebase; the six added are the family-lock suites this branch rebased onto); `--features integration` on `repo_backends_test`, `migration_backends_test` and `revision_race_backends_test`: **6 passed** (PostgreSQL + MySQL containers)
+- [x] Test: revising a base with N dependents refreshes exactly N `type_schema` rows — `refresh_test.rs::revising_a_base_refreshes_every_dependent_schema`, over a derived type and an out-of-chain `$ref`erer, asserting the new property reaches the refreshed artifacts
+- [x] Test: over-bound case commits nothing — the base's `resource_version`, its whole current row and both dependents' fingerprints are byte-identical after the refusal
+- [x] Test: the walk terminates on a cyclic row — `dependency_repo_test.rs` and `repo_test.rs`, both writing the cycle straight through the repository, plus the `PostgreSQL`/`MySQL` case, where a non-terminating backend would hang rather than fail
+- [x] Test: acyclicity is enforced, not assumed — `dependency_test.rs::a_revision_that_would_close_a_ref_cycle_is_refused` pins the `invalid_schema` refusal and that no edge is written. The in-batch half (two candidates referencing each other under one overlay) belongs to T19 and is listed there
+- [x] `make fmt`, `make clippy` (`--all-targets --features integration`) — clean
+
+**Added:** `TR/tests/dependency_repo_test.rs` (7 tests: transitive reach, root exclusion,
+every edge kind, empty set, the bound, no-truncation-past-the-cap, cyclic-row termination),
+`TR/tests/refresh_test.rs` (5 tests), `reverse_impact_walks_back_up_a_chain` in
+`repo_backends_test.rs`, `a_revision_that_would_close_a_ref_cycle_is_refused` in
+`dependency_test.rs`.
 
 **Dependencies:** T13
-**Files likely touched:** `TR/src/domain/dependency.rs` — **second file, so take `TR/src/domain/dependency/`**: `extraction.rs` from T13 plus `worklist.rs` here. Also `TR/src/infra/storage/repo/`, `TR/src/domain/ports.rs`, `TR/src/infra/storage/store.rs`, `TR/src/domain/admission/unit.rs`, `TR/tests/dependency_repo_test.rs`
-**Scope:** M
+**Files touched:** `TR/src/infra/storage/repo/{dependency_repo,mod}.rs`,
+`TR/src/domain/admission/refresh.rs` (new), `TR/src/domain/admission/{mod,unit,worker,errors}.rs`,
+`TR/src/domain/{ports,dependency}.rs`, `TR/src/infra/storage/store.rs`, `TR/src/config.rs`,
+`TR/src/api/rest/error.rs`, `TR/src/domain/registry_service.rs`, `TR/tests/*`, plus the
+document rewrite: `docs/{PRD,DESIGN,database.sql}`, `docs/ADR/0012-*`, `docs/p0/{SPEC,plan}.md`
+
+**Not `TR/src/domain/dependency/`.** The plan called for splitting that file into
+`extraction.rs` + `worklist.rs`. There is no worklist module: the traversal is SQL, and what
+remained is an admission step that speaks `ItemFailure` / `WorkerError` and builds a transient
+store — `unit.rs`'s neighbours, not extraction's. It went to
+`domain/admission/refresh.rs`, and `domain/dependency.rs` stays one pure file.
 
 ---
 
@@ -1117,22 +1176,22 @@ reasoning about it.
 ### - [ ] T19: Dependency-aware partial admission
 
 **Description:** Batch admission: build the candidate graph from authored references between
-candidates plus the implicit `vM.(n-1)~ → vM.n~` edge, condense into SCCs, process in
-topological order, treat each acyclic candidate as one unit and each cyclic component as one
-atomic unit, and record an outcome for every candidate. The SCC condensation and topological
-order stay pure functions over a candidate set.
+candidates plus the implicit `vM.(n-1)~ → vM.n~` edge, process it in topological order with
+one candidate per unit, and record an outcome for every candidate. The relation is acyclic by
+construction (ADR-0012), so there is no condensation step and no atomic group. The ordering
+stays a pure function over a candidate set.
 
 **Acceptance criteria:**
 - [ ] Independent passing branches commit despite failures elsewhere
 - [ ] In-batch references resolve against the candidate overlay, never a previously committed revision
 - [ ] A failed selected dependency yields `blocked_by_dependency`; a failed lower minor yields `blocked_by_predecessor`
-- [ ] A cyclic component with one invalid member commits nothing
+- [ ] A circular `$ref` between two candidates in one batch is refused as `invalid_schema` — the overlay makes both visible to each other, so this is where the acyclicity invariant is actually tested
 - [ ] The implicit predecessor edge is not written to `dependency`
-- [ ] Condensation and ordering are exposed as pure functions over a candidate set, usable without a database — required for unit testing without a fixture DB
+- [ ] The ordering is exposed as a pure function over a candidate set, usable without a database — required for unit testing without a fixture DB
 
 **Verification:**
 - [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Tests: partial commit, blocked dependent, blocked predecessor, atomic cycle
+- [ ] Tests: partial commit, blocked dependent, blocked predecessor, refused in-batch `$ref` cycle
 - [ ] Test: batch over `limits.batch_candidates` refused synchronously
 
 **Dependencies:** Checkpoint 4
@@ -1170,7 +1229,7 @@ deletion, running every check in a rollback-only transaction.
 ---
 
 ### Checkpoint 5
-- [ ] Partial admission, atomic cycles, deletion safety and Dry Run all behave
+- [ ] Partial admission, the refused `$ref` cycle, deletion safety and Dry Run all behave
 - [ ] Gear tests (see [Commands](#commands))
 - [ ] `make dylint` — full workspace, once for the phase (P13)
 - [ ] Human review

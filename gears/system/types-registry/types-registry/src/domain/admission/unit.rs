@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::errors::{ItemFailure, WorkerError};
 use super::fingerprint::canonical_text;
+use super::refresh::refresh_dependents;
 use crate::domain::artifacts::{MaterializedArtifacts, content_hash, materialize};
 use crate::domain::dependency::{DependencyEdge, extract_edges};
 use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
@@ -610,6 +611,58 @@ async fn read_current_content(
     })
 }
 
+/// The `unchanged` half of [`commit_revision`]: re-ask the precondition, then
+/// terminalize the item without allocating a revision.
+///
+/// Its own function so the write path in [`commit_revision`] reads as one sequence.
+/// It writes nothing but the item's terminal state, which is why the re-read below
+/// stands in for the compare-and-swap the real revision carries in its `WHERE`.
+async fn commit_unchanged(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    unit: &EvaluatedUnit,
+    entity_id: i64,
+    expected_resource_version: i64,
+    now: OffsetDateTime,
+) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
+    // `EntityVanished`, not `CurrentStateMissing`: the row that disappeared is
+    // the *entity*, read twice in one transaction. Naming the current-state
+    // tables would point an operator at the wrong half of the corruption.
+    let still = stores
+        .find_by_gts_id(tx, scope, &unit.gts_id)
+        .await?
+        .ok_or_else(|| WorkerError::EntityVanished {
+            gts_id: unit.gts_id.clone(),
+            entity_id,
+        })?;
+    if still.resource_version != expected_resource_version {
+        return Ok(Err(stale_precondition(
+            &unit.gts_id,
+            expected_resource_version,
+            still.resource_version,
+        )));
+    }
+    if !stores
+        .mark_item_unchanged(
+            tx,
+            scope,
+            unit.operation_item_id,
+            still.resource_version,
+            now,
+        )
+        .await?
+    {
+        return Err(WorkerError::ItemAlreadyTerminal {
+            item_id: unit.operation_item_id,
+        });
+    }
+    Ok(Ok(RevisionCommit::Unchanged {
+        gts_uuid: unit.gts_uuid,
+        resource_version: still.resource_version,
+    }))
+}
+
 /// Commit one evaluated unit as a **revision** of an entity that already exists:
 /// the `expected_resource_version` precondition, the immutable revision insert,
 /// the current-state pointer move, and the item outcome.
@@ -650,6 +703,7 @@ pub async fn commit_revision(
     scope: &AccessScope,
     unit: &EvaluatedUnit,
     expected_resource_version: i64,
+    activation_write_set: usize,
     now: OffsetDateTime,
 ) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
     let Some(entity) = stores.find_by_gts_id(tx, scope, &unit.gts_id).await? else {
@@ -693,41 +747,16 @@ pub async fn commit_revision(
     // *older* revision is deliberately not asked — that is an ordinary update which
     // allocates a new number rather than moving the pointer backwards (ADR-0005).
     if current_hash == unit.content_hash && current_body == unit.canonical_body {
-        // `EntityVanished`, not `CurrentStateMissing`: the row that disappeared is
-        // the *entity*, read twice in one transaction. Naming the current-state
-        // tables would point an operator at the wrong half of the corruption.
-        let still = stores
-            .find_by_gts_id(tx, scope, &unit.gts_id)
-            .await?
-            .ok_or_else(|| WorkerError::EntityVanished {
-                gts_id: unit.gts_id.clone(),
-                entity_id: entity.id,
-            })?;
-        if still.resource_version != expected_resource_version {
-            return Ok(Err(stale_precondition(
-                &unit.gts_id,
-                expected_resource_version,
-                still.resource_version,
-            )));
-        }
-        if !stores
-            .mark_item_unchanged(
-                tx,
-                scope,
-                unit.operation_item_id,
-                still.resource_version,
-                now,
-            )
-            .await?
-        {
-            return Err(WorkerError::ItemAlreadyTerminal {
-                item_id: unit.operation_item_id,
-            });
-        }
-        return Ok(Ok(RevisionCommit::Unchanged {
-            gts_uuid: unit.gts_uuid,
-            resource_version: still.resource_version,
-        }));
+        return commit_unchanged(
+            stores,
+            tx,
+            scope,
+            unit,
+            entity.id,
+            expected_resource_version,
+            now,
+        )
+        .await;
     }
 
     if expected_resource_version == i64::MAX {
@@ -852,6 +881,17 @@ pub async fn commit_revision(
     // candidate never reaches here: identical content implies an identical edge set.
     replace_edges(stores, tx, scope, entity.id, &unit.edges).await?;
 
+    refresh_reverse_impact(
+        stores,
+        tx,
+        scope,
+        unit,
+        entity.id,
+        activation_write_set,
+        now,
+    )
+    .await?;
+
     // Last, and its `false` rolls everything above back — see `commit_creation`.
     if !stores
         .mark_item_succeeded(
@@ -874,6 +914,50 @@ pub async fn commit_revision(
         revision_no,
         resource_version,
     })))
+}
+
+/// Step 4.6: re-materialize the artifacts of everything that depends on the entity
+/// this revision just moved.
+///
+/// Its own function so the commit path reads as a sequence of steps rather than
+/// growing a branch inside one, and because the "only for a Type Schema" condition
+/// is a claim worth stating once, next to its reason.
+///
+/// **Only a Type Schema has dependents.** Nothing can depend on an Instance: both
+/// reference-bearing keywords name schemas, and an Instance's own conformance edge
+/// points *at* its type. Called after `replace_edges`, so a dependent reached here
+/// sees this revision's reference set rather than the previous one.
+///
+/// # Errors
+/// [`WorkerError`] for an infrastructure failure, and
+/// [`WorkerError::RefusedAfterWrite`] for a candidate refusal — the refresh runs
+/// inside the caller's transaction by construction (`refresh::refresh_dependents`),
+/// and that transaction has already written the revision, so a refusal has to roll
+/// it back rather than travel in the `Ok` position, which commits.
+async fn refresh_reverse_impact(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    unit: &EvaluatedUnit,
+    entity_id: i64,
+    activation_write_set: usize,
+    now: OffsetDateTime,
+) -> Result<(), WorkerError> {
+    if !matches!(unit.outcome, EvaluatedOutcome::TypeSchema { .. }) {
+        return Ok(());
+    }
+    match refresh_dependents(stores, tx, scope, &[entity_id], activation_write_set, now).await? {
+        Ok(outcome) => {
+            tracing::debug!(
+                gts_id = %unit.gts_id,
+                refreshed = outcome.refreshed.len(),
+                examined = outcome.examined,
+                "types_registry refreshed the dependents of a revision"
+            );
+            Ok(())
+        }
+        Err(failure) => Err(WorkerError::RefusedAfterWrite(failure)),
+    }
 }
 
 /// The refusal for a precondition that was already wrong when read — the entry

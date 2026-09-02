@@ -246,7 +246,7 @@ An installation has one authoritative database served by many pods; every guaran
 
 Storage behaves identically on SQLite, PostgreSQL, and MySQL. The repository layer owns explicit identifier-range bounds, UUID representation, backend-safe set chunking, and compare-and-swap; none leaks into the domain.
 
-Transitive dependency queries use one repository-owned recursive CTE over `dependency`; no closure is materialized. ToolKit outbox already requires MySQL 8.0+ for `FOR UPDATE SKIP LOCKED`, so the recursive CTE does not raise the backend floor. Because the graph may contain cycles, the CTE uses `UNION`, never `UNION ALL`, and its recursive term carries no depth or per-row accumulator that would defeat deduplication. The normative query constraints live beside the table in [database.sql](./database.sql); §4 records the outstanding `sea-query` and MySQL verification.
+Reverse-impact queries use one repository-owned recursive CTE over `dependency`, built through `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001) so the scope predicate is embedded in both the seed and the recursive member and no raw SQL leaves the migration layer. No closure is materialized. ToolKit outbox already requires MySQL 8.0+ for `FOR UPDATE SKIP LOCKED`, so the recursive CTE does not raise the backend floor; MySQL is also the only backend that caps recursion (`cte_max_recursion_depth`, default 1000), and the query's own cap sits under it. The CTE uses `UNION`, never `UNION ALL`: the relation is acyclic (ADR-0012), but its paths converge, and `UNION ALL` would enumerate a fan-in-heavy graph once per path. It carries a depth column, which the builder makes mandatory because a termination cap has to be a predicate on the recursive member; the cap is `limits.activation_write_set`, which is also the write-set refusal threshold — see [p0/SPEC.md](./p0/SPEC.md) §D5 for why that pairing makes a silently truncated walk unreachable. The normative query constraints live beside the table in [database.sql](./database.sql).
 
 **ADRs**: `cpt-cf-types-registry-adr-storage-identity-query-model`
 
@@ -492,22 +492,22 @@ All five bounds are deployment configuration (§3.8); this section fixes their d
 | Authored document | **256 KB** | Bounds retained input; repository schemas are 3–7 KB typically and 14 KB at most. |
 | Resolved document | **1 MB** | Separately bounds derivation expansion, which the authored limit cannot constrain. |
 | Resolution closure | **64 documents** | Bounds reference resolution and composition work. This also bounds derivation depth because each level contributes a document. |
-| Batch | **100 candidates** | Rejected synchronously before storage. It covers the largest current gear (26 definitions) and is also the largest admissible dependency cycle, whose members cannot be split. |
+| Batch | **100 candidates** | Rejected synchronously before storage. It covers the largest current gear (26 definitions), which is the figure that matters: every candidate is its own admission unit, so a batch is split at no cost to correctness and only to the candidate overlay (see below). |
 | Type-filter expansion | **1000 references** | Bounds the server-side result; about 36 KB of JSON and practical to chunk into a consumer's `IN` predicate. |
 
-Dependents and retained revisions remain unbounded. Capping dependents would prevent new uses of widely shared base types; their recursive-CTE processing already runs off the request path and outside a transaction. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Entities per tenant is an abuse-control or billing quota, not a correctness guard, and is outside this design.
+Dependents and retained revisions remain unbounded *as a relation*; what one admission may refresh is bounded by `limits.activation_write_set`. Capping dependents themselves would prevent new uses of widely shared base types; their recursive-CTE processing already runs off the request path. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Entities per tenant is an abuse-control or billing quota, not a correctness guard, and is outside this design.
 
 ##### Dependency-aware partial admission
 
 The P1 batch mode is **dependency-aware partial admission**, deterministic for one committed baseline:
 
 1. build the candidate graph from the authored references between candidates, plus the one implicit edge described below;
-2. condense it into strongly connected components and process them in topological order;
-3. treat each acyclic candidate as one admission unit and every cyclic component as one **atomic** unit;
+2. process it in topological order — the graph is a DAG by construction (ADR-0012), so one exists for every batch and no component needs atomic admission;
+3. treat each candidate as one admission unit;
 4. validate each unit outside a long-lived transaction and commit only database rechecks and writes; §4 records the still-open bound for an unbounded reverse-impact write set;
 5. record a durable outcome for every candidate GTS Identifier.
 
-Independent passing branches commit despite failures elsewhere. In-batch references resolve against the candidate overlay, never a previously committed revision. A failed selected dependency produces `blocked_by_dependency`; failure within an atomic component fails or blocks the whole component.
+Independent passing branches commit despite failures elsewhere. In-batch references resolve against the candidate overlay, never a previously committed revision. A failed selected dependency produces `blocked_by_dependency` for everything downstream of it.
 
 For determinism, the graph adds an implicit edge `vM.(n-1)~` → `vM.n~`. It makes a failed lower minor block the higher one as `blocked_by_predecessor`; without it, the higher minor would fail retryably and succeed on the next reconciliation cycle. The edge is acyclic by construction and is not stored in `dependency` (§3.7).
 
@@ -800,7 +800,7 @@ Maintains every direct managed-to-managed dependency: `$ref`, Instance conforman
 
 **`x-gts-ref` is classified, not stored.** The keyword constrains what a value may name, and `gts-rust` enforces it by matching the value string against the pattern—it never asks whether the named entity exists. The constraint therefore holds with nothing registered, the named document enters no resolution closure (§3.1), and revising it moves no dependent's artifacts. An edge would have exactly one effect: making the named entity undeletable, a guarantee the PRD explicitly declines to give. A pure classification over candidate content supports the managed–external boundary and has no reader on the compatibility, quarantine, read, refresh, availability, or deletion path: the exact identifier, or the pattern's longest valid identifier prefix—never its open match set—while `gts.*` and GTS §9.6 relative JSON pointers such as `/$id` name nothing. New matches therefore require no re-expansion of anything.
 
-Both endpoints are always Managed Entities. Direct rows decide deletion safety. A recursive CTE finds the reverse impact set for a revision; a second edge read supports the worker's SCC condensation and topological ordering. Dry Run exposes the resulting mutation verdict, so no separate graph API is provided.
+Both endpoints are always Managed Entities. Direct rows decide deletion safety. A recursive CTE finds the reverse impact set for a revision; a second edge read supplies the worker's topological ordering, which needs no condensation step because the relation is acyclic (ADR-0012). Dry Run exposes the resulting mutation verdict, so no separate graph API is provided.
 
 ##### Responsibility boundaries
 
@@ -1006,7 +1006,7 @@ Its body field is `items`, the same name registration and `:batchDelete` use, so
 
 Optional `dry_run` defaults false and preserves the `202` operation shape. It runs full admission through the commit boundary, so it is not cheaper validation.
 
-`items` is non-empty and synchronously capped by `limits.batch_candidates` (default 100). Splitting removes the candidate overlay between batches: acyclic dependencies can converge through retry as `cpt-cf-types-registry-fr-two-phase-init` requires, but a dependency cycle cannot be split and the limit is therefore also the maximum cycle size.
+`items` is non-empty and synchronously capped by `limits.batch_candidates` (default 100). Splitting removes the candidate overlay between batches, which costs a retry rather than correctness: dependencies converge through the reconciliation loop `cpt-cf-types-registry-fr-two-phase-init` already requires, and since the graph is acyclic (ADR-0012) no group of candidates has to travel together.
 
 Each item contains authored GTS JSON and optional `expected_resource_version`: present requires that version; absent requires nonexistence. Literal `0` is invalid because absence already expresses creation and versions never equal zero.
 
@@ -2225,7 +2225,7 @@ The ADR-0015 quarantine preflight is **not** among them. A scan for stable schem
 
 **Approve reliance on `toolkit-db/preview-outbox`.** P1 will reuse its leased outbox rather than implement another. `ledger`, `file-storage`, and `chat-engine` already use it; Types Registry needs the same sign-off.
 
-**Verify parameterized recursive CTE support in `sea-query`** for `cpt-cf-types-registry-component-dependency-graph` under `cpt-cf-types-registry-constraint-multi-backend`. Benchmark MySQL, the weakest backend; if inadequate, add transitive closure only as a cache over authoritative direct rows.
+**Benchmark the reverse-impact CTE on a large graph.** The query itself is settled — `SecureCteSelect::recursive_cte` (ADR-0001) renders and executes on all three backends, exercised by `toolkit-db`'s `cte_shapes_are_valid_sql_*` and this gear's `reverse_impact_walks_back_up_a_chain` in the container suites — so what is open is the profile, not the mechanism. The measured max fan-out in-repo is 27 against a bound of 512, which is why no benchmark is meaningful yet; it belongs with the generation/staging protocol above, on the same trigger.
 
 ## 5. Traceability
 

@@ -79,6 +79,21 @@ pub enum WorkerError {
     /// rolls the already-executed resource-version CAS back on this error.
     #[error("entity '{gts_id}' cannot allocate a revision after i32::MAX")]
     RevisionNumberExhausted { gts_id: String },
+    /// A candidate refusal reached **after** the commit transaction began writing
+    /// — today only the reverse-impact refresh (T14), which cannot run before the
+    /// revision it refreshes against exists.
+    ///
+    /// Carried as an error against this enum's own rule ("nothing here is a
+    /// statement about the candidate") because the transaction is the reason: a
+    /// refusal returned in the `Ok(Err(..))` position would **commit** the writes
+    /// it is refusing. `process_item` unwraps it and records the failure in its own
+    /// transaction, exactly as it does for an evaluation-stage refusal, so the
+    /// distinction stays invisible past the worker.
+    ///
+    /// Not retryable: `retryable_db_err` reads it as `None`, and a second attempt
+    /// would recompute the same refusal.
+    #[error("the revision was refused after its writes began: {0}")]
+    RefusedAfterWrite(ItemFailure),
     #[error("storage failure during admission: {0}")]
     Storage(#[from] ScopeError),
     #[error("database failure during admission: {0}")]
@@ -99,6 +114,14 @@ pub struct ItemFailure {
     /// `&'static str`.
     pub reason: Cow<'static, str>,
     pub message: String,
+}
+
+impl std::fmt::Display for ItemFailure {
+    /// `reason: message` — the shape the `WorkerError::RefusedAfterWrite` message
+    /// interpolates, and the one an operator reads in a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.message)
+    }
 }
 
 impl ItemFailure {

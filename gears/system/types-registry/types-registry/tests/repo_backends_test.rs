@@ -51,7 +51,9 @@ use common::{
     seed_pending_revision_item, seed_type_schema_revision,
 };
 use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
-use types_registry::domain::ports::{NewCurrentTypeSchema, NewEntity, commit_write, snapshot_read};
+use types_registry::domain::ports::{
+    NewCurrentTypeSchema, NewEntity, ReverseImpact, commit_write, snapshot_read,
+};
 use types_registry::infra::storage::entity::type_schema;
 use types_registry::infra::storage::repo::{
     DependencyRepo, EntityRepo, OperationRepo, PageRequest, TypeSchemaRepo, VersionFamilyRepo,
@@ -294,6 +296,100 @@ async fn closure_walks_a_chain(db: &Provider, family_id: i64, backend: &str) {
         "the whole chain and nothing else, gts_id-sorted, on {backend}"
     );
     assert!(closure.missing_roots.is_empty());
+}
+
+/// The reverse-impact read on a real backend: `WITH RECURSIVE` is the one query
+/// shape in this gear whose *dialect* differs, and `SQLite` cannot vouch for the
+/// other two.
+///
+/// Three things only a container run can show:
+///
+/// * The `WITH RECURSIVE` renders and executes at all. `sea-query` emits one
+///   statement for every backend, and `MySQL` alone caps recursion
+///   (`cte_max_recursion_depth`, default 1000) — the depth cap here is the
+///   write-set bound, which stays under it.
+/// * `UNION` inside the recursive member needs an equality operator for every
+///   projected column. The walk projects two `bigint`s and a depth, deliberately
+///   narrow: `PostgreSQL` has no equality for `json`, so a full-row projection
+///   would fail here and nowhere else.
+/// * The outer `SELECT DISTINCT … LIMIT` over a joined CTE is accepted. `SQLite`
+///   is the permissive backend for `DISTINCT` shapes, so a mistake there would
+///   surface only in production.
+async fn reverse_impact_walks_back_up_a_chain(db: &Provider, family_id: i64, backend: &str) {
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    let chain = [
+        gts_id!("acme.crm.rev_a.type.v1~"),
+        gts_id!("acme.crm.rev_b.type.v1~"),
+        gts_id!("acme.crm.rev_c.type.v1~"),
+    ];
+    let mut ids = Vec::new();
+    for id in chain {
+        ids.push(
+            EntityRepo::insert(&conn, &scope, new_entity(id, family_id))
+                .await
+                .expect("insert chain member")
+                .expect("the identifier is free")
+                .id,
+        );
+    }
+    // a -> b -> c, so the reverse impact of c is b and a.
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &scope,
+        ids[0],
+        &[(DependencyKind::SchemaRef, ids[1])],
+    )
+    .await
+    .expect("a -> b");
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &scope,
+        ids[1],
+        &[(DependencyKind::SchemaRef, ids[2])],
+    )
+    .await
+    .expect("b -> c");
+    // …and a row closing a cycle back to c. Admission cannot produce one
+    // (ADR-0012); written here because a backend that did not terminate on it would
+    // hang a commit transaction rather than fail a test.
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &scope,
+        ids[2],
+        &[(DependencyKind::SchemaRef, ids[0])],
+    )
+    .await
+    .expect("c -> a");
+
+    match DependencyRepo::reverse_impact(&conn, &scope, &[ids[2]], 512)
+        .await
+        .expect("reverse impact")
+    {
+        ReverseImpact::Within(rows) => {
+            let got: Vec<&str> = rows.iter().map(|r| r.gts_id.as_str()).collect();
+            assert_eq!(
+                got,
+                vec![chain[0], chain[1]],
+                "both dependents once each, gts_id-sorted, with the root excluded \
+                 even though a row leads back to it, on {backend}"
+            );
+        }
+        ReverseImpact::OverBound { at_least, bound } => {
+            panic!("unexpected refusal on {backend}: {at_least} against a bound of {bound}")
+        }
+    }
+
+    // The bound is a refusal on every backend, not a truncated read.
+    assert!(
+        matches!(
+            DependencyRepo::reverse_impact(&conn, &scope, &[ids[2]], 1)
+                .await
+                .expect("reverse impact"),
+            ReverseImpact::OverBound { .. }
+        ),
+        "two dependents must exceed a bound of one on {backend}"
+    );
 }
 
 /// A document too large for any `varchar`, so the column really is large text on
@@ -756,6 +852,7 @@ async fn assert_repo_primitives_behave(db: &Provider, backend: &str) {
     pattern_list_agrees_with_gts(db, backend).await;
     cas_reports_by_affected_rows(db, family.id, backend).await;
     closure_walks_a_chain(db, family.id, backend).await;
+    reverse_impact_walks_back_up_a_chain(db, family.id, backend).await;
     current_documents_reads_the_current_revision_only(db, family.id, backend).await;
     a_revision_moves_the_pointer_and_can_report_unchanged(db, family.id, backend).await;
     snapshot_read_does_not_see_a_mid_read_commit(db, family.id, backend).await;

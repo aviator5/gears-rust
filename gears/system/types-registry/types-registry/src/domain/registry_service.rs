@@ -257,6 +257,7 @@ impl RegistryService {
                 &self.stores,
                 &worker,
                 &Self::scope(),
+                &self.config.limits,
                 accepted.operation_id,
                 now,
                 self.config.worker,

@@ -35,8 +35,8 @@ use crate::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentTypeSchemaRow,
     DependencyClosure, DependencyStore, EntityRow, EntityStore, InstanceStore, NewCurrentInstance,
     NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewOperation, NewOperationItem,
-    NewRevision, OperationItemRow, OperationRow, OperationStore, TypeSchemaStore, VersionFamilyRow,
-    VersionFamilyStore,
+    NewRevision, OperationItemRow, OperationRow, OperationStore, ReverseImpact, TypeSchemaStore,
+    VersionFamilyRow, VersionFamilyStore,
 };
 
 use super::repo::{
@@ -347,6 +347,16 @@ impl DependencyStore for Repos {
         roots: &[String],
     ) -> Result<DependencyClosure, ScopeError> {
         DependencyRepo::closure(tx, scope, roots).await
+    }
+
+    async fn reverse_impact(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[i64],
+        write_set_bound: usize,
+    ) -> Result<ReverseImpact, ScopeError> {
+        DependencyRepo::reverse_impact(tx, scope, roots, write_set_bound).await
     }
 
     async fn replace_outgoing(

@@ -141,9 +141,16 @@ async fn admit(
     let op = submit(db, key, gts_id, content, expected_resource_version)
         .await
         .expect("accepted");
-    let outcome = run_operation(&stores(), &worker(db), &allow_all(), op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let outcome = run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        &common::limits(),
+        op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
     assert_eq!(
         outcome.items[0].status,
         domain_enums::OperationItemStatus::Succeeded,
@@ -151,6 +158,30 @@ async fn admit(
         outcome.items[0].failure,
     );
     outcome
+}
+
+/// Submit and admit without asserting the outcome — for the cases whose claim *is*
+/// the refusal. `admit` asserts success and cannot express one.
+async fn try_admit(
+    db: &Arc<DBProvider<DbError>>,
+    key: &str,
+    gts_id: &str,
+    content: Value,
+    expected_resource_version: Option<i64>,
+) -> OperationOutcome {
+    let op = submit(db, key, gts_id, content, expected_resource_version)
+        .await
+        .expect("accepted");
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        &common::limits(),
+        op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail")
 }
 
 async fn entity_id_of(db: &Arc<DBProvider<DbError>>, gts_id: &str) -> i64 {
@@ -425,9 +456,16 @@ async fn a_ref_naming_no_entity_fails_the_candidate() {
     )
     .await
     .expect("accepted");
-    let outcome = run_operation(&stores(), &worker(&db), &allow_all(), op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let outcome = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        &common::limits(),
+        op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
 
     let item = &outcome.items[0];
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
@@ -445,4 +483,82 @@ async fn a_ref_naming_no_entity_fails_the_candidate() {
         .await
         .expect("edges");
     assert!(rows.is_empty(), "a refused candidate writes no edge");
+}
+
+// ---------------------------------------------------------------------------
+// the relation is acyclic, and this is where that is enforced
+// ---------------------------------------------------------------------------
+
+/// **The acyclicity invariant (ADR-0012).** A revision that would close a `$ref`
+/// cycle is refused, so no cyclic edge is ever written.
+///
+/// The reason is not a registry policy but the resolution semantics: an effective
+/// artifact is materialized by *inlining* the referenced schema, and inlining has no
+/// fixpoint over a cycle — there is no resolved form to store or serve. `gts-rust`
+/// reaches that conclusion during validation and reports it as `invalid_schema`.
+///
+/// Asserted here rather than assumed anywhere else: every traversal over
+/// `dependency` is written to survive a cyclic row (`repo_test.rs`,
+/// `dependency_repo_test.rs`), and this is the test that says such a row cannot come
+/// from admission. The in-batch half of the claim — two candidates referencing each
+/// other in one operation, where the overlay makes both visible — arrives with batch
+/// admission (T19).
+#[tokio::test]
+async fn a_revision_that_would_close_a_ref_cycle_is_refused() {
+    let db = test_db().await;
+    // SHAPE stands alone; INVOICE references it. Both admit.
+    admit(&db, "k-shape", SHAPE, schema(SHAPE), None).await;
+    admit(
+        &db,
+        "k-invoice",
+        INVOICE,
+        schema_with(
+            INVOICE,
+            &json!({ "shape": { "$ref": format!("gts://{SHAPE}") } }),
+        ),
+        None,
+    )
+    .await;
+
+    // Now revise SHAPE to reference INVOICE, which would close SHAPE -> INVOICE ->
+    // SHAPE.
+    let outcome = try_admit(
+        &db,
+        "k-shape-2",
+        SHAPE,
+        schema_with(
+            SHAPE,
+            &json!({ "invoice": { "$ref": format!("gts://{INVOICE}") } }),
+        ),
+        Some(1),
+    )
+    .await;
+
+    let item = &outcome.items[0];
+    assert_eq!(
+        item.status,
+        domain_enums::OperationItemStatus::Failed,
+        "closing a reference cycle must be refused, got {item:?}"
+    );
+    let failure = item
+        .failure
+        .as_ref()
+        .expect("a failed item names its reason");
+    assert_eq!(failure.reason, "invalid_schema");
+    assert!(
+        failure.message.to_lowercase().contains("circular"),
+        "the refusal must name the cycle, got {}",
+        failure.message
+    );
+
+    // And the relation is unchanged: SHAPE still has no outgoing edge.
+    assert!(
+        outgoing(&db, SHAPE).await.is_empty(),
+        "a refused revision writes no edge"
+    );
+    assert_eq!(
+        outgoing(&db, INVOICE).await,
+        vec![(DependencyKind::SchemaRef, SHAPE.to_owned())],
+        "the one direction that does resolve is still the only edge"
+    );
 }

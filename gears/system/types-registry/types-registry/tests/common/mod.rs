@@ -121,12 +121,23 @@ pub fn allow_all() -> AccessScope {
     AccessScope::allow_all()
 }
 
+/// P0's configured limits, as the gear reads them from `TypesRegistryConfig`.
+///
+/// The worker takes these by reference (T14): `limits.activation_write_set` bounds
+/// the dependents one admission refreshes, and a test that needs a different bound
+/// builds its own `Limits` rather than mutating a shared one.
+pub fn limits() -> types_registry::config::Limits {
+    types_registry::config::Limits::default()
+}
+
 /// Test entry point with the documented worker defaults. Production has no
-/// default-configured worker path: it must pass the deployment settings.
+/// default-configured worker path: it must pass the deployment settings and the
+/// configured limits.
 pub async fn run_operation(
     stores: &Arc<dyn types_registry::domain::ports::Stores>,
     db: &DBProvider<types_registry::domain::admission::worker::WorkerError>,
     scope: &AccessScope,
+    limits: &types_registry::config::Limits,
     operation_id: uuid::Uuid,
     now: time::OffsetDateTime,
 ) -> Result<
@@ -137,6 +148,7 @@ pub async fn run_operation(
         stores,
         db,
         scope,
+        limits,
         operation_id,
         now,
         types_registry::config::WorkerSettings::default(),
@@ -354,8 +366,8 @@ use types_registry::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentTypeSchemaRow,
     DependencyClosure, DependencyStore, EntityRow, EntityStore, InstanceStore, NewCurrentInstance,
     NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewOperation, NewOperationItem,
-    NewRevision, OperationItemRow, OperationRow, OperationStore, TypeSchemaStore, VersionFamilyRow,
-    VersionFamilyStore,
+    NewRevision, OperationItemRow, OperationRow, OperationStore, ReverseImpact, TypeSchemaStore,
+    VersionFamilyRow, VersionFamilyStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -733,6 +745,18 @@ impl DependencyStore for PausingStores {
         roots: &[String],
     ) -> Result<DependencyClosure, ScopeError> {
         self.inner.closure(tx, scope, roots).await
+    }
+
+    async fn reverse_impact(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[i64],
+        write_set_bound: usize,
+    ) -> Result<ReverseImpact, ScopeError> {
+        self.inner
+            .reverse_impact(tx, scope, roots, write_set_bound)
+            .await
     }
 
     async fn replace_outgoing(

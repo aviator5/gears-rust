@@ -647,12 +647,22 @@ CREATE TABLE types_registry__instance (
 -- derivation with stored edges would require another branch or an index-defeating
 -- OR. These edges are written once from immutable identifiers.
 --
--- Traversal MUST use UNION, never UNION ALL. Cycles are valid (ADR-0012), and
--- UNION ALL would not terminate consistently across the three backends.
+-- The relation is a DAG by construction (ADR-0012): a circular $ref has no resolved
+-- form and GTS refuses it, derivation strictly shortens the ~-chain, and nothing
+-- references an Instance. Traversal nonetheless MUST use UNION, never UNION ALL --
+-- a DAG whose paths converge is enumerated once per path under UNION ALL, which on a
+-- fan-in-heavy graph is exponential in the path count rather than linear in the rows,
+-- and a row contradicting the invariant would not terminate at all.
 --
--- The recursive term MUST NOT carry depth or another per-row accumulator: UNION
--- deduplicates whole rows, so an accumulator makes cyclic revisits distinct.
--- Fetch affected edges separately, then order SCC condensation in the worker
+-- The recursive term MAY carry a depth column, and the reverse-impact query does: a
+-- recursive CTE needs a termination cap expressible as a predicate on the recursive
+-- member, and `toolkit-db`'s SecureCteSelect emits one for that reason. The cost is
+-- that UNION deduplicates whole rows, so a node reached at two depths is expanded
+-- twice -- bounding re-expansion at (rows x depth) rather than by path count. The cap
+-- is limits.activation_write_set, which is also the write-set refusal threshold; see
+-- p0/SPEC.md D5 for why that pairing makes a silently truncated walk unreachable.
+--
+-- Fetch affected edges separately and order the worker's units topologically
 -- (ADR-0012).
 --
 -- Admission replaces only the admitted entity's outgoing rows.

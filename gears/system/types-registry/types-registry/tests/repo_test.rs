@@ -10,9 +10,10 @@
 //!   every backend — and `GtsId::matches_pattern` decides. Translating the pattern
 //!   grammar into SQL would be the local approximation of GTS semantics that
 //!   `constraint-gts-implementation` forbids.
-//! * **The closure walks direct edges iteratively, not with a recursive CTE.** A CTE
-//!   cannot be expressed through the typed builder, and `11_database_patterns.md`
-//!   forbids raw SQL outside migrations (SPEC D5).
+//! * **The forward closure walks direct edges iteratively.** Not for want of a CTE:
+//!   `SecureCteSelect::recursive_cte` (ADR-0001) is what the *reverse* walk uses, in
+//!   `dependency_repo_test.rs`. The forward walk interleaves per-hop entity reads it
+//!   would need anyway, so one statement buys it nothing (SPEC §D5).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -631,10 +632,15 @@ async fn closure_over_a_chain_returns_the_whole_chain_and_nothing_outside_it() {
     assert!(closure.missing_roots.is_empty());
 }
 
-/// A cycle is valid (ADR-0012), so the walk must terminate on one. This is why the
-/// traversal keeps a `seen` set rather than assuming the graph is acyclic.
+/// The relation is acyclic by construction (ADR-0012), and this test writes a cycle
+/// anyway — straight through the repository, which is the only way to get one.
+///
+/// The claim is defence in depth, not a supported shape: the walk keeps a `seen` set
+/// rather than trusting the invariant, so a row that contradicted it costs bounded
+/// work instead of a traversal that never ends. The invariant itself is pinned where
+/// it is enforced, in `dependency_test.rs`.
 #[tokio::test]
-async fn closure_terminates_on_a_cycle() {
+async fn closure_terminates_on_a_row_that_contradicts_acyclicity() {
     let db = test_db().await;
     let pair = [
         gts_id!("acme.crm.a.type.v1~"),

@@ -15,6 +15,7 @@
 pub mod acceptance;
 mod errors;
 pub mod fingerprint;
+pub mod refresh;
 pub mod unit;
 pub mod worker;
 

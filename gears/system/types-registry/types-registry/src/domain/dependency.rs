@@ -15,11 +15,12 @@
 //! # Two kinds are derivable from the identifier and are stored anyway
 //!
 //! `Derivation` and `InstanceOf` are pure functions of the name — `base~derived~`
-//! consumes `base~` by being spelled so. They are materialized because T14's
+//! consumes `base~` by being spelled so. They are materialized because the
 //! **reverse** walk has no identifier to walk backwards from: finding everything
 //! derived from a revised base means reading rows, and a prefix range over
 //! `entity.gts_id` cannot be mixed into the same recursive traversal on all three
-//! backends (DESIGN §3.2).
+//! backends (DESIGN §3.2). T14's `DependencyRepo::reverse_impact` is that
+//! traversal, and it reads these rows and only these.
 //!
 //! # `x-gts-ref` is not an edge
 //!

@@ -37,7 +37,7 @@ pub use super::errors::{ItemFailure, WorkerError};
 use super::unit::{
     CommittedUnit, EvaluatedUnit, RevisionCommit, commit_creation, commit_revision, evaluate,
 };
-use crate::config::WorkerSettings;
+use crate::config::{Limits, WorkerSettings};
 use crate::domain::admission::Precondition;
 use crate::domain::enums::{OperationItemStatus, OperationStatus};
 use crate::domain::family::{FamilyKey, lock_order};
@@ -89,6 +89,12 @@ pub struct ItemOutcome {
 /// transient store is built inside each unit and dropped with it, so nothing is
 /// retained between invocations and a second pass re-reads the database.
 ///
+/// `limits` are the operator's configured bounds. Only
+/// [`Limits::activation_write_set`](crate::config::Limits::activation_write_set)
+/// has an enforcement site behind this signature today — the reverse-impact
+/// refresh (T14) — and the whole struct travels rather than that one field so the
+/// siblings need no signature change as their own enforcement lands.
+///
 /// # Errors
 /// [`WorkerError`] for an infrastructure failure. A candidate-level refusal is
 /// recorded on its item and reported in [`OperationOutcome`], not returned here.
@@ -96,6 +102,7 @@ pub async fn run_operation(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
+    limits: &Limits,
     operation_id: Uuid,
     now: OffsetDateTime,
     settings: WorkerSettings,
@@ -124,9 +131,13 @@ pub async fn run_operation(
         );
     }
 
+    let config = ItemConfig {
+        limits: *limits,
+        settings,
+    };
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
-        outcomes.push(process_item(stores, db, scope, operation_id, &item, now, settings).await?);
+        outcomes.push(process_item(stores, db, scope, config, operation_id, &item, now).await?);
     }
 
     mark_completed(stores, db, scope, operation_id, now).await?;
@@ -224,6 +235,16 @@ async fn release_family_locks(
     }
 }
 
+/// The operator-configured inputs one item's admission needs, grouped for the same
+/// reason [`CommitRequest`] is: two independent configuration structs would push
+/// `process_item` past Clippy's argument-count threshold. Both halves are `Copy`,
+/// so this travels by value and no retry borrows across a transaction boundary.
+#[derive(Debug, Clone, Copy)]
+struct ItemConfig {
+    limits: Limits,
+    settings: WorkerSettings,
+}
+
 /// Groups the per-item commit inputs so the transaction boundary stays readable
 /// without crossing Clippy's argument-count threshold.
 struct CommitRequest<'a> {
@@ -231,6 +252,7 @@ struct CommitRequest<'a> {
     item: &'a OperationItemRow,
     operation_id: Uuid,
     now: OffsetDateTime,
+    limits: Limits,
     family_lock_timeout: std::time::Duration,
 }
 
@@ -250,6 +272,7 @@ async fn commit_evaluated(
         item,
         operation_id,
         now,
+        limits,
         family_lock_timeout,
     } = request;
     // Step 4a: serialize the family rules, for a **creation** only.
@@ -294,6 +317,9 @@ async fn commit_evaluated(
     // *enforced* here, by a commit that refuses an absent identifier.
     let tx_scope = scope.clone();
     let tx_stores = Arc::clone(stores);
+    // `Limits` is `Copy` and arrives owned on `CommitRequest`, so each retry attempt
+    // takes its own copy rather than borrowing across the transaction boundary.
+    let tx_limits = limits;
     let committed = db
         .db()
         .transaction_with_retry(commit_write(&db.db()), retryable_db_err, |tx| {
@@ -314,6 +340,7 @@ async fn commit_evaluated(
                             &tx_scope,
                             unit.as_ref(),
                             expected,
+                            tx_limits.activation_write_set,
                             now,
                         )
                         .await
@@ -337,10 +364,10 @@ async fn process_item(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
+    config: ItemConfig,
     operation_id: Uuid,
     item: &OperationItemRow,
     now: OffsetDateTime,
-    settings: WorkerSettings,
 ) -> Result<ItemOutcome, WorkerError> {
     if item.status != OperationItemStatus::Pending && item.status != OperationItemStatus::Running {
         return Ok(stored_outcome(item));
@@ -368,7 +395,8 @@ async fn process_item(
             item,
             operation_id,
             now,
-            family_lock_timeout: settings.family_lock_timeout,
+            limits: config.limits,
+            family_lock_timeout: config.settings.family_lock_timeout,
         },
     )
     .await;
@@ -379,6 +407,12 @@ async fn process_item(
         // its entity write back with `ItemAlreadyTerminal`.
         Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
             return stored_item(stores, db, scope, operation_id, item_id).await;
+        }
+        // A refusal the commit could only reach after it began writing: the
+        // transaction rolled back with it, and the item is terminalized here in a
+        // transaction of its own — the same path an evaluation-stage refusal takes.
+        Err(WorkerError::RefusedAfterWrite(failure)) => {
+            return record_failure(stores, db, scope, operation_id, item, failure, now).await;
         }
         Err(error) => return Err(error),
     };

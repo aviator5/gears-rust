@@ -136,9 +136,16 @@ async fn admit(
     let op = submit_with(db, &policy, key, gts_id, content, expected_resource_version)
         .await
         .expect("accepted");
-    run_operation(&stores(), &worker(db), &allow_all(), op, LATER)
-        .await
-        .expect("the worker itself must not fail")
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        &common::limits(),
+        op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail")
 }
 
 /// Every `type_schema_revision` row of one entity, in revision order.
@@ -512,9 +519,16 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
     )
     .await
     .expect("the open policy admits the creation");
-    run_operation(&stores(), &worker(&db), &allow_all(), created, LATER)
-        .await
-        .expect("admission");
+    run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        &common::limits(),
+        created,
+        LATER,
+    )
+    .await
+    .expect("admission");
 
     // The region is closed from here on.
     let outcome = {
@@ -528,9 +542,16 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
         )
         .await
         .expect("a revision bypasses the policy gate");
-        run_operation(&stores(), &worker(&db), &allow_all(), op, LATER)
-            .await
-            .expect("admission")
+        run_operation(
+            &stores(),
+            &worker(&db),
+            &allow_all(),
+            &common::limits(),
+            op,
+            LATER,
+        )
+        .await
+        .expect("admission")
     };
     assert_eq!(
         outcome.items[0].status,

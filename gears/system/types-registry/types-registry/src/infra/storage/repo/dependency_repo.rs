@@ -1,19 +1,41 @@
-//! The `dependency` repository: one entity's outgoing edges, and the transitive
-//! closure the transient `gts-rust` store is built from.
+//! The `dependency` repository: one entity's outgoing edges, the transitive
+//! closure the transient `gts-rust` store is built from, and the reverse-impact
+//! read a revision refreshes against.
+//!
+//! # Two traversals over one table, in two different shapes
+//!
+//! [`DependencyRepo::closure`] walks forward (what a candidate consumes) with an
+//! iterative worklist; [`DependencyRepo::reverse_impact`] walks backward (who
+//! consumes the candidate) with one `WITH RECURSIVE`. The asymmetry is
+//! deliberate, and it is not a portability story — `SecureCteSelect` (ADR-0001)
+//! makes a scoped recursive CTE expressible through the typed builder on all
+//! three backends, so both *could* be either shape.
+//!
+//! What separates them is what each caller needs back. The forward closure is
+//! read to build a store, and its rows arrive as whole entities plus their
+//! authored documents, which the walk interleaves with per-hop reads anyway.
+//! The reverse read is a set of ids the commit is about to write to, and it runs
+//! **inside the commit transaction** — where every extra round trip is time spent
+//! holding the entity's row lock. One statement instead of two per hop is the
+//! whole point.
 
 use std::collections::{HashMap, HashSet};
 
 use gts::GtsId;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, Condition, EntityTrait, FromQueryResult, QueryFilter,
+};
 use toolkit_db::secure::{
-    AccessScope, DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertManyExt,
+    AccessScope, DBRunner, RecursiveCte, ScopeError, SecureDeleteExt, SecureEntityExt,
+    SecureInsertManyExt,
 };
 
 use super::IN_CHUNK;
 use super::entity_repo::EntityRepo;
 use crate::domain::enums::DependencyKind;
-use crate::domain::ports::{DependencyClosure, EntityRow};
-use crate::infra::storage::entity::dependency;
+use crate::domain::ports::{DependencyClosure, EntityRow, ReverseImpact};
+use crate::infra::storage::entity::{dependency, entity};
 
 /// Maximum size of one dependency closure.
 ///
@@ -31,6 +53,11 @@ use crate::infra::storage::entity::dependency;
 /// bounds should be told apart by name. Upgrade path if it is hit: the
 /// generation/staging protocol in DESIGN §4.
 const CLOSURE_BOUND: usize = 512;
+
+/// Name of the reverse-impact CTE. A `&'static str` because that is what
+/// `SecureCteSelect` takes, and one constant because the definition and the join
+/// that references it must not drift apart.
+const REVERSE_IMPACT_CTE: &str = "reverse_impact";
 
 pub struct DependencyRepo;
 
@@ -106,9 +133,12 @@ impl DependencyRepo {
     /// Candidate identifiers plus the transitive closure of what they consume,
     /// `gts_id`-sorted. This is what the transient `gts-rust` store is built from.
     ///
-    /// An iterative worklist over direct edges, not a recursive CTE — see the
-    /// module header. The `seen` set is not an optimization: cycles are valid
-    /// (ADR-0012), so without it the walk would not terminate.
+    /// An iterative worklist over direct edges rather than a recursive CTE — see
+    /// the module header. The `seen` set is what keeps the walk linear in entities
+    /// rather than in paths: the relation is acyclic (ADR-0012) but its paths
+    /// converge, so a diamond would otherwise be re-walked once per path. It also
+    /// bounds the damage if a row ever contradicted that invariant — bounded work
+    /// instead of a walk that never ends.
     ///
     /// # The worklist is seeded from the identifier, not only from the edge table
     ///
@@ -197,8 +227,8 @@ impl DependencyRepo {
     ///
     /// Called once over the seeded roots (`newly_discovered = 0`) and once per
     /// hop over the entities that hop adds; the structured warning names the
-    /// roots and the reached size so the operator can tell a cyclic graph from
-    /// an oversized batch.
+    /// roots and the reached size so the operator can tell a wide graph from an
+    /// oversized batch.
     ///
     /// # Errors
     /// [`ScopeError::Invalid`] when `resolved_entities + newly_discovered`
@@ -222,5 +252,158 @@ impl DependencyRepo {
             ));
         }
         Ok(())
+    }
+
+    /// Every entity that transitively depends on any of `roots`, `gts_id`-sorted,
+    /// with the roots themselves excluded.
+    ///
+    /// One `WITH RECURSIVE` over `dependency` — see the module header for why this
+    /// direction is a CTE and the forward closure is not. The recursion walks the
+    /// edge table against itself: a row is followed when its `to_entity_id` equals a
+    /// walked row's `from_entity_id`, which is the reverse of what the row says.
+    /// The outer query joins `entity` so the caller gets rows rather than bare ids,
+    /// and the join is a single indexed equality — never an `OR` across both
+    /// endpoints, which is what makes `PostgreSQL` abandon the index
+    /// (`SecureCteSelect::join_cte`).
+    ///
+    /// # ponytail: the write-set bound, and why it is also the depth cap
+    ///
+    /// `bound` is `limits.activation_write_set` (**512**; measured max fan-out
+    /// in-repo is **27**). It is a refusal threshold, not a truncation point: over
+    /// it, nothing is committed and the candidate fails with a structured reason.
+    /// Upgrade path when a real graph reaches it: the generation/staging protocol in
+    /// DESIGN §4, which stages the refresh instead of writing it in one transaction.
+    ///
+    /// The bound is *also* passed as the CTE's mandatory `max_depth`, and that pair
+    /// is load-bearing. A depth cap truncates **silently** — a dependent left out of
+    /// this set keeps stale artifacts marked current, which is the one failure mode
+    /// this read must not have. Setting the cap to the bound makes truncation
+    /// unobservable-but-harmless, because it cannot happen below the refusal:
+    ///
+    /// * Seed rows carry depth `0`, so a dependent whose shortest distance from a
+    ///   root is `d` edges appears at depth `d - 1`, and the walk emits every
+    ///   dependent within `bound + 1` edges.
+    /// * If some dependent were hidden, its shortest path would be at least
+    ///   `bound + 2` edges long, and every one of the `bound + 1` distinct
+    ///   dependents along that path is *nearer* than it — so all of them are in
+    ///   this set.
+    /// * That set is then larger than `bound`, and the refusal below has already
+    ///   fired.
+    ///
+    /// So a returned set is complete, and an incomplete walk is an error.
+    ///
+    /// # The relation is acyclic, and the walk still deduplicates
+    ///
+    /// No edge kind can close a cycle (ADR-0012): a circular `$ref` has no resolved
+    /// form and GTS refuses it, derivation strictly shortens the `~`-chain, and
+    /// nothing references an Instance. `UNION` is still the right union — a DAG's
+    /// paths converge, and `UNION ALL` would enumerate a fan-in-heavy graph once per
+    /// path. The depth cap then does double duty: it bounds the re-expansion that
+    /// dedup-including-depth allows, and it keeps a row contradicting the acyclicity
+    /// invariant from hanging the commit transaction this read runs inside.
+    ///
+    /// # Errors
+    /// Propagates the read. Exceeding `bound` is [`ReverseImpact::OverBound`], not
+    /// an error: it is a candidate refusal, and the caller words it as one.
+    pub async fn reverse_impact(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        roots: &[i64],
+        bound: usize,
+    ) -> Result<ReverseImpact, ScopeError> {
+        /// The projection: the dependent's entity id and nothing else. Narrowed
+        /// because `SELECT DISTINCT` compares every selected column, and because the
+        /// full rows are read once at the end rather than once per duplicate.
+        #[derive(FromQueryResult)]
+        struct DependentId {
+            id: i64,
+        }
+
+        if roots.is_empty() {
+            return Ok(ReverseImpact::Within(Vec::new()));
+        }
+        // `u32::MAX` is unreachable for any configured bound and would refuse below
+        // long before the cap mattered; saturating keeps the cast from being a
+        // fallible operation with no meaningful error.
+        let max_depth = u32::try_from(bound).unwrap_or(u32::MAX);
+        let read_limit = u64::try_from(bound.saturating_add(1)).unwrap_or(u64::MAX);
+
+        let mut dependents: HashSet<i64> = HashSet::new();
+        // Chunked for the same reason every other `IN (…)` here is: the seed
+        // predicate binds one parameter per root. Reverse reachability is a union
+        // over the roots, so a chunked read is the same answer as one read — and the
+        // completeness argument above holds per chunk, since each chunk's own count
+        // is checked against the same bound.
+        for chunk in roots.chunks(IN_CHUNK) {
+            let walk = RecursiveCte::<dependency::Entity>::new(
+                REVERSE_IMPACT_CTE,
+                Condition::all().add(dependency::Column::ToEntityId.is_in(chunk.iter().copied())),
+                // The next row's `to_entity_id` points at a walked row's
+                // `from_entity_id`: the dependent of a dependent.
+                dependency::Column::ToEntityId,
+                dependency::Column::FromEntityId,
+                max_depth,
+            );
+            let rows = entity::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .with_ctes()
+                .recursive_cte(walk)
+                .join_cte(
+                    REVERSE_IMPACT_CTE,
+                    Condition::all().add(
+                        Expr::col((Alias::new(REVERSE_IMPACT_CTE), Alias::new("from_entity_id")))
+                            .equals((entity::Entity, entity::Column::Id)),
+                    ),
+                )
+                // The roots are the candidates the commit refreshes itself.
+                // Excluded here rather than in memory so the row limit below counts
+                // only rows the caller will write to.
+                .filter(Condition::all().add(entity::Column::Id.is_not_in(roots.iter().copied())))
+                .select_only()
+                .column(entity::Column::Id)
+                // `join_cte` is an inner join and a dependent is reached by as many
+                // rows as there are paths to it, so without this a hub-shaped graph
+                // would return the same id many times over.
+                .distinct()
+                // One row past the bound is all the refusal needs to see.
+                .limit(read_limit)
+                .all_as::<DependentId>(runner)
+                .await?;
+
+            dependents.extend(rows.into_iter().map(|r| r.id));
+            if dependents.len() > bound {
+                return Ok(Self::over_write_set(roots, dependents.len(), bound));
+            }
+        }
+
+        let mut ids: Vec<i64> = dependents.into_iter().collect();
+        // Sorted so the follow-up read's `IN (…)` chunks are stable; the returned
+        // order is `gts_id`, set below.
+        ids.sort_unstable();
+        let mut rows = EntityRepo::find_by_ids(runner, scope, &ids).await?;
+        rows.sort_by(|a, b| a.gts_id.cmp(&b.gts_id));
+        Ok(ReverseImpact::Within(rows))
+    }
+
+    /// Report a reverse-impact set larger than the write-set bound.
+    ///
+    /// A sibling of [`Self::ensure_within_bound`] guarding a different number:
+    /// that one bounds the entities a store build **reads**, this one the
+    /// dependents an admission **writes** (`config::Limits::activation_write_set`).
+    /// Collapsing them would let an operator move one by editing the other.
+    ///
+    /// Returns the outcome rather than an error, and logs at `warn` here rather
+    /// than at the caller: this is the layer that knows the roots and the size
+    /// reached, and the candidate refusal the caller writes carries neither into
+    /// the operator's logs.
+    fn over_write_set(roots: &[i64], at_least: usize, bound: usize) -> ReverseImpact {
+        tracing::warn!(
+            roots = ?roots,
+            activation_write_set = bound,
+            at_least,
+            "types_registry reverse-impact set exceeded the activation write set bound"
+        );
+        ReverseImpact::OverBound { at_least, bound }
     }
 }

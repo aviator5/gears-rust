@@ -221,6 +221,14 @@ impl From<WorkerError> for CanonicalError {
                 &format!("entity '{gts_id}' cannot allocate a revision after i32::MAX"),
                 "admission",
             ),
+            // Kept only for exhaustiveness, like `ItemAlreadyTerminal`: `process_item`
+            // unwraps this one and records the refusal on the item, so a handler
+            // sees the ordinary `failed` outcome rather than an error. Reaching here
+            // means the worker stopped doing that, which is a worker bug — opaque,
+            // with the refusal in the operator log.
+            WorkerError::RefusedAfterWrite(failure) => {
+                opaque_internal(&failure.to_string(), "admission")
+            }
             WorkerError::Storage(inner) => opaque_internal(&inner, "storage write"),
             WorkerError::Db(inner) => opaque_internal(&inner, "database write"),
         }

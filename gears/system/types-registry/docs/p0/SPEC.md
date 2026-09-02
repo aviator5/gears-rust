@@ -42,7 +42,7 @@ without re-registration.
 |---|---|
 | Durable storage of managed entities, revisions, current-state projections | §3.7 |
 | Asynchronous admission: `202` + operation + `Idempotency-Key` + outbox + worker | ADR-0012, §3.2 *Acceptance path* |
-| Dependency-aware partial admission (SCC condensation, topological order, atomic cycles) | §3.2 |
+| Dependency-aware partial admission (topological order over an acyclic relation) | §3.2 |
 | Optimistic concurrency on the logical entity (`resource_version`) | ADR-0005, ADR-0006 |
 | Immutable retained revisions | ADR-0005, ADR-0006 |
 | Version families: ownership row, kind/shape/contiguity rules | ADR-0004 |
@@ -89,7 +89,7 @@ correctness core, not scope.
 | D2 | **A transient `gts-rust` store per admission unit**, built from the database; reads are served from the database | Resolution, compat, chain validation and derivation need a `GtsStore`, so one is built from the unit's dependency closure and dropped after the unit. Reads need rows, not a store (§8.2), so nothing is held between units. Commit re-verifies under locks |
 | D3 | **Materialize effective artifacts** | `type_schema` current-state row is populated at admission. Read path shape identical to P1, no later backfill of `resolution_fingerprint` |
 | D4 | **Multi-pod** | Commit transaction re-reads `resource_version` of the candidate and the revision vector of everything consumed, and re-derives the reverse-impact set from the database under locks |
-| D5 | **Reverse impact by iterative worklist over direct edges**, not a recursive CTE | Plain indexed `WHERE to_entity_id = ?` + visited set + fingerprint-stability early stop. Portable across three backends with no `sea-query` CTE work |
+| D5 | **Reverse impact by one scoped recursive CTE, refresh by an iterative loop** | `DependencyRepo::reverse_impact` is a single `WITH RECURSIVE` over `dependency` through `SecureCteSelect` (ADR-0001, `toolkit-db`) — no raw SQL — depth-capped at `limits.activation_write_set`, which is also the refusal threshold. The refresh stays a domain loop because the fingerprint-stability stop decides the write set by recomputation, which no closure query can express. See [§D5](#d5-splits-the-traversal-from-the-refresh) |
 | D6 | **The old `TypesRegistryClient` is removed in P0**; every consumer migrates inside this effort | ~50 call sites across 20+ gears move. Forced by two facts: async admission makes the old synchronous `register()` a lie in its own signature, and the old models' `Arc`-linked object graphs cannot cross a wire, so keeping them keeps an out-of-process blocker. Migration is split by gear group — see `plan.md` P5 |
 | D7 | `operation.plane = 1` (platform), `tenant_id = NULL`, `principal_id` a hardcoded constant with a `TODO` | Idempotency scope becomes global — see §9 ceiling C2 |
 | D8 | **`gts`, `gts-id` and `gts-macros` are pinned at 0.12.0 and move together** | A split pin puts the identifier crate and the semantics crate on different specifications. `gts-dylint` / `gts-macros-cli` must not lag either — see §7 |
@@ -121,10 +121,21 @@ latter does not move it.
 structured reason rather than committing a partial refresh. Upgrade path when the bound
 is reached: the generation/staging protocol DESIGN describes. Not built.
 
-**Parameterized recursive CTE in `sea-query`.** Dissolved by D5 — there is no CTE to
-verify. The worklist reproduces the CTE's required semantics: `UNION` deduplication
-becomes a visited set, and the prohibition on a depth accumulator is satisfied because
-the worklist carries no depth. `database.sql` already sanctions the early stop:
+**Parameterized recursive CTE in `sea-query`.** **Closed, and by verification rather
+than by dissolution.** `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001) builds a
+scoped `WITH RECURSIVE` through the typed builder with no raw SQL, and the emitted shape
+executes on all three backends — `toolkit-db`'s own `cte_shapes_are_valid_sql_{sqlite,
+postgres,mysql}` plus this gear's `reverse_impact_walks_back_up_a_chain`, which runs in
+the `PostgreSQL` and `MySQL` container suites. `MySQL` is the only backend that caps
+recursion (`cte_max_recursion_depth`, default 1000) and the depth cap sits under it.
+
+Two of DESIGN's constraints on the query are honoured as stated and one is not. `UNION`
+rather than `UNION ALL`: kept, and it is the builder's default. No per-row accumulator
+that would defeat deduplication: **not** kept — the builder emits a mandatory depth
+column, because a cap has to be expressible as a predicate on the recursive member. The
+consequence is that a node reached at two depths is expanded twice, which bounds
+re-expansion at *(rows × depth)* rather than by path count, and the cap is what makes it
+finite. `database.sql`'s early stop is unaffected and still sanctions the refresh loop:
 *"The traversal reaches the subject anyway, recomputes it, finds an identical digest,
 and stops there."*
 
@@ -360,8 +371,10 @@ the exception both ways: types-registry accepts and admits it itself, inline, wi
 
 1. Build the candidate graph from authored references between candidates, plus the
    implicit `vM.(n-1)~ → vM.n~` edge (not stored in `dependency`).
-2. Condense into SCCs, process in topological order. Acyclic candidate = one unit;
-   cyclic component = one **atomic** unit.
+2. Process in topological order; one candidate is one unit. The relation is acyclic by
+   construction (ADR-0012) — a circular `$ref` has no resolved form and GTS refuses it,
+   derivation strictly shortens the `~`-chain, and nothing references an Instance — so
+   there is no condensation step and no atomic group.
 3. Build the unit's transient `gts-rust` store (D2): the candidates, plus the transitive
    closure of what they consume, read `gts_id`-sorted from the database. Evaluate outside
    any transaction against it: resolution, compat vs
@@ -1118,47 +1131,87 @@ Note on lints: `Gears.toml` currently **skips** `de0101_no_serde_in_contract`,
 conventions — this spec requires them — but do not expect the linter to catch a
 violation.
 
-### D5 is not only a portability choice
+### D5 splits the traversal from the refresh
 
-`11`'s first invariant forbids plain SQL outside migrations. A recursive CTE cannot be
-expressed through SeaORM's typed query builder, so the reverse-impact traversal DESIGN
-prescribes as a CTE would have to be raw SQL in a repository — which the toolkit forbids
-outright. The iterative worklist of D5 is therefore the *only* shape available here, not
-merely the cheaper one.
+**The traversal is one scoped recursive CTE.** `toolkit-db`'s ADR-0001 supplies
+`SecureSelect::with_ctes` / `SecureCteSelect::recursive_cte`: a `WITH RECURSIVE` built
+entirely through `sea-query`, with the scope predicate embedded in both the seed and the
+recursive member and no raw SQL anywhere, so `11`'s first invariant is satisfied. One
+statement replaces two reads per hop, and the read runs inside the commit transaction while
+the candidate's row is locked — where round trips are paid for in contention, not latency.
+
+**The refresh is a loop, and could not be anything else.** Which dependents get *written* is
+decided by recomputing each one and comparing `resolution_fingerprint` against the stored
+digest — a function of the recomputation, not of the graph. A closure query cannot consult
+it, so a CTE can only ever return the *candidate* set that a loop then filters. Nor can the
+bound be checked against a query result: §4's `activation_write_set` bounds the rows an
+admission **writes**, and that number does not exist until the loop has run.
+
+**The depth cap is the bound, and that pairing is load-bearing.** `recursive_cte` requires a
+`max_depth`, and a cap truncates *silently* — a dependent missing from the set keeps stale
+artifacts marked current, the one failure this read must not have. Passing the write-set
+bound as the cap makes truncation unreachable below the refusal: seed rows carry depth `0`,
+so a dependent at shortest distance `d` appears at depth `d - 1`; a hidden dependent would
+need a path of at least `bound + 2` edges, every one of whose `bound + 1` intermediate
+dependents is nearer and therefore already in the set — which puts the set over the bound,
+where the refusal has already fired. A returned set is complete; an incomplete walk is an
+error.
+
+**The relation is acyclic, and the walk still deduplicates.** No edge kind can close a cycle
+(ADR-0012): a circular `$ref` has no resolved form and GTS refuses it, derivation strictly
+shortens the `~`-chain, and nothing references an Instance. `UNION` is nevertheless required
+rather than `UNION ALL`, because a DAG's paths converge and `UNION ALL` would enumerate a
+fan-in-heavy graph once per path. The depth cap then does double duty: it bounds the
+re-expansion `UNION`-with-depth allows, and it keeps a row that contradicted the acyclicity
+invariant from hanging the commit transaction.
 
 Repository-owned traversal, domain-free, no raw SQL:
 
 ```rust
 // infra/storage/repo/dependency_repo.rs
 //
-// ponytail: iterative worklist over direct reverse edges, not a recursive CTE.
-// Bounded by limits.activation_write_set (512); measured max fan-out in-repo is 27.
+// ponytail: one scoped WITH RECURSIVE over `dependency`, depth-capped at
+// limits.activation_write_set (512); measured max fan-out in-repo is 27.
+// Over the bound is a refusal, never a truncated set.
 // Upgrade path if that bound is hit: the generation/staging protocol in DESIGN §4.
 pub async fn reverse_impact(
-    &self,
     runner: &impl DBRunner,
     scope: &AccessScope,
-    roots: &[EntityId],
-) -> Result<Vec<EntityId>, ScopeError> {
-    let mut seen: HashSet<EntityId> = roots.iter().copied().collect();
-    let mut queue: VecDeque<EntityId> = roots.iter().copied().collect();
-    let mut out = Vec::new();
-
-    while let Some(current) = queue.pop_front() {
-        // Chunked to stay inside every backend's parameter limit.
-        for dependent in self.direct_dependents(runner, scope, current).await? {
-            if seen.insert(dependent) {
-                out.push(dependent);
-                queue.push_back(dependent);
-            }
-        }
-        if out.len() > self.activation_bound {
-            return Err(ScopeError::from(ActivationSetTooLarge(out.len())));
-        }
-    }
-    Ok(out)
+    roots: &[i64],
+    bound: usize,
+) -> Result<ReverseImpact, ScopeError> {
+    let walk = RecursiveCte::<dependency::Entity>::new(
+        "reverse_impact",
+        Condition::all().add(dependency::Column::ToEntityId.is_in(roots.iter().copied())),
+        // the next row's `to_entity_id` points at a walked row's `from_entity_id`
+        dependency::Column::ToEntityId,
+        dependency::Column::FromEntityId,
+        u32::try_from(bound).unwrap_or(u32::MAX),
+    );
+    let rows = entity::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .with_ctes()
+        .recursive_cte(walk)
+        .join_cte("reverse_impact", /* entity.id = reverse_impact.from_entity_id */)
+        .filter(/* entity.id NOT IN roots */)
+        .select_only()
+        .column(entity::Column::Id)
+        .distinct()
+        .limit(u64::try_from(bound + 1).unwrap_or(u64::MAX))
+        .all_as::<DependentId>(runner)
+        .await?;
+    // over the bound -> ReverseImpact::OverBound, which the domain words as a
+    // candidate refusal; otherwise the full rows, gts_id-sorted.
 }
 ```
+
+A refusal reached *after* the commit transaction began writing travels as
+`WorkerError::RefusedAfterWrite(ItemFailure)` rather than in the `Ok(Err(..))` position
+every other candidate refusal uses. The reason is the transaction: the `Ok` position
+commits, and this refusal exists to prevent exactly the writes it would commit.
+`process_item` unwraps it and records the failure in its own transaction, so the
+distinction is invisible past the worker.
 
 Structured logging only: `tracing::info!(gts_id = %id, operation_id = %op, "admitted")`.
 No print macros (DE13xx).
@@ -1202,7 +1255,7 @@ Conventions from `12_unit_testing.md`, which override anything implied elsewhere
 - Table-driven tests are manual `vec![]` + loop. **Not `rstest`.** Setup helpers are plain
   `async fn` in `tests/common/mod.rs`, not fixtures.
 - Naming is `{area}_{scenario}` in snake_case: `admission_update_with_stale_version_fails`,
-  `dependency_reverse_impact_terminates_on_cycle`.
+  `dependency_reverse_impact_reaches_transitive_dependents`.
 - Error variants asserted with `assert!(matches!(...), "…got: {err:?}")`.
 
 Target 90%+ coverage. The plain SQLite gear tests plus
@@ -1210,8 +1263,7 @@ Target 90%+ coverage. The plain SQLite gear tests plus
 
 **Unit** — acceptance check ordering, fingerprint computation, family key derivation
 (`vM~` / `vM.n~` → one key), shape and contiguity rules, dialect spelling set,
-identifier profile refusals, SCC condensation and topological order, reverse worklist
-termination on a cycle, baseline selection.
+identifier profile refusals, topological order, baseline selection.
 
 **Compatibility semantics** — the tests that pin the 0.12.0 behaviour, from T1 onward:
 
@@ -1241,9 +1293,9 @@ termination on a cycle, baseline selection.
 | `vM.3~` with `vM.2~` absent | refused on contiguity |
 | Deleted predecessor | still counts as compatibility baseline |
 | Batch with one failing dependency | dependent `failed` with `blocked_by_dependency`, independent branches commit |
-| Dependency cycle, one member invalid | whole component fails, nothing partial |
+| Circular `$ref`, in one batch or closed by a revision | refused as `invalid_schema`; no cyclic edge is ever stored |
 | Revision of a base with N dependents | every dependent's `resolved_schema` and `resolution_fingerprint` refreshed in the same transaction |
-| Refresh yielding identical artifacts | fingerprint unchanged, traversal stops, `resource_version` not moved |
+| Refresh yielding identical artifacts | fingerprint unchanged, nothing written, `resource_version` not moved |
 | Activation set over the bound | candidate fails, no partial refresh committed |
 | Duplicate worker invocation on one operation | second invocation is a no-op |
 | Worker re-invoked after a rolled-back unit | revalidates from scratch and commits once |
@@ -1378,8 +1430,7 @@ is the executable task list. The number is kept because other documents cite it.
 5. An update with a stale `expected_resource_version` fails `precondition_failed` — no
    silent rebase.
 6. A batch where one dependency fails commits the independent branches and reports
-   `blocked_by_dependency` for the dependent; a cycle with one invalid member commits
-   nothing.
+   `blocked_by_dependency` for everything downstream of it.
 7. A revision of a base type refreshes every dependent's `resolved_schema` and
    `resolution_fingerprint` in the same transaction; an identical recomputation moves
    no `resource_version`.
@@ -1439,7 +1490,8 @@ constant is digested.
 - **ADRs out of P0 scope**: 0002, 0007, 0009, 0010, 0011, 0013
 - **`gts-rust`**: 0.12.0 from crates.io, declaring `GTS_SPECIFICATION_VERSION = "0.13"`
 - **Prerequisites closed here**: activation write set (§4), `sea-query` recursive CTE
-  (D5), GTS capabilities 1–7 of DESIGN §4 via the 0.12.0 upgrade (§7)
+  (D5 — verified available and *used*, on all three backends), GTS capabilities 1–7 of
+  DESIGN §4 via the 0.12.0 upgrade (§7)
 - **Prerequisites still open**: worker liveness bounds
   (§10.3 `worker.*` proposes values), benchmark profile. GTS capability 8 (pattern
   containment) is deferred with federation

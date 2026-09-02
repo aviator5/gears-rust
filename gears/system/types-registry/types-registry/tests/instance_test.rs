@@ -106,12 +106,27 @@ async fn admit_type_then(
     content: Value,
 ) -> Result<types_registry::domain::admission::worker::OperationOutcome, WorkerError> {
     let type_op = submit(db, "type-key", TYPE_ID, conforming_schema()).await;
-    run_operation(&stores(), &worker(db), &allow_all(), type_op, LATER)
-        .await
-        .expect("the conforming type admits");
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        &common::limits(),
+        type_op,
+        LATER,
+    )
+    .await
+    .expect("the conforming type admits");
 
     let op = submit(db, key, gts_id, content).await;
-    run_operation(&stores(), &worker(db), &allow_all(), op, LATER).await
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        &common::limits(),
+        op,
+        LATER,
+    )
+    .await
 }
 
 /// An Instance records the exact schema revision that validated it; its current row
@@ -223,9 +238,16 @@ async fn an_instance_without_its_type_fails_retryably() {
     let db = test_db().await;
     let op = submit(&db, "k1", INSTANCE_ID, json!({ "name": "orphan" })).await;
 
-    let err = run_operation(&stores(), &worker(&db), &allow_all(), op, LATER)
-        .await
-        .expect_err("an absent conforming type is retryable, so it surfaces as an error");
+    let err = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        &common::limits(),
+        op,
+        LATER,
+    )
+    .await
+    .expect_err("an absent conforming type is retryable, so it surfaces as an error");
 
     match err {
         WorkerError::ConformingTypeAbsent { gts_id, type_id } => {
@@ -252,9 +274,16 @@ async fn an_instance_may_not_join_a_type_schema_family() {
     let instance_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
 
     let type_op = submit(&db, "type-key", TYPE_ID, conforming_schema()).await;
-    run_operation(&stores(), &worker(&db), &allow_all(), type_op, LATER)
-        .await
-        .expect("the base type admits");
+    run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        &common::limits(),
+        type_op,
+        LATER,
+    )
+    .await
+    .expect("the base type admits");
 
     let derived = json!({
         "$id": format!("gts://{schema_id}"),
@@ -262,9 +291,16 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         "allOf": [{ "$ref": format!("gts://{TYPE_ID}") }],
     });
     let schema_op = submit(&db, "k-schema", schema_id, derived).await;
-    let schema_outcome = run_operation(&stores(), &worker(&db), &allow_all(), schema_op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let schema_outcome = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        &common::limits(),
+        schema_op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
     assert_eq!(
         schema_outcome.items[0].status,
         domain_enums::OperationItemStatus::Succeeded,
@@ -274,9 +310,16 @@ async fn an_instance_may_not_join_a_type_schema_family() {
 
     // Same family key, other kind.
     let instance_op = submit(&db, "k-instance", instance_id, json!({ "name": "clash" })).await;
-    let outcome = run_operation(&stores(), &worker(&db), &allow_all(), instance_op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let outcome = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        &common::limits(),
+        instance_op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
 
     let item = &outcome.items[0];
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
@@ -326,9 +369,16 @@ async fn a_type_schema_may_not_join_an_instance_family() {
         "allOf": [{ "$ref": format!("gts://{TYPE_ID}") }],
     });
     let schema_op = submit(&db, "k-schema", schema_id, derived).await;
-    let schema_outcome = run_operation(&stores(), &worker(&db), &allow_all(), schema_op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let schema_outcome = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        &common::limits(),
+        schema_op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
 
     let item = &schema_outcome.items[0];
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);

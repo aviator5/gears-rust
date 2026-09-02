@@ -283,6 +283,26 @@ pub struct CurrentDocument {
     pub content_hash: Vec<u8>,
 }
 
+/// The result of a reverse-impact read.
+///
+/// The bound is a variant rather than an error because the two answers travel to
+/// different places: a set within the bound is what the refresh writes, and a set
+/// over it is a **candidate refusal** with a structured reason (SPEC §8.1 step
+/// 4.6). Returning `ScopeError` for the second would put a terminal content
+/// outcome into the position the worker reads as retryable infrastructure.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub enum ReverseImpact {
+    /// Every dependent, `gts_id`-sorted, roots excluded. Complete: see
+    /// `DependencyRepo::reverse_impact` on why a depth-capped walk cannot return a
+    /// silently shortened set here.
+    Within(Vec<EntityRow>),
+    /// More dependents than the bound admits. `at_least` is what the read counted
+    /// before it stopped — the walk is cut one row past the bound, so the true size
+    /// is unknown and deliberately not reported as if it were.
+    OverBound { at_least: usize, bound: usize },
+}
+
 /// The result of a dependency-closure read.
 #[domain_model]
 #[derive(Clone, Debug)]
@@ -738,6 +758,21 @@ pub trait DependencyStore: Send + Sync {
         scope: &AccessScope,
         roots: &[String],
     ) -> Result<DependencyClosure, ScopeError>;
+
+    /// Everything that transitively depends on any of `roots`, roots excluded.
+    ///
+    /// The reverse of [`Self::closure`], and the set a revision refreshes: the
+    /// dependents whose effective artifacts the new revision changed. Bounded by
+    /// `write_set_bound` (`config::Limits::activation_write_set`) — over it the
+    /// read reports [`ReverseImpact::OverBound`] and the caller fails the
+    /// candidate rather than committing a partial refresh.
+    async fn reverse_impact(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[i64],
+        write_set_bound: usize,
+    ) -> Result<ReverseImpact, ScopeError>;
 
     /// Replace one entity's **outgoing** edges, and only that entity's.
     ///

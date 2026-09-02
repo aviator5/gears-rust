@@ -86,10 +86,11 @@ pub struct Limits {
     pub authored_document: ByteSize,
     /// Largest resolved document the registry will materialize (§3.2).
     ///
-    /// **Accepted, not enforced in P0.** Its place is D3's materialization
-    /// (`domain::artifacts::materialize`), which has no configuration in scope;
-    /// threading the limits through `worker::run_operation` is T14's change. Also
-    /// the figure T30's SDK cache sizes its byte bound against.
+    /// **Accepted, not enforced in P0.** T14 threaded the whole `Limits` struct
+    /// through `worker::run_operation`, so the value now *reaches* the commit path —
+    /// but D3's materialization (`domain::artifacts::materialize`) still does not
+    /// consult it, and pretending otherwise is what this note exists to prevent.
+    /// Also the figure T30's SDK cache sizes its byte bound against.
     pub resolved_document: ByteSize,
     /// Largest reference-resolution closure one candidate may need.
     ///
@@ -105,14 +106,17 @@ pub struct Limits {
     /// Largest number of dependent rows one admission may refresh (P0-specific,
     /// SPEC §4).
     ///
-    /// **Accepted, not enforced in P0.** SPEC §8.1 step 4.6 is what bounds, and that
-    /// step arrives with **T14** (reverse-impact worklist and artifact refresh);
-    /// until then no admission refreshes a dependent at all, so there is no write set
-    /// to bound. `CLOSURE_BOUND` in `infra::storage::repo::dependency_repo` is a
+    /// **Enforced** (T14) — `worker::run_operation` carries it to
+    /// `admission::refresh`, and a revision whose reverse-impact set exceeds it fails
+    /// with `activation_write_set_exceeded` and commits nothing. It is *also* the
+    /// depth cap of the reverse-impact CTE, which is what keeps a depth-capped walk
+    /// from returning a silently shortened set; see
+    /// `DependencyRepo::reverse_impact`.
+    ///
+    /// `CLOSURE_BOUND` in `infra::storage::repo::dependency_repo` is still a
     /// *different* bound that borrowed this number as its starting value — on the
     /// closure a store build reads, not on the rows an admission writes — so setting
-    /// this key does not move it. T14 is where the configured value should reach the
-    /// worker, and the sibling limits above with it.
+    /// this key does not move it.
     pub activation_write_set: usize,
     /// `GET /entities` page size when the caller names none.
     ///
@@ -381,6 +385,17 @@ impl TypesRegistryConfig {
                 "limits.authored_document must be positive: 0 refuses every candidate".to_owned(),
             ));
         }
+        // Enforced since T14, and zero is the same class of footgun: every revision
+        // of a type anything depends on would fail with
+        // `activation_write_set_exceeded`, and the depth cap derived from it would
+        // be 0 as well.
+        if self.limits.activation_write_set == 0 {
+            return Err(ConfigError::Limits(
+                "limits.activation_write_set must be positive: 0 refuses every revision of a \
+                 type anything depends on"
+                    .to_owned(),
+            ));
+        }
         if self.worker.family_lock_timeout.is_zero() {
             return Err(ConfigError::Worker(
                 "worker.family_lock_timeout must be positive".to_owned(),
@@ -393,10 +408,11 @@ impl TypesRegistryConfig {
     /// enforcing**, ready to be named in one boot-time line.
     ///
     /// Not a validation failure: a P1-ready configuration legitimately carries every
-    /// one of them. But an operator who writes `activation_write_set: 1024` and
-    /// silently gets the hardcoded 512 has no way to find that out — that is the
-    /// defect, not the missing enforcement, which is scheduled. Each field's
-    /// docstring says which task binds it.
+    /// one of them. But an operator who writes `resolution_closure: 128` and silently
+    /// gets no closure bound at all has no way to find that out — that is the defect,
+    /// not the missing enforcement, which is scheduled. Each field's docstring says
+    /// which task binds it. (`activation_write_set` was on this list until T14
+    /// enforced it, which is the transition the list exists to make visible.)
     ///
     /// Comparison is against the default rather than against presence, because
     /// `#[serde(default)]` erases the difference. That errs towards silence — an
@@ -412,9 +428,6 @@ impl TypesRegistryConfig {
         }
         if self.limits.resolution_closure != limits.resolution_closure {
             keys.push("limits.resolution_closure");
-        }
-        if self.limits.activation_write_set != limits.activation_write_set {
-            keys.push("limits.activation_write_set");
         }
         if self.limits.page_size_default != limits.page_size_default {
             keys.push("limits.page_size_default");
