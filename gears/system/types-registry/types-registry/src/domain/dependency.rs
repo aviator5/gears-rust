@@ -1,4 +1,4 @@
-//! Dependency-edge extraction: the four direct edges one candidate implies, from
+//! Dependency-edge extraction: the three direct edges one candidate implies, from
 //! its authored content and its identifier (DESIGN §3.2, SPEC §3.2).
 //!
 //! Pure — a document and an identifier in, an edge set out. No database, no clock,
@@ -21,21 +21,23 @@
 //! `entity.gts_id` cannot be mixed into the same recursive traversal on all three
 //! backends (DESIGN §3.2).
 //!
-//! # Why `$ref` comes from `gts-rust` and `x-gts-ref` is walked here
+//! # `x-gts-ref` is not an edge
+//!
+//! It constrains what a value may *name*, and `gts-rust` enforces that by matching
+//! the value string against a pattern — `XGtsRefValidator` never asks whether the
+//! named entity exists. So the constraint is satisfiable with nothing in the
+//! registry, the target is not inlined into any effective artifact (DESIGN §3.1), and
+//! an edge for it would have exactly one effect: blocking a deletion that harms
+//! nobody. Policies that need to classify the identifier named by this keyword do
+//! so directly from candidate content; the dependency graph has no use for that
+//! classification.
+//!
+//! # Why `$ref` comes from `gts-rust`
 //!
 //! `$ref` has one canonical interpretation, `gts::extract_gts_refs`, shared with
 //! the resolution that validates the candidate. Re-deriving it locally would be a
 //! second implementation of a GTS rule (`constraint-gts-implementation`) and the
 //! two would drift.
-//!
-//! `x-gts-ref` has no such extractor in `gts` 0.12.0: `XGtsRefValidator` validates
-//! patterns and instance values but never reports the sites it visited, and
-//! `GtsEntity::gts_refs` — the lenient walker whose own documentation offers it "for
-//! the dependency graph" — collects *every* identifier-shaped string, so it would
-//! both invent edges out of `const` data and miss every wildcard pattern, which is
-//! not a valid identifier at all. So the keyword sites are walked here, while what a
-//! site *means* still comes from `gts`: [`GtsId::try_new`] is the only judge of
-//! whether a target names anything.
 //!
 //! # An Instance carries exactly one edge
 //!
@@ -50,16 +52,11 @@ use toolkit_macros::domain_model;
 
 use crate::domain::enums::DependencyKind;
 
-/// The JSON Schema keywords whose contents are instance *data* rather than a
-/// subschema. Mirrored from `gts::schema_refs`, which skips the same four, so the
-/// two halves of one document are read under one rule.
-const DATA_VALUED_KEYWORDS: [&str; 4] = ["const", "default", "examples", "enum"];
-
 /// One outgoing edge of a candidate, named by the target's identifier.
 ///
 /// Identifiers rather than entity ids: extraction is pure, and an entity id is a
-/// fact about the database. The commit resolves them, and a target that resolves to
-/// nothing writes no row.
+/// fact about the database. The commit resolves every target and fails retryably if
+/// a row that evaluation observed is no longer present.
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DependencyEdge {
@@ -118,18 +115,6 @@ pub fn extract_edges(
             kind: DependencyKind::SchemaRef,
             target,
         }));
-
-        // Runs only once the strict extractor has accepted the document, which
-        // bounds its nesting at that extractor's scan cap — so this walk needs no
-        // depth guard of its own.
-        edges.extend(
-            x_gts_ref_targets(content)
-                .into_iter()
-                .map(|target| DependencyEdge {
-                    kind: DependencyKind::GtsRef,
-                    target,
-                }),
-        );
     } else if let Some(type_id) = id.get_type_id() {
         // `None` only for a single-segment identifier, which `GtsId::try_new`
         // refuses for an Instance before this function is ever reached.
@@ -144,85 +129,26 @@ pub fn extract_edges(
     Ok(edges)
 }
 
-/// The targets a store build must seed its dependency closure with: the reference
-/// kinds, and only those.
+/// The targets a store build must seed its dependency closure with: the `$ref`
+/// targets, and only those.
 ///
 /// `Derivation` and `InstanceOf` targets are members of the candidate's own
 /// `~`-chain, which the closure already seeds from the identifier
 /// (`DependencyRepo::closure`). Passing them again would say the same thing twice
-/// and charge the closure bound for it.
+/// and charge the closure bound for it. An `x-gts-ref` target is not seeded either,
+/// and for a stronger reason: validating the keyword never reads the target
+/// document, so loading it would charge the bound for a document nothing asks a
+/// question of.
 #[must_use]
 pub fn reference_targets(edges: &[DependencyEdge]) -> Vec<String> {
     let mut targets: Vec<String> = edges
         .iter()
-        .filter(|e| matches!(e.kind, DependencyKind::SchemaRef | DependencyKind::GtsRef))
+        .filter(|e| e.kind == DependencyKind::SchemaRef)
         .map(|e| e.target.clone())
         .collect();
     targets.sort();
     targets.dedup();
     targets
-}
-
-/// Every entity one document's `x-gts-ref` constraints name.
-fn x_gts_ref_targets(content: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_x_gts_refs(content, &mut out);
-    out
-}
-
-fn collect_x_gts_refs(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(pattern)) = map.get("x-gts-ref")
-                && let Some(target) = reference_target(pattern)
-            {
-                out.push(target);
-            }
-            for (key, nested) in map {
-                if key == "x-gts-ref" || DATA_VALUED_KEYWORDS.contains(&key.as_str()) {
-                    continue;
-                }
-                collect_x_gts_refs(nested, out);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_x_gts_refs(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The entity one `x-gts-ref` pattern protects: the exact identifier, or the
-/// pattern's longest valid identifier prefix — never its open match set (DESIGN
-/// §3.2). A new entity that starts matching the pattern therefore needs no
-/// re-expansion of anyone's edges.
-///
-/// Three answers, and two of them are `None`:
-///
-/// * a GTS §9.6 relative pointer (`/$id`, `./properties/id`) resolves inside the
-///   document itself, naming no other entity;
-/// * a pattern with no valid identifier prefix (`gts.*`) names no entity to
-///   protect;
-/// * anything else contributes its longest `~`-terminated valid prefix, which for
-///   an exact identifier is the identifier.
-fn reference_target(pattern: &str) -> Option<String> {
-    if pattern.starts_with('/') || pattern.starts_with('.') {
-        return None;
-    }
-    if GtsId::try_new(pattern).is_ok() {
-        return Some(pattern.to_owned());
-    }
-    // Ascending byte offsets, so the last accepted prefix is the longest. Only
-    // `~`-terminated prefixes are candidates: a type identifier ends in `~`, and a
-    // truncated final segment would name a type that does not exist.
-    pattern
-        .char_indices()
-        .filter(|(_, c)| *c == '~')
-        .filter_map(|(idx, c)| pattern.get(..idx + c.len_utf8()))
-        .rfind(|prefix| GtsId::try_new(prefix).is_ok())
-        .map(str::to_owned)
 }
 
 #[cfg(test)]

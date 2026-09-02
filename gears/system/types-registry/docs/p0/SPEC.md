@@ -46,7 +46,7 @@ without re-registration.
 | Optimistic concurrency on the logical entity (`resource_version`) | ADR-0005, ADR-0006 |
 | Immutable retained revisions | ADR-0005, ADR-0006 |
 | Version families: ownership row, kind/shape/contiguity rules | ADR-0004 |
-| Dependency edges (`$ref`, `x-gts-ref`, derivation, instance_of) — written **and** read | §3.2 *Dependency Graph* |
+| Dependency edges (`$ref`, derivation, instance_of) — written **and** read | §3.2 *Dependency Graph* |
 | **Upgrade `gts-rust` 0.11.0 → 0.12.0** across the workspace (§7) | `constraint-gts-implementation` |
 | BACKWARD compatibility against one baseline, tri-state verdict, undecided **rejected** | ADR-0003, `principle-fail-closed` |
 | Per-level content-model classification as a compatibility input, reported by Dry Run | ADR-0003 |
@@ -310,8 +310,8 @@ out of scope):
 6. `force` per candidate — refuse where `allow_compatibility_force` is off, or where the
    candidate has no cross-minor check to waive. Until T17, also refuse every surviving
    `force`: there is no comparison to waive and no truthful `compat_forced` to record yet.
-7. ADR-0015 quarantine — refuse a stable candidate whose immediate base, `$ref` targets,
-   or `x-gts-ref` targets include a major-0 identifier.
+7. ADR-0015 quarantine — refuse a stable candidate whose immediate base or `$ref` targets
+   include a major-0 identifier. `x-gts-ref` is outside the quarantine.
 8. Canonicalize through `gts-rust`, compute the request fingerprint, resolve the
    mandatory `Idempotency-Key`.
 
@@ -437,8 +437,9 @@ dropped when the unit ends.
 
 The closure is seeded from **both** the candidates' identifiers and their documents. The
 identifier supplies the `~`-chain — every derivation base and an Instance's conforming type
-— and the document supplies its `$ref` and `x-gts-ref` targets, which no identifier
-implies. The document half is not an optimization: a candidate's own edge rows are written
+— and the document supplies its `$ref` targets, which no identifier implies. An
+`x-gts-ref` target is seeded by neither, because validating that keyword never reads the
+target document. The document half is not an optimization: a candidate's own edge rows are written
 at commit (step 4.5 above), so during the read that validates it they either do not exist
 yet, on a first admission, or still describe the previous revision. A reference target that
 no entity carries is reported apart from a candidate that has no row yet — the second is
@@ -811,9 +812,9 @@ weakest of three reasons.**
    `GtsTypeSchema::effective_schema` inlines only the parent's `$ref` and, in its own words,
    leaves *"non-parent `allOf[].$ref` items (mixin references) … as-is"*;
    `effective_properties` / `effective_required` walk `parent` alone. A parent chain is not a
-   reference closure, so any `$ref` or `x-gts-ref` to a type outside the chain stays
-   unresolved. The server resolves through `gts-rust`'s `resolve_schema_refs`, which closes
-   over every reference.
+   reference closure, so any `$ref` to a type outside the chain stays unresolved. The server
+   resolves through `gts-rust`'s `resolve_schema_refs`, which closes over every resolution-bearing
+   reference. An `x-gts-ref` is never inlined and is therefore outside this comparison.
 2. **They are a local approximation of GTS semantics**, which
    `constraint-gts-implementation` forbids outright. The code admits it: `effective_traits`
    carries `TODO(#1723): replace with gts-rust's resolve_schema(...).effective_traits once
@@ -1409,7 +1410,8 @@ is the executable task list. The number is kept because other documents cite it.
 **None remain.** Two answers are load-bearing enough to state rather than merely close:
 
 **O4 — there is no ADR-0015 quarantine preflight scan, and none is needed.** A scan would
-establish the rule's base case over a registry that predated it, and no such registry exists:
+establish that no stable schema has a major-0 immediate base or `$ref` target in a registry that
+predated the rule, and no such registry exists:
 the release that introduces the check is the release that first persists an entity. What
 remains is the negative obligation the ADR states — do not enable the rule against a database
 populated by a build that had the storage but not the check.

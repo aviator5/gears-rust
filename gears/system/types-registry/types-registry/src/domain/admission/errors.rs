@@ -57,6 +57,11 @@ pub enum WorkerError {
     /// projection is missing behind an entity that is still there.
     #[error("entity '{gts_id}' (id {entity_id}) vanished mid-transaction")]
     EntityVanished { gts_id: String, entity_id: i64 },
+    /// An edge target that evaluation resolved disappeared before the dependency
+    /// rows were replaced. Retrying rebuilds the candidate's store and either sees
+    /// the target again or refuses the candidate on its absence.
+    #[error("dependency target '{gts_id}' vanished before its edge was committed")]
+    DependencyTargetAbsent { gts_id: String },
     /// The family lock a creation serializes on could not be taken within its wait
     /// budget. Contention, not a statement about the candidate: a redelivery takes
     /// the lock and admits.

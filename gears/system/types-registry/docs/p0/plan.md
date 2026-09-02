@@ -27,13 +27,14 @@ commit. Two tasks exceed the ~5 file guideline, flagged with the reason where th
 
 ## Decisions taken during planning
 
-Twelve decisions were made here rather than in the spec, because all of them are consequences
+Thirteen decisions were made here rather than in the spec, because all of them are consequences
 of task ordering or of facts about the runtime that only surface once the work is sliced.
 P1–P5 were taken before implementation started; P6–P10 came out of reviewing Phase 1 on its way
 in, and the spec has been updated to match all five. P12 is a correction: it reverses a change T9
 made to the existing v1 REST contract, and adds T9a and T24a. P13 is a reordering — Instances
-into Phase 1, and `make dylint` per phase instead of per task. (P11 was a housekeeping close-out
-and is retired; the number is not reused.)
+into Phase 1, and `make dylint` per phase instead of per task. P14 defines `x-gts-ref`
+independently of the dependency graph. (P11 was a housekeeping close-out and is
+retired; the number is not reused.)
 
 ### P1. The spec's §15 build order is replaced by vertical slices
 
@@ -447,8 +448,9 @@ candidate's base — and `admission_worker_test.rs` asserts a derived Type Schem
 T13's missing edges. That is half right. `GtsId::chain_ids()` and `get_type_id()` are pure
 functions of the identifier, so a derivation base — and an Instance's conforming type — need no
 edge table at all. Seeding the closure worklist with the chain as well as the edges is what makes
-T10 cheap, and it admits derived Type Schemas in Phase 1 as a side effect. T13 keeps what is
-genuinely edge-derived: `$ref` and `x-gts-ref` targets, and T14's reverse walk.
+T10 cheap, and it admits derived Type Schemas in Phase 1 as a side effect. T13 supplies the
+`$ref` targets needed by the forward closure and the direct edge set needed by T14's reverse
+walk. `x-gts-ref` is neither resolved nor represented by an edge.
 
 Phase 1 therefore delivers one global entity **of each kind**, and Phase 2 becomes revisions and
 concurrency. T12's *kind* rule moves with T10 — a Type Schema `…ns.thing.v1~` and an Instance
@@ -487,6 +489,33 @@ findings are recorded. Checkpoint 0's gate is ticked from that same run — Phas
 the run included its changes. Phase 1's run covers T1–T9 only, so Checkpoint 1 carries an explicit
 **re-run** item for T9a and T10.
 
+### P14. `x-gts-ref` is not a dependency edge
+
+`x-gts-ref` constrains an instance value to match a GTS identifier pattern. It does not resolve
+or inline the entity that the value names and therefore creates no dependency edge.
+
+* **Validation.** `gts-rust` enforces the keyword by matching the value string against the
+  pattern — `XGtsRefValidator::validate_value_matches_gts_pattern` parses the value, parses the
+  pattern, compares. It never consults the store. So the constraint is satisfiable with nothing
+  registered under the pattern.
+* **Artifact refresh (T14).** An `x-gts-ref` target is not inlined — DESIGN §3.1 excludes it from
+  the resolution closure by name. Revising the target therefore cannot change the constraining
+  schema's artifacts. Including it in a reverse walk would spend
+  `limits.activation_write_set` on branches whose effective artifact cannot change.
+* **Deletion safety (T20).** The platform provides no referential-integrity guarantee for the
+  keyword: an `x-gts-ref` naming `topic.v1~` will **not** block deleting `topic.v1~`. A value
+  naming a deleted entity stays structurally valid, the registry sees no runtime data that would
+  make the refusal meaningful. Instance values are likewise not scanned for identifiers they
+  contain.
+* **Admission policy.** The managed–external boundary classifies entity-naming patterns directly
+  from candidate content when federation is introduced. Major-0 quarantine has no such check:
+  changing a named v0 entity cannot change the constraining schema's accepted payloads.
+
+The stored edge kinds are `1 schema_ref, 2 derivation, 3 instance_of`, and
+`ck_tr_dependency_kind` admits exactly those values. The numbering is append-only after the
+first release.
+
+
 ## Dependency graph
 
 ```
@@ -508,7 +537,7 @@ T6 config ───────────────────────�
                                                                    │
                                           T12 family shape + contiguity
                                              │
-                              T13 dependency edges ($ref / x-gts-ref only)
+                              T13 dependency edges (3 kinds; only $ref is content-derived)
                                              │
                      ┌───────────────────────┼───────────────────────┐
                      ▼                       ▼                       ▼

@@ -614,7 +614,7 @@ CREATE TABLE types_registry__type_schema (
 -- instance_revision; unlike type_schema there is no resolved artifact to hold.
 --
 -- No conforming-schema columns: that schema is the identifier prefix through the last
--- `~` (GTS spec 11.1), the immutable pair on instance_revision, and a kind 4
+-- `~` (GTS spec 11.1), the immutable pair on instance_revision, and a kind 3
 -- dependency edge, which is how revalidation reaches the Instance. No last-revalidated
 -- revision either — activation keeps a current value valid against its schema's
 -- current revision, and a rolled-back attempt commits nothing, so it could neither
@@ -657,37 +657,38 @@ CREATE TABLE types_registry__instance (
 --
 -- Admission replaces only the admitted entity's outgoing rows.
 --
--- `x-gts-ref` constrains what a value may name but is not itself a schema-resolution
--- dependency, which is why the strict reference extractor in gts-rust excludes it
--- from schema resolution. Its edge protects the entity the value or the constraint
--- **names**:
+-- `x-gts-ref` is NOT an edge, and this table is where that is recorded.
 --
---   * an exact identifier names that entity;
---   * a wildcard names its longest prefix that is a valid GTS Identifier;
---     `...topic.v1~*` and `...topic.v1~x.core.*` both name
---     `gts.cf.core.events.topic.v1~`;
---   * a pattern naming nothing valid, such as `gts.*`, produces no edge, and so
---     does the `/$id` self-reference of GTS spec 9.6.
+-- The keyword constrains what a value may name, and gts-rust enforces it by matching
+-- the value string against the pattern; it never asks whether the named entity
+-- exists. Three consequences keep the keyword outside the dependency graph:
 --
--- Edges do not expand a pattern's open match set, so new matching entities require
--- no edge update or dependency_pattern table.
+--   * the constraint is satisfiable with nothing registered under the pattern, so
+--     validation never needs the target;
+--   * the target is not inlined (it is outside the resolution closure), so revising
+--     it cannot change the constraining schema's effective form — the traversal
+--     would reach the subject, recompute it, find an identical digest and stop;
+--   * an edge would make `topic.v1~` undeletable while some schema constrained a
+--     field to name it. The platform deliberately does not give that guarantee —
+--     a value naming a deleted entity stays structurally valid, and the registry sees
+--     no runtime data that would make the refusal meaningful.
 --
--- The edge protects the named target, not constraint satisfiability. Deleting
--- `topic.v1~` is refused; deleting every current match of `...~x.core.*` while its
--- named base survives is allowed.
---
--- One asymmetry follows and is accepted: a named base is a dependency for deletion
--- but not for revalidation, since the subject holds a pattern string rather than
--- the base's content, so admitting a revision of the base does not change the
--- subject's effective form. The traversal reaches the subject anyway, recomputes
--- it, finds an identical digest, and stops there.
+-- The managed–external admission boundary classifies values directly from candidate
+-- content, but no compatibility, quarantine, read, refresh, availability, or
+-- deletion path reads that classification: an exact identifier names that entity; a
+-- wildcard names its longest valid GTS Identifier prefix. `...topic.v1~*` and
+-- `...topic.v1~x.core.*` both name `gts.cf.core.events.topic.v1~`; `gts.*` and the
+-- `/$id` self-reference of GTS spec 9.6 name nothing. Nothing expands a pattern's
+-- open match set. Consequently, new matching entities require no graph update, and a
+-- `dependency_pattern` table is neither required nor permitted by this design.
 --
 -- Materialized transitive closure was rejected because drift could silently skip
 -- revalidation (ADR-0011). It may later be added only as a cache over these rows.
 CREATE TABLE types_registry__dependency (
     from_entity_id bigint      NOT NULL,
-    -- 1 schema_ref ($ref), 2 gts_ref (x-gts-ref target), 3 derivation
-    -- (immediate base), 4 instance_of (conforming Type Schema)
+    -- 1 schema_ref ($ref), 2 derivation (immediate base),
+    -- 3 instance_of (conforming Type Schema). Numbering is append-only after the
+    -- first release.
     kind           smallint    NOT NULL,
     to_entity_id   bigint      NOT NULL,
 
@@ -700,7 +701,7 @@ CREATE TABLE types_registry__dependency (
         FOREIGN KEY (to_entity_id)
         REFERENCES types_registry__entity (id) ON DELETE CASCADE,
     CONSTRAINT ck_tr_dependency_kind
-        CHECK (kind IN (1, 2, 3, 4))
+        CHECK (kind IN (1, 2, 3))
 );
 
 -- Serves recursive reverse traversal and direct-dependent deletion checks.

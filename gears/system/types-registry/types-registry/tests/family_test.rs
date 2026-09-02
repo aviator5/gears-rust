@@ -55,6 +55,20 @@ const V1_2: &str = gts_id!("cf.core.example.thing.v1.2~");
 const V2: &str = gts_id!("cf.core.example.thing.v2~");
 const V2_0: &str = gts_id!("cf.core.example.thing.v2.0~");
 
+/// A family used by **one** test: the advisory-lock probe below.
+///
+/// It cannot share `cf.core.example.thing` with the rest of this file, and the reason
+/// is cross-process. The `SQLite` lock backend is a marker file under
+/// `<cache_dir>/cf-gears/locks/{database_scope}/{hash(gear, key)}`, and
+/// `database_scope` for `sqlite::memory:` is the same for every test — so two tests
+/// admitting one family key contend **through the filesystem**, in different
+/// processes, however isolated their databases are. Every other test here admits
+/// some version of `cf.core.example.thing`, `nextest` runs them concurrently, and
+/// this test's release probe carries a 1 ms budget with no retries, so a sibling
+/// holding the lock read as "never released". Its own family key removes the
+/// interaction; the mechanism is untouched.
+const LOCK_PROBE: &str = gts_id!("cf.core.lockprobe.thing.v1~");
+
 struct NoDispatch;
 
 #[async_trait::async_trait]
@@ -407,7 +421,7 @@ async fn a_predecessor_is_not_a_dependency_edge() {
 async fn a_creation_holds_the_family_lock_across_its_commit() {
     let dir = TestDir::new("types-registry-family-lock-held");
     let db = test_db_file(&dir.path().join("registry.sqlite")).await;
-    let op = submit(&db, "k1", V1).await;
+    let op = submit(&db, "k1", LOCK_PROBE).await;
 
     let (paused_stores, reached, resume) =
         common::PausingStores::new(common::PausePoint::CreateOrGet);
@@ -431,7 +445,7 @@ async fn a_creation_holds_the_family_lock_across_its_commit() {
     };
     let key = types_registry::domain::admission::worker::family_lock_key(
         &types_registry::domain::family::family_key(
-            &gts::GtsId::try_new(V1).expect("fixture identifier"),
+            &gts::GtsId::try_new(LOCK_PROBE).expect("fixture identifier"),
         ),
     );
     let held = db

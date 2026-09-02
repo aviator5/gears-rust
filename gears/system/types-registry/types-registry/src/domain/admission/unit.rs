@@ -298,12 +298,10 @@ fn evaluate_loaded(
 /// edges, and the delete inside `replace_outgoing` is keyed on `from_entity_id`
 /// alone.
 ///
-/// **A target with no entity row writes no row and is not an error.** For a `$ref`
-/// that case cannot arise — resolution would already have refused the candidate. For
-/// an `x-gts-ref` pattern it is the specified behaviour: the edge protects the entity
-/// the pattern *names*, and a pattern naming nothing has nothing to protect (DESIGN
-/// §3.2). Which means a later entity that starts matching the pattern needs no
-/// re-expansion of this edge set — it simply is not one.
+/// Every admitted edge target has already resolved during evaluation: `$ref`
+/// resolution checks document targets, while derivation and conformance targets come
+/// from the identifier chain. `x-gts-ref` never reaches this function because it is
+/// not a dependency edge.
 async fn replace_edges(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -319,18 +317,18 @@ async fn replace_edges(
     let resolved: std::collections::HashMap<&str, i64> =
         rows.iter().map(|r| (r.gts_id.as_str(), r.id)).collect();
 
-    let mut pairs: Vec<(DependencyKind, i64)> = Vec::with_capacity(edges.len());
-    for edge in edges {
-        if let Some(to) = resolved.get(edge.target.as_str()) {
-            pairs.push((edge.kind, *to));
-        } else {
-            tracing::debug!(
-                target_gts_id = %edge.target,
-                kind = ?edge.kind,
-                "types_registry dependency target names no entity; no edge written"
-            );
-        }
-    }
+    let pairs: Vec<(DependencyKind, i64)> = edges
+        .iter()
+        .map(|edge| {
+            resolved
+                .get(edge.target.as_str())
+                .copied()
+                .map(|to| (edge.kind, to))
+                .ok_or_else(|| WorkerError::DependencyTargetAbsent {
+                    gts_id: edge.target.clone(),
+                })
+        })
+        .collect::<Result<_, _>>()?;
     stores
         .replace_outgoing(tx, scope, entity_id, &pairs)
         .await?;

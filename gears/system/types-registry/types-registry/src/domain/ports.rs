@@ -482,8 +482,8 @@ pub trait EntityStore: Send + Sync {
     ) -> Result<Option<EntityRow>, ScopeError>;
 
     /// Batch exact read. Identifiers with no row are simply absent from the
-    /// result, which is how a caller distinguishes them: an `x-gts-ref` target that
-    /// names no entity is an ordinary outcome, not a failure (DESIGN §3.2).
+    /// result; callers compare the returned identifiers with the requested set
+    /// when absence has domain meaning.
     async fn find_by_gts_ids(
         &self,
         tx: &DbTx<'_>,

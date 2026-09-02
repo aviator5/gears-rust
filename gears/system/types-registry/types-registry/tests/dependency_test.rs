@@ -53,6 +53,8 @@ const SHAPE: &str = gts_id!("cf.core.dep.shape.v1~");
 const INVOICE: &str = gts_id!("cf.core.dep.invoice.v1~");
 /// The target of an `x-gts-ref` constraint.
 const ROLE: &str = gts_id!("cf.core.dep.role.v1~");
+/// A major-0 identifier used only as an `x-gts-ref` instance-value constraint.
+const UNSTABLE: &str = gts_id!("cf.core.dep.unstable.v0~");
 /// An Instance of [`BASE`].
 const INSTANCE: &str = gts_id!("cf.core.dep.thing.v1~cf.core.dep.first.v1");
 /// An identifier no test here ever admits.
@@ -191,13 +193,14 @@ async fn outgoing(db: &Arc<DBProvider<DbError>>, gts_id: &str) -> Vec<(Dependenc
 }
 
 // ---------------------------------------------------------------------------
-// The four kinds, written by one admission each
+// The edge kinds, written by one admission each
 // ---------------------------------------------------------------------------
 
-/// A derived schema that also references out of its chain and constrains a value
-/// with `x-gts-ref` carries three of the four kinds at once — and two of them point
-/// at the same entity by different relations, which the primary key
-/// `(from, kind, to)` keeps apart.
+/// A derived schema that also references out of its chain carries both kinds a
+/// schema can have — and the `$ref` to its base and the derivation from it point at
+/// the same entity by different relations, which the primary key `(from, kind, to)`
+/// keeps apart. The `x-gts-ref` beside them adds nothing because it is an
+/// instance-value constraint rather than a dependency.
 #[tokio::test]
 async fn one_admission_writes_a_row_per_edge_kind() {
     let db = test_db().await;
@@ -225,7 +228,6 @@ async fn one_admission_writes_a_row_per_edge_kind() {
         outgoing(&db, DERIVED).await,
         vec![
             (DependencyKind::SchemaRef, BASE.to_owned()),
-            (DependencyKind::GtsRef, ROLE.to_owned()),
             (DependencyKind::Derivation, BASE.to_owned()),
             (DependencyKind::SchemaRef, SHAPE.to_owned()),
         ]
@@ -233,7 +235,8 @@ async fn one_admission_writes_a_row_per_edge_kind() {
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>(),
-        "the `$ref` to the base and the derivation from it are two relations, not one",
+        "the `$ref` to the base and the derivation from it are two relations, not one; \
+         the `x-gts-ref` to ROLE is neither",
     );
 }
 
@@ -336,29 +339,73 @@ async fn a_revision_that_keeps_its_reference_keeps_the_edge() {
 // Targets that name nothing
 // ---------------------------------------------------------------------------
 
-/// An `x-gts-ref` pattern is a constraint on what a value may name, and it is
-/// satisfiable before anything matches it. So a target no entity carries writes no
-/// row and refuses nothing (DESIGN §3.2) — while a `$ref` to the same absent
-/// identifier is a content failure, which the neighbouring assertion pins.
+/// An `x-gts-ref` writes no row whether or not its target exists, and admits either
+/// way: `gts-rust` enforces the keyword by matching the value string against the
+/// pattern and never consults the registry. Both halves are asserted
+/// together, because "no row" would otherwise be indistinguishable from "the target
+/// happened to be missing".
 #[tokio::test]
-async fn an_x_gts_ref_naming_no_entity_writes_no_row_and_admits() {
+async fn an_x_gts_ref_writes_no_row_whether_its_target_exists_or_not() {
     let db = test_db().await;
-    admit(
-        &db,
-        "base",
-        BASE,
-        schema_with(
-            BASE,
-            &json!({ "role": { "type": "string", "x-gts-ref": ABSENT } }),
-        ),
-        None,
-    )
-    .await;
+    admit(&db, "role", ROLE, schema(ROLE), None).await;
 
-    assert!(
-        outgoing(&db, BASE).await.is_empty(),
-        "there is no entity to point the edge at",
-    );
+    for (key, id, target) in [("present", SHAPE, ROLE), ("absent", INVOICE, ABSENT)] {
+        admit(
+            &db,
+            key,
+            id,
+            schema_with(
+                id,
+                &json!({ "role": { "type": "string", "x-gts-ref": target } }),
+            ),
+            None,
+        )
+        .await;
+        assert!(
+            outgoing(&db, id).await.is_empty(),
+            "{id} constrains a value to name {target}; that is not a dependency",
+        );
+    }
+
+    // And the constrained target keeps no incoming row either, so a deletion of it
+    // has nothing to be blocked by — the point of the decision.
+    let provider = worker(&db);
+    let conn = provider.conn().expect("conn");
+    let rows = dependency::Entity::find()
+        .secure()
+        .scope_with(&allow_all())
+        .all(&conn)
+        .await
+        .expect("edges");
+    assert!(rows.is_empty(), "no edge of any kind was written: {rows:?}");
+}
+
+/// Major-0 quarantine applies to resolution-bearing references and derivation, not
+/// to an `x-gts-ref` constraint that only matches an identifier string in a payload.
+#[tokio::test]
+async fn a_stable_schema_may_use_an_x_gts_ref_that_names_major_zero() {
+    let db = test_db().await;
+    for (key, id, pattern) in [
+        ("stable-x-gts-ref-v0-exact", INVOICE, UNSTABLE.to_owned()),
+        ("stable-x-gts-ref-v0-pattern", SHAPE, format!("{UNSTABLE}*")),
+    ] {
+        admit(
+            &db,
+            key,
+            id,
+            schema_with(
+                id,
+                &json!({ "role": { "type": "string", "x-gts-ref": pattern } }),
+            ),
+            None,
+        )
+        .await;
+
+        assert!(
+            outgoing(&db, id).await.is_empty(),
+            "an x-gts-ref naming major zero is not a dependency",
+        );
+    }
 }
 
 /// The mirror of the case above: an unresolvable `$ref` is a content failure, and it

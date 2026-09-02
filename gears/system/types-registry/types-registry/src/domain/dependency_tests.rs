@@ -103,62 +103,36 @@ fn a_malformed_ref_is_reported_rather_than_silently_dropped() {
 }
 
 // ---------------------------------------------------------------------------
-// `x-gts-ref`
+// `x-gts-ref` — never an edge
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_exact_x_gts_ref_targets_that_identifier() {
-    let doc = schema(
-        ROOT,
-        json!({ "properties": { "role": { "type": "string", "x-gts-ref": OTHER } } }),
-    );
-    assert_eq!(
-        targets_of(&edges(ROOT, &doc), DependencyKind::GtsRef),
-        vec![OTHER.to_owned()],
-    );
-}
-
-#[test]
-fn a_wildcard_x_gts_ref_targets_the_patterns_longest_valid_prefix() {
-    let doc = schema(
-        ROOT,
-        json!({
-            "properties": {
-                "role": { "type": "string", "x-gts-ref": format!("{OTHER}*") },
-            },
-        }),
-    );
-    assert_eq!(
-        targets_of(&edges(ROOT, &doc), DependencyKind::GtsRef),
-        vec![OTHER.to_owned()],
-        "the edge protects the entity the pattern names, never its open match set",
-    );
-}
-
-#[test]
-fn an_x_gts_ref_that_names_nothing_valid_creates_no_edge() {
-    let doc = schema(
-        ROOT,
-        json!({ "properties": { "any": { "type": "string", "x-gts-ref": "gts.*" } } }),
-    );
-    assert!(
-        targets_of(&edges(ROOT, &doc), DependencyKind::GtsRef).is_empty(),
-        "`gts.*` has no valid identifier prefix, so there is no entity to protect",
-    );
-}
-
-#[test]
-fn a_relative_x_gts_ref_pointer_creates_no_edge() {
-    for pointer in ["/$id", "./properties/id", "../$id"] {
+fn an_x_gts_ref_is_not_a_dependency_edge_in_any_of_its_forms() {
+    for value in [
+        OTHER,                // an exact identifier
+        &format!("{OTHER}*"), // a wildcard pattern over it
+        "gts.*",              // a pattern naming nothing valid
+        "/$id",               // a GTS §9.6 relative pointer
+    ] {
         let doc = schema(
             ROOT,
-            json!({ "properties": { "self": { "type": "string", "x-gts-ref": pointer } } }),
+            json!({ "properties": { "role": { "type": "string", "x-gts-ref": value } } }),
         );
         assert!(
-            targets_of(&edges(ROOT, &doc), DependencyKind::GtsRef).is_empty(),
-            "{pointer} resolves inside this document (GTS §9.6), naming no other entity",
+            edges(ROOT, &doc).is_empty(),
+            "`x-gts-ref: {value}` must produce no edge: the keyword is enforced by \
+             matching the value string, so it never consults the registry",
         );
     }
+}
+
+#[test]
+fn an_x_gts_ref_inside_a_data_valued_keyword_is_data() {
+    let doc = schema(
+        ROOT,
+        json!({ "properties": { "a": { "const": { "x-gts-ref": OTHER } } } }),
+    );
+    assert!(edges(ROOT, &doc).is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +191,7 @@ fn an_instance_values_ref_shaped_data_is_data_and_not_an_edge() {
 }
 
 // ---------------------------------------------------------------------------
-// The four kinds, and the cases that produce none, over one table
+// The edge kinds, and the cases that produce none, over one table
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -231,7 +205,8 @@ fn the_edge_kinds_over_their_fixtures() {
 
     let cases = vec![
         Case {
-            what: "a `$ref` and an `x-gts-ref` in one derived schema: three kinds at once",
+            what: "a derived schema with a `$ref`: both kinds a schema can carry, and the \
+                   `x-gts-ref` beside them adding neither",
             gts_id: DERIVED,
             content: schema(
                 DERIVED,
@@ -244,7 +219,6 @@ fn the_edge_kinds_over_their_fixtures() {
             ),
             expected: vec![
                 (DependencyKind::SchemaRef, OTHER),
-                (DependencyKind::GtsRef, THIRD),
                 (DependencyKind::Derivation, ROOT),
             ],
         },
@@ -254,15 +228,6 @@ fn the_edge_kinds_over_their_fixtures() {
             content: schema(
                 ROOT,
                 json!({ "properties": { "name": { "type": "string" } } }),
-            ),
-            expected: vec![],
-        },
-        Case {
-            what: "an `x-gts-ref` inside a data-valued keyword is data, not a constraint",
-            gts_id: ROOT,
-            content: schema(
-                ROOT,
-                json!({ "properties": { "a": { "const": { "x-gts-ref": OTHER } } } }),
             ),
             expected: vec![],
         },
@@ -295,11 +260,12 @@ fn the_edge_kinds_over_their_fixtures() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn only_the_reference_kinds_seed_the_closure() {
+fn only_the_ref_targets_seed_the_closure() {
     // Derivation and conformance targets are chain members, which the closure
-    // already seeds from the identifier (T10). Seeding them again would say the
-    // same thing twice; a `$ref` or `x-gts-ref` target is the half no identifier
-    // implies.
+    // already seeds from the identifier (T10) — and an `x-gts-ref` target is not
+    // seeded at all, because validating the keyword never reads the target
+    // document. What is left is the one thing no identifier implies and resolution
+    // does read: the `$ref` target.
     let doc = schema(
         DERIVED,
         json!({
@@ -309,7 +275,8 @@ fn only_the_reference_kinds_seed_the_closure() {
             },
         }),
     );
-    let mut seeds = reference_targets(&edges(DERIVED, &doc));
-    seeds.sort();
-    assert_eq!(seeds, vec![OTHER.to_owned(), THIRD.to_owned()]);
+    assert_eq!(
+        reference_targets(&edges(DERIVED, &doc)),
+        vec![OTHER.to_owned()],
+    );
 }

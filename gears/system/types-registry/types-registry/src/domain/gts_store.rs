@@ -103,14 +103,14 @@ impl UnitStore {
         &self.missing_candidates
     }
 
-    /// Reference targets — `$ref` and `x-gts-ref` — that no entity carries.
+    /// `$ref` targets that no entity carries.
     ///
     /// Kept apart from [`Self::missing_candidates`] rather than merged into it,
     /// because the two mean opposite things. A missing *candidate* is the normal
     /// state of every first admission: the entity is about to be created. A missing
-    /// *reference* is a target the document names and the registry does not hold —
-    /// for a `$ref` a refusal, for an `x-gts-ref` pattern merely an edge that
-    /// cannot be written. T19 must be able to tell the two apart to order a batch.
+    /// *reference* is a target the document resolves and the registry does not
+    /// hold, which is a refusal. T19 must be able to tell the two apart to order a
+    /// batch. `x-gts-ref` is absent because its validation reads no target entity.
     #[must_use]
     pub fn missing_references(&self) -> &[String] {
         &self.missing_references
@@ -285,12 +285,13 @@ pub fn build_store(mut documents: Vec<UnitDocument>) -> Result<UnitStore, StoreB
 /// **The overlay covers edges too, and it has to.** Seeding the closure with the
 /// candidates' identifiers alone would walk the *stored* edge set — and those rows
 /// are written at commit, so they never describe the candidate that is being
-/// validated. A first admission has no rows of its own at all, which made a `$ref`
-/// or `x-gts-ref` naming an entity outside the candidate's `~`-chain invisible:
-/// `validate_schema` refused a target the registry was holding. A revision had the
+/// validated. A first admission has no rows of its own at all, which makes a `$ref`
+/// naming an entity outside the candidate's `~`-chain invisible: `validate_schema`
+/// would refuse a target the registry was holding. A revision has the
 /// mirror problem, following the previous revision's edges rather than this
 /// document's. So [`extract_edges`] runs over each candidate **document** here and
-/// its reference targets join `chain_ids()` as closure roots (T13).
+/// its `$ref` targets join `chain_ids()` as closure roots (T13). `x-gts-ref` reads
+/// no target document and never enters this closure.
 ///
 /// The candidate's own stored rows are still walked — `closure` cannot tell a
 /// candidate root from any other — so a reference a revision *dropped* may still be

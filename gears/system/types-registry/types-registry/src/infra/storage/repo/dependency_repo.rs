@@ -114,19 +114,15 @@ impl DependencyRepo {
     ///
     /// Each root contributes its whole `GtsId::chain_ids()` — every prefix of its
     /// `~`-chain — before the edge walk starts (T10). That is a **different
-    /// relation**, not a shortcut for T13's edges: a derivation base is a pure
-    /// function of the identifier (`base~derived~` consumes `base~` by being named
-    /// so, and an Instance `base~thing.v1` conforms to `base~` likewise). Nothing
-    /// writes a `dependency` row for either, and nothing should — a stored edge
-    /// could disagree with the name. Without the seed, `validate_schema` on a
-    /// derived candidate and `validate_instance` on any Instance would fail with a
-    /// missing base. T13 adds what is *genuinely* edge-derived: `$ref` and
-    /// `x-gts-ref` targets, which no identifier implies — and it adds them **as
-    /// roots the caller passes in**, extracted from the candidate document, not
-    /// only as `dependency` rows. The rows are written at commit and so do not
-    /// exist during the read that validates the candidate that authored them; a
-    /// caller relying on the edge walk alone cannot see a first admission's own
-    /// references. See `domain::gts_store::load_unit_store`.
+    /// relation**, not a shortcut for T13's stored edges: a derivation base is a
+    /// pure function of the identifier (`base~derived~` consumes `base~` by being
+    /// named so, and an Instance `base~thing.v1` conforms to `base~` likewise).
+    /// Those relations are materialized for reverse impact, but validation seeds
+    /// them from the identifier so a first admission does not depend on rows that
+    /// are written only at commit. T13 also adds candidate `$ref` targets **as
+    /// roots the caller passes in**, extracted from the candidate document. An
+    /// `x-gts-ref` target is neither stored nor seeded because validation reads no
+    /// target document. See `domain::gts_store::load_unit_store`.
     ///
     /// Candidates with no entity row are reported in
     /// [`DependencyClosure::missing_roots`] rather than failing the read, because a

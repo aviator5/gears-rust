@@ -197,6 +197,12 @@ impl From<WorkerError> for CanonicalError {
                 &format!("entity '{gts_id}' (id {entity_id}) vanished mid-transaction"),
                 "admission",
             ),
+            // A retryable snapshot race, not a malformed candidate. Exposing the
+            // target would also disclose a dependency the caller may not read.
+            WorkerError::DependencyTargetAbsent { gts_id } => opaque_internal(
+                &format!("dependency target '{gts_id}' vanished before its edge was committed"),
+                "admission",
+            ),
             // Contention, not corruption: the request is correct and can be
             // repeated after the short hint advertised by the response.
             WorkerError::FamilyLockUnavailable {
@@ -710,6 +716,9 @@ mod tests {
             }),
             worker_problem(WorkerError::RevisionNumberExhausted {
                 gts_id: "revision-secret".to_owned(),
+            }),
+            worker_problem(WorkerError::DependencyTargetAbsent {
+                gts_id: "dependency-secret".to_owned(),
             }),
             worker_problem(WorkerError::ResourceVersionExhausted {
                 gts_id: "version-secret".to_owned(),

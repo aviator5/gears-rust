@@ -111,6 +111,8 @@ There is therefore no **registered or platform-observable** external dependent f
 
 **Managed to external** fails on each of the platform's four guarantees independently, and this half of the decision is unchanged:
 
+The four guarantees below concern resolution-bearing dependencies. An entity-naming `x-gts-ref` engages none of them: it is refused by the identifier-space disjointness rule itself. That is why admission checks its classified identifier against Source Claims without resolving the target, recording an edge, or adding it to a revision vector.
+
 * **Compatibility.** ADR-0004 makes a managed `$ref` float to the current revision, and ADR-0005 requires the affected dependency closure to be revalidated before a referenced revision becomes current. A source publishes a new revision without telling the platform, so the revalidation that makes floating references safe never runs. ADR-0003 already concluded that a managed schema referencing an external one inherits the weakest guarantee in its closure; with no per-revision monotonicity assertion, that is no guarantee.
 * **Deletion safety.** A source may delete its entity unilaterally. The managed entity that references it breaks with no registry event and no opportunity to block.
 * **Availability.** Under ADR-0010 a `$ref` target is an availability-blocking edge, so every availability evaluation for the managed entity would require a live plugin call. That places a network hop inside the managed resolution path and makes the managed lookup NFR contingent on plugin latency.
@@ -172,7 +174,7 @@ The cost that remains is real and must be documented for vendors: **an external 
 
 Deletion of a Managed Entity is decided from managed storage alone. It calls no plugin, reads no plugin-supplied data, and depends on neither plugin uptime nor plugin diligence.
 
-What it examines is exactly what Types Registry owns and can enumerate: types derived from the target, read from the identifier chain; schemas holding a `$ref` or `x-gts-ref` to it; and registered Instances conforming to it. There is no fourth category.
+What it examines is exactly what Types Registry owns and can enumerate as dependencies: types derived from the target, read from the identifier chain; schemas holding a `$ref` to it; and registered Instances conforming to it. There is no fourth category. A schema whose `x-gts-ref` names the target is not a category: the keyword creates no dependency under `cpt-cf-types-registry-fr-ref-tracking`, so there is nothing to refuse.
 
 **Live reverse-impact query is not retained at all,** and closing the boundary is what emptied it. It could report nothing **platform-authoritative** about a Managed Entity: no externally managed entity may depend on one, so any dependent a source named would be one the rule forbids and the platform does not recognize — and, because a reference from inside an external document is undetectable here, the platform could neither confirm nor refute it. What remained was external dependents of an *externally managed* entity: a question entirely inside the source's own universe, which the source's own tooling answers better.
 

@@ -367,7 +367,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
             FOREIGN KEY (to_entity_id)
             REFERENCES types_registry__entity (id) ON DELETE CASCADE,
         CONSTRAINT ck_tr_dependency_kind
-            CHECK (kind IN (1, 2, 3, 4))
+            CHECK (kind IN (1, 2, 3))
     )",
     "CREATE INDEX IF NOT EXISTS idx_tr_dependency_to
         ON types_registry__dependency (to_entity_id, from_entity_id)",
@@ -680,7 +680,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             FOREIGN KEY (to_entity_id)
             REFERENCES types_registry__entity (id) ON DELETE CASCADE,
         CONSTRAINT ck_tr_dependency_kind
-            CHECK (kind IN (1, 2, 3, 4))
+            CHECK (kind IN (1, 2, 3))
     )",
     "CREATE INDEX IF NOT EXISTS idx_tr_dependency_to
         ON types_registry__dependency (to_entity_id, from_entity_id)",
@@ -981,7 +981,7 @@ const MYSQL_UP_STATEMENTS: &[&str] = &[
             FOREIGN KEY (to_entity_id)
             REFERENCES types_registry__entity (id) ON DELETE CASCADE,
         CONSTRAINT ck_tr_dependency_kind
-            CHECK (kind IN (1, 2, 3, 4))
+            CHECK (kind IN (1, 2, 3))
     )",
 ];
 

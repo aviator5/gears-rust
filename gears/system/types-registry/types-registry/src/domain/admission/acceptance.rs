@@ -20,10 +20,10 @@
 //! | 7 ADR-0015 major-0 quarantine | **T18** — it needs the reference extractor |
 //! | 8 canonicalize, fingerprint, idempotency | here |
 //!
-//! Step 7 is a gap by dependency: it refuses a stable candidate whose base, `$ref`
-//! or `x-gts-ref` targets include a major-0 identifier, and the extractor that
-//! finds those targets is T13's. A `TODO` marks its position between steps 6 and 8,
-//! so it lands as an insertion rather than a reordering.
+//! Step 7 is a gap by dependency: it refuses a stable candidate whose base or
+//! `$ref` targets include a major-0 identifier, and the extractor that finds those
+//! targets is T13's. A `TODO` marks its position between steps 6 and 8, so it lands
+//! as an insertion rather than a reordering. `x-gts-ref` is outside quarantine.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -341,9 +341,10 @@ pub fn validate(
         }
 
         // TODO(T18): step 7, the ADR-0015 quarantine — refuse a stable candidate
-        // whose immediate base, `$ref` or `x-gts-ref` targets include a major-0
-        // identifier. It needs T13's reference extractor, so it slots in here
-        // rather than being reordered in later.
+        // whose immediate base or `$ref` targets include a major-0 identifier. It
+        // needs T13's reference extractor, so it slots in here rather than being
+        // reordered in later. `x-gts-ref` is outside the quarantine because it
+        // validates an instance value without resolving or inlining a target.
 
         // --- step 8: canonicalize ----------------------------------------
         let canonical = canonical_text(content);
