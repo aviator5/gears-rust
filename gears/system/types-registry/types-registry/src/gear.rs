@@ -14,6 +14,7 @@ use crate::config::TypesRegistryConfig;
 use crate::domain::admission::{NullDispatch, OperationDispatch};
 use crate::domain::local_client::TypesRegistryLocalClient;
 use crate::domain::ports::Stores;
+use crate::domain::ports::metrics::AdmissionMetrics;
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 use crate::infra::InMemoryGtsRepository;
@@ -72,6 +73,18 @@ impl Default for TypesRegistryGear {
 impl Gear for TypesRegistryGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: TypesRegistryConfig = ctx.config_or_default()?;
+
+        // Build the admission instruments here rather than on their first use
+        // (T16): `ToolKit` installs the real `SdkMeterProvider` before `init`
+        // runs, so an adapter built at a known point cannot accidentally attach
+        // to whatever provider happened to be global at the first registration
+        // — which, during seeding, is a different moment. The adapter is
+        // infra's and the port is the domain's; this is the one place the two
+        // are joined, and the handle is then injected rather than reached
+        // through a global.
+        let metrics_prefix = cfg.metrics.effective_prefix(Self::MODULE_NAME);
+        let metrics: Arc<dyn AdmissionMetrics> =
+            crate::infra::metrics::default_adapter(&metrics_prefix);
 
         // Startup validation. An unparsable registration-policy region reads
         // exactly like a closed one at admission time, so the boot fails here
@@ -197,6 +210,7 @@ impl Gear for TypesRegistryGear {
                 cfg_for_registry,
                 dispatch,
                 crate::domain::registry_service::AdmissionMode::Inline,
+                Arc::clone(&metrics),
             ));
             self.registry
                 .set(registry)

@@ -30,7 +30,9 @@ use uuid::Uuid;
 
 use types_registry::config::{PolicyEntry, TypesRegistryConfig};
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::worker::{OperationOutcome, WorkerError, run_operation};
+use types_registry::domain::admission::worker::{
+    OperationOutcome, Tuning, WorkerError, run_operation,
+};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -101,6 +103,7 @@ async fn submit_with(
         &AcceptanceContext {
             policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -140,8 +143,11 @@ async fn admit(
         &stores(),
         &worker(db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         op,
         LATER,
     )
@@ -524,8 +530,11 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         created,
         LATER,
     )
@@ -548,8 +557,11 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
             &stores(),
             &worker(&db),
             &allow_all(),
-            &common::limits(),
-            &common::worker_settings(),
+            Tuning {
+                limits: &common::limits(),
+                worker: &common::worker_settings(),
+                metrics: &common::metrics(),
+            },
             op,
             LATER,
         )

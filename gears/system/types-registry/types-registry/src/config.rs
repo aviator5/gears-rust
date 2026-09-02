@@ -68,6 +68,35 @@ pub struct TypesRegistryConfig {
     /// Admission-worker tuning (SPEC §10.3).
     #[serde(default)]
     pub worker: WorkerSettings,
+
+    /// Metrics naming configuration.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Metrics configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Metric name prefix. When empty (the default), derived from the gear
+    /// name by converting it to `snake_case` (e.g., `"types-registry"` →
+    /// `"types_registry"`).
+    #[serde(default)]
+    pub prefix: String,
+}
+
+impl MetricsConfig {
+    /// Resolve the effective prefix: explicit config value, or
+    /// `snake_case(gear_name)`.
+    #[must_use]
+    pub fn effective_prefix(&self, gear_name: &str) -> String {
+        let trimmed = self.prefix.trim();
+        if trimmed.is_empty() {
+            heck::ToSnakeCase::to_snake_case(gear_name)
+        } else {
+            trimmed.to_owned()
+        }
+    }
 }
 
 /// Bounds on one request's work and on one document's size.
@@ -347,6 +376,7 @@ impl Default for TypesRegistryConfig {
             limits: Limits::default(),
             registration_policy: BTreeMap::new(),
             worker: WorkerSettings::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }

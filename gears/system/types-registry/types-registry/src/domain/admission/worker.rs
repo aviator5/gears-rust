@@ -26,11 +26,13 @@
 //! the item's stored precondition chooses which commit runs.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
 use toolkit_db::{DBProvider, DbError, DbLockGuard, LockConfig};
 use toolkit_macros::domain_model;
+use tracing::{Instrument, Span};
 use uuid::Uuid;
 
 pub use super::errors::{ItemFailure, WorkerError};
@@ -42,7 +44,9 @@ use crate::config::{Limits, WorkerSettings};
 use crate::domain::admission::Precondition;
 use crate::domain::enums::{OperationItemStatus, OperationStatus};
 use crate::domain::family::{FamilyKey, lock_order};
+use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage, TerminalStatus};
 use crate::domain::ports::{OperationItemRow, OperationRow, Stores, commit_write, snapshot_read};
+use crate::observability;
 
 /// The advisory-lock namespace every types-registry lock is taken under.
 pub const LOCK_GEAR: &str = "types_registry";
@@ -54,9 +58,10 @@ pub const LOCK_GEAR: &str = "types_registry";
 /// is tuning on how the *pass* behaves. Borrowed and `Copy`, so passing it costs
 /// two pointers.
 #[derive(Clone, Copy)]
-struct Tuning<'a> {
-    limits: &'a Limits,
-    worker: &'a WorkerSettings,
+pub struct Tuning<'a> {
+    pub limits: &'a Limits,
+    pub worker: &'a WorkerSettings,
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
 /// Prefix on the family lock key, so a future lock on some other thing in this
@@ -122,8 +127,31 @@ pub async fn run_operation(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
-    limits: &Limits,
-    worker: &WorkerSettings,
+    tuning: Tuning<'_>,
+    operation_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<OperationOutcome, WorkerError> {
+    // The span opens before the first read, so it covers the whole pass — which
+    // is why its `kind` and `dry_run` fields are filled in from inside, once the
+    // operation row has been read (`observability::operation_span`).
+    let span = observability::operation_span(operation_id);
+    let started = Instant::now();
+    let outcome = run_operation_inner(stores, db, scope, tuning, operation_id, now)
+        .instrument(span)
+        .await;
+    // Recorded on the failing path too: an infrastructure failure is still time
+    // this pass spent, and a histogram that only sees successes hides the shape
+    // of a deployment that is timing out.
+    tuning.metrics.observe_operation_duration(started.elapsed());
+    outcome
+}
+
+/// [`run_operation`]'s body, running inside the operation span.
+async fn run_operation_inner(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<WorkerError>,
+    scope: &AccessScope,
+    tuning: Tuning<'_>,
     operation_id: Uuid,
     now: OffsetDateTime,
 ) -> Result<OperationOutcome, WorkerError> {
@@ -132,16 +160,13 @@ pub async fn run_operation(
     // after changes nothing — and it makes the pair consistent, which two
     // separately-snapshotted reads would not be.
     let (operation, items) = read_operation(stores, db, scope, operation_id).await?;
+    observability::record_operation_facts(&Span::current(), operation.kind, operation.dry_run);
 
     // A redelivered message finds the operation terminal and reports the stored
     // outcomes. Delivery is at-least-once (T21), so this is the shape that makes
     // duplicate delivery a no-op rather than a second admission.
     if operation.status == OperationStatus::Completed {
-        return Ok(OperationOutcome {
-            operation_id,
-            already_terminal: true,
-            items: items.iter().map(stored_outcome).collect(),
-        });
+        return Ok(already_terminal(operation_id, &items));
     }
 
     if !mark_running(stores, db, scope, operation_id, now).await? {
@@ -151,10 +176,17 @@ pub async fn run_operation(
         );
     }
 
-    let tuning = Tuning { limits, worker };
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
-        outcomes.push(process_item(stores, db, scope, tuning, operation_id, &item, now).await?);
+        // Instrumented here rather than inside `process_item` so that the pass's
+        // one long function does not need to be split in two to own a span.
+        let span =
+            observability::unit_span(operation_id, &item.gts_id, item.kind, item.dry_run, item.id);
+        outcomes.push(
+            process_item(stores, db, scope, tuning, operation_id, &item, now)
+                .instrument(span)
+                .await?,
+        );
     }
 
     mark_completed(stores, db, scope, operation_id, now).await?;
@@ -261,6 +293,7 @@ struct CommitRequest<'a> {
     now: OffsetDateTime,
     limits: Limits,
     family_lock_timeout: std::time::Duration,
+    metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
 /// Steps 4a and 4b: take the family lock a creation needs, run the commit
@@ -281,6 +314,7 @@ async fn commit_evaluated(
         now,
         limits,
         family_lock_timeout,
+        metrics,
     } = request;
     // Step 4a: serialize the family rules, for a **creation** only.
     //
@@ -324,6 +358,9 @@ async fn commit_evaluated(
     // *enforced* here, by a commit that refuses an absent identifier.
     let tx_scope = scope.clone();
     let tx_stores = Arc::clone(stores);
+    // Cloned per attempt like `tx_stores`: the closure is `'static`, so it can
+    // borrow neither the caller's handle nor anything else from this frame.
+    let tx_metrics = Arc::clone(metrics);
     // `Limits` is `Copy` and arrives owned on `CommitRequest`, so each retry attempt
     // takes its own copy rather than borrowing across the transaction boundary.
     let tx_limits = limits;
@@ -333,6 +370,7 @@ async fn commit_evaluated(
             let unit = Arc::clone(evaluated);
             let tx_scope = tx_scope.clone();
             let tx_stores = Arc::clone(&tx_stores);
+            let tx_metrics = Arc::clone(&tx_metrics);
             Box::pin(async move {
                 match precondition {
                     Precondition::MustNotExist => commit_creation(
@@ -354,6 +392,7 @@ async fn commit_evaluated(
                             expected,
                             tx_limits.activation_write_set,
                             now,
+                            &tx_metrics,
                         )
                         .await
                     }
@@ -428,7 +467,17 @@ async fn process_item(
         {
             Ok(evaluated) => Arc::new(evaluated),
             Err(failure) => {
-                return record_failure(stores, db, scope, operation_id, item, failure, now).await;
+                return record_failure(
+                    stores,
+                    db,
+                    scope,
+                    operation_id,
+                    item,
+                    failure,
+                    now,
+                    tuning.metrics,
+                )
+                .await;
             }
         };
 
@@ -443,6 +492,7 @@ async fn process_item(
                 now,
                 limits: *tuning.limits,
                 family_lock_timeout: tuning.worker.family_lock_timeout,
+                metrics: tuning.metrics,
             },
         )
         .await
@@ -458,11 +508,22 @@ async fn process_item(
             // a transaction of its own — the same path an evaluation-stage refusal
             // takes.
             Err(WorkerError::RefusedAfterWrite(failure)) => {
-                return record_failure(stores, db, scope, operation_id, item, failure, now).await;
+                return record_failure(
+                    stores,
+                    db,
+                    scope,
+                    operation_id,
+                    item,
+                    failure,
+                    now,
+                    tuning.metrics,
+                )
+                .await;
             }
             // The guard fired: this transaction wrote nothing and rolled back. Round
             // again from a fresh snapshot.
             Err(WorkerError::RevalidationRequired(drift)) => {
+                tuning.metrics.revalidation_retried(&drift);
                 tracing::info!(
                     %operation_id,
                     operation_item_id = item.id,
@@ -479,9 +540,25 @@ async fn process_item(
         };
 
         return match committed {
-            Ok(commit) => Ok(committed_outcome(operation_id, item, commit, attempt)),
+            Ok(commit) => Ok(committed_outcome(
+                operation_id,
+                item,
+                commit,
+                attempt,
+                tuning.metrics,
+            )),
             Err(failure) => {
-                record_failure(stores, db, scope, operation_id, item, failure, now).await
+                record_failure(
+                    stores,
+                    db,
+                    scope,
+                    operation_id,
+                    item,
+                    failure,
+                    now,
+                    tuning.metrics,
+                )
+                .await
             }
         };
     }
@@ -501,19 +578,34 @@ async fn process_item(
              revalidation attempts were exhausted, the last on {drift}"
         ),
     );
-    record_failure(stores, db, scope, operation_id, item, failure, now).await
+    record_failure(
+        stores,
+        db,
+        scope,
+        operation_id,
+        item,
+        failure,
+        now,
+        tuning.metrics,
+    )
+    .await
 }
 
-/// The outcome to report for a commit that succeeded, and the log line that goes
-/// with it.
+/// The outcome to report for a commit that succeeded, and the log line and the
+/// counter that go with it.
 ///
-/// Pure, and outside the revalidation loop's body so the loop reads as the control
-/// flow it is rather than as two long success arms with a `continue` between them.
+/// Outside the revalidation loop's body so the loop reads as the control flow it
+/// is rather than as two long success arms with a `continue` between them. It is
+/// the *only* place a successful commit is turned into an outcome, which is why
+/// the candidate counter sits here: every success passes through it exactly once,
+/// and a redelivery reporting an outcome some earlier pass committed goes through
+/// `stored_outcome` instead and is not counted again.
 fn committed_outcome(
     operation_id: Uuid,
     item: &OperationItemRow,
     commit: RevisionCommit,
     attempt: u32,
+    metrics: &Arc<dyn AdmissionMetrics>,
 ) -> ItemOutcome {
     match commit {
         RevisionCommit::Admitted(CommittedUnit {
@@ -530,6 +622,7 @@ fn committed_outcome(
                 attempt,
                 "types_registry candidate admitted"
             );
+            metrics.candidate_terminalized(TerminalStatus::Succeeded);
             ItemOutcome {
                 gts_id: item.gts_id.clone(),
                 status: OperationItemStatus::Succeeded,
@@ -554,6 +647,7 @@ fn committed_outcome(
                 attempt,
                 "types_registry candidate content already current"
             );
+            metrics.candidate_terminalized(TerminalStatus::Unchanged);
             ItemOutcome {
                 gts_id: item.gts_id.clone(),
                 status: OperationItemStatus::Unchanged,
@@ -563,6 +657,28 @@ fn committed_outcome(
                 failure: None,
             }
         }
+    }
+}
+
+/// The `reason` label a refusal counts under.
+///
+/// The port's parameter type is `&'static str` because the label vocabulary is
+/// closed: every fresh refusal site names its reason as a literal, and a literal
+/// is its own label. The one reason that is not provably a literal is an owned
+/// `Cow` — a failure read back off a stored `error_payload`
+/// ([`ItemFailure::from_payload`]) — and that maps to the single closed
+/// fallback `other` rather than being admitted into the series as an unbounded
+/// string. Pinned by `worker_tests`, including both halves of that sentence.
+#[must_use]
+// The `Cow` variant *is* the input: this function exists to tell a borrowed
+// literal from an owned string, which is precisely the distinction `&str` would
+// erase — taking clippy's suggestion here would let every read-back reason
+// through as its own unbounded label.
+#[allow(clippy::ptr_arg)]
+pub fn reason_label(reason: &std::borrow::Cow<'static, str>) -> &'static str {
+    match reason {
+        std::borrow::Cow::Borrowed(reason) => reason,
+        std::borrow::Cow::Owned(_) => "other",
     }
 }
 
@@ -576,6 +692,7 @@ fn committed_outcome(
 /// and reported instead of the failure this pass computed. For a deterministic
 /// refusal the two agree; where they do not, the store is right and this pass is
 /// the duplicate.
+#[allow(clippy::too_many_arguments)]
 async fn record_failure(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
@@ -584,6 +701,7 @@ async fn record_failure(
     item: &OperationItemRow,
     failure: ItemFailure,
     now: OffsetDateTime,
+    metrics: &Arc<dyn AdmissionMetrics>,
 ) -> Result<ItemOutcome, WorkerError> {
     let tx_stores = Arc::clone(stores);
     let tx_scope = scope.clone();
@@ -601,6 +719,11 @@ async fn record_failure(
         .await?;
 
     if recorded {
+        // Both counters are behind `recorded`: this pass owns the decision only
+        // when its compare-and-swap won. The loser falls through to
+        // `stored_item`, whose outcome the winner already counted.
+        metrics.candidate_terminalized(TerminalStatus::Failed);
+        metrics.refused(RefusalStage::Admission, reason_label(&failure.reason));
         tracing::warn!(
             %operation_id,
             operation_item_id = item.id,
@@ -618,6 +741,26 @@ async fn record_failure(
         });
     }
     stored_item(stores, db, scope, operation_id, item_id).await
+}
+
+/// The outcome a redelivered pass reports: every stored item, nothing written.
+///
+/// Its own log line is the one thing a redelivered pass emits. It runs inside
+/// the operation span with the facts `record_operation_facts` filled in from the
+/// row, so it carries the kind and mode a redelivery has no request to read them
+/// from — which is the thing to grep for when asking "did the second delivery
+/// really pass through here?"
+fn already_terminal(operation_id: Uuid, items: &[OperationItemRow]) -> OperationOutcome {
+    tracing::debug!(
+        %operation_id,
+        "types_registry operation was already terminal; the redelivered pass reports \
+         the stored outcomes"
+    );
+    OperationOutcome {
+        operation_id,
+        already_terminal: true,
+        items: items.iter().map(stored_outcome).collect(),
+    }
 }
 
 /// The outcome the store holds for one item, re-read outside any transaction this
@@ -735,3 +878,7 @@ fn stored_outcome(item: &OperationItemRow) -> ItemOutcome {
         failure: item.error_payload.as_deref().map(ItemFailure::from_payload),
     }
 }
+
+#[cfg(test)]
+#[path = "worker_tests.rs"]
+mod worker_tests;

@@ -126,6 +126,16 @@ pub fn allow_all() -> AccessScope {
 /// The worker takes these by reference (T14): `limits.activation_write_set` bounds
 /// the dependents one admission refreshes, and a test that needs a different bound
 /// builds its own `Limits` rather than mutating a shared one.
+/// The admission instruments a test injects: counting nothing.
+///
+/// `observability_test.rs` is the one suite that wants a real meter, and it
+/// builds its own adapter over an in-memory exporter. Everything else asserts
+/// on behaviour rather than on series, so it passes this.
+#[must_use]
+pub fn metrics() -> std::sync::Arc<dyn types_registry::domain::ports::metrics::AdmissionMetrics> {
+    std::sync::Arc::new(types_registry::domain::ports::metrics::NoopMetrics)
+}
+
 pub fn limits() -> types_registry::config::Limits {
     types_registry::config::Limits::default()
 }

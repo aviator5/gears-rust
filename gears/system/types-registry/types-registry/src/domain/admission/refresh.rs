@@ -41,6 +41,13 @@
 //! before the commit would be computed against a base that the commit may not
 //! write. The bound (`limits.activation_write_set`) is what keeps the work inside
 //! the transaction finite.
+//!
+//! Inside is not *on*: the meta-compilation itself runs on the blocking pool via
+//! `spawn_blocking` — the same offload `unit::evaluate` uses — with the owned
+//! store and the whole subject list in one task, so the sum of all dependents'
+//! compilations blocks no Tokio worker while the transaction stays open across
+//! the await. Only the fingerprint reads and the writes remain on the async
+//! path.
 
 use std::collections::HashMap;
 
@@ -50,10 +57,12 @@ use toolkit_db::secure::AccessScope;
 use toolkit_macros::domain_model;
 
 use super::errors::{ItemFailure, WorkerError};
-use crate::domain::artifacts::materialize;
+use crate::domain::artifacts::{MaterializedArtifacts, materialize};
 use crate::domain::enums::{EntityKind, LifecycleStatus};
 use crate::domain::gts_store::{UnitDocument, load_unit_store};
-use crate::domain::ports::{EntityRow, NewCurrentTypeSchema, ReverseImpact, Stores};
+use crate::domain::ports::{
+    CurrentTypeSchemaRow, EntityRow, NewCurrentTypeSchema, ReverseImpact, Stores,
+};
 
 /// What one refresh wrote.
 #[domain_model]
@@ -158,41 +167,97 @@ pub async fn refresh_dependents(
         .await
         .map_err(WorkerError::StoreBuild)?;
 
-    let mut refreshed = Vec::new();
-    for row in &subjects {
-        let resolved = match store.store_mut().validate_schema(&row.gts_id) {
-            Ok(resolved) => resolved,
-            // Committed content that no longer resolves against the new revision.
-            // A candidate-level refusal, not infrastructure: the *candidate* is what
-            // broke it, and retrying would break it identically. The compatibility
-            // gate that refuses such a revision before it is written is T17–T19;
-            // until then this is the backstop that keeps the registry consistent.
-            Err(e) => {
-                return Ok(Err(ItemFailure::new(
-                    "dependent_invalid",
-                    format!(
-                        "dependent '{}' no longer validates against this revision: {e}",
-                        row.gts_id
-                    ),
-                )));
-            }
-        };
-        let artifacts = materialize(&resolved);
+    // One blocking task recomputes every dependent, not one await per subject:
+    // the CPU-bound meta-compilation of up to `write_set_bound` dependents must
+    // block no Tokio worker while the commit transaction is open across the
+    // await. The store is owned and closed — all database reads finished above
+    // — so the task needs nothing from this future but the subjects themselves.
+    let blocking_subjects: Vec<(i64, String)> = subjects
+        .iter()
+        .map(|row| (row.id, row.gts_id.clone()))
+        .collect();
+    let recomputed = tokio::task::spawn_blocking(move || {
+        let mut artifacts = Vec::with_capacity(blocking_subjects.len());
+        for (entity_id, gts_id) in blocking_subjects {
+            let resolved = store.store_mut().validate_schema(&gts_id);
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return Err(DependentInvalid {
+                        entity_id,
+                        gts_id,
+                        error: error.to_string(),
+                    });
+                }
+            };
+            artifacts.push((entity_id, gts_id, materialize(&resolved)));
+        }
+        Ok(artifacts)
+    })
+    .await
+    .map_err(WorkerError::EvaluationTask)?;
+    let recomputed: Vec<(i64, String, MaterializedArtifacts)> = match recomputed {
+        Ok(recomputed) => recomputed,
+        // Committed content that no longer resolves against the new revision.
+        // A candidate-level refusal, not infrastructure: the *candidate* is what
+        // broke it, and retrying would break it identically. The compatibility
+        // gate that refuses such a revision before it is written is T17–T19;
+        // until then this is the backstop that keeps the registry consistent.
+        //
+        // The dependent's identifier and the raw validation error are operator
+        // knowledge, logged here — the refusal the caller reads names only the
+        // candidate, because the dependent is a third party that depends on it
+        // and its identifier is not the submitter's to learn (the
+        // non-disclosure rule `WorkerError::DependencyTargetAbsent` states at
+        // the REST boundary).
+        Err(refusal) => {
+            tracing::warn!(
+                gts_id = %refusal.gts_id,
+                entity_id = refusal.entity_id,
+                error = %refusal.error,
+                "types_registry dependent no longer validates against a new revision"
+            );
+            return Ok(Err(ItemFailure::new(
+                "dependent_invalid",
+                "a dependent of this candidate no longer validates against this \
+                 revision; nothing was committed"
+                    .to_owned(),
+            )));
+        }
+    };
 
-        // Read per dependent rather than batched, still: the write set is bounded
-        // and small (measured max fan-out 27), and this read is interleaved with the
-        // recomputation that decides whether to write. The batched port the earlier
-        // note here called for now exists — `Stores::current_schemas`, which the
-        // revision vector (T15) needed twice — so the change is available if the
-        // bound is ever raised; it is not made here, where it would reorder the
-        // transaction's reads and writes for nothing.
-        let current = stores
-            .find_current_schema(tx, scope, row.id)
-            .await?
-            .ok_or_else(|| WorkerError::CurrentStateMissing {
-                gts_id: row.gts_id.clone(),
-                entity_id: row.id,
-            })?;
+    // Every fingerprint in one batched read — one round trip, not one per
+    // dependent, because each extra statement is time the transaction holds the
+    // candidate's row and the version-family lock, which is the window sibling
+    // admissions of the same family block in (`Stores::current_schemas` exists
+    // for exactly this).
+    //
+    // **After the recomputation, not before it.** A commit transaction runs
+    // `READ COMMITTED` (`ports::commit_write`) and nothing here locks a
+    // *dependent* — the family lock covers the candidate's family, and step
+    // 4.3's vector guard has already run — so a dependent's own revision can
+    // commit while this pass computes. `update_current` is keyed on `entity_id`
+    // alone, so a row read before a long meta-compilation and written after it
+    // would restore that row's stale `revision_no` over the newer revision, or
+    // skip the refresh on a fingerprint that is no longer current. Reading here
+    // leaves only the write loop between the read and the write, with no
+    // CPU-bound work in between.
+    let mut current: HashMap<i64, CurrentTypeSchemaRow> = stores
+        .current_schemas(tx, scope, &subject_ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.entity_id, row))
+        .collect();
+
+    let mut refreshed = Vec::new();
+    for (entity_id, gts_id, artifacts) in recomputed {
+        let current =
+            current
+                .remove(&entity_id)
+                .ok_or_else(|| WorkerError::CurrentStateMissing {
+                    gts_id: gts_id.clone(),
+                    entity_id,
+                })?;
         if current.resolution_fingerprint == artifacts.resolution_fingerprint {
             continue;
         }
@@ -204,7 +269,7 @@ pub async fn refresh_dependents(
                 tx,
                 scope,
                 NewCurrentTypeSchema {
-                    entity_id: row.id,
+                    entity_id,
                     revision_no: current.revision_no,
                     resolved_schema: artifacts.resolved_schema,
                     effective_traits: artifacts.effective_traits,
@@ -216,15 +281,25 @@ pub async fn refresh_dependents(
             .await?
         {
             return Err(WorkerError::CurrentStateMissing {
-                gts_id: row.gts_id.clone(),
-                entity_id: row.id,
+                gts_id: gts_id.clone(),
+                entity_id,
             });
         }
-        refreshed.push(row.gts_id.clone());
+        refreshed.push(gts_id);
     }
 
     Ok(Ok(RefreshOutcome {
         refreshed,
         examined: subjects.len(),
     }))
+}
+
+/// The blocking task's refusal: which dependent stopped validating, and why.
+///
+/// Operator-side only — see the refusal site for why none of it reaches the
+/// caller.
+struct DependentInvalid {
+    entity_id: i64,
+    gts_id: String,
+    error: String,
 }

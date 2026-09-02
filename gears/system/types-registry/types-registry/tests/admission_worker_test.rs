@@ -21,7 +21,7 @@ use uuid::Uuid;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::unit::{commit_creation, evaluate};
-use types_registry::domain::admission::worker::{WorkerError, run_operation};
+use types_registry::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::artifacts::resolution_fingerprint;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -75,6 +75,7 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
         &AcceptanceContext {
             policy: &policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -114,8 +115,11 @@ async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -241,8 +245,11 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &stores(),
         &worker_provider(&first_db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         first,
         LATER,
     )
@@ -273,8 +280,11 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
         &stores(),
         &worker_provider(&second_db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -426,8 +436,11 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         first,
         LATER,
     )
@@ -442,8 +455,11 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -456,8 +472,11 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -508,8 +527,11 @@ async fn an_item_naming_a_version_fails_terminally_and_writes_nothing() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -565,8 +587,11 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         first,
         LATER,
     )
@@ -583,8 +608,11 @@ async fn a_creation_against_an_existing_identifier_fails_terminally_with_no_revi
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -629,8 +657,11 @@ async fn an_unresolvable_reference_is_an_item_failure_not_a_worker_error() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -670,8 +701,11 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         first,
         LATER,
     )
@@ -698,8 +732,11 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )
@@ -739,8 +776,11 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -752,8 +792,11 @@ async fn a_second_pass_over_a_completed_operation_is_a_no_op() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -790,8 +833,11 @@ async fn an_unknown_operation_is_an_error() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         Uuid::new_v4(),
         LATER,
     )
@@ -821,8 +867,11 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -891,8 +940,11 @@ async fn a_ref_outside_the_chain_is_admitted() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         first,
         LATER,
     )
@@ -912,8 +964,11 @@ async fn a_ref_outside_the_chain_is_admitted() {
         &stores(),
         &worker_provider(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         second,
         LATER,
     )

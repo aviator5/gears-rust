@@ -151,6 +151,7 @@ async fn router_with(v1_ready: bool) -> Router {
         dispatch,
         // Admission inline, as `init()` wires it until T21.
         AdmissionMode::Inline,
+        common::metrics(),
     ));
     types_registry::api::rest::routes::register_routes(
         Router::new(),

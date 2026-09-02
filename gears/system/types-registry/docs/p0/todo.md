@@ -1194,24 +1194,137 @@ way, so T15 keeps the docstring that states the re-read argument and adds nothin
 `TR/src/infra/storage/{store.rs,repo/type_schema_repo.rs}`, `TR/src/api/rest/error.rs`,
 `TR/src/config.rs`, `TR/tests/*`, `docs/p0/{SPEC,plan}.md`
 
-### - [ ] T16: Observability for the admission path
+### - [x] T16: Observability for the admission path
 
 **Description:** Instrument admission so production behaviour is diagnosable: structured
 spans per operation and per admission unit, and counters for the outcomes and bounds that
 matter.
 
 **Acceptance criteria:**
-- [ ] One span per operation and one per admission unit, carrying `operation_id`, `gts_id`, kind and dry-run mode
-- [ ] Counters: candidates by terminal status, refusals by reason, revalidation retries, activation-set size, worker duration
-- [ ] Every refusal reason in the acceptance path is countable and distinguishable — including `Unknown` compatibility once T17 lands
-- [ ] Structured fields only; no print macros (DE13xx)
+- [x] One span per operation and one per admission unit, carrying `operation_id`, `gts_id`,
+  kind and dry-run mode. `types_registry.admission.operation` opens **before** the first
+  read, so it covers the whole pass — which is why its `kind` and `dry_run` are
+  `field::Empty` and filled in by `record_operation_facts` once the operation row is
+  read. A pass that fails before that read therefore carries *no* `kind` label rather
+  than a blank one, which is its own test. `types_registry.admission.unit` restates
+  `operation_id`, `kind` and `dry_run` beside `gts_id` and `operation_item_id`:
+  deliberate duplication, because under a flat log format a field that lives only on the
+  parent span is not on the line an operator greps
+- [x] Counters: candidates by terminal status, refusals by reason, revalidation retries,
+  activation-set size, worker duration. Five instruments —
+  `types_registry_candidates_total{status}`, `types_registry_refusals_total{stage,reason}`,
+  `types_registry_revalidations_total{drift}`, `types_registry_activation_write_set` and
+  `types_registry_operation_duration_seconds`. **Every label value comes from a closed
+  vocabulary** and no identifier is ever a label: the `drift` label is the *shape* of the
+  drift (`appeared` / `vanished` / `moved` / `refreshed`), not the `gts_id` that drifted,
+  because that one is unbounded and belongs on a span
+- [x] Every refusal reason in the acceptance path is countable and distinguishable —
+  `AcceptanceError::reason()`, one arm per variant over an exhaustive match, so a refusal
+  a later task adds cannot compile until it has a reason — demonstrated by the rebase onto
+  the family-lock work, whose `force_compatibility_unavailable` and
+  `minor_type_schema_revision` refusals broke the build here until both were named. Distinct from the RFC-9457
+  `reason` code `api/rest/error.rs` maps onto, which is deliberately coarse (six variants
+  share `VALIDATION_FAILED`): a client branches on the class, an operator needs the
+  variant. T17's `Unknown` compatibility verdict is refused in the **worker**, so it
+  earns an `ItemFailure` reason and is counted by the same `refusals_total` under
+  `stage="admission"` with no change here
+- [x] Structured fields only; no print macros (DE13xx) — nothing added uses one
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-types-registry` using `tracing-test` to assert emitted fields
-- [ ] Manual: register over REST against `make example`, confirm spans and counters appear
+- [x] Gear tests (see [Commands](#commands)) — `cargo nextest run -p cf-gears-types-registry`:
+  **592 passed** (570 before, +22: 12 in-source, 10 integration; 586 before the rebase onto
+  the family lock, whose own six suites are the difference).
+  `--features integration` on the three container suites: 6 passed
+- [x] Test: the instrument contract — rendered names, label keys, label values and bucket
+  layouts — asserted against a local `InMemoryMetricExporter`, not reviewed. That is what
+  a dashboard depends on, and a dropped `_total` or a renamed label value is invisible in
+  a code review and silently empties a panel
+- [x] Test: the emission sites, end to end through the real `accept` / `run_operation`.
+  `tests/observability_test.rs` installs its own global meter provider and a
+  `types_registry=debug` subscriber for the binary, then drives a success, an `unchanged`
+  re-submission, an admission refusal, two acceptance refusals, a revision that refreshes
+  one dependent, and a real revalidation retry through `PausingStores`
+- [x] Mutation-tested: with all eight emission calls and both `.instrument()` layers
+  removed, **all 10** integration tests fail; restored, all 10 pass. The suite measures
+  the emission and not the fixtures
+- [x] `make fmt`, `make clippy` (`--workspace --all-targets --all-features`) — clean
+- [x] Manual, at runtime: booted the focused example server
+  (`--features static-tenants,static-authn,static-authz,otel`) with the metrics exporter
+  pointed at a local OTLP/HTTP sink, then `POST /cf/types-registry/v2/entities` three
+  times — an admitted schema (`202`), a revision naming version 1 of an absent identifier
+  (`202`, item `failed`), and an empty batch (`400`).
+  **Spans:** both appear on the real log lines, nested inside the gateway's own
+  `http_request` span —
+  `…:types_registry.admission.operation{operation_id=… kind="registration" dry_run=false}:types_registry.admission.unit{operation_id=… gts_id="gts.cf.core.t16.probe.v1~" kind="registration" dry_run=false operation_item_id=1}: … candidate admitted`.
+  **Counters:** the pushed OTLP payloads carry
+  `types_registry_candidates_total`, `types_registry_refusals_total` and
+  `types_registry_operation_duration_seconds`, with the label pairs
+  `status=succeeded`, `status=failed`, `stage=acceptance`, `stage=admission`,
+  `reason=empty_batch` and `reason=precondition_failed` all present as
+  protobuf key/value pairs. Metrics reach a collector only by OTLP push — this gear
+  declares no exporter and no `/metrics` endpoint — so the sink is what makes the
+  check observable at all
+- [x] **One pre-existing boot failure found and set aside, not caused by T16.** With
+  `config/quickstart.yaml` unchanged, the focused server dies at types-registry post-init:
+  the seeded `…am.tenant_type.v1~cf.core.am.platform.v1~` derives from
+  account-management's base schema, which this feature set does not link
+  (`Base schema 'gts.cf.core.am.tenant_type.v1~' not found for chain validation`).
+  The manual check therefore ran against a copy of the config with `entities: []`.
+  Attributed rather than assumed: the failing step is `switch_to_ready`'s chain
+  validation on the **legacy in-memory** path, which T16 does not touch — no line of this
+  task is on that path — and the missing base schema is a feature-selection fact about the
+  focused server, not a registry defect. Not run against `main`'s tree, so "pre-existing"
+  here means "independent of this task", which is what the call graph shows
+
+**Two design decisions worth stating, because both are trade-offs:**
+
+**The instruments are a process-global set, not a domain port.** Every other gear that
+emits metrics (`usage-collector`, `file-storage`, `mini-chat`) owns a
+`domain::ports::…Metrics` trait with an `infra::metrics` adapter injected at `init`. That
+shape was weighed and rejected *for this call graph*: the emission sites are
+`run_operation` → `process_item` → `commit_evaluated` → the commit transaction's `'static`
+closure → `commit_creation` / `commit_revision` → `refresh_reverse_impact`, and two of
+those frames would need their own `Arc` clone per retry attempt while every one of the
+worker's several dozen existing test call sites took an argument no test asserts on.
+`tracing` is already reached exactly this way — a global sink the emitting code neither
+carries nor injects — and metrics are the same kind of signal. What injectability buys is
+testability, and that is bought instead by `AdmissionMetrics::new(&Meter)`: the contract
+is tested against a local provider and the emission against a global one. The cost that
+remains is real: a caller cannot stub these out.
+
+**The activation-write-set histogram counts revisions, not admissions.** A creation
+observes **nothing** rather than zero, because nothing can depend on an identifier the
+registry did not hold a moment ago and `commit_creation` runs no reverse-impact refresh at
+all. A zero *is* recorded for a revision whose dependents all recomputed to identical
+bytes. Both halves are tests, and the creation one carries a control assertion so its zero
+reads as scope rather than as silence.
+
+**Two smaller findings, both from the tests:**
+- `tests/revalidation_test.rs` needed `#![recursion_limit = "256"]`. Its spawned pass nests
+  the whole admission future, and one `tracing::Instrument` layer per level put it over the
+  default 128 — the same reason `lib.rs` already carries the attribute
+- The integration tests **all** hold one serial lock, including the two span tests. Letting
+  the span tests run alongside made `a_creation_observes_no_activation_write_set` see three
+  successes instead of one, intermittently: their admissions increment the very counters the
+  others measure a delta of. `Temporality::Delta` is what makes the per-test reset
+  meaningful — under the default cumulative temporality a flush re-exports every count
+  since process start and `reset()` clears the batches without clearing the sums
 
 **Dependencies:** T8 (may run parallel with T14, T15)
-**Files likely touched:** `TR/src/domain/admission/worker.rs`, `TR/src/domain/admission/acceptance.rs`, `TR/src/observability.rs`, `TR/tests/observability_test.rs`
+**Files touched:**
+- `TR/src/observability.rs` — NEW, the instrument set, the label vocabularies and the two
+  span constructors
+- `TR/src/observability_tests.rs` — NEW, 12 in-source contract tests
+- `TR/tests/observability_test.rs` — NEW, 10 emission tests
+- `TR/src/domain/admission/worker.rs` — the two spans, the duration histogram, the
+  candidate counters and the revalidation-retry counter; `run_operation` split into a
+  wrapper and `run_operation_inner` so the span covers the first read
+- `TR/src/domain/admission/acceptance.rs` — `AcceptanceError::reason()`; `accept` split
+  into a wrapper and `accept_inner` so every refusal of the path passes one counting point
+- `TR/src/domain/admission/unit.rs` — the activation-write-set observation
+- `TR/src/gear.rs` — `bind_instruments()` at a known point after `ToolKit` installs the
+  provider
+- `TR/src/lib.rs`, `TR/Cargo.toml`, `TR/tests/revalidation_test.rs`
 **Scope:** S
 
 ---
@@ -1220,7 +1333,7 @@ matter.
 - [ ] Dependent refresh is atomic with the new revision; identical recomputation is a no-op
 - [ ] Activation bound refuses rather than partially commits
 - [ ] Multi-pod read-after-commit holds
-- [ ] Admission emits spans and metrics
+- [x] Admission emits spans and metrics — T16, verified at runtime as well as in tests
 - [ ] `make dylint` — full workspace, once for the phase (P13)
 - [ ] Human review
 

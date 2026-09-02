@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::worker::{WorkerError, run_operation};
+use types_registry::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -74,6 +74,7 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
         &AcceptanceContext {
             policy: &policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -110,8 +111,11 @@ async fn admit_type_then(
         &stores(),
         &worker(db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         type_op,
         LATER,
     )
@@ -123,8 +127,11 @@ async fn admit_type_then(
         &stores(),
         &worker(db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         op,
         LATER,
     )
@@ -244,8 +251,11 @@ async fn an_instance_without_its_type_fails_retryably() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         op,
         LATER,
     )
@@ -281,8 +291,11 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         type_op,
         LATER,
     )
@@ -299,8 +312,11 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         schema_op,
         LATER,
     )
@@ -319,8 +335,11 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         instance_op,
         LATER,
     )
@@ -379,8 +398,11 @@ async fn a_type_schema_may_not_join_an_instance_family() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         schema_op,
         LATER,
     )

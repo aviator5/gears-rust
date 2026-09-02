@@ -26,6 +26,13 @@
 //! would see no tables.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
+// `admit_with_a_mutation_in_the_gap` spawns a task whose future nests the whole
+// admission pass — handler-free, but still worker → item → commit → transaction
+// closure, and since T16 one `tracing::Instrument` layer per level on top. The
+// default limit of 128 is reached laying that state machine out. The lib crate
+// carries the same attribute for the same reason; nothing here recurses at
+// runtime.
+#![recursion_limit = "256"]
 
 mod common;
 
@@ -47,7 +54,9 @@ use types_registry::domain::admission::unit::{
     EvaluatedUnit, RevisionCommit, commit_creation, commit_revision, evaluate,
 };
 use types_registry::domain::admission::vector::{VectorDrift, VectorRole};
-use types_registry::domain::admission::worker::{OperationOutcome, WorkerError, run_operation};
+use types_registry::domain::admission::worker::{
+    OperationOutcome, Tuning, WorkerError, run_operation,
+};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
@@ -143,6 +152,7 @@ async fn submit(
         &AcceptanceContext {
             policy: &policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -177,8 +187,11 @@ async fn admit(
         &stores(),
         &worker(db),
         &allow_all(),
-        &common::limits(),
-        &worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &worker_settings(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -245,6 +258,7 @@ async fn commit_the_revision(
                     expected_resource_version,
                     common::limits().activation_write_set,
                     LATER,
+                    &common::metrics(),
                 )
                 .await
             })
@@ -353,7 +367,7 @@ async fn a_phantom_dependent_created_after_the_scan_is_detected() {
 
     let unit = evaluated(&db, "k-base-2", BASE, base_schema("label"), Some(1)).await;
     assert!(
-        unit.vector.entries.is_empty(),
+        unit.vector.entries().is_empty(),
         "the base has no dependencies and, yet, no dependents: {:?}",
         unit.vector
     );
@@ -395,7 +409,7 @@ async fn a_dependent_refreshed_after_the_scan_is_detected() {
     let unit = evaluated(&db, "k-base-2", BASE, base_schema("label"), Some(1)).await;
     let recorded = unit
         .vector
-        .entries
+        .entries()
         .iter()
         .find(|entry| entry.gts_id == DERIVED)
         .expect("the derived type is a dependent of the base")
@@ -563,8 +577,11 @@ where
             &ports,
             &provider,
             &allow_all(),
-            &common::limits(),
-            &settings,
+            Tuning {
+                limits: &common::limits(),
+                worker: &settings,
+                metrics: &common::metrics(),
+            },
             operation_id,
             LATER,
         )
@@ -696,6 +713,7 @@ fn service(db: &Provider) -> RegistryService {
         TypesRegistryConfig::default(),
         dispatch,
         AdmissionMode::Inline,
+        common::metrics(),
     )
 }
 

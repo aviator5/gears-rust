@@ -30,6 +30,10 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# The admission-path instruments (T16). Declared on a `Meter` from the
+# **global** `SdkMeterProvider` ToolKit installs before `Gear::init`; this gear
+# never builds an exporter and exposes no `/metrics` endpoint.
+opentelemetry = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -63,6 +67,9 @@ toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-utils = { workspace = true }
+# `MetricsConfig::effective_prefix` derives the default metric prefix from the
+# gear name, the way the other gears' metrics configs do.
+heck = { workspace = true }
 
 [features]
 # Gates the container-backed PostgreSQL / MySQL migration tests
@@ -86,4 +93,18 @@ testcontainers = { workspace = true }
 test-containers = { workspace = true }
 # `Router::oneshot` for the REST contract tests (T9).
 tower = { workspace = true }
+# `InMemoryMetricExporter` for the instrument-contract tests: the rendered
+# names, labels and bucket layouts are the observability contract, so they are
+# asserted rather than reviewed (T16).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Span and event fields are the other half of that contract; `tracing-test`
+# captures them per test (T16).
+tracing-test = { workspace = true }
+# `tests/observability_test.rs` captures spans emitted by the real admission
+# path. It builds its own subscriber rather than using `tracing-test`, whose
+# per-crate env filter is derived from the *test* crate's name and so filters
+# out everything this gear emits (its own documentation says integration tests
+# need the `no-env-filter` feature, which would capture every dependency's
+# TRACE output into one global buffer for the whole binary).
+tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }

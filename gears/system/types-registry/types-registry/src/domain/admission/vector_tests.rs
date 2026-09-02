@@ -29,12 +29,10 @@ fn dependent(gts_id: &str, resource_version: i64, fingerprint: u8) -> VectorEntr
 }
 
 fn vector(entries: Vec<VectorEntry>) -> RevisionVector {
-    let mut entries = entries;
-    entries.sort_by(|a, b| key(a).cmp(&key(b)));
-    RevisionVector {
-        roots: vec![BASE.to_owned()],
-        entries,
-    }
+    // The constructor sorts, so order in the fixtures below is free — and the
+    // invariant the private field exists to protect is the constructor's job,
+    // not each test's.
+    RevisionVector::new(vec![BASE.to_owned()], entries)
 }
 
 #[test]

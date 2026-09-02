@@ -30,6 +30,12 @@ pub use gear::TypesRegistryGear;
 pub mod config;
 mod policy_config;
 
+// === OBSERVABILITY ===
+// The admission path's spans (T16). The instruments live behind
+// `domain::ports::metrics` with their OpenTelemetry adapter in `infra::metrics`;
+// this module keeps what every signal shares: the `tracing` spans.
+pub mod observability;
+
 // === INTERNAL MODULES ===
 #[doc(hidden)]
 pub mod api;

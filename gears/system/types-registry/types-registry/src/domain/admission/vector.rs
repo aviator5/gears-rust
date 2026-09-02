@@ -145,7 +145,13 @@ pub struct RevisionVector {
     /// commit transaction should not do.
     pub roots: Vec<String>,
     /// One entry per dependency and dependent, `(gts_id, role)`-sorted.
-    pub entries: Vec<VectorEntry>,
+    ///
+    /// Private because the sortedness is load-bearing: [`Self::drift`] is one
+    /// merge walk over two sorted sequences, so a vector built without the sort
+    /// would report a spurious `Vanished` / `Appeared` and terminalize a valid
+    /// candidate as `revalidation_exhausted`. [`Self::new`] is the only
+    /// constructor and it sorts, so the invariant cannot be bypassed.
+    entries: Vec<VectorEntry>,
 }
 
 /// The first difference between a recorded vector and a freshly-derived one.
@@ -201,6 +207,21 @@ impl std::fmt::Display for VectorDrift {
 }
 
 impl RevisionVector {
+    /// The only constructor: takes the entries in whatever order they were
+    /// collected and sorts them into the canonical `(gts_id, role)` order the
+    /// comparison below is a merge walk over.
+    #[must_use]
+    pub fn new(roots: Vec<String>, mut entries: Vec<VectorEntry>) -> Self {
+        entries.sort_by(|a, b| key(a).cmp(&key(b)));
+        Self { roots, entries }
+    }
+
+    /// One entry per dependency and dependent, `(gts_id, role)`-sorted.
+    #[must_use]
+    pub fn entries(&self) -> &[VectorEntry] {
+        &self.entries
+    }
+
     /// The drift between this vector and a freshly-derived one, or `None` when the
     /// two agree.
     ///
@@ -405,11 +426,7 @@ pub async fn derive_from(
         });
     }
 
-    entries.sort_by(|a, b| key(a).cmp(&key(b)));
-    Ok(Ok(RevisionVector {
-        roots: roots.to_vec(),
-        entries,
-    }))
+    Ok(Ok(RevisionVector::new(roots.to_vec(), entries)))
 }
 
 /// Step 4.3: re-derive the vector inside the commit transaction, compare, and

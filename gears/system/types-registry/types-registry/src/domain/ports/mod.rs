@@ -51,6 +51,9 @@ use crate::domain::enums::{
 };
 use crate::domain::family::FamilyKey;
 
+// The output port the admission path's instruments cross (T16).
+pub mod metrics;
+
 // ---------------------------------------------------------------------------
 // Read transactions
 // ---------------------------------------------------------------------------

@@ -122,10 +122,7 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
         // and nothing else, and nothing references it, so both halves are empty
         // (T15). The commit's guard re-derives exactly this and finds no drift,
         // which is what keeps this file about the two branches it is named for.
-        vector: RevisionVector {
-            roots: vec![parsed.id().to_owned()],
-            entries: Vec::new(),
-        },
+        vector: RevisionVector::new(vec![parsed.id().to_owned()], Vec::new()),
     }
 }
 
@@ -215,6 +212,7 @@ async fn commit_alone(
                     expected,
                     common::limits().activation_write_set,
                     NOW,
+                    &common::metrics(),
                 )
                 .await
             })
@@ -269,6 +267,7 @@ async fn a_paused_unchanged_pass_reports_the_precondition_it_lost(db: &Provider,
                         1,
                         common::limits().activation_write_set,
                         NOW,
+                        &common::metrics(),
                     )
                     .await
                 })
@@ -335,6 +334,7 @@ async fn a_paused_revision_loses_the_compare_and_swap(db: &Provider, backend: &s
                         1,
                         common::limits().activation_write_set,
                         NOW,
+                        &common::metrics(),
                     )
                     .await
                 })

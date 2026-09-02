@@ -482,6 +482,8 @@ impl From<AcceptanceError> for CanonicalError {
 mod tests {
     use super::*;
     use crate::domain::admission::acceptance::PolicyRefusalError;
+    use crate::domain::admission::vector::{VectorDrift, VectorRole};
+    use crate::domain::admission::worker::ItemFailure;
     use crate::domain::gts_store::StoreBuildError;
     use crate::domain::policy::PolicyRefusal;
     use axum::response::IntoResponse;
@@ -738,6 +740,19 @@ mod tests {
             worker_problem(WorkerError::ResourceVersionExhausted {
                 gts_id: "version-secret".to_owned(),
             }),
+            // The two arms whose `Display` interpolates caller-visible content:
+            // the refusal's reason and message, and the drift's identifiers. The
+            // leak guard below must hold for them exactly as for the opaque ones.
+            worker_problem(WorkerError::RefusedAfterWrite(ItemFailure::new(
+                "reason-secret",
+                "message-secret".to_owned(),
+            ))),
+            worker_problem(WorkerError::RevalidationRequired(VectorDrift::Moved {
+                gts_id: "drift-secret".to_owned(),
+                role: VectorRole::Dependent,
+                recorded: 1,
+                found: 2,
+            })),
             worker_problem(WorkerError::Storage(ScopeError::Invalid("storage-secret"))),
             worker_problem(WorkerError::Db(DbError::InvalidConfig(
                 "database-secret".to_owned(),

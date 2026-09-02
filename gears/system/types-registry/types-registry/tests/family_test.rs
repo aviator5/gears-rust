@@ -31,7 +31,7 @@ use uuid::Uuid;
 use types_registry::config::{TypesRegistryConfig, WorkerSettings};
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::worker::{
-    LOCK_GEAR, OperationOutcome, WorkerError, family_lock_key, run_operation,
+    LOCK_GEAR, OperationOutcome, Tuning, WorkerError, family_lock_key, run_operation,
 };
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
@@ -98,6 +98,7 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str) -> Uuid 
         &AcceptanceContext {
             policy: &policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -128,8 +129,11 @@ async fn admit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str) -> Operat
         &stores(),
         &worker(db),
         &allow_all(),
-        &common::limits(),
-        &common::worker_settings(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
         op,
         LATER,
     )
@@ -439,8 +443,11 @@ async fn a_creation_holds_the_family_lock_across_its_commit() {
             &stores_handle,
             &provider,
             &allow_all(),
-            &common::limits(),
-            &common::worker_settings(),
+            Tuning {
+                limits: &common::limits(),
+                worker: &common::worker_settings(),
+                metrics: &common::metrics(),
+            },
             op,
             LATER,
         )
@@ -540,8 +547,11 @@ async fn family_lock_contention_honours_the_configured_wait_budget() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &settings,
+        Tuning {
+            limits: &common::limits(),
+            worker: &settings,
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -559,8 +569,11 @@ async fn family_lock_contention_honours_the_configured_wait_budget() {
         &stores(),
         &worker(&db),
         &allow_all(),
-        &common::limits(),
-        &WorkerSettings::default(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &WorkerSettings::default(),
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )

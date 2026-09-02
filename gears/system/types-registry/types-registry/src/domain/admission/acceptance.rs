@@ -44,6 +44,7 @@ use super::{Accepted, OperationDispatch, Precondition, SubmitRequest};
 use crate::config::TypesRegistryConfig;
 use crate::domain::enums::{OperationKind, OwnershipScope, Plane};
 use crate::domain::policy::{PolicyRefusal, RegistrationPolicy};
+use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage};
 use crate::domain::ports::{NewOperation, NewOperationItem, OperationRow, Stores};
 
 /// Largest `Idempotency-Key` the column accepts (`varchar(255)`).
@@ -129,6 +130,58 @@ pub enum AcceptanceError {
     Db(#[from] DbError),
 }
 
+impl AcceptanceError {
+    /// The stable machine reason this refusal is counted and logged under.
+    ///
+    /// One arm per variant, and the match is exhaustive on purpose: a refusal
+    /// added by a later task cannot compile until it has a reason here, which is
+    /// what keeps *"every refusal reason in the acceptance path is countable and
+    /// distinguishable"* true rather than aspirational. T17's `Unknown`
+    /// compatibility verdict is refused in the worker, so it earns an
+    /// `ItemFailure` reason rather than one of these.
+    ///
+    /// Distinct from the RFC-9457 `reason` code `api::rest::error` maps these
+    /// onto, which is deliberately coarse — six variants share
+    /// `VALIDATION_FAILED` there, because a client branches on the *class* of
+    /// problem while an operator needs the variant.
+    ///
+    /// The three infrastructure arms are included rather than excluded: they are
+    /// not client refusals, but they are outcomes of the acceptance path, and a
+    /// deployment whose acceptances are failing on storage wants that series next
+    /// to the ones that are being refused on their merits.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::MissingIdempotencyKey => "missing_idempotency_key",
+            Self::IdempotencyKeyTooLong { .. } => "idempotency_key_too_long",
+            Self::EmptyBatch => "empty_batch",
+            Self::BatchTooLarge { .. } => "batch_too_large",
+            Self::InvalidIdentifier { .. } => "invalid_identifier",
+            Self::DuplicateCandidate { .. } => "duplicate_candidate",
+            Self::PolicyRefused(_) => "policy_refused",
+            Self::ExplicitUuidTail { .. } => "explicit_uuid_tail",
+            Self::InstanceVersionProfile { .. } => "instance_version_profile",
+            Self::MissingDialect { .. } => "missing_dialect",
+            Self::UnsupportedDialect { .. } => "unsupported_dialect",
+            Self::ConflictingDialect { .. } => "conflicting_dialect",
+            Self::MissingContent { .. } => "missing_content",
+            Self::AuthoredDocumentTooLarge { .. } => "authored_document_too_large",
+            Self::ForceNotPermitted { .. } => "force_not_permitted",
+            Self::ForceHasNothingToWaive { .. } => "force_has_nothing_to_waive",
+            Self::ForceCompatibilityUnavailable { .. } => "force_compatibility_unavailable",
+            Self::MinorTypeSchemaRevision { .. } => "minor_type_schema_revision",
+            Self::ZeroPrecondition { .. } => "zero_precondition",
+            Self::NegativePrecondition { .. } => "negative_precondition",
+            Self::UnsupportedOperationKind => "unsupported_operation_kind",
+            Self::DryRunNotAccepted => "dry_run_not_accepted",
+            Self::FingerprintConflict { .. } => "fingerprint_conflict",
+            Self::Dispatch(_) => "dispatch_failure",
+            Self::Storage(_) => "storage_failure",
+            Self::Db(_) => "database_failure",
+        }
+    }
+}
+
 /// Wrapper so [`PolicyRefusal`] — which is a value, not an error — can be a
 /// `#[source]` without implementing `Error` in the policy module.
 #[domain_model]
@@ -142,6 +195,9 @@ pub struct PolicyRefusalError(pub PolicyRefusal);
 pub struct AcceptanceContext<'a> {
     pub policy: &'a RegistrationPolicy,
     pub config: &'a TypesRegistryConfig,
+    /// The admission instruments (T16), injected rather than reached through a
+    /// global — the same wiring every other gear's meter uses.
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
 /// A validated request: everything the transaction needs, and nothing that would
@@ -411,6 +467,46 @@ pub fn validate(
 /// Any [`AcceptanceError`], including [`AcceptanceError::FingerprintConflict`]
 /// for a key already bound to a different request.
 pub async fn accept(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<AcceptanceError>,
+    scope: &AccessScope,
+    ctx: &AcceptanceContext<'_>,
+    dispatch: &Arc<dyn OperationDispatch>,
+    request: &SubmitRequest,
+    now: OffsetDateTime,
+) -> Result<Accepted, AcceptanceError> {
+    let accepted = accept_inner(stores, db, scope, ctx, dispatch, request, now).await;
+    // Every refusal of this path passes through exactly this point, which is why
+    // the counting is here and not at the two dozen `return Err(..)` sites in
+    // `validate`: a reason added later is counted without anyone remembering to
+    // count it, and `validate` stays a pure function of its inputs.
+    if let Err(error) = &accepted {
+        let reason = error.reason();
+        ctx.metrics.refused(RefusalStage::Acceptance, reason);
+        // The `warn` is for client refusals only. The three infrastructure arms
+        // — `Storage`, `Db`, `Dispatch` — are faults, not refusals: reporting
+        // one at `warn` as well would log it twice (the REST boundary's
+        // `opaque_internal` already logs it at `error`) and put a failing
+        // database on a refusal-rate dashboard beside rejected requests.
+        let infrastructure = matches!(
+            error,
+            AcceptanceError::Storage(_) | AcceptanceError::Db(_) | AcceptanceError::Dispatch(_)
+        );
+        if !infrastructure {
+            tracing::warn!(
+                reason,
+                candidates = request.candidates.len(),
+                %error,
+                "types_registry refused a submission"
+            );
+        }
+    }
+    accepted
+}
+
+/// [`accept`]'s body. Separated only so that its single exit point is a place the
+/// refusal counter can sit; nothing else calls it.
+async fn accept_inner(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<AcceptanceError>,
     scope: &AccessScope,

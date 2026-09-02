@@ -33,6 +33,7 @@ use crate::domain::dependency::{DependencyEdge, extract_edges};
 use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
 use crate::domain::family::{FamilyKey, admits_new_member, family_key};
 use crate::domain::gts_store::{UnitDocument, UnitStore, load_unit_store};
+use crate::domain::ports::metrics::AdmissionMetrics;
 use crate::domain::ports::{
     NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewRevision, Stores,
     snapshot_read,
@@ -768,6 +769,7 @@ async fn commit_unchanged(
 /// current state. A lost or stale precondition, and a revision aimed at a
 /// tombstone, are [`ItemFailure`]s in the `Ok(Err(..))` position — terminal, and
 /// never rebased onto the current version.
+#[allow(clippy::too_many_arguments)]
 pub async fn commit_revision(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -776,6 +778,7 @@ pub async fn commit_revision(
     expected_resource_version: i64,
     activation_write_set: usize,
     now: OffsetDateTime,
+    metrics: &Arc<dyn AdmissionMetrics>,
 ) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
     let Some(entity) = stores.find_by_gts_id(tx, scope, &unit.gts_id).await? else {
         return Ok(Err(ItemFailure::new(
@@ -987,6 +990,7 @@ pub async fn commit_revision(
         entity.id,
         activation_write_set,
         now,
+        metrics,
     )
     .await?;
 
@@ -1032,6 +1036,7 @@ pub async fn commit_revision(
 /// inside the caller's transaction by construction (`refresh::refresh_dependents`),
 /// and that transaction has already written the revision, so a refusal has to roll
 /// it back rather than travel in the `Ok` position, which commits.
+#[allow(clippy::too_many_arguments)]
 async fn refresh_reverse_impact(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -1040,12 +1045,19 @@ async fn refresh_reverse_impact(
     entity_id: i64,
     activation_write_set: usize,
     now: OffsetDateTime,
+    metrics: &Arc<dyn AdmissionMetrics>,
 ) -> Result<(), WorkerError> {
     if !matches!(unit.outcome, EvaluatedOutcome::TypeSchema { .. }) {
         return Ok(());
     }
     match refresh_dependents(stores, tx, scope, &[entity_id], activation_write_set, now).await? {
         Ok(outcome) => {
+            // Observed here rather than inside `refresh_dependents`, which also
+            // returns the over-bound refusal: a refused revision commits nothing,
+            // so recording its would-be write set would put a value in the
+            // histogram that never became a write. That case is the
+            // `activation_write_set_exceeded` refusal counter instead.
+            metrics.observe_activation_write_set(outcome.refreshed.len());
             tracing::debug!(
                 gts_id = %unit.gts_id,
                 refreshed = outcome.refreshed.len(),

@@ -30,7 +30,9 @@ use common::{allow_all, stores, test_db};
 use types_registry::config::{Limits, TypesRegistryConfig, WorkerSettings};
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::refresh::RefreshOutcome;
-use types_registry::domain::admission::worker::{OperationOutcome, WorkerError, run_operation};
+use types_registry::domain::admission::worker::{
+    OperationOutcome, Tuning, WorkerError, run_operation,
+};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
@@ -122,6 +124,7 @@ async fn submit(
         &AcceptanceContext {
             policy: &policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -158,8 +161,11 @@ async fn admit_with(
         &stores(),
         &worker(db),
         &allow_all(),
-        limits,
-        worker_settings,
+        Tuning {
+            limits: limits,
+            worker: worker_settings,
+            metrics: &common::metrics(),
+        },
         operation_id,
         LATER,
     )
@@ -407,6 +413,68 @@ async fn an_over_bound_write_set_commits_nothing() {
     assert_eq!(
         current(&db, REFERRER).await.resolution_fingerprint,
         before_referrer.resolution_fingerprint,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the consistency backstop
+// ---------------------------------------------------------------------------
+
+/// A revision that makes committed content stop validating is refused by the
+/// refresh — the backstop that keeps the registry consistent until the T17–T19
+/// compatibility gate refuses such a revision *before* it is written.
+///
+/// The incompatible revision here is the base declaring `x-gts-final`, which the
+/// base itself validates under (its chain is one segment) and which breaks every
+/// derived type above it. The refusal must name only the candidate: the
+/// dependent is a third party that happens to depend on it, and its identifier
+/// is operator knowledge, not the submitter's.
+#[tokio::test]
+async fn an_incompatible_revision_refuses_on_dependent_invalid_and_commits_nothing() {
+    let db = test_db().await;
+    admit(&db, "k-base", BASE, base_schema("name"), None).await;
+    admit(&db, "k-derived", DERIVED, derived_schema(), None).await;
+
+    let before_base = entity(&db, BASE).await;
+    let before_base_current = current(&db, BASE).await;
+    let before_derived = current(&db, DERIVED).await;
+
+    let final_base = json!({
+        "$id": format!("gts://{BASE}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": { "name": { "type": "string" } },
+        "x-gts-final": true,
+    });
+    let outcome = admit(&db, "k-base-final", BASE, final_base, Some(1)).await;
+
+    let item = &outcome.items[0];
+    assert_eq!(item.status, OperationItemStatus::Failed, "got {item:?}");
+    let failure = item
+        .failure
+        .as_ref()
+        .expect("a failed item names its reason");
+    assert_eq!(failure.reason, "dependent_invalid");
+    assert!(
+        !failure.message.contains(DERIVED),
+        "the refusal must not disclose the dependent to the submitter: {}",
+        failure.message
+    );
+
+    assert_eq!(
+        entity(&db, BASE).await.resource_version,
+        before_base.resource_version,
+        "the incompatible revision rolled back with the refresh"
+    );
+    assert_eq!(
+        current(&db, BASE).await,
+        before_base_current,
+        "the base's current row is the one it had before the refused revision"
+    );
+    assert_eq!(
+        current(&db, DERIVED).await.resolution_fingerprint,
+        before_derived.resolution_fingerprint,
+        "no dependent was refreshed by a revision that was refused"
     );
 }
 
