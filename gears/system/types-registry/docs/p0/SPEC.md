@@ -770,6 +770,33 @@ The toolkit has no `ETag` helper, which is manual work rather than a missing cap
 `OperationBuilder::no_content_response` accepts any status, so `304` is declarable, and
 `file-storage` already returns `StatusCode::NOT_MODIFIED` with headers by hand.
 
+### 8.6 Observability of the write path
+
+Admission is asynchronous, so an operator cannot read a decision off the response that triggered
+it. What the write path emits is therefore part of the contract, not a by-product:
+
+- **Two spans.** `types_registry.admission.operation` covers one pass over one operation and
+  opens before its first read; `types_registry.admission.unit` covers one candidate. Both carry
+  `operation_id`, `kind` and `dry_run`, the unit span also `gts_id` and `operation_item_id`.
+  Identifiers, selected baselines and dependent counts are **span fields** — per event, not per
+  series.
+- **Instruments behind a domain port.** `AdmissionMetrics` is a `domain::ports` trait with an
+  OpenTelemetry adapter in `infra`, injected at `init`; domain code never names the SDK. The
+  rendered names carry a configurable prefix, `_total` on counters and `_seconds` on the duration
+  histogram, and they are asserted rather than reviewed.
+- **Every label value comes from a closed vocabulary, and no identifier is ever a label.** The
+  vocabularies are `status`, `stage`, `reason`, `drift`, `verdict`, `dry_run` and `kind`.
+- **Every terminal outcome and every refusal is countable, and the vocabulary is
+  compile-enforced.** Acceptance-stage reasons come from an exhaustive match; admission-stage
+  reasons come from a `Reason` newtype whose only constructors are named consts, so a refusal
+  added later cannot compile without a reason. The one unbounded case — a reason read back off a
+  stored `error_payload` — maps to a single `other` label.
+- **A series never blends decisions of different kinds.** A dry run performs no write and a
+  deletion is not a registration, so `dry_run` and `kind` are labels wherever a counter would
+  otherwise merge them. An undecidable compatibility comparison is likewise distinguishable from
+  a decided-against one in the metrics, not only in the refusal reason — which is what makes
+  §16.12 observable in a deployment.
+
 ## 9. Database
 
 `database.sql` is the normative target. P0 creates **9 of its 11 tables**, omitting only
@@ -1544,6 +1571,10 @@ is the executable task list. The number is kept because other documents cite it.
     move (§8.5).
 15. `GET /entities` returns a bounded, content-free page whose cursor traverses the whole
     set exactly once, and no response is unbounded in item count or in bytes (§10.2, D12).
+16. Every admission decision is diagnosable from the emitted signals alone (§8.6): each terminal
+    outcome and each refusal is counted under a closed vocabulary, an `Unknown` compatibility
+    verdict and a forced waiver are each distinguishable in the metrics, and no series blends a
+    dry run with a commit or a deletion with a registration.
 
 ---
 

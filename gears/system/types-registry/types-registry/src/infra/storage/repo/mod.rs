@@ -25,7 +25,7 @@
 //! the pattern (`prefilter_prefix` in [`entity_repo`]): too tight would silently
 //! *drop* real matches.
 //!
-//! # One dependency walk is a recursive CTE and the other is a loop
+//! # Both dependency walks are recursive CTEs
 //!
 //! `11_database_patterns.md` forbids raw SQL outside migration definitions, and
 //! this file has none. That used to rule a recursive CTE out entirely; it no
@@ -33,10 +33,11 @@
 //! a scoped `WITH RECURSIVE` through the typed builder, scope embedded in both the
 //! seed and the recursive member.
 //!
-//! So the two walks are shaped by what their callers need rather than by what SQL
-//! was available: [`DependencyRepo::reverse_impact`] is one statement, and
-//! [`DependencyRepo::closure`] stays an iterative worklist. See that module's
-//! header for the reasons, and SPEC §D5 for the decision this corrected.
+//! [`DependencyRepo::reverse_impact`] took that first (SPEC §D5);
+//! [`DependencyRepo::closure`] followed, once it was clear that the per-hop
+//! `entity` reads its worklist interleaved were never what drove the walk. Both
+//! now cost a fixed number of round trips rather than a pair per hop. See that
+//! module's header.
 
 pub mod dependency_repo;
 pub mod entity_repo;

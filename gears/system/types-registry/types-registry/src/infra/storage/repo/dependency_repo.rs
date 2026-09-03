@@ -2,30 +2,32 @@
 //! closure the transient `gts-rust` store is built from, and the reverse-impact
 //! read a revision refreshes against.
 //!
-//! # Two traversals over one table, in two different shapes
+//! # Two traversals over one table, one shape
 //!
-//! [`DependencyRepo::closure`] walks forward (what a candidate consumes) with an
-//! iterative worklist; [`DependencyRepo::reverse_impact`] walks backward (who
-//! consumes the candidate) with one `WITH RECURSIVE`. The asymmetry is
-//! deliberate, and it is not a portability story — `SecureCteSelect` (ADR-0001)
-//! makes a scoped recursive CTE expressible through the typed builder on all
-//! three backends, so both *could* be either shape.
+//! [`DependencyRepo::closure`] walks forward (what a candidate consumes) and
+//! [`DependencyRepo::reverse_impact`] walks backward (who consumes the
+//! candidate). Both are one scoped `WITH RECURSIVE` through `SecureCteSelect`
+//! (ADR-0001), and they differ only in which of the edge table's two columns
+//! anchors the recursion and which one the outer join reads back.
 //!
-//! What separates them is what each caller needs back. The forward closure is
-//! read to build a store, and its rows arrive as whole entities plus their
-//! authored documents, which the walk interleaves with per-hop reads anyway.
-//! The reverse read is a set of ids the commit is about to write to, and it runs
-//! **inside the commit transaction** — where every extra round trip is time spent
-//! holding the entity's row lock. One statement instead of two per hop is the
-//! whole point.
+//! The forward walk was an iterative worklist until this commit, on the reasoning
+//! that its caller wants whole entities plus their authored documents and so
+//! interleaves per-hop `entity` reads anyway. That reasoning was circular: the
+//! per-hop read never drove the walk — the frontier came from the edge table
+//! alone — so it was a batched read the loop had merely spread across hops.
+//! Round trips are now fixed rather than linear in depth for both directions.
+//!
+//! What still differs is what a round trip *costs*. The reverse read runs
+//! **inside the commit transaction**, where each one is time spent holding the
+//! entity's row lock; the forward read runs in the caller's snapshot, where it is
+//! only latency. That is a difference in how much the saving is worth, not in
+//! whether the shape is available.
 
 use std::collections::{HashMap, HashSet};
 
 use gts::GtsId;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait};
-use sea_orm::{
-    ActiveValue::Set, ColumnTrait, Condition, EntityTrait, FromQueryResult, QueryFilter,
-};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, FromQueryResult};
 use toolkit_db::secure::{
     AccessScope, DBRunner, RecursiveCte, ScopeError, SecureDeleteExt, SecureEntityExt,
     SecureInsertManyExt,
@@ -54,9 +56,12 @@ use crate::infra::storage::entity::{dependency, entity};
 /// generation/staging protocol in DESIGN §4.
 const CLOSURE_BOUND: usize = 512;
 
-/// Name of the reverse-impact CTE. A `&'static str` because that is what
+/// Name of the forward-closure CTE. A `&'static str` because that is what
 /// `SecureCteSelect` takes, and one constant because the definition and the join
 /// that references it must not drift apart.
+const FORWARD_CLOSURE_CTE: &str = "forward_closure";
+
+/// Name of the reverse-impact CTE. See [`FORWARD_CLOSURE_CTE`].
 const REVERSE_IMPACT_CTE: &str = "reverse_impact";
 
 pub struct DependencyRepo;
@@ -111,36 +116,14 @@ impl DependencyRepo {
         Ok(())
     }
 
-    /// The entities directly consumed by any of `from_entity_ids`, chunked.
-    pub async fn direct_dependencies(
-        runner: &impl DBRunner,
-        scope: &AccessScope,
-        from_entity_ids: &[i64],
-    ) -> Result<Vec<i64>, ScopeError> {
-        let mut out = Vec::new();
-        for chunk in from_entity_ids.chunks(IN_CHUNK) {
-            let rows = dependency::Entity::find()
-                .filter(dependency::Column::FromEntityId.is_in(chunk.iter().copied()))
-                .secure()
-                .scope_with(scope)
-                .all(runner)
-                .await?;
-            out.extend(rows.into_iter().map(|r| r.to_entity_id));
-        }
-        Ok(out)
-    }
-
     /// Candidate identifiers plus the transitive closure of what they consume,
     /// `gts_id`-sorted. This is what the transient `gts-rust` store is built from.
     ///
-    /// An iterative worklist over direct edges rather than a recursive CTE — see
-    /// the module header. The `seen` set is what keeps the walk linear in entities
-    /// rather than in paths: the relation is acyclic (ADR-0012) but its paths
-    /// converge, so a diamond would otherwise be re-walked once per path. It also
-    /// bounds the damage if a row ever contradicted that invariant — bounded work
-    /// instead of a walk that never ends.
+    /// Three reads regardless of graph depth: resolve the seeds, one
+    /// `WITH RECURSIVE` for everything reachable from them, one batched read for
+    /// the rows the walk added. See the module header for what this replaced.
     ///
-    /// # The worklist is seeded from the identifier, not only from the edge table
+    /// # The walk is seeded from the identifier, not only from the edge table
     ///
     /// Each root contributes its whole `GtsId::chain_ids()` — every prefix of its
     /// `~`-chain — before the edge walk starts (T10). That is a **different
@@ -160,6 +143,10 @@ impl DependencyRepo {
     /// computed over the original roots only** — a chain member the seed added is
     /// not something the caller asked for, so its absence is the store builder's
     /// problem to name, not a missing root.
+    ///
+    /// # Errors
+    /// Propagates the reads, and [`ScopeError::Invalid`] when the closure exceeds
+    /// [`CLOSURE_BOUND`].
     pub async fn closure(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -189,30 +176,23 @@ impl DependencyRepo {
         missing_roots.sort();
         missing_roots.dedup();
 
-        let mut seen: HashSet<i64> = resolved.iter().map(|r| r.id).collect();
-        let mut frontier: Vec<i64> = seen.iter().copied().collect();
+        let seed_ids: Vec<i64> = resolved.iter().map(|r| r.id).collect();
         let mut by_id: HashMap<i64, EntityRow> = resolved.into_iter().map(|r| (r.id, r)).collect();
 
-        // The bound covers the seeded roots too, not only what the walk adds: a
-        // batch of chained identifiers can already exceed it before the first
-        // hop, and a first hop that discovers nothing new would break the loop
-        // before the guard below ever runs.
-        Self::ensure_within_bound(roots, by_id.len(), 0)?;
+        // The bound covers the seeded roots on their own: a batch of chained
+        // identifiers can exceed it before a single edge is followed, and the walk
+        // below would then never run to check it.
+        Self::ensure_within_bound(roots, by_id.len())?;
 
-        while !frontier.is_empty() {
-            let discovered = Self::direct_dependencies(runner, scope, &frontier).await?;
-            let fresh: Vec<i64> = discovered
-                .into_iter()
-                .filter(|id| seen.insert(*id))
-                .collect();
-            if fresh.is_empty() {
-                break;
-            }
-            Self::ensure_within_bound(roots, by_id.len(), fresh.len())?;
-            for row in EntityRepo::find_by_ids(runner, scope, &fresh).await? {
-                by_id.insert(row.id, row);
-            }
-            frontier = fresh;
+        // The walk returns everything reachable, which includes any seed another
+        // seed consumes; those rows are already in hand, and `by_id` is the filter.
+        let fresh: Vec<i64> = Self::forward_reachable(runner, scope, roots, &seed_ids)
+            .await?
+            .into_iter()
+            .filter(|id| !by_id.contains_key(id))
+            .collect();
+        for row in EntityRepo::find_by_ids(runner, scope, &fresh).await? {
+            by_id.insert(row.id, row);
         }
 
         let mut entities: Vec<EntityRow> = by_id.into_values().collect();
@@ -223,27 +203,131 @@ impl DependencyRepo {
         })
     }
 
-    /// Refuse a closure that has exceeded or would exceed [`CLOSURE_BOUND`].
+    /// Every entity reachable from `seed_ids` by following outgoing edges, seeds
+    /// included where one seed consumes another.
     ///
-    /// Called once over the seeded roots (`newly_discovered = 0`) and once per
-    /// hop over the entities that hop adds; the structured warning names the
-    /// roots and the reached size so the operator can tell a wide graph from an
-    /// oversized batch.
+    /// One `WITH RECURSIVE` over `dependency`, the mirror image of
+    /// [`Self::reverse_impact`]: a row is followed when its `from_entity_id` equals
+    /// a walked row's `to_entity_id`, which is what the row already says, and the
+    /// outer query joins `entity` on the `to_entity_id` side. The join is a single
+    /// indexed equality for the same reason it is there — never an `OR` across both
+    /// endpoints (`SecureCteSelect::join_cte`).
+    ///
+    /// # The bound is also the depth cap, and the two together rule out truncation
+    ///
+    /// [`CLOSURE_BOUND`] is passed as the CTE's mandatory `max_depth` and as the
+    /// per-chunk row limit, exactly as `activation_write_set` is in
+    /// [`Self::reverse_impact`], and the argument carries over unchanged. A depth
+    /// cap truncates **silently**, and a dependency missing from the store is worse
+    /// than a refusal: it would make the candidate fail validation for a reason that
+    /// is not about the candidate. Seed rows carry depth `0`, so an entity whose
+    /// shortest distance from a seed is `d` edges appears at depth `d - 1`, and the
+    /// walk emits everything within `CLOSURE_BOUND + 1` edges. Anything hidden would
+    /// sit at least `CLOSURE_BOUND + 2` edges out, behind `CLOSURE_BOUND + 1`
+    /// distinct nearer entities that are all in this set — which is already over the
+    /// bound, where the refusal has fired.
+    ///
+    /// The row limit is exact for the same reason. A chunk returning fewer rows
+    /// than the limit was not truncated. One returning the limit returned
+    /// `CLOSURE_BOUND + 1` *distinct* entity ids — `DISTINCT` runs before `LIMIT` —
+    /// so the accumulated set is over the bound whether or not any of them were
+    /// new, and the refusal fires before a truncated chunk can be believed.
     ///
     /// # Errors
-    /// [`ScopeError::Invalid`] when `resolved_entities + newly_discovered`
-    /// exceeds the bound.
-    fn ensure_within_bound(
+    /// Propagates the read, and [`ScopeError::Invalid`] past [`CLOSURE_BOUND`].
+    async fn forward_reachable(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
         roots: &[String],
-        resolved_entities: usize,
-        newly_discovered: usize,
-    ) -> Result<(), ScopeError> {
-        if resolved_entities + newly_discovered > CLOSURE_BOUND {
+        seed_ids: &[i64],
+    ) -> Result<Vec<i64>, ScopeError> {
+        /// The projection: the dependency's entity id and nothing else. Narrowed
+        /// because `SELECT DISTINCT` compares every selected column, and because the
+        /// full rows are read once at the end rather than once per duplicate.
+        #[derive(FromQueryResult)]
+        struct DependencyId {
+            id: i64,
+        }
+
+        if seed_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `u32::MAX` is unreachable for this bound and would refuse below long
+        // before the cap mattered; saturating keeps the cast infallible.
+        let max_depth = u32::try_from(CLOSURE_BOUND).unwrap_or(u32::MAX);
+        let read_limit = u64::try_from(CLOSURE_BOUND.saturating_add(1)).unwrap_or(u64::MAX);
+
+        // Seeded with the roots because the bound counts the whole closure, not only
+        // what the walk adds, and because a seed reached through another seed must
+        // not be counted twice.
+        let mut reachable: HashSet<i64> = seed_ids.iter().copied().collect();
+        // Chunked for the same reason every other `IN (…)` here is: the seed
+        // predicate binds one parameter per root. Forward reachability is a union
+        // over the seeds, so a chunked read is the same answer as one read — and the
+        // no-truncation argument above holds per chunk, since each chunk's limit is
+        // the same bound the accumulated set is checked against.
+        for chunk in seed_ids.chunks(IN_CHUNK) {
+            let walk = RecursiveCte::<dependency::Entity>::new(
+                FORWARD_CLOSURE_CTE,
+                Condition::all().add(dependency::Column::FromEntityId.is_in(chunk.iter().copied())),
+                // The next row's `from_entity_id` points at a walked row's
+                // `to_entity_id`: the dependency of a dependency.
+                dependency::Column::FromEntityId,
+                dependency::Column::ToEntityId,
+                max_depth,
+            );
+            let rows = entity::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .with_ctes()
+                .recursive_cte(walk)
+                .join_cte(
+                    FORWARD_CLOSURE_CTE,
+                    Condition::all().add(
+                        Expr::col((Alias::new(FORWARD_CLOSURE_CTE), Alias::new("to_entity_id")))
+                            .equals((entity::Entity, entity::Column::Id)),
+                    ),
+                )
+                // The seeds are *not* excluded in SQL, unlike the reverse read's
+                // roots: there can be `CLOSURE_BOUND` of them, and a `NOT IN` that
+                // wide would push the statement past `SQLite`'s parameter limit —
+                // which is what `IN_CHUNK` exists to stay under. They are absorbed
+                // by the set instead, at no cost to the limit's exactness.
+                .select_only()
+                .column(entity::Column::Id)
+                // `join_cte` is an inner join and an entity is reached by as many
+                // rows as there are paths to it, so without this a diamond would
+                // return the same id once per path.
+                .distinct()
+                // One row past the bound is all the refusal needs to see.
+                .limit(read_limit)
+                .all_as::<DependencyId>(runner)
+                .await?;
+
+            reachable.extend(rows.into_iter().map(|r| r.id));
+            Self::ensure_within_bound(roots, reachable.len())?;
+        }
+
+        let mut ids: Vec<i64> = reachable.into_iter().collect();
+        // Sorted so the follow-up read's `IN (…)` chunks are stable.
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Refuse a closure that has exceeded [`CLOSURE_BOUND`].
+    ///
+    /// Called over the seeded roots before the walk, and again after each chunk of
+    /// the walk; the structured warning names the roots and the reached size so the
+    /// operator can tell a wide graph from an oversized batch.
+    ///
+    /// # Errors
+    /// [`ScopeError::Invalid`] when `reached` exceeds the bound.
+    fn ensure_within_bound(roots: &[String], reached: usize) -> Result<(), ScopeError> {
+        if reached > CLOSURE_BOUND {
             tracing::warn!(
                 roots = ?roots,
                 closure_bound = CLOSURE_BOUND,
-                resolved_entities,
-                newly_discovered,
+                reached,
                 "types_registry dependency closure exceeded its safety bound"
             );
             return Err(ScopeError::Invalid(
