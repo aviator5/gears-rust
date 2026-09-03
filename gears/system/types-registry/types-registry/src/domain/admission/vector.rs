@@ -1,76 +1,5 @@
-//! The revision vector: what evaluation's verdict rests on, and the commit-time
-//! guard that refuses to write when any of it has moved (SPEC §8.1 steps 3 and
-//! 4.3 — D4).
-//!
-//! # Why a guard rather than a lock
-//!
-//! `unit::evaluate` deliberately runs with **no transaction open** (§8.2): it
-//! builds a transient store, resolves references and meta-compiles the schema
-//! against rows it read a moment ago, and any of those rows may have moved since.
-//! Nothing prevents that, and nothing should — holding read locks across
-//! `gts-rust` validation is what the transient-store design exists to avoid.
-//!
-//! # And why not a lock over the vector
-//!
-//! SPEC §8.1 step 4.2 once asked for locks on *"candidate and revision-vector
-//! entity/current rows"*. That is not deferred here, it is retired: a lock
-//! guarantees only that nothing moves **after** it is taken, and the movement that
-//! matters happens between evaluation and the lock — a phantom dependent appears
-//! before any lock could be held. The comparison below is therefore required either
-//! way, and a lock would be purely additive, buying a wait instead of a rollback.
-//! It would cost one round trip per vector member *inside* the commit transaction,
-//! on a set `activation_write_set` allows to reach 512, and it is the only reason
-//! step 4.2's canonical ordering ever needed to extend past families. What
-//! serializes those rows instead: the compare-and-swap that writes the candidate's
-//! own row, and — for a dependency — the write-write conflict its mover's own
-//! refresh creates on this candidate's `type_schema` row, precisely when the move
-//! affects it. SPEC §8.1 step 4.2 has the full argument, the one window it leaves
-//! and the liveness cost; `plan.md` P15 has the decision.
-//!
-//! **One per-entity lock does survive that argument and is not taken here:**
-//! deletion needs the target of each new edge serialized, because adding an edge
-//! moves no `resource_version` and writes only `dependency` while deletion writes
-//! the target's `entity` row. That is T20's, with deletion — see `docs/p0/todo.md`.
-//!
-//! What makes it *safe* is that the commit re-derives the same question inside its
-//! own transaction and compares. Two identical vectors mean the evaluation was
-//! computed against the state being committed against. One difference means it was
-//! not, and the only sound answer is to throw the evaluation away and redo it —
-//! which is why a drift travels as [`WorkerError::RevalidationRequired`] and rolls
-//! the transaction back, rather than as an item failure. The candidate is not
-//! wrong; this pass is stale.
-//!
-//! # What the vector carries, and why the fingerprint is not redundant
-//!
-//! A **dependency** contributes its `resource_version`. That is sufficient: what
-//! evaluation consumed from a dependency is its *authored* document, and authored
-//! content changes only through a revision, which moves `resource_version` by
-//! construction (`unit::commit_revision`).
-//!
-//! A **dependent** contributes its `resolution_fingerprint` as well, and there the
-//! version alone would be blind. A dependent refreshed by someone else's commit
-//! gets new effective artifacts and **no** version move at all — that is the whole
-//! shape of the reverse-impact refresh (T14, `admission::refresh`). The
-//! fingerprint is the only column that moves, so it is the only column that can
-//! detect it. This is SPEC's *"plus `resolution_fingerprint` where effective
-//! content was consumed"*: the refresh consumes each dependent's effective
-//! artifacts to decide whether to rewrite them.
-//!
-//! # Membership is re-derived, not just re-read
-//!
-//! Comparing versions of the entities evaluation happened to see would miss a
-//! dependency that *appeared* — a transitive one pulled in because some
-//! intermediate entity gained an edge — and a dependent that appeared, which is
-//! the phantom-dependent case. So the commit re-runs both reads from the recorded
-//! **roots** ([`RevisionVector::roots`]), which are a pure function of the
-//! candidate's own document and therefore the same question both times, and
-//! compares the two answers as sets.
-//!
-//! # Canonical order everywhere
-//!
-//! Entries are `gts_id`-sorted (SPEC §8.1 step 4.2's *"canonical identifier
-//! order"*), which is what lets the comparison be one merge walk and what makes
-//! the reported drift deterministic rather than dependent on row order.
+//! The revision vector: what evaluation's verdict rests on, and the commit-time guard that refuses
+//! to write when any of it has moved (SPEC §8.1 steps 3 and 4.3 — D4).
 
 use std::collections::HashMap;
 
@@ -83,19 +12,13 @@ use crate::domain::enums::{EntityKind, LifecycleStatus};
 use crate::domain::ports::{EntityRow, ReverseImpact, Stores};
 
 /// Which side of the candidate an entry stands on.
-///
-/// Part of the entry's identity rather than a decoration: the two roles are
-/// compared on different columns, and a drift report that did not name the role
-/// would leave an operator unable to tell "the base I validated against moved"
-/// from "someone else's schema now depends on me".
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VectorRole {
-    /// Evaluation consumed this entity's authored document while building the
-    /// transient store.
+    /// Evaluation consumed this entity's authored document while building the transient store.
     Dependency,
-    /// This entity depends on the candidate, so the commit's refresh consumes its
-    /// effective artifacts.
+    /// This entity depends on the candidate, so the commit's refresh consumes its effective
+    /// artifacts.
     Dependent,
 }
 
@@ -122,47 +45,26 @@ pub struct VectorEntry {
     pub gts_id: String,
     pub role: VectorRole,
     pub resource_version: i64,
-    /// `Some` exactly where effective content was consumed — a live Type Schema
-    /// dependent. `None` for a dependency (only its authored document was read),
-    /// for an Instance dependent (`instance` carries no artifacts) and for a
-    /// tombstone (the refresh skips both, `admission::refresh`).
+    /// `Some` exactly where effective content was consumed — a live Type Schema dependent.
     pub resolution_fingerprint: Option<Vec<u8>>,
 }
 
 /// The full vector, plus the roots it was derived from.
-///
-/// `gts_id`-sorted, and the candidate itself is **not** in it: the candidate's own
-/// `resource_version` is the caller's optimistic precondition, rechecked by the
-/// compare-and-swap that writes it.
 #[domain_model]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RevisionVector {
-    /// The closure roots — the candidate identifier plus its document's reference
-    /// targets — carried so the commit asks the same question evaluation did. A
-    /// pure function of the authored document, so re-deriving them would give the
-    /// same answer; carried rather than recomputed because the commit holds the
-    /// canonical body as text and re-parsing it under the entity lock is work the
-    /// commit transaction should not do.
+    /// The closure roots — the candidate identifier plus its document's reference targets — carried
+    /// so the commit asks the same question evaluation did.
     pub roots: Vec<String>,
     /// One entry per dependency and dependent, `(gts_id, role)`-sorted.
-    ///
-    /// Private because the sortedness is load-bearing: [`Self::drift`] is one
-    /// merge walk over two sorted sequences, so a vector built without the sort
-    /// would report a spurious `Vanished` / `Appeared` and terminalize a valid
-    /// candidate as `revalidation_exhausted`. [`Self::new`] is the only
-    /// constructor and it sorts, so the invariant cannot be bypassed.
     entries: Vec<VectorEntry>,
 }
 
 /// The first difference between a recorded vector and a freshly-derived one.
-///
-/// One difference, not all of them: any difference is already decisive, and the
-/// first in canonical order is a stable thing to name in a log line.
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VectorDrift {
-    /// Not there when evaluation looked. The phantom-dependent case, and the
-    /// transitive-dependency case.
+    /// Not there when evaluation looked.
     Appeared { gts_id: String, role: VectorRole },
     /// There when evaluation looked, gone now.
     Vanished { gts_id: String, role: VectorRole },
@@ -173,9 +75,7 @@ pub enum VectorDrift {
         recorded: i64,
         found: i64,
     },
-    /// Someone else's commit re-materialized this dependent's artifacts. The
-    /// version stood still — see the module header on why the fingerprint is the
-    /// only column that can show this.
+    /// Someone else's commit re-materialized this dependent's artifacts.
     Refreshed { gts_id: String },
 }
 
@@ -207,9 +107,8 @@ impl std::fmt::Display for VectorDrift {
 }
 
 impl RevisionVector {
-    /// The only constructor: takes the entries in whatever order they were
-    /// collected and sorts them into the canonical `(gts_id, role)` order the
-    /// comparison below is a merge walk over.
+    /// The only constructor: takes the entries in whatever order they were collected and sorts them
+    /// into the canonical `(gts_id, role)` order the comparison below is a merge walk over.
     #[must_use]
     pub fn new(roots: Vec<String>, mut entries: Vec<VectorEntry>) -> Self {
         entries.sort_by(|a, b| key(a).cmp(&key(b)));
@@ -222,13 +121,7 @@ impl RevisionVector {
         &self.entries
     }
 
-    /// The drift between this vector and a freshly-derived one, or `None` when the
-    /// two agree.
-    ///
-    /// One merge walk over two sorted sequences. The sort key is `(gts_id, role)`,
-    /// so an entity that changed role reports as a `Vanished` / `Appeared` pair and
-    /// the first of them is returned — which is the honest description: the entity
-    /// left one side of the candidate.
+    /// The drift between this vector and a freshly-derived one, or `None` when the two agree.
     #[must_use]
     pub fn drift(&self, fresh: &Self) -> Option<VectorDrift> {
         let mut recorded = self.entries.iter();
@@ -276,16 +169,12 @@ impl RevisionVector {
     }
 }
 
-/// The sort and merge key. Borrowed, so the walk allocates nothing until it has a
-/// drift to report.
+/// The sort and merge key.
 fn key(entry: &VectorEntry) -> (&str, VectorRole) {
     (entry.gts_id.as_str(), entry.role)
 }
 
 /// The two column comparisons for one entity present on both sides.
-///
-/// The version is asked first: a revision moves both columns, and reporting it as
-/// `Moved` names the cause rather than one of its effects.
 fn moved(recorded: &VectorEntry, found: &VectorEntry) -> Option<VectorDrift> {
     if recorded.resource_version != found.resource_version {
         return Some(VectorDrift::Moved {
@@ -303,15 +192,8 @@ fn moved(recorded: &VectorEntry, found: &VectorEntry) -> Option<VectorDrift> {
     None
 }
 
-/// Derive the vector for one candidate: its dependency closure and its
-/// reverse-impact set, as the database holds them right now.
-///
-/// Reads the closure itself, which is what the commit needs. Evaluation has the
-/// same row set already — `load_unit_store` walked it to build the store — and
-/// calls [`derive_from`] with it rather than walking it twice in one transaction.
-///
-/// # Errors
-/// As [`derive_from`].
+/// Derive the vector for one candidate: its dependency closure and its reverse-impact set, as the
+/// database holds them right now.
 pub async fn derive(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -334,24 +216,6 @@ pub async fn derive(
 }
 
 /// [`derive`] over a dependency closure the caller has already read.
-///
-/// The vector is built here on both sides — the recording one and the rechecking
-/// one — because it *must* be the same function both times, or the comparison
-/// would be measuring the difference between two readers rather than between two
-/// states. Only who ran the closure walk differs, and that is the same repository
-/// call in the same transaction either way.
-///
-/// The candidate's own entity row is excluded, and its id is taken from the
-/// closure rather than read separately: `roots` always contains the candidate
-/// identifier, so the closure already resolved it, or reported it missing for a
-/// first admission.
-///
-/// # Errors
-/// [`WorkerError`] for an infrastructure failure. A reverse-impact set over
-/// `write_set_bound` is a candidate refusal in the `Ok(Err(..))` position under
-/// the same `activation_write_set_exceeded` reason the refresh uses — reached
-/// earlier here, before anything is written, which is strictly better and changes
-/// nothing a client sees.
 #[allow(clippy::too_many_arguments)]
 pub async fn derive_from(
     stores: &dyn Stores,
@@ -377,8 +241,8 @@ pub async fn derive_from(
         });
     }
 
-    // Empty for a creation, which has no row for anything to depend on: a `$ref`
-    // to an absent target has no resolved form, so nothing can already point here.
+    // Empty for a creation, which has no row for anything to depend on: a `$ref` to an absent
+    // target has no resolved form, so nothing can already point here.
     let dependent_roots: Vec<i64> = candidate_id.into_iter().collect();
     let dependents = match stores
         .reverse_impact(tx, scope, &dependent_roots, write_set_bound)
@@ -396,8 +260,8 @@ pub async fn derive_from(
         }
     };
 
-    // One batched read for every dependent that carries artifacts, rather than one
-    // per row: at recheck time this runs inside the commit transaction.
+    // One batched read for every dependent that carries artifacts, rather than one per row: at
+    // recheck time this runs inside the commit transaction.
     let artifact_bearing: Vec<i64> = dependents
         .iter()
         .filter(|row| {
@@ -418,10 +282,8 @@ pub async fn derive_from(
             gts_id: row.gts_id.clone(),
             role: VectorRole::Dependent,
             resource_version: row.resource_version,
-            // Absent for an Instance or a tombstone, which the refresh skips, and
-            // absent for a Type Schema whose current row has gone missing — a
-            // corruption the refresh reports by name. Recording `None` rather than
-            // failing here keeps the guard from being the thing that reports it.
+            // Absent for an Instance or a tombstone, which the refresh skips, and absent for a Type
+            // Schema whose current row has gone missing — a corruption the refresh reports by name.
             resolution_fingerprint: fingerprints.remove(&row.id),
         });
     }
@@ -429,17 +291,8 @@ pub async fn derive_from(
     Ok(Ok(RevisionVector::new(roots.to_vec(), entries)))
 }
 
-/// Step 4.3: re-derive the vector inside the commit transaction, compare, and
-/// refuse to continue when anything has moved.
-///
-/// `Ok(Ok(()))` is the only outcome that lets the commit proceed. A drift becomes
-/// [`WorkerError::RevalidationRequired`], which rolls the transaction back and
-/// sends the worker round for another attempt — the rule has one site here rather
-/// than one per commit path.
-///
-/// # Errors
-/// [`WorkerError::RevalidationRequired`] when anything the evaluation rested on
-/// has moved; otherwise as [`derive`].
+/// Step 4.3: re-derive the vector inside the commit transaction, compare, and refuse to continue
+/// when anything has moved.
 pub async fn guard(
     stores: &dyn Stores,
     tx: &DbTx<'_>,

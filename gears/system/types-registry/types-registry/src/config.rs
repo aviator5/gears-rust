@@ -78,16 +78,13 @@ pub struct TypesRegistryConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
-    /// Metric name prefix. When empty (the default), derived from the gear
-    /// name by converting it to `snake_case` (e.g., `"types-registry"` →
-    /// `"types_registry"`).
+    /// Metric name prefix.
     #[serde(default)]
     pub prefix: String,
 }
 
 impl MetricsConfig {
-    /// Resolve the effective prefix: explicit config value, or
-    /// `snake_case(gear_name)`.
+    /// Resolve the effective prefix: explicit config value, or `snake_case(gear_name)`.
     #[must_use]
     pub fn effective_prefix(&self, gear_name: &str) -> String {
         let trimmed = self.prefix.trim();
@@ -114,51 +111,21 @@ pub struct Limits {
     /// fingerprinted (`AcceptanceError::AuthoredDocumentTooLarge`).
     pub authored_document: ByteSize,
     /// Largest resolved document the registry will materialize (§3.2).
-    ///
-    /// **Accepted, not enforced in P0.** T14 threaded the whole `Limits` struct
-    /// through `worker::run_operation`, so the value now *reaches* the commit path —
-    /// but D3's materialization (`domain::artifacts::materialize`) still does not
-    /// consult it, and pretending otherwise is what this note exists to prevent.
-    /// Also the figure T30's SDK cache sizes its byte bound against.
+    /// Not enforced in P0.
     pub resolved_document: ByteSize,
     /// Largest reference-resolution closure one candidate may need.
-    ///
-    /// **Accepted, not enforced in P0**, and *not* the same bound as
-    /// [`Self::activation_write_set`]: this counts what one candidate must read to
-    /// resolve, that counts the dependents an admission writes. Its consumer is the
-    /// reference-resolution work (T13/T19).
+    /// Not enforced in P0; unlike [`Self::activation_write_set`], this bounds reads.
     pub resolution_closure: usize,
     /// Largest number of candidates in one batch.
     ///
     /// **Enforced** — acceptance step 1 (`AcceptanceError::BatchTooLarge`).
     pub batch_candidates: usize,
-    /// Largest number of dependent rows one admission may refresh (P0-specific,
-    /// SPEC §4).
-    ///
-    /// **Enforced** (T14) — `worker::run_operation` carries it to
-    /// `admission::refresh`, and a revision whose reverse-impact set exceeds it fails
-    /// with `activation_write_set_exceeded` and commits nothing. It is *also* the
-    /// depth cap of the reverse-impact CTE, which is what keeps a depth-capped walk
-    /// from returning a silently shortened set; see
-    /// `DependencyRepo::reverse_impact`.
-    ///
-    /// `CLOSURE_BOUND` in `infra::storage::repo::dependency_repo` is still a
-    /// *different* bound that borrowed this number as its starting value — on the
-    /// closure a store build reads, not on the rows an admission writes — so setting
-    /// this key does not move it.
+    /// Maximum dependents refreshed by one admission (SPEC §4).
+    /// Also caps reverse-impact CTE depth; overflow refuses the revision.
     pub activation_write_set: usize,
-    /// `GET /entities` page size when the caller names none.
-    ///
-    /// **Validated, and without a consumer until T27**: `GET /entities` is still
-    /// served from the pre-database in-memory path, which pages nothing. Validated
-    /// anyway because the pair constrains each other and a boot is the only honest
-    /// place to say so.
+    /// Default `GET /entities` page size; not consumed in P0.
     pub page_size_default: u32,
-    /// Largest page a caller may ask for. A request above this is **refused,
-    /// not clamped** (D12) — a clamped page looks complete and is not.
-    ///
-    /// **Validated, and without a consumer until T27** — see
-    /// [`Self::page_size_default`].
+    /// Maximum `GET /entities` page size; not consumed in P0.
     pub page_size_max: u32,
 }
 
@@ -180,32 +147,13 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerSettings {
-    /// Retry-scheduling budget for an inline admission's version-family lock.
-    ///
-    /// **Enforced** by the admission worker. An already in-flight database call
-    /// may complete after this budget, so this is not an end-to-end request
-    /// deadline. It is kept well below the REST gateway timeout so ordinary lock
-    /// contention can be returned as a retryable `503` instead of becoming an
-    /// opaque transport timeout.
+    /// Wait budget for an inline admission's version-family lock.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub family_lock_timeout: Duration,
-    /// Wall-clock bound on one operation's admission.
-    ///
-    /// **Accepted, not enforced in P0.** There is nothing to time out against: a
-    /// pass is a direct call, not a lease, so no operation can be held by a worker
-    /// that stopped. **T21** turns this into the lease that lets a live pass be told
-    /// apart from a dead one — see `worker::mark_running`, which cannot honour its
-    /// own CAS until then.
+    /// Wall-clock admission bound; accepted but not enforced in P0.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub operation_timeout: Duration,
-    /// Revalidation attempts before an item is terminalized as `failed` (D4).
-    ///
-    /// **Enforced** (T15) — `worker::process_item` evaluates and commits inside a
-    /// loop bounded by this value, going round whenever the commit-time
-    /// revision-vector guard finds that the state the evaluation rested on has
-    /// moved. Exhaustion records `revalidation_exhausted` on the item.
-    ///
-    /// Attempts, not retries: `1` means one evaluation and no second chance.
+    /// Revalidation attempts before failure; `1` allows no retry.
     pub max_revalidation_attempts: u32,
 }
 
@@ -419,10 +367,7 @@ impl TypesRegistryConfig {
                 "limits.authored_document must be positive: 0 refuses every candidate".to_owned(),
             ));
         }
-        // Enforced since T14, and zero is the same class of footgun: every revision
-        // of a type anything depends on would fail with
-        // `activation_write_set_exceeded`, and the depth cap derived from it would
-        // be 0 as well.
+        // Zero would reject every revision with dependents.
         if self.limits.activation_write_set == 0 {
             return Err(ConfigError::Limits(
                 "limits.activation_write_set must be positive: 0 refuses every revision of a \
@@ -435,9 +380,7 @@ impl TypesRegistryConfig {
                 "worker.family_lock_timeout must be positive".to_owned(),
             ));
         }
-        // Enforced since T15. Zero would give the revalidation loop no attempts at
-        // all, and `process_item` would terminalize every item as
-        // `revalidation_exhausted` without evaluating it once.
+        // At least one evaluation attempt is required.
         if self.worker.max_revalidation_attempts == 0 {
             return Err(ConfigError::Worker(
                 "worker.max_revalidation_attempts must be positive: 0 refuses every candidate \
@@ -448,21 +391,7 @@ impl TypesRegistryConfig {
         Ok(RegistrationPolicy::compile(&self.registration_policy)?)
     }
 
-    /// The keys this deployment moved off their default that P0 accepts **without
-    /// enforcing**, ready to be named in one boot-time line.
-    ///
-    /// Not a validation failure: a P1-ready configuration legitimately carries every
-    /// one of them. But an operator who writes `resolution_closure: 128` and silently
-    /// gets no closure bound at all has no way to find that out — that is the defect,
-    /// not the missing enforcement, which is scheduled. Each field's docstring says
-    /// which task binds it. (`activation_write_set` was on this list until T14
-    /// enforced it and `worker.max_revalidation_attempts` until T15, which is the
-    /// transition the list exists to make visible.)
-    ///
-    /// Comparison is against the default rather than against presence, because
-    /// `#[serde(default)]` erases the difference. That errs towards silence — an
-    /// explicit `resolution_closure: 64` gets no warning — which is the right
-    /// direction, since that deployment gets what it asked for.
+    /// Non-default settings accepted but not enforced in P0.
     #[must_use]
     pub fn inert_limit_keys(&self) -> Vec<&'static str> {
         let limits = Limits::default();

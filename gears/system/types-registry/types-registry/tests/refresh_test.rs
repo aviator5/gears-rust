@@ -1,17 +1,4 @@
-//! Reverse-impact artifact refresh (T14): a revision re-materializes every
-//! dependent's effective artifacts in its own commit transaction.
-//!
-//! Driven through the real worker — submit, then `run_operation` — because the
-//! claim is about what one commit leaves behind, and only a commit can show it.
-//! No `sleep`, no timer, no polling (SPEC §13).
-//!
-//! # What a refresh moves, and what it must not
-//!
-//! A dependent's authored document did not change, so it gets **no new
-//! revision** and its `resource_version` stays where it is — that column is
-//! reserved for optimistic writes. What moves is `type_schema`'s materialized
-//! artifacts and their `resolution_fingerprint`, which is why the fingerprint
-//! supports equality and never ordering (`database.sql`).
+//! Reverse-impact artifact refresh within a revision transaction.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -43,18 +30,10 @@ use types_registry::infra::storage::repo::{EntityRepo, InstanceRepo, TypeSchemaR
 const NOW: OffsetDateTime = datetime!(2026-08-19 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-19 10:20:40 UTC);
 
-/// Its own family prefix, for the reason `dependency_test.rs` records: the
-/// `SQLite` family lock is keyed per DSN across processes, so two binaries
-/// admitting one family key contend even with isolated databases.
 const BASE: &str = gts_id!("cf.core.ref.thing.v1~");
-/// Derived from [`BASE`] — its resolution composes the base, so a base revision
-/// changes its effective artifacts.
 const DERIVED: &str = gts_id!("cf.core.ref.thing.v1~cf.core.ref.leaf.v1~");
-/// Outside every chain here, and reaches [`BASE`] only through a `$ref`.
 const REFERRER: &str = gts_id!("cf.core.ref.referrer.v1~");
-/// A second referrer, so an over-bound case has two dependents to exceed one.
 const SECOND: &str = gts_id!("cf.core.ref.second.v1~");
-/// An Instance of [`BASE`]: a dependent with no materialized artifacts at all.
 const INSTANCE: &str = gts_id!("cf.core.ref.thing.v1~cf.core.ref.first.v1");
 
 type Provider = Arc<DBProvider<DbError>>;
@@ -72,8 +51,6 @@ fn worker(db: &Provider) -> DBProvider<WorkerError> {
     DBProvider::new(db.db())
 }
 
-/// A base schema with one named property, so a revision can change the shape its
-/// dependents compose.
 fn base_schema(property: &str) -> Value {
     json!({
         "$id": format!("gts://{BASE}"),
@@ -83,8 +60,6 @@ fn base_schema(property: &str) -> Value {
     })
 }
 
-/// Derived from [`BASE`] through the identifier chain **and** an explicit `$ref`,
-/// which is the shape whose resolved schema inlines the base.
 fn derived_schema() -> Value {
     json!({
         "$id": format!("gts://{DERIVED}"),
@@ -96,7 +71,6 @@ fn derived_schema() -> Value {
     })
 }
 
-/// A schema outside the chain whose one property is a `$ref` to [`BASE`].
 fn referencing_schema(id: &str) -> Value {
     json!({
         "$id": format!("gts://{id}"),
@@ -144,7 +118,6 @@ async fn submit(
     .map(|accepted| accepted.operation_id)
 }
 
-/// Submit one candidate and admit it under `limits`.
 async fn admit_with(
     db: &Provider,
     limits: &Limits,
@@ -162,7 +135,7 @@ async fn admit_with(
         &worker(db),
         &allow_all(),
         Tuning {
-            limits: limits,
+            limits,
             worker: worker_settings,
             metrics: &common::metrics(),
         },
@@ -173,7 +146,6 @@ async fn admit_with(
     .expect("the worker must not fail on infrastructure")
 }
 
-/// The same, under P0's configured defaults.
 async fn admit(
     db: &Provider,
     key: &str,
@@ -210,7 +182,6 @@ async fn current(db: &Provider, gts_id: &str) -> CurrentTypeSchemaRow {
         .unwrap_or_else(|| panic!("{gts_id} must have a current row"))
 }
 
-/// [`BASE`] plus the two dependents that carry artifacts, all three admitted.
 async fn seed_base_and_dependents(db: &Provider) {
     admit(db, "k-base", BASE, base_schema("name"), None).await;
     admit(db, "k-derived", DERIVED, derived_schema(), None).await;
@@ -236,13 +207,6 @@ fn succeeded(
     item
 }
 
-// ---------------------------------------------------------------------------
-// the refresh
-// ---------------------------------------------------------------------------
-
-/// The criterion: revising a base refreshes exactly its N dependents, in the same
-/// transaction as the new revision — and moves neither their revision pointer nor
-/// their `resource_version`.
 #[tokio::test]
 async fn revising_a_base_refreshes_every_dependent_schema() {
     let db = test_db().await;
@@ -284,10 +248,6 @@ async fn revising_a_base_refreshes_every_dependent_schema() {
     );
 }
 
-/// The early stop: a dependent whose recomputation is byte-identical is not
-/// written at all. Shown by refreshing twice — the second pass sees the state the
-/// first left, recomputes the same artifacts, and touches nothing. A redelivered
-/// commit is exactly this case.
 #[tokio::test]
 async fn a_dependent_whose_artifacts_are_identical_is_not_rewritten() {
     let db = test_db().await;
@@ -316,9 +276,6 @@ async fn a_dependent_whose_artifacts_are_identical_is_not_rewritten() {
     );
 }
 
-/// An Instance carries no materialized artifacts (`instance` holds a revision
-/// pointer and nothing else), so the walk reaches it and the refresh has nothing
-/// to do for it. The claim is that this is a no-op rather than a failure.
 #[tokio::test]
 async fn an_instance_dependent_is_reached_and_left_alone() {
     let db = test_db().await;
@@ -354,13 +311,6 @@ async fn an_instance_dependent_is_reached_and_left_alone() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// the bound
-// ---------------------------------------------------------------------------
-
-/// Over `limits.activation_write_set` the candidate fails with a structured
-/// reason and **nothing** is committed — not the new revision, not a partial
-/// refresh.
 #[tokio::test]
 async fn an_over_bound_write_set_commits_nothing() {
     let db = test_db().await;
@@ -416,19 +366,6 @@ async fn an_over_bound_write_set_commits_nothing() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// the consistency backstop
-// ---------------------------------------------------------------------------
-
-/// A revision that makes committed content stop validating is refused by the
-/// refresh — the backstop that keeps the registry consistent until the T17–T19
-/// compatibility gate refuses such a revision *before* it is written.
-///
-/// The incompatible revision here is the base declaring `x-gts-final`, which the
-/// base itself validates under (its chain is one segment) and which breaks every
-/// derived type above it. The refusal must name only the candidate: the
-/// dependent is a third party that happens to depend on it, and its identifier
-/// is operator knowledge, not the submitter's.
 #[tokio::test]
 async fn an_incompatible_revision_refuses_on_dependent_invalid_and_commits_nothing() {
     let db = test_db().await;
@@ -478,9 +415,6 @@ async fn an_incompatible_revision_refuses_on_dependent_invalid_and_commits_nothi
     );
 }
 
-/// A creation refreshes nothing, and that is a claim about the *base*: admitting a
-/// new derived type cannot move the artifacts of the type it composes. Nothing
-/// depended on the candidate a moment ago, so there is no reverse impact to have.
 #[tokio::test]
 async fn a_creation_leaves_its_base_untouched() {
     let db = test_db().await;
@@ -497,14 +431,6 @@ async fn a_creation_leaves_its_base_untouched() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// helpers that reach the refresh step on its own
-// ---------------------------------------------------------------------------
-
-/// Run the refresh step alone, in its own commit transaction, and report which
-/// dependents it wrote. Used by the early-stop test: the claim there is about a
-/// *second* refresh over unchanged state, which no second admission can express —
-/// identical content is `unchanged` and never reaches a commit.
 async fn refresh_directly(db: &Provider, roots: &[i64], limits: &Limits) -> RefreshOutcome {
     use types_registry::domain::admission::refresh::refresh_dependents;
     use types_registry::domain::ports::commit_write;

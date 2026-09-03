@@ -44,13 +44,8 @@ const FAMILY_KEY: &str = "gts.acme.crm.customer.type";
 const BASE: &str = gts_id!("acme.crm.customer.type.v1~");
 const DERIVED: &str = gts_id!("acme.crm.customer.type.v1~acme.crm.premium.type.v1~");
 const STRANGER: &str = gts_id!("acme.crm.order.type.v1~");
-/// A second schema outside every fixture's identifier chain, so a revision can
-/// swap one out-of-chain reference for another.
 const INVOICE: &str = gts_id!("acme.crm.invoice.type.v1~");
-/// A consumer of an out-of-chain schema. Its identifier implies nothing about
-/// what it references — which is the whole point of the seed under test.
 const CONSUMER: &str = gts_id!("acme.crm.report.type.v1~");
-/// An identifier no entity carries, and none of these tests creates.
 const ABSENT: &str = gts_id!("acme.crm.ghost.type.v1~");
 
 type Provider = Arc<DBProvider<DbError>>;
@@ -78,8 +73,6 @@ fn derived_schema(id: &str, base: &str) -> Value {
     })
 }
 
-/// A document whose only dependency is a `$ref` to a schema **outside its
-/// identifier chain** — the reference no `chain_ids()` seed can reach.
 fn referencing_schema(id: &str, target: &str) -> Value {
     json!({
         "$id": format!("gts://{id}"),
@@ -493,14 +486,6 @@ async fn the_builder_runs_inside_a_transaction() {
     assert_eq!(loaded, [BASE, DERIVED]);
 }
 
-// ---------------------------------------------------------------------------
-// The candidate document seeds the closure (T13)
-// ---------------------------------------------------------------------------
-
-/// The case that fails without the document-side seed. `CONSUMER` is a **first**
-/// admission, so it has no stored edges at all, and its target sits outside its
-/// `~`-chain, so the identifier-derived seed cannot reach it either. The only
-/// thing that knows about the dependency is the document.
 #[tokio::test]
 async fn a_reference_outside_the_identifier_chain_is_seeded_from_the_document() {
     let db = test_db().await;
@@ -527,9 +512,6 @@ async fn a_reference_outside_the_identifier_chain_is_seeded_from_the_document() 
     );
 }
 
-/// The two absences are different questions, so they are reported apart: the
-/// candidate has no row *yet* — every first admission is in that state — while a
-/// reference target that no entity carries is a fact about the registry.
 #[tokio::test]
 async fn a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_candidate() {
     let db = test_db().await;
@@ -550,16 +532,12 @@ async fn a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_cand
     assert_eq!(unit.missing_references(), [ABSENT]);
 }
 
-/// A revision's references come from the document it carries, never from the edge
-/// set the previous revision left behind: the added target resolves even though no
-/// row names it yet.
 #[tokio::test]
 async fn a_revision_resolves_against_the_reference_it_now_carries() {
     let db = test_db().await;
     let family = seed_family(&db).await;
     let stranger_id = seed_schema(&db, family, STRANGER, &base_schema(STRANGER, "sku")).await;
     seed_schema(&db, family, INVOICE, &base_schema(INVOICE, "total")).await;
-    // Revision 1 referenced `STRANGER`, and that is what the stored edge says.
     let consumer_id = seed_schema(
         &db,
         family,
@@ -569,7 +547,6 @@ async fn a_revision_resolves_against_the_reference_it_now_carries() {
     .await;
     add_edge(&db, consumer_id, stranger_id).await;
 
-    // Revision 2 drops that reference and names `INVOICE` instead.
     let candidate = referencing_schema(CONSUMER, INVOICE);
     let mut unit = load_in_snapshot(&db, vec![doc(CONSUMER, candidate.clone())])
         .await

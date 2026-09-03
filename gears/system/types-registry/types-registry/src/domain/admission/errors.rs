@@ -58,9 +58,8 @@ pub enum WorkerError {
     /// projection is missing behind an entity that is still there.
     #[error("entity '{gts_id}' (id {entity_id}) vanished mid-transaction")]
     EntityVanished { gts_id: String, entity_id: i64 },
-    /// An edge target that evaluation resolved disappeared before the dependency
-    /// rows were replaced. Retrying rebuilds the candidate's store and either sees
-    /// the target again or refuses the candidate on its absence.
+    /// An edge target that evaluation resolved disappeared before the dependency rows were
+    /// replaced.
     #[error("dependency target '{gts_id}' vanished before its edge was committed")]
     DependencyTargetAbsent { gts_id: String },
     /// The family lock a creation serializes on could not be taken within its wait
@@ -80,36 +79,11 @@ pub enum WorkerError {
     /// rolls the already-executed resource-version CAS back on this error.
     #[error("entity '{gts_id}' cannot allocate a revision after i32::MAX")]
     RevisionNumberExhausted { gts_id: String },
-    /// A candidate refusal reached **after** the commit transaction began writing
-    /// — today only the reverse-impact refresh (T14), which cannot run before the
-    /// revision it refreshes against exists.
-    ///
-    /// Carried as an error against this enum's own rule ("nothing here is a
-    /// statement about the candidate") because the transaction is the reason: a
-    /// refusal returned in the `Ok(Err(..))` position would **commit** the writes
-    /// it is refusing. `process_item` unwraps it and records the failure in its own
-    /// transaction, exactly as it does for an evaluation-stage refusal, so the
-    /// distinction stays invisible past the worker.
-    ///
-    /// Not retryable: `retryable_db_err` reads it as `None`, and a second attempt
-    /// would recompute the same refusal.
+    /// A candidate refusal discovered after the commit transaction began writing.
     #[error("the revision was refused after its writes began: {0}")]
     RefusedAfterWrite(ItemFailure),
-    /// The commit-time revision-vector guard found that something the evaluation
-    /// rested on has moved (D4, SPEC §8.1 step 4.3).
-    ///
-    /// Carried as an error for the same reason as [`Self::RefusedAfterWrite`] and
-    /// with the opposite meaning. That one is terminal; this one is the *least*
-    /// terminal thing the worker can be told: the candidate has not been judged at
-    /// all, because the state it was judged against is gone. The error position is
-    /// what rolls the transaction back, and `process_item` answers it by
-    /// revalidating from scratch — bounded by `worker.max_revalidation_attempts`,
-    /// after which the item is terminalized as `revalidation_exhausted`.
-    ///
-    /// Not classified as a database retry: `retryable_db_err` reads it as `None`,
-    /// because re-running the *same* transaction would compare the same stale
-    /// vector and drift identically. The retry that helps is a new evaluation, and
-    /// that lives a level up.
+    /// The commit-time revision-vector guard found that something the evaluation rested on has
+    /// moved (D4, SPEC §8.1 step 4.3).
     #[error("the evaluation is stale and must be redone: {0}")]
     RevalidationRequired(VectorDrift),
     #[error("storage failure during admission: {0}")]
@@ -135,8 +109,8 @@ pub struct ItemFailure {
 }
 
 impl std::fmt::Display for ItemFailure {
-    /// `reason: message` — the shape the `WorkerError::RefusedAfterWrite` message
-    /// interpolates, and the one an operator reads in a log line.
+    /// `reason: message` — the shape the `WorkerError::RefusedAfterWrite` message interpolates, and
+    /// the one an operator reads in a log line.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.reason, self.message)
     }

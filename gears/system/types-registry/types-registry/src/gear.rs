@@ -74,14 +74,7 @@ impl Gear for TypesRegistryGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: TypesRegistryConfig = ctx.config_or_default()?;
 
-        // Build the admission instruments here rather than on their first use
-        // (T16): `ToolKit` installs the real `SdkMeterProvider` before `init`
-        // runs, so an adapter built at a known point cannot accidentally attach
-        // to whatever provider happened to be global at the first registration
-        // — which, during seeding, is a different moment. The adapter is
-        // infra's and the port is the domain's; this is the one place the two
-        // are joined, and the handle is then injected rather than reached
-        // through a global.
+        // Build admission instruments eagerly from ToolKit's configured provider.
         let metrics_prefix = cfg.metrics.effective_prefix(Self::MODULE_NAME);
         let metrics: Arc<dyn AdmissionMetrics> =
             crate::infra::metrics::default_adapter(&metrics_prefix);

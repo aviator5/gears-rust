@@ -197,8 +197,7 @@ impl From<WorkerError> for CanonicalError {
                 &format!("entity '{gts_id}' (id {entity_id}) vanished mid-transaction"),
                 "admission",
             ),
-            // A retryable snapshot race, not a malformed candidate. Exposing the
-            // target would also disclose a dependency the caller may not read.
+            // A retryable snapshot race, not a malformed candidate.
             WorkerError::DependencyTargetAbsent { gts_id } => opaque_internal(
                 &format!("dependency target '{gts_id}' vanished before its edge was committed"),
                 "admission",
@@ -221,18 +220,15 @@ impl From<WorkerError> for CanonicalError {
                 &format!("entity '{gts_id}' cannot allocate a revision after i32::MAX"),
                 "admission",
             ),
-            // Kept only for exhaustiveness, like `ItemAlreadyTerminal`: `process_item`
-            // unwraps this one and records the refusal on the item, so a handler
-            // sees the ordinary `failed` outcome rather than an error. Reaching here
-            // means the worker stopped doing that, which is a worker bug — opaque,
-            // with the refusal in the operator log.
+            // Kept only for exhaustiveness, like `ItemAlreadyTerminal`: `process_item` unwraps this
+            // one and records the refusal on the item, so a handler sees the ordinary `failed`
+            // outcome rather than an error.
             WorkerError::RefusedAfterWrite(failure) => {
                 opaque_internal(&failure.to_string(), "admission")
             }
-            // Also exhaustiveness only: `process_item` catches this one and
-            // revalidates, and after `worker.max_revalidation_attempts` it records a
-            // `revalidation_exhausted` failure on the item. Reaching a handler means
-            // the retry loop stopped answering it.
+            // Also exhaustiveness only: `process_item` catches this one and revalidates, and after
+            // `worker.max_revalidation_attempts` it records a `revalidation_exhausted` failure on
+            // the item.
             WorkerError::RevalidationRequired(drift) => {
                 opaque_internal(&drift.to_string(), "admission")
             }
@@ -740,9 +736,8 @@ mod tests {
             worker_problem(WorkerError::ResourceVersionExhausted {
                 gts_id: "version-secret".to_owned(),
             }),
-            // The two arms whose `Display` interpolates caller-visible content:
-            // the refusal's reason and message, and the drift's identifiers. The
-            // leak guard below must hold for them exactly as for the opaque ones.
+            // The two arms whose `Display` interpolates caller-visible content: the refusal's
+            // reason and message, and the drift's identifiers.
             worker_problem(WorkerError::RefusedAfterWrite(ItemFailure::new(
                 "reason-secret",
                 "message-secret".to_owned(),

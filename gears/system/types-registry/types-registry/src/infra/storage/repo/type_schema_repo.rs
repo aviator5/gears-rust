@@ -120,20 +120,6 @@ impl TypeSchemaRepo {
     }
 
     /// The current-state rows of many entities in one read, `entity_id`-sorted.
-    ///
-    /// The batched sibling of [`Self::find_current`], for the two callers that hold
-    /// a whole set of entity ids at once: the revision vector (T15) records and
-    /// rechecks every dependent's `resolution_fingerprint`, and the reverse-impact
-    /// refresh (T14) compares each one against a recomputation. Both run inside the
-    /// commit transaction, where a round trip per dependent is time spent holding
-    /// the candidate's row.
-    ///
-    /// Entities with no `type_schema` row are **absent** rather than an error, as in
-    /// [`Self::current_documents`] and for the same reason: a registered Instance
-    /// has no row in this table.
-    ///
-    /// # Errors
-    /// Propagates the scoped query's failure.
     pub async fn current_states(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -149,8 +135,8 @@ impl TypeSchemaRepo {
                 .await?;
             out.extend(rows.into_iter().map(current_row));
         }
-        // Sorted here rather than left to the chunk order, so a caller comparing two
-        // reads of the same set compares two identically-ordered sequences.
+        // Sorted here rather than left to the chunk order, so a caller comparing two reads of the
+        // same set compares two identically-ordered sequences.
         out.sort_by_key(|row| row.entity_id);
         Ok(out)
     }

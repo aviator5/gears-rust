@@ -925,7 +925,6 @@ async fn every_table_accepts_a_complete_admission_graph() {
     .await
     .expect("insert current instance");
 
-    // kind 3 instance_of: the Instance conforms to the Type Schema.
     exec(
         &db,
         "INSERT INTO types_registry__dependency (from_entity_id, kind, to_entity_id) \

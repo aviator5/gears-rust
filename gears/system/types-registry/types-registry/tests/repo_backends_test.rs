@@ -298,23 +298,6 @@ async fn closure_walks_a_chain(db: &Provider, family_id: i64, backend: &str) {
     assert!(closure.missing_roots.is_empty());
 }
 
-/// The reverse-impact read on a real backend: `WITH RECURSIVE` is the one query
-/// shape in this gear whose *dialect* differs, and `SQLite` cannot vouch for the
-/// other two.
-///
-/// Three things only a container run can show:
-///
-/// * The `WITH RECURSIVE` renders and executes at all. `sea-query` emits one
-///   statement for every backend, and `MySQL` alone caps recursion
-///   (`cte_max_recursion_depth`, default 1000) — the depth cap here is the
-///   write-set bound, which stays under it.
-/// * `UNION` inside the recursive member needs an equality operator for every
-///   projected column. The walk projects two `bigint`s and a depth, deliberately
-///   narrow: `PostgreSQL` has no equality for `json`, so a full-row projection
-///   would fail here and nowhere else.
-/// * The outer `SELECT DISTINCT … LIMIT` over a joined CTE is accepted. `SQLite`
-///   is the permissive backend for `DISTINCT` shapes, so a mistake there would
-///   surface only in production.
 async fn reverse_impact_walks_back_up_a_chain(db: &Provider, family_id: i64, backend: &str) {
     let conn = db.conn().expect("conn");
     let scope = allow_all();
@@ -350,9 +333,6 @@ async fn reverse_impact_walks_back_up_a_chain(db: &Provider, family_id: i64, bac
     )
     .await
     .expect("b -> c");
-    // …and a row closing a cycle back to c. Admission cannot produce one
-    // (ADR-0012); written here because a backend that did not terminate on it would
-    // hang a commit transaction rather than fail a test.
     DependencyRepo::replace_outgoing(
         &conn,
         &scope,
@@ -380,7 +360,6 @@ async fn reverse_impact_walks_back_up_a_chain(db: &Provider, family_id: i64, bac
         }
     }
 
-    // The bound is a refusal on every backend, not a truncated read.
     assert!(
         matches!(
             DependencyRepo::reverse_impact(&conn, &scope, &[ids[2]], 1)
@@ -483,14 +462,6 @@ async fn current_documents_reads_the_current_revision_only(
     assert_eq!(single_doc.raw_schema, only);
 }
 
-/// The batched current-state read the revision vector rechecks against (T15).
-///
-/// Two things a real backend decides. `resolution_fingerprint` is `BYTEA` here and
-/// `BINARY` there and typeless `BLOB` on `SQLite`, so a byte-identical round trip
-/// through an `IN (…)` read is only demonstrable on a container — and the whole
-/// guard rests on comparing those bytes for equality. And an entity with no
-/// `type_schema` row must be **absent** rather than an error or a null row: the
-/// walk reaches Instances, and the vector records them with no fingerprint.
 async fn current_schemas_reads_every_named_entity_that_has_one(
     db: &Provider,
     family_id: i64,

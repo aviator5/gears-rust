@@ -69,7 +69,6 @@ fn dependency_kind_numbering() {
         (DependencyKind::Derivation, 2),
         (DependencyKind::InstanceOf, 3),
     ]);
-    // The vocabulary and `ck_tr_dependency_kind` both end at 3.
     assert!(
         DependencyKind::try_from_value(&4).is_err(),
         "the vocabulary has three values",

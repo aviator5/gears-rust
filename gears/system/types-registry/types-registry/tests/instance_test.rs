@@ -32,13 +32,7 @@ use common::{allow_all, stores, test_db};
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
 
-/// The conforming type. `name` is required, so a value omitting it really fails.
-///
-/// Its own `inst` module, not the shared `example` one: the family advisory lock's
-/// `SQLite` scope is keyed on the DSN, which every test binding `sqlite::memory:`
-/// shares through a cross-process marker directory, so two binaries admitting one
-/// family key contend across processes. `family_test` probes that lock with no retry
-/// budget, and used to see it held by this file under a loaded full-suite run.
+/// Conforming type with a dedicated family key to avoid cross-process lock contention.
 const TYPE_ID: &str = gts_id!("cf.core.inst.thing.v1~");
 /// An Instance of it: a full five-token last segment with no `~`.
 const INSTANCE_ID: &str = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
@@ -417,10 +411,6 @@ async fn a_type_schema_may_not_join_an_instance_family() {
     );
 }
 
-/// An Instance admits against a type committed by an **earlier operation**, reaching
-/// it through its own identifier: the conformance *row* T13 writes is an output of
-/// the admission, never its input, so the type must already be resolvable before any
-/// edge exists.
 #[tokio::test]
 async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
     let db = test_db().await;
@@ -434,11 +424,6 @@ async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
         outcome.items[0].failure,
     );
 
-    // One edge, and one only: the Instance's conformance. It is materialized despite
-    // being derivable from the identifier, because T14's reverse walk has no
-    // identifier to walk backwards from — and the *type* it points at carries no
-    // outgoing edge of its own, which is what says the resolution above did not need
-    // a row (`dependency_test.rs` owns the edge rules themselves).
     let provider = worker(&db);
     let conn = provider.conn().expect("conn");
     let edges = types_registry::infra::storage::entity::dependency::Entity::find()

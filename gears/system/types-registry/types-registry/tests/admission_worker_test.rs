@@ -921,14 +921,6 @@ async fn a_failed_evaluation_leaves_no_partial_write() {
     assert_eq!(ops[0].status, storage_enums::OperationStatus::Completed);
 }
 
-/// What T13 closed. A `$ref` **outside** the candidate's own `~`-chain is genuinely
-/// edge-derived: no identifier implies it, and the candidate's own `dependency` rows
-/// are written at commit, so they cannot describe the read that validates it. The
-/// target is therefore seeded from the candidate *document*
-/// (`gts_store::load_unit_store`), and a reference the registry holds resolves.
-///
-/// This test asserted the opposite refusal until T13 — deliberately, as the boundary
-/// marker of the gap. `dependency_test.rs` pins the rows the same admission writes.
 #[tokio::test]
 async fn a_ref_outside_the_chain_is_admitted() {
     let db = test_db().await;

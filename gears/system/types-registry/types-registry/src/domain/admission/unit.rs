@@ -89,20 +89,8 @@ pub struct EvaluatedUnit {
     pub outcome: EvaluatedOutcome,
     pub operation_item_id: i64,
     /// The candidate's outgoing edges, by target **identifier** (T13).
-    ///
-    /// Extracted during evaluation, where the document is already parsed, and
-    /// carried rather than re-extracted at commit: the commit transaction should
-    /// hold no work that a read outside it can do, and re-parsing the body under
-    /// the entity lock is exactly that. Resolving the identifiers to rows is the
-    /// commit's own job, because that answer changes between the two.
     pub edges: Vec<DependencyEdge>,
-    /// Everything this evaluation's verdict rests on, as the evaluation snapshot
-    /// saw it (D4, T15).
-    ///
-    /// Read in the *same* transaction as the transient store, so the vector and
-    /// the documents that were validated describe one state. The commit re-derives
-    /// it and refuses to write if the two disagree — see
-    /// [`crate::domain::admission::vector`].
+    /// The database state on which this evaluation's verdict rests.
     pub vector: RevisionVector,
 }
 
@@ -139,9 +127,7 @@ pub enum RevisionCommit {
 /// when this returns: nothing is retained anywhere, and the next invocation reads
 /// the database again.
 ///
-/// `activation_write_set` bounds the reverse-impact half of the revision vector
-/// (T15) — the same bound the refresh enforces, asked here so an over-bound
-/// candidate is refused before a transaction has written anything.
+/// `activation_write_set` bounds reverse-impact evaluation before any write begins.
 ///
 /// # Errors
 /// [`WorkerError`] for an infrastructure failure, which the outbox handler must
@@ -177,11 +163,7 @@ pub async fn evaluate(
         }
     };
 
-    // Extracted here, where the document is parsed and no transaction is open. A
-    // malformed `$ref` fails the candidate as `invalid_schema` — the same refusal
-    // `validate_schema` would reach below, arrived at before the store is even
-    // built, and under the same reason code so a client branching on it sees one
-    // outcome.
+    // Extracted here, where the document is parsed and no transaction is open.
     let edges = match extract_edges(&id, &content) {
         Ok(edges) => edges,
         Err(e) => {
@@ -221,10 +203,9 @@ pub async fn evaluate(
                     }
                     None => None,
                 };
-                // In this transaction, not a later one: the vector must describe the
-                // same state as the documents that are about to be validated, or the
-                // commit's comparison would be measuring a gap that opened *before*
-                // the evaluation rather than after it (D4).
+                // In this transaction, not a later one: the vector must describe the same state as
+                // the documents that are about to be validated, or the commit's comparison would be
+                // measuring a gap that opened *before* the evaluation rather than after it (D4).
                 let vector = vector::derive_from(
                     stores.as_ref(),
                     tx,
@@ -330,17 +311,8 @@ fn evaluate_loaded(
     }))
 }
 
-/// Replace the admitted entity's outgoing edges, resolving each target identifier
-/// to the row it names.
-///
-/// Only this entity's rows are touched: an admission never rewrites anyone else's
-/// edges, and the delete inside `replace_outgoing` is keyed on `from_entity_id`
-/// alone.
-///
-/// Every admitted edge target has already resolved during evaluation: `$ref`
-/// resolution checks document targets, while derivation and conformance targets come
-/// from the identifier chain. `x-gts-ref` never reaches this function because it is
-/// not a dependency edge.
+/// Replace the admitted entity's outgoing edges, resolving each target identifier to the row it
+/// names.
 async fn replace_edges(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -348,9 +320,9 @@ async fn replace_edges(
     entity_id: i64,
     edges: &[DependencyEdge],
 ) -> Result<(), WorkerError> {
-    // Called even for an empty edge set: on a revision that dropped its last
-    // reference, the *delete* is the whole point, and skipping it would leave the
-    // previous revision's rows standing.
+    // Called even for an empty edge set: on a revision that dropped its last reference, the
+    // *delete* is the whole point, and skipping it would leave the previous revision's rows
+    // standing.
     let targets: Vec<String> = edges.iter().map(|e| e.target.clone()).collect();
     let rows = stores.find_by_gts_ids(tx, scope, &targets).await?;
     let resolved: std::collections::HashMap<&str, i64> =
@@ -424,11 +396,8 @@ pub async fn commit_creation(
         )
         .await?;
 
-    // Step 4.3: the revision vector, re-derived and compared under the family lock
-    // this transaction holds. A creation has no dependents — a `$ref` at an absent
-    // identifier has no resolved form, so nothing can already point here — so what
-    // this catches is a **dependency** that moved, appeared or vanished since the
-    // candidate was resolved against it.
+    // Step 4.3: the revision vector, re-derived and compared under the family lock this transaction
+    // holds.
     if let Err(failure) = vector::guard(
         stores,
         tx,
@@ -668,27 +637,8 @@ async fn read_current_content(
     })
 }
 
-/// The `unchanged` outcome: the authored content already equals the current
-/// revision, so there is nothing to write but the item's own result.
-///
-/// Its own function because it is a **complete** commit path — it returns rather
-/// than falling through — and because the re-read below is the whole of its
-/// concurrency argument, which is easier to state next to the three statements it
-/// concerns than in the middle of a longer function.
-///
-/// The re-read is not redundant with the caller's entry check. The commit
-/// transaction runs at `READ COMMITTED` ([`commit_write`](crate::domain::ports::commit_write)),
-/// so a concurrent admission can commit between that check and the content read,
-/// and this pass would otherwise answer `unchanged` about content that is no longer
-/// current. A revision closes the same window with its compare-and-swap, whose
-/// precondition is in the `WHERE`; an `unchanged` outcome writes nothing and so has
-/// no `WHERE` to put it in. A re-read that still sees `expected` means the other
-/// admission had not committed yet, so this pass genuinely came first.
-///
-/// # Errors
-/// [`WorkerError::EntityVanished`] if the entity row disappeared between the two
-/// reads, [`WorkerError::ItemAlreadyTerminal`] if an overlapping pass recorded the
-/// outcome first, and a stale precondition as an [`ItemFailure`].
+/// The `unchanged` outcome: the authored content already equals the current revision, so there is
+/// nothing to write but the item's own result.
 async fn commit_unchanged(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -698,9 +648,8 @@ async fn commit_unchanged(
     expected_resource_version: i64,
     now: OffsetDateTime,
 ) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
-    // `EntityVanished`, not `CurrentStateMissing`: the row that disappeared is
-    // the *entity*, read twice in one transaction. Naming the current-state
-    // tables would point an operator at the wrong half of the corruption.
+    // `EntityVanished`, not `CurrentStateMissing`: the row that disappeared is the *entity*, read
+    // twice in one transaction.
     let still = stores
         .find_by_gts_id(tx, scope, &unit.gts_id)
         .await?
@@ -735,40 +684,12 @@ async fn commit_unchanged(
     }))
 }
 
-/// Commit one evaluated unit as a **revision** of an entity that already exists:
-/// the `expected_resource_version` precondition, the immutable revision insert,
-/// the current-state pointer move, and the item outcome.
-///
-/// # The order of the statements is the concurrency design
-///
-/// 1. read the entity, refuse a tombstone, and compare `resource_version` to
-///    `expected`, so a stale caller gets a message naming both versions rather
-///    than a bare CAS failure;
-/// 2. read the current revision's authored content, to decide `unchanged` — which
-///    is a complete path of its own, [`commit_unchanged`], and carries the re-read
-///    that closes the `READ COMMITTED` window for a pass that writes nothing;
-/// 3. the revision-vector guard (T15): re-derive everything the evaluation rested
-///    on and refuse to write if any of it moved;
-/// 4. **re-ask the precondition** as a compare-and-swap, whose `WHERE` closes the
-///    same window by construction, then write.
-///
-/// Step 4 is not redundant with step 1. The commit transaction runs at
-/// `READ COMMITTED` ([`commit_write`](crate::domain::ports::commit_write)), so a
-/// concurrent admission can commit between the two, and a check whose result is
-/// separated from the write it guards is not a check at all.
-///
-/// ponytail: ceiling C6 (SPEC §9) — nothing authorizes this path. The registration
-/// policy is asked of creations only, and P0 has no principal to check in its place,
-/// so any caller that reaches the submit route can revise the authored content of
-/// any entity the registry holds. Bounded by transport rather than by policy: the
-/// mutation routes are internal-only (ceiling C8). Upgrade: the
-/// identity-to-permission binding, then an owner check before this call.
+/// Commit an evaluated unit as a revision with compare-and-swap protection.
+/// The final CAS closes the `READ COMMITTED` window after validation.
 ///
 /// # Errors
-/// [`WorkerError`] for an infrastructure failure, including a corrupt row with no
-/// current state. A lost or stale precondition, and a revision aimed at a
-/// tombstone, are [`ItemFailure`]s in the `Ok(Err(..))` position — terminal, and
-/// never rebased onto the current version.
+/// [`WorkerError`] for infrastructure failures; candidate refusals are returned as
+/// [`ItemFailure`] without committing.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_revision(
     stores: &dyn Stores,
@@ -839,20 +760,8 @@ pub async fn commit_revision(
         });
     }
 
-    // Step 4.3: the revision vector, re-derived from the database and compared —
-    // membership and every column, dependencies and dependents alike. A difference
-    // means this evaluation was computed against a state that is gone, so
-    // `vector::guard` returns `WorkerError::RevalidationRequired`, this transaction
-    // rolls back, and the worker evaluates again.
-    //
-    // **After the `unchanged` branch, not before it.** Step 4.3's place in SPEC
-    // §8.1 is ahead of every write, and an `unchanged` outcome writes none: it
-    // allocates no revision, moves no version and refreshes no dependent, and the
-    // one thing it does decide — "this content already equals the current
-    // revision" — is decided from rows read *inside* this transaction, so no part
-    // of it rests on the evaluation's view. Guarding it could only turn a genuine
-    // no-op re-submit into a revalidation, and after
-    // `worker.max_revalidation_attempts` of those, into a failure.
+    // Step 4.3: the revision vector, re-derived from the database and compared — membership and
+    // every column, dependencies and dependents alike.
     if let Err(failure) = vector::guard(
         stores,
         tx,
@@ -976,10 +885,9 @@ pub async fn commit_revision(
         }
     }
 
-    // The authored document decided the edges, so they are replaced on every
-    // revision that wrote one — including a revision whose references did not
-    // change, where the replacement is the same set written again. An `unchanged`
-    // candidate never reaches here: identical content implies an identical edge set.
+    // The authored document decided the edges, so they are replaced on every revision that wrote
+    // one — including a revision whose references did not change, where the replacement is the same
+    // set written again.
     replace_edges(stores, tx, scope, entity.id, &unit.edges).await?;
 
     refresh_reverse_impact(
@@ -1018,24 +926,8 @@ pub async fn commit_revision(
     })))
 }
 
-/// Step 4.6: re-materialize the artifacts of everything that depends on the entity
-/// this revision just moved.
-///
-/// Its own function so the commit path reads as a sequence of steps rather than
-/// growing a branch inside one, and because the "only for a Type Schema" condition
-/// is a claim worth stating once, next to its reason.
-///
-/// **Only a Type Schema has dependents.** Nothing can depend on an Instance: both
-/// reference-bearing keywords name schemas, and an Instance's own conformance edge
-/// points *at* its type. Called after `replace_edges`, so a dependent reached here
-/// sees this revision's reference set rather than the previous one.
-///
-/// # Errors
-/// [`WorkerError`] for an infrastructure failure, and
-/// [`WorkerError::RefusedAfterWrite`] for a candidate refusal — the refresh runs
-/// inside the caller's transaction by construction (`refresh::refresh_dependents`),
-/// and that transaction has already written the revision, so a refusal has to roll
-/// it back rather than travel in the `Ok` position, which commits.
+/// Step 4.6: re-materialize the artifacts of everything that depends on the entity this revision
+/// just moved.
 #[allow(clippy::too_many_arguments)]
 async fn refresh_reverse_impact(
     stores: &dyn Stores,
@@ -1052,11 +944,9 @@ async fn refresh_reverse_impact(
     }
     match refresh_dependents(stores, tx, scope, &[entity_id], activation_write_set, now).await? {
         Ok(outcome) => {
-            // Observed here rather than inside `refresh_dependents`, which also
-            // returns the over-bound refusal: a refused revision commits nothing,
-            // so recording its would-be write set would put a value in the
-            // histogram that never became a write. That case is the
-            // `activation_write_set_exceeded` refusal counter instead.
+            // Observed here rather than inside `refresh_dependents`, which also returns the
+            // over-bound refusal: a refused revision commits nothing, so recording its would-be
+            // write set would put a value in the histogram that never became a write.
             metrics.observe_activation_write_set(outcome.refreshed.len());
             tracing::debug!(
                 gts_id = %unit.gts_id,

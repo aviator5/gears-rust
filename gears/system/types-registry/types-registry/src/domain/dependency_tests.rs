@@ -1,6 +1,4 @@
-//! Unit tests for the pure edge extractor. No database, no clock: every case is a
-//! document and an identifier in, an edge set out — which is the whole reason
-//! [`extract_edges`](super::extract_edges) takes content rather than a row.
+//! Unit tests for the pure edge extractor.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -21,8 +19,6 @@ fn id(s: &str) -> GtsId {
     GtsId::try_new(s).expect("the fixture identifier parses")
 }
 
-/// A schema carrying whatever body a case needs, with the `$id` and dialect every
-/// admitted schema has.
 fn schema(gts_id: &str, body: Value) -> Value {
     let mut doc = json!({
         "$id": format!("gts://{gts_id}"),
@@ -49,10 +45,6 @@ fn targets_of(edges: &[DependencyEdge], kind: DependencyKind) -> Vec<String> {
         .map(|e| e.target.clone())
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// `$ref`
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_ref_outside_the_identifier_chain_is_a_schema_ref_edge() {
@@ -96,15 +88,10 @@ fn refs_are_deduplicated_and_the_traits_schema_is_covered() {
 
 #[test]
 fn a_malformed_ref_is_reported_rather_than_silently_dropped() {
-    // A bare id with no `gts://` scheme: what `validate_schema` also refuses.
     let doc = schema(ROOT, json!({ "properties": { "a": { "$ref": OTHER } } }));
     let err = extract_edges(&id(ROOT), &doc).expect_err("a bare-id ref is not extractable");
     assert_eq!(err.gts_id, ROOT);
 }
-
-// ---------------------------------------------------------------------------
-// `x-gts-ref` — never an edge
-// ---------------------------------------------------------------------------
 
 #[test]
 fn an_x_gts_ref_is_not_a_dependency_edge_in_any_of_its_forms() {
@@ -134,10 +121,6 @@ fn an_x_gts_ref_inside_a_data_valued_keyword_is_data() {
     );
     assert!(edges(ROOT, &doc).is_empty());
 }
-
-// ---------------------------------------------------------------------------
-// Derivation and conformance
-// ---------------------------------------------------------------------------
 
 #[test]
 fn a_derived_schema_edges_only_to_its_immediate_base() {
@@ -173,9 +156,8 @@ fn an_instance_conforms_to_its_type_and_carries_nothing_else() {
 
 #[test]
 fn an_instance_values_ref_shaped_data_is_data_and_not_an_edge() {
-    // An Instance is a *value*: `$ref` and `x-gts-ref` are schema keywords, so the
-    // same strings inside a value name nothing. Extracting them would invent an
-    // edge — and, worse, a malformed one would refuse a perfectly valid value.
+    // An Instance is a *value*: `$ref` and `x-gts-ref` are schema keywords, so the same strings
+    // inside a value name nothing.
     let value = json!({
         "$ref": OTHER,
         "x-gts-ref": "not-an-identifier",
@@ -189,10 +171,6 @@ fn an_instance_values_ref_shaped_data_is_data_and_not_an_edge() {
         }],
     );
 }
-
-// ---------------------------------------------------------------------------
-// The edge kinds, and the cases that produce none, over one table
-// ---------------------------------------------------------------------------
 
 #[test]
 fn the_edge_kinds_over_their_fixtures() {
@@ -255,17 +233,11 @@ fn the_edge_kinds_over_their_fixtures() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The read-side seed
-// ---------------------------------------------------------------------------
-
 #[test]
 fn only_the_ref_targets_seed_the_closure() {
-    // Derivation and conformance targets are chain members, which the closure
-    // already seeds from the identifier (T10) — and an `x-gts-ref` target is not
-    // seeded at all, because validating the keyword never reads the target
-    // document. What is left is the one thing no identifier implies and resolution
-    // does read: the `$ref` target.
+    // Derivation and conformance targets are chain members, which the closure already seeds from
+    // the identifier — and an `x-gts-ref` target is not seeded at all, because validating the
+    // keyword never reads the target document.
     let doc = schema(
         DERIVED,
         json!({

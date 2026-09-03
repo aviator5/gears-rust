@@ -26,8 +26,7 @@
 pub mod admission;
 // Materialized effective artifacts and the resolution fingerprint (SPEC D3).
 pub mod artifacts;
-// The three direct dependency edge kinds, extracted from authored content and
-// the identifier.
+// The three direct dependency edge kinds, extracted from authored content and the identifier.
 pub mod dependency;
 // Version-family key derivation and the three family rules.
 pub mod family;

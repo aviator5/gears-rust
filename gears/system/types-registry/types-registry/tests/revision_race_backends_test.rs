@@ -114,14 +114,10 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
             },
         },
         operation_item_id,
-        // No `$ref`, no `x-gts-ref`, one identifier segment: the fixture body
-        // implies no edge of any kind.
         edges: Vec::new(),
-        // The vector a real evaluation of this fixture would record, spelled out:
-        // the closure over the candidate's own identifier resolves to the candidate
-        // and nothing else, and nothing references it, so both halves are empty
-        // (T15). The commit's guard re-derives exactly this and finds no drift,
-        // which is what keeps this file about the two branches it is named for.
+        // The vector a real evaluation of this fixture would record, spelled out: the closure over
+        // the candidate's own identifier resolves to the candidate and nothing else, and nothing
+        // references it, so both halves are empty.
         vector: RevisionVector::new(vec![parsed.id().to_owned()], Vec::new()),
     }
 }

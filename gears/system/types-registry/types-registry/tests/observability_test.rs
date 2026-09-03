@@ -1,39 +1,4 @@
 //! The admission path's emission sites (T16).
-//!
-//! `infra::metrics_tests` pins the *instrument contract* — names, labels,
-//! buckets — against instruments a test built itself. This file asks the other
-//! half of the question: does the real path actually reach those instruments,
-//! with the labels the criteria name, on the outcomes the criteria name. So
-//! nothing here builds an `AdmissionMetricsMeter`; every assertion is downstream
-//! of a real `accept` or `run_operation`.
-//!
-//! # Why one global recorder and a serial lock
-//!
-//! Production binds the adapter to the process-global `MeterProvider` from
-//! `Gear::init`; a test binary never runs gear init, so [`recorder`] installs an
-//! in-memory provider **and binds the adapter to it**, once for this binary,
-//! before any admission runs. The domain reaches the instruments through its
-//! port's process-wide binding — see `domain::ports::metrics` for why that is a
-//! binding rather than a threaded parameter.
-//!
-//! Two consequences, both handled rather than hoped away:
-//!
-//! * The exporter is shared, so every metric assertion holds [`SERIAL`] across
-//!   reset → drive → flush → assert. That makes each figure exactly this test's
-//!   own, with no `>=` hedging.
-//! * `Temporality::Delta` is what makes the reset meaningful: under the default
-//!   cumulative temporality a flush re-exports every count since process start,
-//!   and `reset()` would clear the stored batches without clearing the sums.
-//!
-//! The span assertions filter the captured log by an identifier unique to their
-//! own test, so the shared buffer costs them nothing — but they hold [`SERIAL`]
-//! all the same, because their admissions increment the very counters the tests
-//! above are measuring a delta of. Letting them run alongside made
-//! `a_creation_observes_no_activation_write_set` see three successes instead of
-//! one, intermittently.
-//!
-//! No `sleep`, no timer, no polling (SPEC §13): `force_flush` is synchronous and
-//! the worker is a plain function.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -75,26 +40,14 @@ use types_registry::infra::metrics::{AdmissionMetricsMeter, SCOPE};
 const NOW: OffsetDateTime = datetime!(2026-08-21 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-21 10:20:40 UTC);
 
-/// Its own family prefix, for the reason `dependency_test.rs` records: the
-/// `SQLite` family lock is keyed per DSN across processes, so two binaries
-/// admitting one family key contend even with isolated databases.
 const SUBJECT: &str = gts_id!("cf.core.obsv.subject.v1~");
-/// Reaches [`SUBJECT`] through a `$ref`, so a revision of [`SUBJECT`] refreshes it.
 const REFERRER: &str = gts_id!("cf.core.obsv.referrer.v1~");
-/// Never registered. Naming a version for it is the cheapest admission-stage
-/// refusal there is: `commit_revision` refuses an absent identifier.
 const ABSENT: &str = gts_id!("cf.core.obsv.absent.v1~");
 
 type Provider = Arc<DBProvider<DbError>>;
 
-/// Serializes the metric assertions — see the module header.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-// ---------------------------------------------------------------------------
-// The recorder: one meter provider and one subscriber for the whole binary
-// ---------------------------------------------------------------------------
-
-/// The captured `types_registry` log, shared by every test in this binary.
 static LOG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 struct LogWriter;
@@ -118,12 +71,6 @@ impl MakeWriter<'_> for LogWriter {
     }
 }
 
-/// Install the in-memory meter provider and the log-capturing subscriber, once.
-///
-/// Called at the top of every test. [`metrics`] is the adapter over this
-/// provider, and every `accept` / `run_operation` below is handed it — the
-/// test-binary stand-in for what `Gear::init` injects in production, and what
-/// makes the domain's instruments land on this exporter rather than on a no-op.
 fn recorder() -> &'static (SdkMeterProvider, InMemoryMetricExporter) {
     static RECORDER: OnceLock<(SdkMeterProvider, InMemoryMetricExporter)> = OnceLock::new();
     RECORDER.get_or_init(|| {
@@ -135,9 +82,6 @@ fn recorder() -> &'static (SdkMeterProvider, InMemoryMetricExporter) {
             .build();
         opentelemetry::global::set_meter_provider(provider.clone());
 
-        // Only this gear, and only down to DEBUG: the point is to read the
-        // admission path's own spans, and a `trace`-level catch-all would bury
-        // them under every statement `sea-orm` logs.
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter("types_registry=debug")
             .with_writer(LogWriter)
@@ -150,14 +94,10 @@ fn recorder() -> &'static (SdkMeterProvider, InMemoryMetricExporter) {
     })
 }
 
-/// Everything captured so far. Read whole and filtered by the caller, because the
-/// buffer is shared with every other test in this binary.
 fn captured_log() -> String {
     String::from_utf8_lossy(&LOG.lock().expect("log buffer")).into_owned()
 }
 
-/// The captured lines mentioning `needle` — an identifier unique to one test, so
-/// the result is that test's own output even under parallel execution.
 fn lines_mentioning(needle: &str) -> Vec<String> {
     captured_log()
         .lines()
@@ -166,14 +106,6 @@ fn lines_mentioning(needle: &str) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Reading the exporter
-// ---------------------------------------------------------------------------
-
-/// The adapter every admission in this file is handed.
-///
-/// Built once over [`recorder`]'s provider, under the default prefix, so the
-/// series names asserted below are the ones production renders.
 fn metrics() -> &'static Arc<dyn AdmissionMetrics> {
     static METRICS: OnceLock<Arc<dyn AdmissionMetrics>> = OnceLock::new();
     METRICS.get_or_init(|| {
@@ -252,7 +184,6 @@ fn histogram_sum(name: &str) -> f64 {
     total
 }
 
-/// Discard everything recorded before the test's own work.
 fn reset_metrics() {
     let (provider, exporter) = recorder();
     provider.force_flush().expect("flush");
@@ -262,10 +193,6 @@ fn reset_metrics() {
 fn flush() {
     recorder().0.force_flush().expect("flush");
 }
-
-// ---------------------------------------------------------------------------
-// Driving one admission
-// ---------------------------------------------------------------------------
 
 struct NoDispatch;
 
@@ -289,9 +216,6 @@ fn subject_schema(property: &str) -> Value {
     })
 }
 
-/// `marker` is a second property, so a *revision* of this schema differs from
-/// the admitted one — identical content commits as `Unchanged`, which writes
-/// nothing and therefore never reaches the revision-vector guard.
 fn referencing_schema(marker: &str) -> Value {
     json!({
         "$id": format!("gts://{REFERRER}"),
@@ -320,10 +244,6 @@ async fn submit(
     submit_via(db, key, Arc::new(NoDispatch), candidates).await
 }
 
-/// [`submit`] with the dispatcher chosen by the caller — the seam the
-/// infrastructure-arm test needs, since a failing dispatch is the one
-/// `AcceptanceError` arm that is drivable end to end without breaking the
-/// database.
 async fn submit_via(
     db: &Provider,
     key: &str,
@@ -394,13 +314,6 @@ async fn admit(
     .expect("the worker must not fail on infrastructure")
 }
 
-// ---------------------------------------------------------------------------
-// Candidates by terminal status
-// ---------------------------------------------------------------------------
-
-/// A first admission counts one `succeeded` candidate and observes one pass
-/// duration — the two signals that answer "is the registry admitting anything,
-/// and how long is it taking".
 #[tokio::test]
 async fn a_successful_admission_counts_one_succeeded_candidate_and_one_pass_duration() {
     let _serial = SERIAL.lock().await;
@@ -426,9 +339,6 @@ async fn a_successful_admission_counts_one_succeeded_candidate_and_one_pass_dura
     );
 }
 
-/// Re-submitting identical content is `Unchanged`, and it must be countable
-/// *apart* from a success: the two look the same to a client polling for
-/// completion and are entirely different to an operator watching write volume.
 #[tokio::test]
 async fn a_redundant_resubmission_counts_an_unchanged_candidate() {
     let _serial = SERIAL.lock().await;
@@ -458,13 +368,6 @@ async fn a_redundant_resubmission_counts_an_unchanged_candidate() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Refusals by reason, at both stages
-// ---------------------------------------------------------------------------
-
-/// An admission-stage refusal is two facts: the candidate ended `failed`, and it
-/// ended that way for a named reason. Both are counted, and the `stage` label is
-/// what tells this refusal apart from one the acceptance path made.
 #[tokio::test]
 async fn an_admission_refusal_counts_a_failed_candidate_and_its_reason() {
     let _serial = SERIAL.lock().await;
@@ -472,7 +375,6 @@ async fn an_admission_refusal_counts_a_failed_candidate_and_its_reason() {
     let db = test_db().await;
     reset_metrics();
 
-    // A revision naming version 1 of an identifier the registry does not hold.
     let outcome = admit(&db, "k-absent", ABSENT, absent_schema(), Some(1)).await;
     flush();
 
@@ -495,8 +397,6 @@ async fn an_admission_refusal_counts_a_failed_candidate_and_its_reason() {
     );
 }
 
-/// An acceptance-stage refusal never becomes an operation, so no item status can
-/// carry it. The counter is the only place it is visible.
 #[tokio::test]
 async fn an_acceptance_refusal_counts_under_its_own_stage_and_reason() {
     let _serial = SERIAL.lock().await;
@@ -522,10 +422,6 @@ async fn an_acceptance_refusal_counts_under_its_own_stage_and_reason() {
     );
 }
 
-/// Two different acceptance refusals are two series. This is the criterion
-/// "countable **and distinguishable**" read against the real path rather than
-/// against instruments a test built: it is `AcceptanceError::reason`'s
-/// per-variant mapping that is under test here.
 #[tokio::test]
 async fn two_acceptance_refusals_are_told_apart_by_their_reason() {
     let _serial = SERIAL.lock().await;
@@ -568,15 +464,6 @@ async fn two_acceptance_refusals_are_told_apart_by_their_reason() {
     );
 }
 
-/// A refusal reason that is not provably a literal counts under the single closed
-/// `other` label rather than becoming a series of its own — the cardinality rule
-/// the `reason` parameter type enforces and `worker::reason_label` implements.
-///
-/// Driven through the bound adapter with the exact value `record_failure` passes
-/// for the one owned-reason producer there is: a failure read back off a stored
-/// `error_payload` (`ItemFailure::from_payload`). The live worker always refuses
-/// with a fresh literal (pinned by the test above), so this is as close to that
-/// site as the current call graph reaches.
 #[tokio::test]
 async fn a_read_back_failure_reason_counts_under_other_and_creates_no_new_series() {
     let _serial = SERIAL.lock().await;
@@ -610,20 +497,8 @@ async fn a_read_back_failure_reason_counts_under_other_and_creates_no_new_series
     );
 }
 
-/// An infrastructure arm of the acceptance path is a fault, not a refusal: it must
-/// not emit the "refused a submission" `warn` (the REST boundary's
-/// `opaque_internal` already logs it once, at `error`), while the counter still
-/// counts it — the counter is the one place both kinds of outcome are meant to be
-/// visible side by side, so the counting half is exactly what a careless edit to
-/// the `warn`'s `if` would silently break.
-///
-/// `Dispatch` is the drivable infrastructure arm: the dispatcher is a port the
-/// test owns, unlike the database.
 #[tokio::test]
 async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
-    // The infrastructure arm: validation passes, the dispatch fails. Declared
-    // before the first statement, because an item after one reads as if it were
-    // scoped to that point when it is in fact live for the whole body.
     struct FailingDispatch;
     #[async_trait::async_trait]
     impl OperationDispatch for FailingDispatch {
@@ -637,9 +512,8 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
     let db = test_db().await;
     reset_metrics();
 
-    // A client refusal, with an identifier unique to this test so its warn line
-    // is filterable out of the shared log: the `warn` carries the error `Display`,
-    // which names it.
+    // A client refusal, with an identifier unique to this test so its warn line is filterable out
+    // of the shared log: the `warn` carries the error `Display`, which names it.
     let client = gts_id!("cf.core.obsv.warnclient.v1~");
     let refused = submit(
         &db,
@@ -652,7 +526,6 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
         Err(AcceptanceError::ZeroPrecondition { .. })
     ));
 
-    // Validation passes; the dispatch is what fails.
     let infra = gts_id!("cf.core.obsv.warninfra.v1~");
     let content = json!({
         "$id": format!("gts://{infra}"),
@@ -679,8 +552,8 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
         "a client refusal is warned; captured:\n{}",
         captured_log()
     );
-    // The suppressed warn was the only place the dispatch error's `Display`
-    // would reach the log from `accept`, so its absence proves the suppression.
+    // The suppressed warn was the only place the dispatch error's `Display` would reach the log
+    // from `accept`, so its absence proves the suppression.
     assert!(
         !captured_log().contains("observability-dispatch-outage"),
         "an infrastructure arm must not be logged as a refusal; captured:\n{}",
@@ -705,13 +578,6 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The activation write set
-// ---------------------------------------------------------------------------
-
-/// A revision of a schema something `$ref`s refreshes that dependent, and the
-/// size of what it rewrote is the bound `limits.activation_write_set` governs —
-/// so it is the figure an operator needs before raising or lowering that bound.
 #[tokio::test]
 async fn a_revision_observes_the_activation_write_set_it_rewrote() {
     let _serial = SERIAL.lock().await;
@@ -751,14 +617,6 @@ async fn a_revision_observes_the_activation_write_set_it_rewrote() {
     );
 }
 
-/// A creation observes **nothing**, and that is the histogram's scope rather than
-/// a gap: nothing can depend on an identifier the registry did not hold a moment
-/// ago, so `commit_creation` runs no reverse-impact refresh at all. The series
-/// therefore counts *revisions*, and reading its count as "admissions" would
-/// overstate the denominator.
-///
-/// A zero **is** recorded for a revision whose dependents all recomputed to
-/// identical bytes — `observability_tests.rs` pins that half.
 #[tokio::test]
 async fn a_creation_observes_no_activation_write_set() {
     let _serial = SERIAL.lock().await;
@@ -785,15 +643,6 @@ async fn a_creation_observes_no_activation_write_set() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Revalidation retries
-// ---------------------------------------------------------------------------
-
-/// The retry counter is incremented by the guard's own arm, so it counts
-/// *rollbacks*, not attempts: a candidate that commits first time contributes
-/// nothing, and this one — whose dependency moves while its commit transaction is
-/// held open at the boundary — contributes exactly one, under the shape of the
-/// drift that caused it.
 #[tokio::test]
 async fn a_revalidation_retry_is_counted_by_its_drift_shape() {
     let _serial = SERIAL.lock().await;
@@ -839,7 +688,6 @@ async fn a_revalidation_retry_is_counted_by_its_drift_shape() {
     });
 
     reached.await.expect("the pass must reach the commit");
-    // A real committed revision of the dependency, landing in the gap.
     let mutating = Arc::clone(&db);
     admit(
         &mutating,
@@ -869,23 +717,11 @@ async fn a_revalidation_retry_is_counted_by_its_drift_shape() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Spans
-// ---------------------------------------------------------------------------
-
-/// Every line the pass logs carries both spans, and between them the four fields
-/// the criterion names: `operation_id`, `gts_id`, kind and dry-run mode.
-///
-/// Asserted on the admission log line rather than on a probe event, because what
-/// is under test is that the *real* path opens the spans — a probe would only
-/// prove the span constructors still work, which `observability_tests.rs` already
-/// does.
 #[tokio::test]
 async fn the_real_pass_wraps_its_work_in_an_operation_span_and_a_unit_span() {
     let _serial = SERIAL.lock().await;
     recorder();
     let db = test_db().await;
-    // Unique to this test, which is what makes the shared log filterable.
     let unique = gts_id!("cf.core.obsv.spanned.v1~");
     let content = json!({
         "$id": format!("gts://{unique}"),
@@ -929,13 +765,6 @@ async fn the_real_pass_wraps_its_work_in_an_operation_span_and_a_unit_span() {
     );
 }
 
-/// The operation span's `kind` and `dry_run` are recorded from the row the pass
-/// reads, not from the caller's request — so a pass driven by a redelivery, which
-/// has no request in hand, carries them too.
-///
-/// The assertion is on the lines **the second pass alone** added: the first pass
-/// also logs inside the span, so a whole-buffer assertion would pass even if the
-/// redelivered pass recorded nothing.
 #[tokio::test]
 async fn a_redelivered_pass_still_carries_the_operation_facts() {
     let _serial = SERIAL.lock().await;
@@ -951,7 +780,6 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
         .await
         .expect("acceptance");
 
-    // The first pass completes the operation.
     run_operation(
         &stores(),
         &worker(&db),
@@ -968,11 +796,10 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
     .expect("the worker must not fail on infrastructure");
     let first_pass_lines = lines_mentioning(&operation_id.to_string()).len();
 
-    // Discard the first pass's counts, so what the exporter holds below is the
-    // redelivered pass alone.
+    // Discard the first pass's counts, so what the exporter holds below is the redelivered pass
+    // alone.
     reset_metrics();
 
-    // The second pass finds the operation terminal.
     run_operation(
         &stores(),
         &worker(&db),
@@ -989,8 +816,8 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
     .expect("the worker must not fail on infrastructure");
     flush();
 
-    // Lines are appended to a shared buffer and the filter is by needle, so the
-    // second pass's lines are exactly the ones past the first pass's count.
+    // Lines are appended to a shared buffer and the filter is by needle, so the second pass's lines
+    // are exactly the ones past the first pass's count.
     let all_lines = lines_mentioning(&operation_id.to_string());
     let redelivered_lines = &all_lines[first_pass_lines..];
     assert!(
@@ -1007,9 +834,9 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
         redelivered_lines.join("\n")
     );
 
-    // And that pass is observationally a no-op beyond the duration it spent: no
-    // candidate is terminalized a second time, because the counter counts
-    // decisions and the redelivery reported one another pass decided.
+    // And that pass is observationally a no-op beyond the duration it spent: no candidate is
+    // terminalized a second time, because the counter counts decisions and the redelivery reported
+    // one another pass decided.
     assert_eq!(
         counter_sum_where("types_registry_candidates_total", &[]),
         0,

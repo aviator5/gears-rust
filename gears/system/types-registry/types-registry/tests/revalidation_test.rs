@@ -1,37 +1,6 @@
-//! The commit-time revision-vector guard and the bounded revalidation loop
-//! (T15, D4, SPEC §8.1 steps 3 and 4.3).
-//!
-//! # Why the guard needs its own suite
-//!
-//! Every other admission test runs one pass at a time, and a single pass can
-//! never drift: it evaluates and commits against the same state. The claim here is
-//! about what happens when something moves *between* those two, which needs a
-//! mutation placed exactly in that gap.
-//!
-//! Two shapes do that, and both are deterministic — no `sleep`, no timer, no
-//! polling (SPEC §13):
-//!
-//! * **Split by hand.** `evaluate` closes its snapshot transaction before it
-//!   returns, so a test can call it, commit a real mutation, and then call
-//!   `commit_revision`. Nothing overlaps, so `SQLite` is enough, and the mutation
-//!   is an ordinary committed admission rather than an injection.
-//! * **Held at the boundary.** `common::PausingStores` holds the pass at
-//!   `PausePoint::RevisionEntityRead` — the commit transaction's *first* statement,
-//!   which means the transaction is open and holding nothing, so a second
-//!   connection can commit underneath it even on `SQLite`. That is what makes the
-//!   loop itself observable: one drift, one rollback, one fresh evaluation.
-//!
-//! The file-backed database is deliberate for the second shape: `sqlite::memory:`
-//! gives every pooled connection its own empty database, so a second connection
-//! would see no tables.
+//! Commit-time revision-vector guard and bounded revalidation loop.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
-// `admit_with_a_mutation_in_the_gap` spawns a task whose future nests the whole
-// admission pass — handler-free, but still worker → item → commit → transaction
-// closure, and since T16 one `tracing::Instrument` layer per level on top. The
-// default limit of 128 is reached laying that state machine out. The lib crate
-// carries the same attribute for the same reason; nothing here recurses at
-// runtime.
 #![recursion_limit = "256"]
 
 mod common;
@@ -72,13 +41,8 @@ use types_registry::infra::storage::repo::{EntityRepo, OperationRepo, TypeSchema
 const NOW: OffsetDateTime = datetime!(2026-08-20 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-20 10:20:40 UTC);
 
-/// Its own family prefix, for the reason `dependency_test.rs` records: the
-/// `SQLite` family lock is keyed per DSN across processes, so two binaries
-/// admitting one family key contend even with isolated databases.
 const BASE: &str = gts_id!("cf.core.reval.thing.v1~");
-/// Derived from [`BASE`] through the identifier chain and an explicit `$ref`.
 const DERIVED: &str = gts_id!("cf.core.reval.thing.v1~cf.core.reval.leaf.v1~");
-/// Outside every chain here, and reaches [`BASE`] only through a `$ref`.
 const REFERRER: &str = gts_id!("cf.core.reval.referrer.v1~");
 
 type Provider = Arc<DBProvider<DbError>>;
@@ -116,8 +80,6 @@ fn derived_schema() -> Value {
     })
 }
 
-/// A schema outside the chain whose one property is a `$ref` to [`BASE`], with a
-/// second property so a revision of it has something to change.
 fn referencing_schema(marker: &str) -> Value {
     json!({
         "$id": format!("gts://{REFERRER}"),
@@ -129,10 +91,6 @@ fn referencing_schema(marker: &str) -> Value {
         },
     })
 }
-
-// ---------------------------------------------------------------------------
-// Driving one admission
-// ---------------------------------------------------------------------------
 
 async fn submit(
     db: &Provider,
@@ -172,7 +130,6 @@ async fn submit(
     .map(|accepted| accepted.operation_id)
 }
 
-/// Submit one candidate and admit it through the real worker and the real ports.
 async fn admit(
     db: &Provider,
     key: &str,
@@ -199,8 +156,6 @@ async fn admit(
     .expect("the worker must not fail on infrastructure")
 }
 
-/// Submit a candidate and run only step 3 against it: the evaluation whose
-/// verdict — and whose revision vector — the commit will be handed.
 async fn evaluated(
     db: &Provider,
     key: &str,
@@ -232,8 +187,6 @@ async fn evaluated(
     .expect("the candidate is valid")
 }
 
-/// Hand an already-evaluated unit to `commit_revision`, in its own transaction,
-/// exactly as `worker::commit_evaluated` does.
 async fn commit_the_revision(
     db: &Provider,
     unit: &EvaluatedUnit,
@@ -266,10 +219,6 @@ async fn commit_the_revision(
         .await
 }
 
-// ---------------------------------------------------------------------------
-// Reads
-// ---------------------------------------------------------------------------
-
 async fn entity(db: &Provider, gts_id: &str) -> EntityRow {
     let conn = db.conn().expect("conn");
     EntityRepo::find_by_gts_id(&conn, &allow_all(), gts_id)
@@ -287,19 +236,12 @@ async fn current(db: &Provider, gts_id: &str) -> CurrentTypeSchemaRow {
         .unwrap_or_else(|| panic!("{gts_id} must have a current row"))
 }
 
-/// [`BASE`] and the two dependents that carry artifacts, all admitted.
 async fn seed_base_and_dependents(db: &Provider) {
     admit(db, "k-base", BASE, base_schema("name"), None).await;
     admit(db, "k-derived", DERIVED, derived_schema(), None).await;
     admit(db, "k-referrer", REFERRER, referencing_schema("note"), None).await;
 }
 
-// ---------------------------------------------------------------------------
-// The guard, split by hand
-// ---------------------------------------------------------------------------
-
-/// The control. Without it every assertion below could be passing because the
-/// guard refuses everything.
 #[tokio::test]
 async fn a_commit_whose_vector_did_not_move_stands() {
     let db = test_db().await;
@@ -315,9 +257,6 @@ async fn a_commit_whose_vector_did_not_move_stands() {
     assert_eq!(entity(&db, REFERRER).await.resource_version, 2);
 }
 
-/// The criterion: a dependency that moved between evaluation and commit rolls the
-/// transaction back. The mutation is a real committed admission of a [`BASE`]
-/// revision — not an injected column write — landing while nothing is open.
 #[tokio::test]
 async fn a_dependency_that_moved_after_evaluation_rolls_the_commit_back() {
     let db = test_db().await;
@@ -326,9 +265,6 @@ async fn a_dependency_that_moved_after_evaluation_rolls_the_commit_back() {
     let unit = evaluated(&db, "k-ref-2", REFERRER, referencing_schema("tag"), Some(1)).await;
     let before = entity(&db, REFERRER).await;
 
-    // The base moves underneath the evaluation. This also refreshes REFERRER's
-    // artifacts, which is what makes the stale resolution the unit is holding
-    // genuinely wrong rather than merely old.
     admit(&db, "k-base-2", BASE, base_schema("label"), Some(1)).await;
 
     let outcome = commit_the_revision(&db, &unit, 1).await;
@@ -357,9 +293,6 @@ async fn a_dependency_that_moved_after_evaluation_rolls_the_commit_back() {
     );
 }
 
-/// The phantom dependent: nothing depended on [`BASE`] when its revision was
-/// evaluated, and something does by the time it commits. Detected on **membership**
-/// — no column of any recorded entry changed.
 #[tokio::test]
 async fn a_phantom_dependent_created_after_the_scan_is_detected() {
     let db = test_db().await;
@@ -393,13 +326,6 @@ async fn a_phantom_dependent_created_after_the_scan_is_detected() {
     );
 }
 
-/// The case `resource_version` alone cannot see. A dependent refreshed by someone
-/// else's commit gets new artifacts and **no** version move, so only the recorded
-/// `resolution_fingerprint` can show it — which is why the vector carries one.
-///
-/// The refresh is applied through `update_current_schema`, the same port the real
-/// reverse-impact refresh writes through, with the dependent's revision pointer
-/// carried over unchanged exactly as `refresh::refresh_dependents` does.
 #[tokio::test]
 async fn a_dependent_refreshed_after_the_scan_is_detected() {
     let db = test_db().await;
@@ -470,9 +396,6 @@ async fn a_dependent_refreshed_after_the_scan_is_detected() {
     );
 }
 
-/// The guard is on the creation path too. A creation has no dependents — nothing
-/// can point at an identifier that does not resolve — so what it protects is the
-/// resolution the candidate was validated against.
 #[tokio::test]
 async fn a_creation_whose_dependency_moved_after_evaluation_rolls_the_commit_back() {
     let db = test_db().await;
@@ -519,10 +442,6 @@ async fn a_creation_whose_dependency_moved_after_evaluation_rolls_the_commit_bac
     );
 }
 
-/// An `unchanged` outcome is deliberately **not** guarded: it writes nothing, and
-/// the one thing it decides is decided from rows read inside its own transaction.
-/// Guarding it could only turn a genuine no-op re-submit into a revalidation and,
-/// eventually, into a failure.
 #[tokio::test]
 async fn an_unchanged_resubmission_is_not_refused_by_a_moved_dependency() {
     let db = test_db().await;
@@ -549,16 +468,6 @@ async fn an_unchanged_resubmission_is_not_refused_by_a_moved_dependency() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The bounded loop, held at the commit boundary
-// ---------------------------------------------------------------------------
-
-/// Run one operation with the pass held at the commit boundary, letting `mutate`
-/// commit on a second connection in the gap, and return the outcome.
-///
-/// The pass is held with its commit transaction open and holding nothing — see
-/// [`PausePoint::RevisionEntityRead`] — so the mutation is a real concurrent
-/// commit rather than an injected write.
 async fn admit_with_a_mutation_in_the_gap<F, Fut>(
     db: &Provider,
     settings: WorkerSettings,
@@ -597,14 +506,6 @@ where
         .expect("the worker must not fail on infrastructure")
 }
 
-/// The criterion: a dependency mutated between evaluation and commit causes
-/// exactly one rollback and one successful retry.
-///
-/// "One rollback" is read off the versions: the candidate lands at
-/// `resource_version` 2 and revision 2, which a second commit would have made 3.
-/// "Successful retry" is read off the artifacts: the committed resolution inlines
-/// the base's **new** property, which only a fresh evaluation could have produced —
-/// the rolled-back attempt was holding a resolution of the old one.
 #[tokio::test]
 async fn a_dependency_mutated_between_evaluation_and_commit_costs_one_rollback_and_one_retry() {
     let dir = TestDir::new("types-registry-reval-retry");
@@ -653,9 +554,6 @@ async fn a_dependency_mutated_between_evaluation_and_commit_costs_one_rollback_a
     );
 }
 
-/// Exhaustion is terminal. With a budget of one attempt there is no retry to take,
-/// so the single drift ends the item as `failed` under a reason an operator and a
-/// client can both branch on.
 #[tokio::test]
 async fn exhausting_the_revalidation_budget_terminalizes_the_item_as_failed() {
     let dir = TestDir::new("types-registry-reval-exhausted");
@@ -700,10 +598,6 @@ async fn exhausting_the_revalidation_budget_terminalizes_the_item_as_failed() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Two pods, one database
-// ---------------------------------------------------------------------------
-
 fn service(db: &Provider) -> RegistryService {
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
     RegistryService::new(
@@ -717,15 +611,6 @@ fn service(db: &Provider) -> RegistryService {
     )
 }
 
-/// `nfr-multi-pod-correctness`: a commit on one pod is visible to the other's
-/// **first** post-commit read.
-///
-/// Two pods are two `DBProvider`s with their own pools over one database file —
-/// the same thing two processes have, minus the process boundary, which is what
-/// this criterion is about: neither pod holds any state between calls, so there is
-/// nothing to invalidate and nothing that could serve a stale answer. A
-/// process-local snapshot is exactly what would fail here, and P0 has no
-/// cross-pod invalidation channel to repair one (SPEC §8.2).
 #[tokio::test]
 async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(), ServiceError> {
     let dir = TestDir::new("types-registry-two-pods");
@@ -733,8 +618,8 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
     let pod_a = test_db_file(&path).await;
     let pod_b = test_db_file(&path).await;
 
-    // B looks first, so its miss is a read it actually performed rather than an
-    // absence it never asked about.
+    // B looks first, so its miss is a read it actually performed rather than an absence it never
+    // asked about.
     let key = EntityKey::parse(BASE);
     assert!(
         service(&pod_b).entity(&key).await?.is_none(),
@@ -749,8 +634,8 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
         .expect("B's first read after A's commit must see it");
     assert_eq!(first_read.resource_version, 1);
 
-    // And a revision on A is visible to B just the same: the read is a `SELECT`,
-    // not a snapshot, so there is no second thing to invalidate.
+    // And a revision on A is visible to B just the same: the read is a `SELECT`, not a snapshot, so
+    // there is no second thing to invalidate.
     admit(&pod_a, "k-base-2", BASE, base_schema("label"), Some(1)).await;
     let second_read = service(&pod_b)
         .entity(&key)

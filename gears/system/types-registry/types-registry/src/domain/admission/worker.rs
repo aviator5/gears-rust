@@ -52,11 +52,6 @@ use crate::observability;
 pub const LOCK_GEAR: &str = "types_registry";
 
 /// The two configuration sections one admission pass obeys, carried together.
-///
-/// They travel as a pair because the functions below want both and neither is a
-/// subset of the other: `limits` are bounds on what a *candidate* may be, `worker`
-/// is tuning on how the *pass* behaves. Borrowed and `Copy`, so passing it costs
-/// two pointers.
 #[derive(Clone, Copy)]
 pub struct Tuning<'a> {
     pub limits: &'a Limits,
@@ -103,22 +98,7 @@ pub struct ItemOutcome {
 
 /// Perform one full admission pass over an operation.
 ///
-/// Directly callable and returning a result: no `sleep`, no timer, no polling. The
-/// transient store is built inside each unit and dropped with it, so nothing is
-/// retained between invocations and a second pass re-reads the database.
-///
-/// `limits` are the operator's configured bounds. Only
-/// [`Limits::activation_write_set`](crate::config::Limits::activation_write_set)
-/// has an enforcement site behind this signature today — the reverse-impact
-/// refresh (T14) and the reverse-impact half of the revision vector (T15) — and the
-/// whole struct travels rather than that one field so the siblings need no
-/// signature change as their own enforcement lands.
-///
-/// `worker` is the tuning the pass itself obeys:
-/// [`WorkerSettings::max_revalidation_attempts`](crate::config::WorkerSettings::max_revalidation_attempts)
-/// bounds the revalidation loop in [`process_item`] (T15). It is a second parameter
-/// rather than a field folded into `limits` because the two are different
-/// configuration sections and an operator sets them by their own names.
+/// Each invocation rebuilds its transient store and re-reads the database.
 ///
 /// # Errors
 /// [`WorkerError`] for an infrastructure failure. A candidate-level refusal is
@@ -131,17 +111,16 @@ pub async fn run_operation(
     operation_id: Uuid,
     now: OffsetDateTime,
 ) -> Result<OperationOutcome, WorkerError> {
-    // The span opens before the first read, so it covers the whole pass — which
-    // is why its `kind` and `dry_run` fields are filled in from inside, once the
-    // operation row has been read (`observability::operation_span`).
+    // The span opens before the first read, so it covers the whole pass — which is why its `kind`
+    // and `dry_run` fields are filled in from inside, once the operation row has been read
+    // (`observability::operation_span`).
     let span = observability::operation_span(operation_id);
     let started = Instant::now();
     let outcome = run_operation_inner(stores, db, scope, tuning, operation_id, now)
         .instrument(span)
         .await;
-    // Recorded on the failing path too: an infrastructure failure is still time
-    // this pass spent, and a histogram that only sees successes hides the shape
-    // of a deployment that is timing out.
+    // Recorded on the failing path too: an infrastructure failure is still time this pass spent,
+    // and a histogram that only sees successes hides the shape of a deployment that is timing out.
     tuning.metrics.observe_operation_duration(started.elapsed());
     outcome
 }
@@ -178,8 +157,8 @@ async fn run_operation_inner(
 
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
-        // Instrumented here rather than inside `process_item` so that the pass's
-        // one long function does not need to be split in two to own a span.
+        // Instrumented here rather than inside `process_item` so that the pass's one long function
+        // does not need to be split in two to own a span.
         let span =
             observability::unit_span(operation_id, &item.gts_id, item.kind, item.dry_run, item.id);
         outcomes.push(
@@ -358,11 +337,11 @@ async fn commit_evaluated(
     // *enforced* here, by a commit that refuses an absent identifier.
     let tx_scope = scope.clone();
     let tx_stores = Arc::clone(stores);
-    // Cloned per attempt like `tx_stores`: the closure is `'static`, so it can
-    // borrow neither the caller's handle nor anything else from this frame.
+    // Cloned per attempt like `tx_stores`: the closure is `'static`, so it can borrow neither the
+    // caller's handle nor anything else from this frame.
     let tx_metrics = Arc::clone(metrics);
-    // `Limits` is `Copy` and arrives owned on `CommitRequest`, so each retry attempt
-    // takes its own copy rather than borrowing across the transaction boundary.
+    // `Limits` is `Copy` and arrives owned on `CommitRequest`, so each retry attempt takes its own
+    // copy rather than borrowing across the transaction boundary.
     let tx_limits = limits;
     let committed = db
         .db()
@@ -409,26 +388,8 @@ async fn commit_evaluated(
     committed
 }
 
-/// Evaluate and commit one non-terminal operation item, or report the durable
-/// outcome an overlapping pass already established.
-///
-/// # The revalidation loop is the whole of D4's retry policy
-///
-/// Evaluation runs against rows that may already have moved (`vector`'s module
-/// header), and the commit's revision-vector guard is what makes that safe. When
-/// the guard fires, nothing about the *candidate* has been decided: the state it
-/// was judged against is gone, so the judgement is void rather than wrong. The
-/// only sound answer is to redo the whole of step 3 — a fresh snapshot, a fresh
-/// transient store, fresh validation — which is why the loop is here, outside both
-/// transactions, and not inside `commit_evaluated`'s `transaction_with_retry`
-/// (which would re-run the same transaction against the same stale vector and
-/// drift identically).
-///
-/// The bound is `worker.max_revalidation_attempts`. Exhaustion is terminal: the
-/// item records `revalidation_exhausted` with the last drift, because a candidate
-/// whose neighbourhood moves under it that many times in a row is not going to
-/// commit by being asked again, and leaving the item `running` forever is worse
-/// than a failure the caller can resubmit.
+/// Evaluate and commit one non-terminal item.
+/// Revision-vector drift triggers a fresh evaluation up to the configured attempt limit.
 async fn process_item(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
@@ -449,9 +410,8 @@ async fn process_item(
 
     let attempts = tuning.worker.max_revalidation_attempts;
     let mut last_drift: Option<VectorDrift> = None;
-    // `1..=n` rather than `0..n` so the number in the log line is the attempt an
-    // operator would count. A configured `0` is refused at boot
-    // (`config::validate`), so the loop always runs at least once.
+    // `1..=n` rather than `0..n` so the number in the log line is the attempt an operator would
+    // count.
     for attempt in 1..=attempts {
         // Step 3: evaluation releases its snapshot before CPU-heavy validation.
         let evaluated = match evaluate(
@@ -498,15 +458,14 @@ async fn process_item(
         .await
         {
             Ok(committed) => committed,
-            // The competing pass's terminal item is authoritative; this pass rolled
-            // its entity write back with `ItemAlreadyTerminal`.
+            // The competing pass's terminal item is authoritative; this pass rolled its entity
+            // write back with `ItemAlreadyTerminal`.
             Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
                 return stored_item(stores, db, scope, operation_id, item_id).await;
             }
-            // A refusal the commit could only reach after it began writing: the
-            // transaction rolled back with it, and the item is terminalized here in
-            // a transaction of its own — the same path an evaluation-stage refusal
-            // takes.
+            // A refusal the commit could only reach after it began writing: the transaction rolled
+            // back with it, and the item is terminalized here in a transaction of its own — the
+            // same path an evaluation-stage refusal takes.
             Err(WorkerError::RefusedAfterWrite(failure)) => {
                 return record_failure(
                     stores,
@@ -520,8 +479,7 @@ async fn process_item(
                 )
                 .await;
             }
-            // The guard fired: this transaction wrote nothing and rolled back. Round
-            // again from a fresh snapshot.
+            // The guard fired: this transaction wrote nothing and rolled back.
             Err(WorkerError::RevalidationRequired(drift)) => {
                 tuning.metrics.revalidation_retried(&drift);
                 tracing::info!(
@@ -563,10 +521,7 @@ async fn process_item(
         };
     }
 
-    // Every attempt drifted. `last_drift` is `Some` on every path that reaches
-    // here — the loop body's only `continue` sets it — and the fallback exists
-    // because the type says the `Option` can be empty, not because a zero attempt
-    // budget is reachable (`config::validate` refuses one).
+    // Every attempt drifted.
     let drift = last_drift.map_or_else(
         || "no attempt was made".to_owned(),
         |drift| drift.to_string(),
@@ -591,15 +546,8 @@ async fn process_item(
     .await
 }
 
-/// The outcome to report for a commit that succeeded, and the log line and the
-/// counter that go with it.
-///
-/// Outside the revalidation loop's body so the loop reads as the control flow it
-/// is rather than as two long success arms with a `continue` between them. It is
-/// the *only* place a successful commit is turned into an outcome, which is why
-/// the candidate counter sits here: every success passes through it exactly once,
-/// and a redelivery reporting an outcome some earlier pass committed goes through
-/// `stored_outcome` instead and is not counted again.
+/// The outcome to report for a commit that succeeded, and the log line and the counter that go with
+/// it.
 fn committed_outcome(
     operation_id: Uuid,
     item: &OperationItemRow,
@@ -661,19 +609,8 @@ fn committed_outcome(
 }
 
 /// The `reason` label a refusal counts under.
-///
-/// The port's parameter type is `&'static str` because the label vocabulary is
-/// closed: every fresh refusal site names its reason as a literal, and a literal
-/// is its own label. The one reason that is not provably a literal is an owned
-/// `Cow` — a failure read back off a stored `error_payload`
-/// ([`ItemFailure::from_payload`]) — and that maps to the single closed
-/// fallback `other` rather than being admitted into the series as an unbounded
-/// string. Pinned by `worker_tests`, including both halves of that sentence.
 #[must_use]
-// The `Cow` variant *is* the input: this function exists to tell a borrowed
-// literal from an owned string, which is precisely the distinction `&str` would
-// erase — taking clippy's suggestion here would let every read-back reason
-// through as its own unbounded label.
+// Preserve `Cow`: owned values map to a bounded fallback label.
 #[allow(clippy::ptr_arg)]
 pub fn reason_label(reason: &std::borrow::Cow<'static, str>) -> &'static str {
     match reason {
@@ -719,9 +656,8 @@ async fn record_failure(
         .await?;
 
     if recorded {
-        // Both counters are behind `recorded`: this pass owns the decision only
-        // when its compare-and-swap won. The loser falls through to
-        // `stored_item`, whose outcome the winner already counted.
+        // Both counters are behind `recorded`: this pass owns the decision only when its
+        // compare-and-swap won.
         metrics.candidate_terminalized(TerminalStatus::Failed);
         metrics.refused(RefusalStage::Admission, reason_label(&failure.reason));
         tracing::warn!(
@@ -744,12 +680,6 @@ async fn record_failure(
 }
 
 /// The outcome a redelivered pass reports: every stored item, nothing written.
-///
-/// Its own log line is the one thing a redelivered pass emits. It runs inside
-/// the operation span with the facts `record_operation_facts` filled in from the
-/// row, so it carries the kind and mode a redelivery has no request to read them
-/// from — which is the thing to grep for when asking "did the second delivery
-/// really pass through here?"
 fn already_terminal(operation_id: Uuid, items: &[OperationItemRow]) -> OperationOutcome {
     tracing::debug!(
         %operation_id,

@@ -20,11 +20,6 @@
 //! | 7 ADR-0015 major-0 quarantine | **T18** — it needs the reference extractor |
 //! | 8 canonicalize, fingerprint, idempotency | here |
 //!
-//! Step 7 is a gap by dependency: it refuses a stable candidate whose base or
-//! `$ref` targets include a major-0 identifier, and the extractor that finds those
-//! targets is T13's. A `TODO` marks its position between steps 6 and 8, so it lands
-//! as an insertion rather than a reordering. `x-gts-ref` is outside quarantine.
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -132,23 +127,6 @@ pub enum AcceptanceError {
 
 impl AcceptanceError {
     /// The stable machine reason this refusal is counted and logged under.
-    ///
-    /// One arm per variant, and the match is exhaustive on purpose: a refusal
-    /// added by a later task cannot compile until it has a reason here, which is
-    /// what keeps *"every refusal reason in the acceptance path is countable and
-    /// distinguishable"* true rather than aspirational. T17's `Unknown`
-    /// compatibility verdict is refused in the worker, so it earns an
-    /// `ItemFailure` reason rather than one of these.
-    ///
-    /// Distinct from the RFC-9457 `reason` code `api::rest::error` maps these
-    /// onto, which is deliberately coarse — six variants share
-    /// `VALIDATION_FAILED` there, because a client branches on the *class* of
-    /// problem while an operator needs the variant.
-    ///
-    /// The three infrastructure arms are included rather than excluded: they are
-    /// not client refusals, but they are outcomes of the acceptance path, and a
-    /// deployment whose acceptances are failing on storage wants that series next
-    /// to the ones that are being refused on their merits.
     #[must_use]
     pub const fn reason(&self) -> &'static str {
         match self {
@@ -195,8 +173,7 @@ pub struct PolicyRefusalError(pub PolicyRefusal);
 pub struct AcceptanceContext<'a> {
     pub policy: &'a RegistrationPolicy,
     pub config: &'a TypesRegistryConfig,
-    /// The admission instruments (T16), injected rather than reached through a
-    /// global — the same wiring every other gear's meter uses.
+    /// Admission metrics.
     pub metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
@@ -396,11 +373,7 @@ pub fn validate(
             });
         }
 
-        // TODO(T18): step 7, the ADR-0015 quarantine — refuse a stable candidate
-        // whose immediate base or `$ref` targets include a major-0 identifier. It
-        // needs T13's reference extractor, so it slots in here rather than being
-        // reordered in later. `x-gts-ref` is outside the quarantine because it
-        // validates an instance value without resolving or inlining a target.
+        // TODO(T18): enforce ADR-0015 quarantine for major-0 bases and `$ref` targets.
 
         // --- step 8: canonicalize ----------------------------------------
         let canonical = canonical_text(content);
@@ -476,18 +449,11 @@ pub async fn accept(
     now: OffsetDateTime,
 ) -> Result<Accepted, AcceptanceError> {
     let accepted = accept_inner(stores, db, scope, ctx, dispatch, request, now).await;
-    // Every refusal of this path passes through exactly this point, which is why
-    // the counting is here and not at the two dozen `return Err(..)` sites in
-    // `validate`: a reason added later is counted without anyone remembering to
-    // count it, and `validate` stays a pure function of its inputs.
+    // Count at the shared exit so every refusal is covered.
     if let Err(error) = &accepted {
         let reason = error.reason();
         ctx.metrics.refused(RefusalStage::Acceptance, reason);
-        // The `warn` is for client refusals only. The three infrastructure arms
-        // — `Storage`, `Db`, `Dispatch` — are faults, not refusals: reporting
-        // one at `warn` as well would log it twice (the REST boundary's
-        // `opaque_internal` already logs it at `error`) and put a failing
-        // database on a refusal-rate dashboard beside rejected requests.
+        // The `warn` is for client refusals only.
         let infrastructure = matches!(
             error,
             AcceptanceError::Storage(_) | AcceptanceError::Db(_) | AcceptanceError::Dispatch(_)
@@ -504,8 +470,7 @@ pub async fn accept(
     accepted
 }
 
-/// [`accept`]'s body. Separated only so that its single exit point is a place the
-/// refusal counter can sit; nothing else calls it.
+/// [`accept`]'s body.
 async fn accept_inner(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<AcceptanceError>,

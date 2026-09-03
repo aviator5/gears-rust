@@ -1,15 +1,4 @@
-//! The instrument contract: rendered names, label keys, label values and bucket
-//! layouts.
-//!
-//! These are asserted rather than reviewed because they are the *only* part of
-//! the adapter a dashboard or an alert rule depends on. A mistyped name, a
-//! dropped `_total`, a renamed label value — each of those is invisible in a code
-//! review and silently empties a panel. Every test below builds its own
-//! [`SdkMeterProvider`] over an in-memory exporter, so nothing here touches the
-//! process-global provider the production adapter binds to.
-//!
-//! The *emission sites* — that the real admission path reaches these instruments
-//! with the right labels — are `tests/observability_test.rs`.
+//! The instrument contract: rendered names, label keys, label values and bucket layouts.
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -24,10 +13,6 @@ use super::{
 use crate::domain::admission::vector::{VectorDrift, VectorRole};
 use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage, TerminalStatus};
 
-/// The prefix every name below is asserted under — derived from the gear name
-/// through the real config path, not spelled as a literal. A change to
-/// `MetricsConfig`'s default that moved every series would fail here rather
-/// than silently renaming an operator's dashboards.
 fn default_prefix() -> String {
     crate::config::MetricsConfig::default().effective_prefix("types-registry")
 }
@@ -150,13 +135,6 @@ fn histogram_count(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
     0
 }
 
-// ---------------------------------------------------------------------------
-// Candidates by terminal status
-// ---------------------------------------------------------------------------
-
-/// The three terminal statuses are separate series under one name, and the label
-/// values are the snake-case wire spellings rather than the `Debug` of the enum:
-/// `use_debug` is denied precisely so a derive's output cannot become a contract.
 #[test]
 fn candidates_are_counted_by_their_terminal_status() {
     let (provider, exporter, metrics) = recorder();
@@ -194,11 +172,6 @@ fn candidates_are_counted_by_their_terminal_status() {
     );
 }
 
-/// A non-terminal status is not a candidate outcome, and counting one would put a
-/// value in the series that can never be an end state. The port's parameter type
-/// makes that unrepresentable: `Pending` and `Running` do not convert to
-/// [`TerminalStatus`], so a mis-wired call site fails to compile instead of
-/// silently dropping the count.
 #[test]
 fn a_non_terminal_status_does_not_convert_to_a_terminal_one() {
     use crate::domain::enums::OperationItemStatus;
@@ -217,13 +190,6 @@ fn a_non_terminal_status_does_not_convert_to_a_terminal_one() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Refusals by reason
-// ---------------------------------------------------------------------------
-
-/// Both stages count into one name and are told apart by the `stage` label, so
-/// "how many submissions were refused at all" is one query and "which stage
-/// refused them" is a `by (stage)`.
 #[test]
 fn refusals_carry_their_stage_and_reason() {
     let (provider, exporter, metrics) = recorder();
@@ -252,10 +218,6 @@ fn refusals_carry_their_stage_and_reason() {
     );
 }
 
-/// Two different reasons at one stage are two series, which is the whole of
-/// acceptance criterion "countable **and distinguishable**". A single
-/// `refusals_total` with no reason label would satisfy "countable" and none of the
-/// rest.
 #[test]
 fn two_reasons_at_one_stage_are_two_series() {
     let (provider, exporter, metrics) = recorder();
@@ -282,14 +244,6 @@ fn two_reasons_at_one_stage_are_two_series() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Revalidation retries
-// ---------------------------------------------------------------------------
-
-/// The `drift` label is the *shape* of the drift, never the identifier that
-/// drifted: `gts_id` is unbounded and would make this series grow with the
-/// registry. The four shapes are the four `VectorDrift` variants, so the label
-/// vocabulary is closed by the type.
 #[test]
 fn revalidation_retries_are_counted_by_drift_shape() {
     let (provider, exporter, metrics) = recorder();
@@ -330,16 +284,6 @@ fn revalidation_retries_are_counted_by_drift_shape() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The two histograms
-// ---------------------------------------------------------------------------
-
-/// The bound an operator configures is `limits.activation_write_set`, so the top
-/// bucket tracks it: a refresh at the bound falls in the last bucket rather than
-/// in `+Inf`, and a refusal for exceeding it is the only thing past the end.
-///
-/// The top bucket is asserted against `Limits::default()` itself — not against
-/// the same literal the constant was defined from, which could never fail.
 #[test]
 #[allow(clippy::cast_precision_loss)]
 fn activation_write_set_buckets_reach_the_configured_default_bound() {
@@ -363,10 +307,6 @@ fn activation_write_set_buckets_reach_the_configured_default_bound() {
     );
 }
 
-/// A zero-dependent revision is recorded, not skipped. "How often does a revision
-/// refresh nothing" is the question the bottom bucket answers, and omitting the
-/// observation would make the histogram's count disagree with the number of
-/// revisions.
 #[test]
 fn an_empty_activation_write_set_is_still_observed() {
     let (provider, exporter, metrics) = recorder();
@@ -384,9 +324,6 @@ fn an_empty_activation_write_set_is_still_observed() {
     );
 }
 
-/// Seconds, and named `_seconds`, so the rendered series name is identical whether
-/// the downstream collector appends unit suffixes or not — the reason no
-/// `.with_unit()` hint is set on it.
 #[test]
 fn operation_duration_is_recorded_in_seconds() {
     let (provider, exporter, metrics) = recorder();
@@ -406,16 +343,11 @@ fn operation_duration_is_recorded_in_seconds() {
     );
 }
 
-/// The default prefix is what the asserted names above are built from, and it
-/// comes from the gear name rather than a literal in the adapter.
 #[test]
 fn the_default_prefix_is_the_gear_name_in_snake_case() {
     assert_eq!(default_prefix(), "types_registry");
 }
 
-/// A configured prefix renames every series, so an operator running two
-/// registries against one collector can tell them apart. The suffixes after the
-/// prefix stay put — they are this module's contract.
 #[test]
 fn a_configured_prefix_renames_every_series() {
     let exporter = InMemoryMetricExporterBuilder::new()
@@ -450,7 +382,6 @@ fn a_configured_prefix_renames_every_series() {
     }
 }
 
-/// Every instrument name the exporter saw.
 fn recorded_names(exporter: &InMemoryMetricExporter) -> Vec<String> {
     let mut names = Vec::new();
     for rm in &exporter.get_finished_metrics().unwrap() {

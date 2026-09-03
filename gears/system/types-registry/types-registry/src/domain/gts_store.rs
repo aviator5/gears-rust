@@ -98,26 +98,15 @@ impl UnitStore {
         &self.load_order
     }
 
-    /// The closure roots this store was read from: the candidate identifiers plus
-    /// their documents' reference targets.
-    ///
-    /// Exposed for the revision vector (T15), which must re-derive the closure at
-    /// commit time from the **same** roots — a set that is a pure function of the
-    /// authored documents and so cannot be recovered from the store's contents,
-    /// which are the closure's *answer*.
+    /// The closure roots this store was read from: the candidate identifiers plus their documents'
+    /// reference targets.
     #[must_use]
     pub fn roots(&self) -> &[String] {
         &self.roots
     }
 
-    /// The entity rows the closure resolved, `gts_id`-sorted, exactly as
-    /// `DependencyStore::closure` returned them.
-    ///
-    /// Also for the revision vector, and for a narrower reason: the vector's
-    /// dependency half *is* this row set, and asking the database for it a second
-    /// time in the same transaction would be a second walk for an answer already in
-    /// hand. Handed out rather than folded in, because the vector is built by
-    /// `admission::vector` from the same function the commit uses.
+    /// The entity rows the closure resolved, `gts_id`-sorted, exactly as `DependencyStore::closure`
+    /// returned them.
     #[must_use]
     pub fn closure_entities(&self) -> &[EntityRow] {
         &self.closure
@@ -131,13 +120,6 @@ impl UnitStore {
     }
 
     /// `$ref` targets that no entity carries.
-    ///
-    /// Kept apart from [`Self::missing_candidates`] rather than merged into it,
-    /// because the two mean opposite things. A missing *candidate* is the normal
-    /// state of every first admission: the entity is about to be created. A missing
-    /// *reference* is a target the document resolves and the registry does not
-    /// hold, which is a refusal. T19 must be able to tell the two apart to order a
-    /// batch. `x-gts-ref` is absent because its validation reads no target entity.
     #[must_use]
     pub fn missing_references(&self) -> &[String] {
         &self.missing_references
@@ -291,9 +273,8 @@ pub fn build_store(mut documents: Vec<UnitDocument>) -> Result<UnitStore, StoreB
     Ok(UnitStore {
         store,
         load_order,
-        // Empty: this constructor is handed a document set, not a closure to read,
-        // so it has neither roots nor resolved rows of its own. `load_unit_store`
-        // fills both in.
+        // Empty: this constructor is handed a document set, not a closure to read, so it has
+        // neither roots nor resolved rows of its own.
         roots: Vec::new(),
         closure: Vec::new(),
         missing_candidates: Vec::new(),
@@ -304,46 +285,8 @@ pub fn build_store(mut documents: Vec<UnitDocument>) -> Result<UnitStore, StoreB
 /// Build the store one admission unit needs: the candidates, plus the transitive
 /// closure of what they consume, read from the database.
 ///
-/// The closure comes from the `dependency` edges (D5) — never from the whole
-/// `entity` table, which is what keeps this bounded by the candidate's own
-/// dependency graph rather than by the size of the registry.
-///
-/// **The candidate overlay wins.** A candidate that is a revision of an existing
-/// entity has a committed document too, and that document is not read: an
-/// in-batch reference must resolve against what is being admitted. This costs
-/// nothing downstream, because compatibility compares two documents passed to
-/// `compare_documents` directly and reads its baseline revision separately.
-///
-/// **The overlay covers edges too, and it has to.** Seeding the closure with the
-/// candidates' identifiers alone would walk the *stored* edge set — and those rows
-/// are written at commit, so they never describe the candidate that is being
-/// validated. A first admission has no rows of its own at all, which makes a `$ref`
-/// naming an entity outside the candidate's `~`-chain invisible: `validate_schema`
-/// would refuse a target the registry was holding. A revision has the
-/// mirror problem, following the previous revision's edges rather than this
-/// document's. So [`extract_edges`] runs over each candidate **document** here and
-/// its `$ref` targets join `chain_ids()` as closure roots (T13). `x-gts-ref` reads
-/// no target document and never enters this closure.
-///
-/// The candidate's own stored rows are still walked — `closure` cannot tell a
-/// candidate root from any other — so a reference a revision *dropped* may still be
-/// loaded. That is inert: resolution follows the document, and an extra registered
-/// schema answers no question. What matters is the direction that is not inert, and
-/// it now holds: a reference the candidate **added** is seeded from the document.
-///
-/// A target no entity carries lands in [`UnitStore::missing_references`], never in
-/// [`UnitStore::missing_candidates`] — see that accessor for why the split is not
-/// cosmetic.
-///
-/// Nothing is retained: the store is built here and dropped with the unit, so two
-/// sequential calls after a committed revision each see it with no invalidation
-/// step.
-///
-/// **Both reads run in the caller's transaction.** The edge set and the documents
-/// it names are two statements, so under independent snapshots a concurrent
-/// revision could hand this function edges from one state and content from another.
-/// The caller opens `ports::snapshot_read()` around it; the guard against a commit
-/// landing *afterwards* is the revision vector (D4), which is T15's.
+/// Candidate documents and their `$ref` edges override committed versions. All reads share the
+/// caller's snapshot transaction.
 ///
 /// # Errors
 /// Propagates the closure and document reads, and every [`StoreBuildError`] the
@@ -363,8 +306,8 @@ pub async fn load_unit_store(
     roots.dedup();
 
     let closure = stores.closure(tx, scope, &roots).await?;
-    // Kept for `UnitStore::closure_entities`, before the loops below borrow and
-    // consume what they need from it.
+    // Kept for `UnitStore::closure_entities`, before the loops below borrow and consume what they
+    // need from it.
     let closure_entities = closure.entities.clone();
 
     // Authored text lives in a different table per kind, and `entity_kind` is the
@@ -423,9 +366,7 @@ pub async fn load_unit_store(
     let mut unit = build_store(documents)?;
     unit.roots = roots;
     unit.closure = closure_entities;
-    // One read, split by which root it was. `closure` reports every root with no
-    // entity row; which of them is a candidate is this function's own knowledge,
-    // so the port needs no second list.
+    // One read, split by which root it was.
     let (missing_candidates, missing_references): (Vec<String>, Vec<String>) = closure
         .missing_roots
         .into_iter()
@@ -436,13 +377,6 @@ pub async fn load_unit_store(
 }
 
 /// The reference targets of every candidate document, as extra closure roots.
-///
-/// An extraction failure seeds **nothing** rather than propagating: a malformed
-/// `$ref` is a content fault, and the layer that reports it as one is the caller
-/// that also runs `validate_schema` (`admission::unit::evaluate`). Turning it into a
-/// [`StoreBuildError`] here would report a bad document as a store-build fault, and
-/// the worker treats those as infrastructure. An unparsable identifier is the same
-/// case: `build_store` refuses it a few lines later, by name.
 fn candidate_reference_targets(candidates: &[UnitDocument]) -> Vec<String> {
     let mut targets = Vec::new();
     for candidate in candidates {

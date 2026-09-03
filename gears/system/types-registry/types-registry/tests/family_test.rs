@@ -54,18 +54,7 @@ const V1_2: &str = gts_id!("cf.core.example.thing.v1.2~");
 const V2: &str = gts_id!("cf.core.example.thing.v2~");
 const V2_0: &str = gts_id!("cf.core.example.thing.v2.0~");
 
-/// A family used by **one** test: the advisory-lock probe below.
-///
-/// It cannot share `cf.core.example.thing` with the rest of this file, and the reason
-/// is cross-process. The `SQLite` lock backend is a marker file under
-/// `<cache_dir>/cf-gears/locks/{database_scope}/{hash(gear, key)}`, and
-/// `database_scope` for `sqlite::memory:` is the same for every test — so two tests
-/// admitting one family key contend **through the filesystem**, in different
-/// processes, however isolated their databases are. Every other test here admits
-/// some version of `cf.core.example.thing`, `nextest` runs them concurrently, and
-/// this test's release probe carries a 1 ms budget with no retries, so a sibling
-/// holding the lock read as "never released". Its own family key removes the
-/// interaction; the mechanism is untouched.
+/// Dedicated family key to avoid cross-process `SQLite` lock contention.
 const LOCK_PROBE: &str = gts_id!("cf.core.lockprobe.thing.v1~");
 
 struct NoDispatch;

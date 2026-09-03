@@ -3,18 +3,7 @@
 //! Every method takes `runner: &impl DBRunner`, so one body serves both a pooled
 //! connection and a transaction; the last test exercises the transaction path.
 //!
-//! Two primitives are worth reading the tests for:
-//!
-//! * **The list read never translates GTS matching into SQL.** SQL narrows by a
-//!   prefix range over `gts_id` — exact, because the column has binary collation on
-//!   every backend — and `GtsId::matches_pattern` decides. Translating the pattern
-//!   grammar into SQL would be the local approximation of GTS semantics that
-//!   `constraint-gts-implementation` forbids.
-//! * **The forward closure is one recursive CTE**, the mirror of the reverse walk
-//!   in `dependency_repo_test.rs` (`SecureCteSelect::recursive_cte`, ADR-0001).
-//!   Because a CTE can be depth-capped and a worklist cannot, the tests below pin
-//!   both edges of the bound: a closure at exactly 512 comes back whole, and one
-//!   past it — by fan-out or by depth — is refused rather than shortened.
+//! Covers GTS-filtered listing and bounded recursive dependency closure.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -635,13 +624,6 @@ async fn closure_over_a_chain_returns_the_whole_chain_and_nothing_outside_it() {
     assert!(closure.missing_roots.is_empty());
 }
 
-/// The relation is acyclic by construction (ADR-0012), and this test writes a cycle
-/// anyway — straight through the repository, which is the only way to get one.
-///
-/// The claim is defence in depth, not a supported shape: the walk keeps a `seen` set
-/// rather than trusting the invariant, so a row that contradicted it costs bounded
-/// work instead of a traversal that never ends. The invariant itself is pinned where
-/// it is enforced, in `dependency_test.rs`.
 #[tokio::test]
 async fn closure_terminates_on_a_row_that_contradicts_acyclicity() {
     let db = test_db().await;
@@ -700,9 +682,6 @@ async fn closure_reports_candidates_that_have_no_entity_row() {
     );
 }
 
-/// The closure bound applies to roots resolved before the walk runs at all. A
-/// large independent root set must not bypass it merely because the graph has no
-/// edges for the CTE to follow.
 #[tokio::test]
 async fn closure_rejects_more_than_512_resolved_roots_before_the_first_hop() {
     let db = test_db().await;
@@ -726,11 +705,6 @@ async fn closure_rejects_more_than_512_resolved_roots_before_the_first_hop() {
     );
 }
 
-/// The bound now governs what the **walk** reaches, not only the seeds: the
-/// per-hop check the worklist used to do is one check per CTE chunk, and the
-/// statement's own `LIMIT` is one row past the bound. Both sides of the boundary
-/// are pinned, because a limit that cuts one row early is exactly as wrong as one
-/// that lets the closure run away.
 #[tokio::test]
 async fn closure_refuses_a_fan_out_past_the_bound_and_admits_the_boundary() {
     let db = test_db().await;
@@ -766,7 +740,6 @@ async fn closure_refuses_a_fan_out_past_the_bound_and_admits_the_boundary() {
         .expect("512 entities is the bound, not past it");
     assert_eq!(closure.entities.len(), 512);
 
-    // One more leaf puts the closure at 513.
     let edges: Vec<(DependencyKind, i64)> = leaf_ids
         .iter()
         .map(|id| (DependencyKind::SchemaRef, *id))
@@ -783,12 +756,6 @@ async fn closure_refuses_a_fan_out_past_the_bound_and_admits_the_boundary() {
     );
 }
 
-/// The CTE's mandatory depth cap is the closure bound, so a chain longer than the
-/// cap cannot come back quietly shortened: by the argument in `forward_reachable`,
-/// anything the cap could hide sits behind more distinct entities than the bound
-/// admits, so the count refusal has already fired. Truncation was unrepresentable
-/// under the worklist; under a recursive CTE it is the one failure this pairing
-/// exists to rule out, so it is pinned rather than reasoned about.
 #[tokio::test]
 async fn closure_refuses_rather_than_truncating_a_chain_deeper_than_the_bound() {
     let db = test_db().await;
@@ -891,8 +858,6 @@ async fn replace_outgoing_treats_a_repeated_edge_as_one() {
     .await
     .expect("a repeated edge is one edge, not a constraint violation");
 
-    // Read straight off `dependency`: the claim is about how many rows the table
-    // holds, and any reader that deduplicates would report one either way.
     let rows = dependency::Entity::find()
         .filter(dependency::Column::FromEntityId.eq(from))
         .secure()

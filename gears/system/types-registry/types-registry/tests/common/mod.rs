@@ -121,16 +121,6 @@ pub fn allow_all() -> AccessScope {
     AccessScope::allow_all()
 }
 
-/// P0's configured limits, as the gear reads them from `TypesRegistryConfig`.
-///
-/// The worker takes these by reference (T14): `limits.activation_write_set` bounds
-/// the dependents one admission refreshes, and a test that needs a different bound
-/// builds its own `Limits` rather than mutating a shared one.
-/// The admission instruments a test injects: counting nothing.
-///
-/// `observability_test.rs` is the one suite that wants a real meter, and it
-/// builds its own adapter over an in-memory exporter. Everything else asserts
-/// on behaviour rather than on series, so it passes this.
 #[must_use]
 pub fn metrics() -> std::sync::Arc<dyn types_registry::domain::ports::metrics::AdmissionMetrics> {
     std::sync::Arc::new(types_registry::domain::ports::metrics::NoopMetrics)
@@ -140,12 +130,6 @@ pub fn limits() -> types_registry::config::Limits {
     types_registry::config::Limits::default()
 }
 
-/// P0's configured worker tuning, as the gear reads it from
-/// `TypesRegistryConfig`.
-///
-/// `worker.max_revalidation_attempts` bounds the revalidation loop (T15). A test
-/// that needs a different budget — one attempt, to prove exhaustion terminalizes —
-/// builds its own `WorkerSettings` rather than mutating a shared one.
 pub fn worker_settings() -> types_registry::config::WorkerSettings {
     types_registry::config::WorkerSettings::default()
 }
@@ -381,16 +365,6 @@ pub enum PausePoint {
     /// Inside `commit_creation`, with the family row taken and the three family
     /// rules not yet asked — the window the family advisory lock exists to close.
     CreateOrGet,
-    /// **Before** `commit_revision`'s opening entity read, which is the commit
-    /// transaction's first statement — so the pass is held with its transaction
-    /// open and holding nothing, which is what lets a second connection commit
-    /// underneath it even on `SQLite`. The window the revision-vector guard exists
-    /// to close (T15).
-    ///
-    /// A Type Schema candidate reaches `find_by_gts_id` exactly once per commit
-    /// attempt and never during evaluation — `evaluate` reads an entity by
-    /// identifier only for an Instance's conforming type — so this point is the
-    /// boundary between one attempt's evaluation and its commit.
     RevisionEntityRead,
 }
 
@@ -478,8 +452,6 @@ impl EntityStore for PausingStores {
         scope: &AccessScope,
         gts_id: &str,
     ) -> Result<Option<EntityRow>, ScopeError> {
-        // Before the read, not after: what the test does while the pass is held has
-        // to be visible to this very statement.
         self.pause(PausePoint::RevisionEntityRead).await;
         self.inner.find_by_gts_id(tx, scope, gts_id).await
     }

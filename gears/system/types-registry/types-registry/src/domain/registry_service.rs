@@ -175,9 +175,7 @@ pub struct RegistryService {
     config: TypesRegistryConfig,
     dispatch: Arc<dyn OperationDispatch>,
     admission_mode: AdmissionMode,
-    /// The admission instruments (T16). Injected like `stores`, for the same
-    /// reason: it keeps this layer free of the metrics SDK, and the gear passes
-    /// `infra::metrics::default_adapter`.
+    /// The admission instruments (T16).
     metrics: Arc<dyn AdmissionMetrics>,
 }
 

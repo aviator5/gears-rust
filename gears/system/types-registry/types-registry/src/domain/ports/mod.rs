@@ -287,22 +287,12 @@ pub struct CurrentDocument {
 }
 
 /// The result of a reverse-impact read.
-///
-/// The bound is a variant rather than an error because the two answers travel to
-/// different places: a set within the bound is what the refresh writes, and a set
-/// over it is a **candidate refusal** with a structured reason (SPEC §8.1 step
-/// 4.6). Returning `ScopeError` for the second would put a terminal content
-/// outcome into the position the worker reads as retryable infrastructure.
 #[domain_model]
 #[derive(Clone, Debug)]
 pub enum ReverseImpact {
-    /// Every dependent, `gts_id`-sorted, roots excluded. Complete: see
-    /// `DependencyRepo::reverse_impact` on why a depth-capped walk cannot return a
-    /// silently shortened set here.
+    /// Every dependent, `gts_id`-sorted, roots excluded.
     Within(Vec<EntityRow>),
-    /// More dependents than the bound admits. `at_least` is what the read counted
-    /// before it stopped — the walk is cut one row past the bound, so the true size
-    /// is unknown and deliberately not reported as if it were.
+    /// More dependents than the bound admits.
     OverBound { at_least: usize, bound: usize },
 }
 
@@ -504,9 +494,7 @@ pub trait EntityStore: Send + Sync {
         gts_id: &str,
     ) -> Result<Option<EntityRow>, ScopeError>;
 
-    /// Batch exact read. Identifiers with no row are simply absent from the
-    /// result; callers compare the returned identifiers with the requested set
-    /// when absence has domain meaning.
+    /// Batch exact read.
     async fn find_by_gts_ids(
         &self,
         tx: &DbTx<'_>,
@@ -586,16 +574,6 @@ pub trait TypeSchemaStore: Send + Sync {
     ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError>;
 
     /// The current-state rows of many entities in one read, `entity_id`-sorted.
-    ///
-    /// Rows for entities with no `type_schema` row are simply absent, so the result
-    /// is not positionally aligned with `entity_ids`; callers key on
-    /// `CurrentTypeSchemaRow::entity_id`.
-    ///
-    /// The batched sibling of [`Self::find_current_schema`]. Both the revision
-    /// vector (T15) and the reverse-impact refresh (T14) need every dependent's
-    /// `resolution_fingerprint` at once, and both run inside the commit
-    /// transaction, where a round trip per dependent is time spent holding the
-    /// candidate's row.
     async fn current_schemas(
         &self,
         tx: &DbTx<'_>,
@@ -781,12 +759,6 @@ pub trait DependencyStore: Send + Sync {
     ) -> Result<DependencyClosure, ScopeError>;
 
     /// Everything that transitively depends on any of `roots`, roots excluded.
-    ///
-    /// The reverse of [`Self::closure`], and the set a revision refreshes: the
-    /// dependents whose effective artifacts the new revision changed. Bounded by
-    /// `write_set_bound` (`config::Limits::activation_write_set`) — over it the
-    /// read reports [`ReverseImpact::OverBound`] and the caller fails the
-    /// candidate rather than committing a partial refresh.
     async fn reverse_impact(
         &self,
         tx: &DbTx<'_>,
@@ -796,11 +768,6 @@ pub trait DependencyStore: Send + Sync {
     ) -> Result<ReverseImpact, ScopeError>;
 
     /// Replace one entity's **outgoing** edges, and only that entity's.
-    ///
-    /// Delete-then-insert on `from_entity_id`, so a reference a new revision
-    /// dropped disappears with the same call that records the one it added. The
-    /// edges are a set, and the target ids are the caller's to resolve: a target no
-    /// entity carries has no row to point at.
     async fn replace_outgoing(
         &self,
         tx: &DbTx<'_>,

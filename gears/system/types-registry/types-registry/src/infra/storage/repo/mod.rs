@@ -25,19 +25,7 @@
 //! the pattern (`prefilter_prefix` in [`entity_repo`]): too tight would silently
 //! *drop* real matches.
 //!
-//! # Both dependency walks are recursive CTEs
-//!
-//! `11_database_patterns.md` forbids raw SQL outside migration definitions, and
-//! this file has none. That used to rule a recursive CTE out entirely; it no
-//! longer does — `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001) builds
-//! a scoped `WITH RECURSIVE` through the typed builder, scope embedded in both the
-//! seed and the recursive member.
-//!
-//! [`DependencyRepo::reverse_impact`] took that first (SPEC §D5);
-//! [`DependencyRepo::closure`] followed, once it was clear that the per-hop
-//! `entity` reads its worklist interleaved were never what drove the walk. Both
-//! now cost a fixed number of round trips rather than a pair per hop. See that
-//! module's header.
+//! Dependency walks use `ToolKit`'s scoped recursive CTE builder, without raw SQL.
 
 pub mod dependency_repo;
 pub mod entity_repo;

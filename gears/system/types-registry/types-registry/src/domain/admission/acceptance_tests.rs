@@ -15,8 +15,6 @@ use crate::config::{PolicyEntry, TypesRegistryConfig};
 use crate::domain::enums::OperationKind;
 use crate::domain::policy::RegistrationPolicy;
 
-/// The instruments these tests inject: counting nothing. Acceptance's refusal
-/// counter is asserted in `observability_test.rs`, against a real meter.
 fn noop_metrics() -> std::sync::Arc<dyn crate::domain::ports::metrics::AdmissionMetrics> {
     std::sync::Arc::new(crate::domain::ports::metrics::NoopMetrics)
 }

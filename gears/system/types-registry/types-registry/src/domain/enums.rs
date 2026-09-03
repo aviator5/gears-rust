@@ -138,14 +138,7 @@ pub enum OperationItemStatus {
 
 /// Why one entity depends on another.
 ///
-/// **`x-gts-ref` is deliberately absent.** It constrains what a value may *name*,
-/// and `gts-rust` enforces it by pattern-matching the value string — it never asks
-/// whether the named entity exists (`XGtsRefValidator::validate_value_matches_gts_pattern`).
-/// So the constraint is satisfiable with no target in the registry, its target is not
-/// inlined into any effective artifact, and an edge for it would protect a deletion
-/// nobody is harmed by. Policies such as the managed–external boundary classify
-/// the named identifier directly from candidate content; they do not turn that
-/// identifier into a dependency.
+/// `x-gts-ref` is excluded because it validates identifier syntax without reading a target.
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DependencyKind {

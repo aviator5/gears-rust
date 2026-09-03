@@ -1,9 +1,4 @@
 //! The comparison half of the revision vector, with no database in sight.
-//!
-//! [`RevisionVector::drift`] is a pure function over two sorted sequences, and
-//! every case it can reach is reachable by construction here. The database-backed
-//! half — that the two derivations agree when nothing moved, and disagree in each
-//! of these shapes when something did — is `tests/revalidation_test.rs`.
 
 use super::*;
 
@@ -29,9 +24,8 @@ fn dependent(gts_id: &str, resource_version: i64, fingerprint: u8) -> VectorEntr
 }
 
 fn vector(entries: Vec<VectorEntry>) -> RevisionVector {
-    // The constructor sorts, so order in the fixtures below is free — and the
-    // invariant the private field exists to protect is the constructor's job,
-    // not each test's.
+    // The constructor sorts, so order in the fixtures below is free — and the invariant the private
+    // field exists to protect is the constructor's job, not each test's.
     RevisionVector::new(vec![BASE.to_owned()], entries)
 }
 
@@ -64,8 +58,6 @@ fn a_dependency_whose_version_moved_is_reported_as_moved() {
     );
 }
 
-/// The case `resource_version` alone cannot see: someone else's commit refreshed
-/// this dependent's artifacts, which moves the fingerprint and nothing else.
 #[test]
 fn a_dependent_whose_fingerprint_moved_under_a_still_version_is_reported_as_refreshed() {
     let recorded = vector(vec![dependent(DERIVED, 7, 0xAA)]);
@@ -78,8 +70,6 @@ fn a_dependent_whose_fingerprint_moved_under_a_still_version_is_reported_as_refr
     );
 }
 
-/// Both columns moved, and the report names the revision rather than one of its
-/// effects.
 #[test]
 fn a_revision_is_reported_as_moved_not_refreshed() {
     let recorded = vector(vec![dependent(DERIVED, 7, 0xAA)]);
@@ -116,10 +106,6 @@ fn a_dependency_that_is_gone_is_reported_as_vanished() {
     );
 }
 
-/// An entity that swapped sides is a `Vanished` on the side it left. Not a
-/// separate variant: acyclicity (ADR-0012) makes the swap unreachable in practice,
-/// and inventing a third description of it would be describing something the graph
-/// cannot do.
 #[test]
 fn an_entity_that_changed_role_reports_the_side_it_left() {
     let recorded = vector(vec![dependency(BASE, 3)]);
@@ -133,8 +119,6 @@ fn an_entity_that_changed_role_reports_the_side_it_left() {
     );
 }
 
-/// The walk stops at the first difference in canonical order, so the reported
-/// drift does not depend on how many others follow it.
 #[test]
 fn the_first_difference_in_canonical_order_is_the_one_reported() {
     let recorded = vector(vec![dependency(BASE, 3), dependency(DERIVED, 1)]);
@@ -150,8 +134,6 @@ fn the_first_difference_in_canonical_order_is_the_one_reported() {
     );
 }
 
-/// The message an operator reads, pinned because it is the only place the drift's
-/// shape reaches a log line.
 #[test]
 fn every_drift_shape_says_what_happened() {
     assert_eq!(

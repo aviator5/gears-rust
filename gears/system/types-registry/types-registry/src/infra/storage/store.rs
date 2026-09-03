@@ -14,13 +14,7 @@
 //! five separate unit structs. The alternative, six `Arc<dyn XStore>` in the
 //! service, is more wiring at every call site for no gain.
 //!
-//! # Not every repository method is a port
-//!
-//! Only the calls the domain makes are here. `list_page` and `mark_deleted` stay as
-//! inherent methods until a domain rule needs them: a port method with no domain
-//! caller is an abstraction with nothing to abstract. `compare_and_swap_version`
-//! left that list when the revision commit became its first domain caller, and
-//! `replace_outgoing` with `find_by_gts_ids` when edge extraction did (T13).
+//! Only repository operations used by the domain are exposed as ports.
 
 use async_trait::async_trait;
 use time::OffsetDateTime;

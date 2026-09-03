@@ -354,10 +354,6 @@ fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
         );
     }
 
-    // One worker key is left on the list: `max_revalidation_attempts` came off it at
-    // T15, which is the transition the list exists to make visible, and
-    // `the_enforced_limits_are_never_reported_as_inert` covers it from the other
-    // side.
     let worker = json!({ "operation_timeout": "30s" });
     let cfg = parse(json!({ "worker": worker }));
     assert_eq!(
@@ -376,7 +372,6 @@ fn the_enforced_limits_are_never_reported_as_inert() {
         "worker": { "max_revalidation_attempts": 3 }
     }));
     assert!(cfg.inert_limit_keys().is_empty());
-    // And they really are the enforced set, read back as configured.
     assert_eq!(cfg.limits.authored_document.bytes(), 1024 * 1024);
     assert_eq!(cfg.limits.batch_candidates, 7);
     assert_eq!(
@@ -407,9 +402,6 @@ fn several_inert_keys_are_reported_together() {
     );
 }
 
-/// Zero is refused for every limit that *is* enforced, for the same reason as the
-/// page sizes: such a deployment boots and then refuses every request that reaches
-/// it, naming a limit the operator chose without meaning this.
 #[test]
 fn a_zero_enforced_limit_fails_startup() {
     for limits in [
@@ -426,10 +418,6 @@ fn a_zero_enforced_limit_fails_startup() {
     }
 }
 
-/// The same rule on the worker section: a zero attempt budget would terminalize
-/// every candidate as `revalidation_exhausted` without evaluating it once. Reported
-/// as `ConfigError::Worker`, like `worker.family_lock_timeout` — the section the key
-/// lives in, not the kind of bound it is.
 #[test]
 fn a_zero_revalidation_budget_fails_startup() {
     let cfg = parse(json!({ "worker": { "max_revalidation_attempts": 0 } }));
