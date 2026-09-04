@@ -17,21 +17,20 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use sea_orm::EntityTrait;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_db::secure::SecureEntityExt;
-use toolkit_db::{DBProvider, DbError, DbTx, LockConfig};
+use toolkit_db::{DBProvider, DbError, DbTx};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
-use types_registry::config::{TypesRegistryConfig, WorkerSettings};
+use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use types_registry::domain::admission::worker::{
-    LOCK_GEAR, OperationOutcome, Tuning, WorkerError, family_lock_key, run_operation,
+    OperationOutcome, Tuning, WorkerError, run_operation,
 };
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
@@ -40,7 +39,7 @@ use types_registry::infra::storage::entity::{dependency, entity, version_family}
 use types_registry::infra::storage::repo::EntityRepo;
 
 mod common;
-use common::{TestDir, allow_all, stores, test_db, test_db_file};
+use common::{allow_all, stores, test_db};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
@@ -53,9 +52,6 @@ const V1_1: &str = gts_id!("cf.core.example.thing.v1.1~");
 const V1_2: &str = gts_id!("cf.core.example.thing.v1.2~");
 const V2: &str = gts_id!("cf.core.example.thing.v2~");
 const V2_0: &str = gts_id!("cf.core.example.thing.v2.0~");
-
-/// Dedicated family key to avoid cross-process `SQLite` lock contention.
-const LOCK_PROBE: &str = gts_id!("cf.core.lockprobe.thing.v1~");
 
 struct NoDispatch;
 
@@ -402,174 +398,3 @@ async fn a_predecessor_is_not_a_dependency_edge() {
 // ---------------------------------------------------------------------------
 // The family lock
 // ---------------------------------------------------------------------------
-
-/// A creation holds the family's advisory lock **across** its commit transaction.
-///
-/// That is what makes the three rules above safe: they are check-then-act reads at
-/// `READ COMMITTED`, and the lock is the serialization the family row cannot provide
-/// (`version_family_repo`).
-///
-/// Asserted by probing rather than by racing: a second admission is paused inside
-/// its commit transaction, with the family row taken and the rules not yet asked,
-/// and the lock is then probed with a **non-waiting** config. `None` means held. A
-/// race would prove nothing — the correct answer also comes out of a lucky ordering
-/// — and waiting for one would need the `sleep` SPEC §13 forbids.
-///
-/// Mutation-checked: removing the `lock_families` call from `worker::process_item`
-/// makes the probe succeed.
-#[tokio::test]
-async fn a_creation_holds_the_family_lock_across_its_commit() {
-    let dir = TestDir::new("types-registry-family-lock-held");
-    let db = test_db_file(&dir.path().join("registry.sqlite")).await;
-    let op = submit(&db, "k1", LOCK_PROBE).await;
-
-    let (paused_stores, reached, resume) =
-        common::PausingStores::new(common::PausePoint::CreateOrGet);
-    let stores_handle: Arc<dyn types_registry::domain::ports::Stores> = paused_stores;
-    let provider = worker(&db);
-    let admission = tokio::spawn(async move {
-        run_operation(
-            &stores_handle,
-            &provider,
-            &allow_all(),
-            Tuning {
-                limits: &common::limits(),
-                worker: &common::worker_settings(),
-                metrics: &common::metrics(),
-            },
-            op,
-            LATER,
-        )
-        .await
-        .expect("the worker itself must not fail")
-    });
-
-    reached
-        .await
-        .expect("the admission reaches the family row inside its commit");
-
-    // One attempt, no retries: this must report the lock as held, not wait for it.
-    let probe = toolkit_db::LockConfig {
-        max_wait: Some(std::time::Duration::from_millis(1)),
-        max_retries: Some(0),
-        ..toolkit_db::LockConfig::default()
-    };
-    let key = types_registry::domain::admission::worker::family_lock_key(
-        &types_registry::domain::family::family_key(
-            &gts::GtsId::try_new(LOCK_PROBE).expect("fixture identifier"),
-        ),
-    );
-    let held = db
-        .db()
-        .try_lock(
-            types_registry::domain::admission::worker::LOCK_GEAR,
-            &key,
-            probe.clone(),
-        )
-        .await
-        .expect("probing a held lock is not an error");
-    assert!(
-        held.is_none(),
-        "the family lock must be held while the commit transaction is open",
-    );
-
-    resume
-        .send(())
-        .expect("the paused admission is still waiting");
-    let outcome = admission.await.expect("task");
-    assert_eq!(
-        verdict(&outcome).0,
-        domain_enums::OperationItemStatus::Succeeded,
-    );
-
-    // And released afterwards, or the next admission of a sibling would block for
-    // the whole wait budget.
-    let after = db
-        .db()
-        .try_lock(
-            types_registry::domain::admission::worker::LOCK_GEAR,
-            &key,
-            probe,
-        )
-        .await
-        .expect("probe");
-    assert!(
-        after.is_some(),
-        "the lock must be released when the commit transaction closes",
-    );
-    after
-        .expect("just asserted")
-        .release()
-        .await
-        .expect("release the probe's own guard");
-}
-
-#[tokio::test]
-async fn family_lock_contention_honours_the_configured_wait_budget() {
-    let dir = TestDir::new("types-registry-family-lock-timeout");
-    let db = test_db_file(&dir.path().join("registry.sqlite")).await;
-    let family_key = types_registry::domain::family::family_key(
-        &gts::GtsId::try_new(V1).expect("fixture identifier"),
-    );
-    let lock_key = family_lock_key(&family_key);
-    let blocker = db
-        .db()
-        .try_lock(
-            LOCK_GEAR,
-            &lock_key,
-            LockConfig {
-                max_wait: Some(Duration::from_millis(1)),
-                max_retries: Some(0),
-                ..LockConfig::default()
-            },
-        )
-        .await
-        .expect("take blocker lock")
-        .expect("family starts unlocked");
-
-    let operation_id = submit(&db, "lock-timeout", V1).await;
-    let settings = WorkerSettings {
-        family_lock_timeout: Duration::from_millis(1),
-        ..WorkerSettings::default()
-    };
-    let error = run_operation(
-        &stores(),
-        &worker(&db),
-        &allow_all(),
-        Tuning {
-            limits: &common::limits(),
-            worker: &settings,
-            metrics: &common::metrics(),
-        },
-        operation_id,
-        LATER,
-    )
-    .await
-    .expect_err("the held family lock must exhaust the configured budget");
-    assert!(matches!(
-        error,
-        WorkerError::FamilyLockUnavailable { family_key: found, retry_after_seconds: 1 }
-            if found == family_key.as_str()
-    ));
-
-    blocker.release().await.expect("release blocker lock");
-
-    let outcome = run_operation(
-        &stores(),
-        &worker(&db),
-        &allow_all(),
-        Tuning {
-            limits: &common::limits(),
-            worker: &WorkerSettings::default(),
-            metrics: &common::metrics(),
-        },
-        operation_id,
-        LATER,
-    )
-    .await
-    .expect("the same operation is recoverable after contention clears");
-    assert_eq!(
-        verdict(&outcome).0,
-        domain_enums::OperationItemStatus::Succeeded
-    );
-}

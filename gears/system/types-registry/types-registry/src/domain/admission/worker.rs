@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
-use toolkit_db::{DBProvider, DbError, DbLockGuard, LockConfig};
+use toolkit_db::{DBProvider, DbError};
 use toolkit_macros::domain_model;
 use tracing::{Instrument, Span};
 use uuid::Uuid;
@@ -43,13 +43,9 @@ use super::vector::VectorDrift;
 use crate::config::{Limits, WorkerSettings};
 use crate::domain::admission::Precondition;
 use crate::domain::enums::{OperationItemStatus, OperationStatus};
-use crate::domain::family::{FamilyKey, lock_order};
 use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage, TerminalStatus};
 use crate::domain::ports::{OperationItemRow, OperationRow, Stores, commit_write, snapshot_read};
 use crate::observability;
-
-/// The advisory-lock namespace every types-registry lock is taken under.
-pub const LOCK_GEAR: &str = "types_registry";
 
 /// The two configuration sections one admission pass obeys, carried together.
 #[derive(Clone, Copy)]
@@ -57,19 +53,6 @@ pub struct Tuning<'a> {
     pub limits: &'a Limits,
     pub worker: &'a WorkerSettings,
     pub metrics: &'a Arc<dyn AdmissionMetrics>,
-}
-
-/// Prefix on the family lock key, so a future lock on some other thing in this
-/// gear cannot collide with a family key that happens to spell the same bytes.
-const FAMILY_LOCK_PREFIX: &str = "family:";
-
-/// The advisory-lock key one version family is serialized under.
-///
-/// Public so that a test can probe the key the worker actually takes. A test that
-/// spelled the key itself would keep passing after this function changed it.
-#[must_use]
-pub fn family_lock_key(family_key: &FamilyKey) -> String {
-    format!("{FAMILY_LOCK_PREFIX}{family_key}")
 }
 
 /// What one pass over an operation produced.
@@ -111,16 +94,13 @@ pub async fn run_operation(
     operation_id: Uuid,
     now: OffsetDateTime,
 ) -> Result<OperationOutcome, WorkerError> {
-    // The span opens before the first read, so it covers the whole pass — which is why its `kind`
-    // and `dry_run` fields are filled in from inside, once the operation row has been read
-    // (`observability::operation_span`).
+    // Open before the first read; populate operation fields after loading it.
     let span = observability::operation_span(operation_id);
     let started = Instant::now();
     let outcome = run_operation_inner(stores, db, scope, tuning, operation_id, now)
         .instrument(span)
         .await;
-    // Recorded on the failing path too: an infrastructure failure is still time this pass spent,
-    // and a histogram that only sees successes hides the shape of a deployment that is timing out.
+    // Include failed passes in the duration histogram.
     tuning.metrics.observe_operation_duration(started.elapsed());
     outcome
 }
@@ -157,8 +137,7 @@ async fn run_operation_inner(
 
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
-        // Instrumented here rather than inside `process_item` so that the pass's one long function
-        // does not need to be split in two to own a span.
+        // Instrument each item without splitting `process_item` to own the span.
         let span =
             observability::unit_span(operation_id, &item.gts_id, item.kind, item.dry_run, item.id);
         outcomes.push(
@@ -197,89 +176,19 @@ const fn retryable_db_err(e: &WorkerError) -> Option<&sea_orm::DbErr> {
     }
 }
 
-/// Take the advisory lock on each named family, in [`lock_order`]'s order.
-///
-/// The guards are returned rather than held here because they must outlive the
-/// commit transaction: the window they close spans `create_or_get`, the three family
-/// rules and the entity insert.
-///
-/// # Errors
-/// [`WorkerError::FamilyLockUnavailable`] when the wait budget expires — contention,
-/// not a statement about the candidate, so a redelivery re-drives it. Any guard
-/// already taken is explicitly released before the error is returned.
-async fn lock_families(
-    db: &DBProvider<WorkerError>,
-    family_keys: &[FamilyKey],
-    operation_id: Uuid,
-    operation_item_id: i64,
-    max_wait: std::time::Duration,
-) -> Result<Vec<DbLockGuard>, WorkerError> {
-    let handle = db.db();
-    let mut guards = Vec::with_capacity(family_keys.len());
-    for key in lock_order(family_keys) {
-        let lock_key = family_lock_key(&key);
-        let config = LockConfig {
-            max_wait: Some(max_wait),
-            ..LockConfig::default()
-        };
-        match handle.try_lock(LOCK_GEAR, &lock_key, config).await {
-            Ok(Some(guard)) => guards.push(guard),
-            Ok(None) => {
-                release_family_locks(guards, operation_id, operation_item_id).await;
-                return Err(WorkerError::FamilyLockUnavailable {
-                    family_key: key.as_str().to_owned(),
-                    retry_after_seconds: max_wait.as_secs().max(1),
-                });
-            }
-            Err(error) => {
-                release_family_locks(guards, operation_id, operation_item_id).await;
-                return Err(error.into());
-            }
-        }
-    }
-    Ok(guards)
-}
-
-/// Release every acquired family lock deterministically.
-///
-/// Used on the normal commit path and on partial acquisition failures. A release
-/// error cannot change an already-decided commit or replace the acquisition error;
-/// the session still bounds the lock lifetime, so the failure is logged.
-async fn release_family_locks(
-    guards: Vec<DbLockGuard>,
-    operation_id: Uuid,
-    operation_item_id: i64,
-) {
-    for guard in guards {
-        if let Err(error) = guard.release().await {
-            tracing::warn!(
-                %operation_id,
-                operation_item_id,
-                %error,
-                "types_registry could not release a version-family lock; it expires with the \
-                 session"
-            );
-        }
-    }
-}
-
 /// Groups the per-item commit inputs so the transaction boundary stays readable
 /// without crossing Clippy's argument-count threshold.
 struct CommitRequest<'a> {
     evaluated: &'a Arc<EvaluatedUnit>,
     item: &'a OperationItemRow,
-    operation_id: Uuid,
     now: OffsetDateTime,
     limits: Limits,
-    family_lock_timeout: std::time::Duration,
     metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
-/// Steps 4a and 4b: take the family lock a creation needs, run the commit
-/// transaction, and release the lock however the commit ended.
+/// Run the serialized commit transaction (SPEC step 4b).
 ///
-/// Its own function so the lock's lifetime is a single lexical scope: the guard is
-/// taken before the transaction and released after it on every path.
+/// Its first statement claims `entity_write_order`, replacing the former family locks.
 async fn commit_evaluated(
     db: &DBProvider<WorkerError>,
     stores: &Arc<dyn Stores>,
@@ -289,40 +198,12 @@ async fn commit_evaluated(
     let CommitRequest {
         evaluated,
         item,
-        operation_id,
         now,
         limits,
-        family_lock_timeout,
         metrics,
     } = request;
-    // Step 4a: serialize the family rules, for a **creation** only.
-    //
-    // `create_or_get`'s unique key decides which of two concurrent admissions founds
-    // a family, and nothing more: the kind, minor-shape and minor-contiguity rules
-    // are check-then-act reads inside a READ COMMITTED transaction, so two admissions
-    // of two *different* new members of one family — `…v1~` and `…v1.0~`, or a Type
-    // Schema beside an Instance — can each pass and both commit an invariant
-    // violation nothing later repairs. The lock is taken here rather than in the
-    // repository because it lives on the `Db` handle and must be held **across** the
-    // transaction, which a repository inside one cannot do.
-    //
-    // A revision takes nothing: it adds no member, so it asks none of the rules.
     let precondition = item.precondition;
-    let family_lock = match precondition {
-        Precondition::MustNotExist => {
-            lock_families(
-                db,
-                std::slice::from_ref(&evaluated.family_key),
-                operation_id,
-                item.id,
-                family_lock_timeout,
-            )
-            .await?
-        }
-        Precondition::Version(_) => Vec::new(),
-    };
-
-    // Step 4b: a short READ COMMITTED transaction containing only rechecks and
+    // A short READ COMMITTED transaction containing only rechecks and
     // writes. The `Arc` keeps transaction retries from cloning the artifacts.
     //
     // Retried on lock contention: every statement in both commit paths re-reads
@@ -337,14 +218,11 @@ async fn commit_evaluated(
     // *enforced* here, by a commit that refuses an absent identifier.
     let tx_scope = scope.clone();
     let tx_stores = Arc::clone(stores);
-    // Cloned per attempt like `tx_stores`: the closure is `'static`, so it can borrow neither the
-    // caller's handle nor anything else from this frame.
+    // The `'static` retry closure owns each attempt's handles.
     let tx_metrics = Arc::clone(metrics);
-    // `Limits` is `Copy` and arrives owned on `CommitRequest`, so each retry attempt takes its own
-    // copy rather than borrowing across the transaction boundary.
+    // Copy limits into the `'static` retry closure.
     let tx_limits = limits;
-    let committed = db
-        .db()
+    db.db()
         .transaction_with_retry(commit_write(&db.db()), retryable_db_err, |tx| {
             let unit = Arc::clone(evaluated);
             let tx_scope = tx_scope.clone();
@@ -378,14 +256,7 @@ async fn commit_evaluated(
                 }
             })
         })
-        .await;
-
-    // Released deterministically rather than on `Drop`, which the toolkit documents
-    // as best-effort: a sibling admission is waiting on this key. A failed release is
-    // logged, not propagated — the commit above is already decided.
-    release_family_locks(family_lock, operation_id, item.id).await;
-
-    committed
+        .await
 }
 
 /// Evaluate and commit one non-terminal item.
@@ -410,8 +281,7 @@ async fn process_item(
 
     let attempts = tuning.worker.max_revalidation_attempts;
     let mut last_drift: Option<VectorDrift> = None;
-    // `1..=n` rather than `0..n` so the number in the log line is the attempt an operator would
-    // count.
+    // Log attempts using one-based numbering.
     for attempt in 1..=attempts {
         // Step 3: evaluation releases its snapshot before CPU-heavy validation.
         let evaluated = match evaluate(
@@ -448,24 +318,19 @@ async fn process_item(
             CommitRequest {
                 evaluated: &evaluated,
                 item,
-                operation_id,
                 now,
                 limits: *tuning.limits,
-                family_lock_timeout: tuning.worker.family_lock_timeout,
                 metrics: tuning.metrics,
             },
         )
         .await
         {
             Ok(committed) => committed,
-            // The competing pass's terminal item is authoritative; this pass rolled its entity
-            // write back with `ItemAlreadyTerminal`.
+            // Another pass terminalized the item; this pass rolled back.
             Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
                 return stored_item(stores, db, scope, operation_id, item_id).await;
             }
-            // A refusal the commit could only reach after it began writing: the transaction rolled
-            // back with it, and the item is terminalized here in a transaction of its own — the
-            // same path an evaluation-stage refusal takes.
+            // Terminalize a post-write refusal after its transaction rolls back.
             Err(WorkerError::RefusedAfterWrite(failure)) => {
                 return record_failure(
                     stores,
@@ -479,7 +344,7 @@ async fn process_item(
                 )
                 .await;
             }
-            // The guard fired: this transaction wrote nothing and rolled back.
+            // Guard or artifact CAS drift rolls the transaction back.
             Err(WorkerError::RevalidationRequired(drift)) => {
                 tuning.metrics.revalidation_retried(&drift);
                 tracing::info!(
@@ -546,8 +411,7 @@ async fn process_item(
     .await
 }
 
-/// The outcome to report for a commit that succeeded, and the log line and the counter that go with
-/// it.
+/// Report, log, and count a successful commit.
 fn committed_outcome(
     operation_id: Uuid,
     item: &OperationItemRow,
@@ -656,8 +520,7 @@ async fn record_failure(
         .await?;
 
     if recorded {
-        // Both counters are behind `recorded`: this pass owns the decision only when its
-        // compare-and-swap won.
+        // Count only the pass that won the item CAS.
         metrics.candidate_terminalized(TerminalStatus::Failed);
         metrics.refused(RefusalStage::Admission, reason_label(&failure.reason));
         tracing::warn!(

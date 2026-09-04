@@ -19,6 +19,14 @@ per-gear push, and a new SDK trait replaces the old one outright.
 Global entities only — no tenant ownership, no `PlatformSecurityContext`, no PDP, no
 federation.
 
+**Coordination state, stated once for the whole plan.** `types_registry__coordination_state`
+exists — it is created and seeded by this P0's second migration. Only its
+`entity_write_order` row is seeded and used in P0: the serialization point every commit
+that writes entity state advances as its first statement (P15 below). `source_claim` is
+not created in P0. The `routing` state row — the future routing generation — arrives with
+federation, seeded by that phase's own migration alongside `source_claim`. A standalone
+`routing_config` table is never created, in P0 or any later phase.
+
 32 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a added
 out of the Checkpoint 1 review (P12/P13). Twenty-nine are S or M; three are **L** and say
 why in their own entry — T25 and T26 (consumer migration across twenty-plus gears) and T28
@@ -34,7 +42,9 @@ in, and the spec has been updated to match all five. P12 is a correction: it rev
 made to the existing v1 REST contract, and adds T9a and T24a. P13 is a reordering — Instances
 into Phase 1, and `make dylint` per phase instead of per task. P14 defines `x-gts-ref`
 independently of the dependency graph. P15 replaces the revision-vector lock with the optimistic
-guard and hands deletion the one per-entity lock that survives the argument. P16 and P17 came out
+guard and keeps the one thing that survives the argument: a serialized write path — one row,
+claimed first by every commit — that orders commits, joined by every writer of entity state:
+admission here, deletion at T20, purge under ADR-0013. P16 and P17 came out
 of reviewing Phase 3 on its way out: P16 makes observability a per-task obligation from T17
 onward, and P17 moves T27 — the REST surface — from Phase 7 into Phase 5. (P11 was a
 housekeeping close-out and is retired; the number is not reused.)
@@ -427,6 +437,21 @@ cutover and Phase 7 is **T24 → T24a → T28**, with T24a promoting all seven a
 in this decision changes — v1 and v2 stay separate stores until T24, and the promotion is still
 where the break reaches a v1 caller.
 
+**What the T24–T26 window owes `TypesRegistryClient`.** T25 and T26
+migrate consumers off the *Rust trait*, not off `/v2/`, so T24a's rename costs them nothing and
+their placement after it is right. The gap is one task earlier: T24 deletes the in-memory
+repository the old trait's implementation reads, while ~13 `register(...)` sites and every read
+site stay on that trait until T25/T26. Its `register` is synchronous, and after T24 the only store
+is the asynchronous one. **The decision, rather than a note that one is needed:** the old trait keeps its shape over the
+window and its `register` becomes a **submit-then-poll shim** over the one database store, deleted
+by T26 with the trait. It is not a dual path in P6's sense — one store, one write path, no
+fallback read — and it is what keeps the workspace building while ~15 gears migrate one at a time.
+The alternative, folding T25 and T26 into T24, is rejected: T25 is ten gears and their plugins and
+T26 five more, which is not work that shares a task with the cutover, and a task that cannot
+compile until all of it lands is not a task. T24 carries the criterion; *"repointing it at the
+database would be a compatibility shim with no consumer"* (T24a) stays true of the **routes** and
+was never true of the trait.
+
 **What this buys, concretely.** `make e2e-local` stays green from here to T24 with no e2e file
 edited, and the red window shrinks from ~19 tasks to the T24–T28 stretch, where the wire break is
 real and unavoidable. What it does *not* buy is an earlier cutover: the SDK and every consumer
@@ -521,8 +546,20 @@ The stored edge kinds are `1 schema_ref, 2 derivation, 3 instance_of`, and
 `ck_tr_dependency_kind` admits exactly those values. The numbering is append-only after the
 first release.
 
+**Renumbering them in the initial migration is safe here, and this is why.** `main` carries
+`1 schema_ref, 2 gts_ref, 3 derivation, 4 instance_of` and the same initial migration, so a
+deployment on `main` with a database has applied that migration and will not re-apply the
+edited one. Nothing is mis-decoded regardless, because **no supported production path in
+`main` can have persisted a `dependency` row**: `DependencyRepo::replace_outgoing` has no
+caller there outside tests — `main`'s own T13 entry says so — and this branch is where
+admission first calls it. So no row exists whose `kind` could be reinterpreted, and the only
+residue on an
+already-migrated database is a laxer `CHECK` (`IN (1,2,3,4)` where the edited migration writes
+`IN (1,2,3)`), which admits a superset of what the code can now produce. Once a release has
+persisted an edge, this argument expires and the numbering is append-only, full stop.
 
-### P15. Locking the revision vector is the wrong tool; one per-entity lock is right, and it is deletion's
+
+### P15. Locking the revision vector is the wrong tool; serializing commits is right
 
 SPEC §8.1 step 4.2 asked for two lock levels: the version family, then *"candidate and
 revision-vector entity/current rows in canonical identifier order"*. T15 implements the first and
@@ -549,20 +586,27 @@ tomorrow.
 **What holds instead.** The candidate's own row is serialized by the compare-and-swap that writes
 it. A dependency that moves is serialized by the refresh its mover owes the dependants: that
 refresh writes each affected dependant's `type_schema` row, the same row this commit writes, so
-the two block on one another and the later one recomputes against the earlier. Where the change
-leaves a dependant's fingerprint unmoved, nothing is written and nothing was stale. SPEC §8.1
+the two block on one another — which orders them and nothing more, since a refresh computes its
+artifacts before it writes. What makes the loser notice is that the refresh's write is a
+compare-and-swap on the revision and fingerprint it read; it rolls back and recomputes. Where the
+change leaves a dependant's fingerprint unmoved, nothing is written and nothing was stale. SPEC §8.1
 step 4.2 records the argument, the one window it leaves, and the liveness cost by name.
 
-**One per-entity lock survives the argument, and T15 does not own it.** DESIGN §4 rested
-deletion's *"no new dependant between the check and the tombstone"* on admission locking every
-dependency target. Admission does not, and the optimistic mechanism does not reach this case:
-adding an edge moves no `resource_version` and writes only `dependency`, while deletion writes the
-target's `entity` row, so in the order where the edge commits second nothing serializes them, and
-deletion's dependant check is a check-then-act on a predicate no compare-and-swap carries. The
-requirement is **one lock per edge target**, taken by admission and deletion alike after their
-family locks — cheap, portable, and nothing like a lock over the vector. It is **T20's**, with
-deletion; P0 has no deletion path, so nothing is exposed meanwhile. DESIGN now states it where it
-is needed instead of as a property of admission.
+**One lock survives the argument, and it orders commits.** The argument covers everything that
+meets on a row. What it cannot cover is an edge committed *after* a mover's reverse scan: adding an
+edge moves no `resource_version` and writes only `dependency`, so the two commits write no row in
+common, both pass their own guards, and the dependant keeps an artifact inlined from a revision
+that is no longer current with a fingerprint that matches it. The requirement is therefore a **serialized write
+path**: every commit claims the `entity_write_order` row of `types_registry__coordination_state`
+as its transaction's first
+statement, one commit at a time per installation. It works because the reverse-impact scan and
+the vector guard already run inside the commit transaction: either the edge is visible to the
+mover's scan, or the unit writing it has not committed and its own guard catches the mover. Two
+cases, no third. A row rather than an advisory lock, because advisory keys live on a session
+separate from the transaction's connection and losing it would release the key while the
+transaction carried on. This is nothing like a lock over the vector, which stays the optimistic
+guard for the window between evaluation and the claim. Every writer of entity state claims it:
+admission here, deletion at **T20**, the purge job under ADR-0013. DESIGN §3.7 states it.
 
 **The `unchanged` outcome is not guarded, deliberately.** Step 4.3 sits ahead of every write, and
 an `unchanged` candidate performs none: no revision, no version move, no refresh. The one thing it
@@ -577,7 +621,10 @@ would catch the mistake.
 vector's reverse-impact read is the same read the refresh does. An over-bound candidate is
 therefore refused at evaluation, before any transaction has written, under the same
 `activation_write_set_exceeded` reason — strictly earlier and cheaper, and invisible to a client.
-T14's refusal stays as the backstop for a set that grew in between.
+T14's refusal stays as the backstop for a set that grew in between. Both ask the same question,
+because D5 states the bound over the set the walk *returns* rather than over the rows the
+fingerprint filter ends up writing — the written set is a subset, and only the walked set is a
+number either read has before it writes.
 
 ### P16. Observability is a per-task obligation from T17 on, not a second T16
 
@@ -664,8 +711,9 @@ Three consequences, each tighter than what it replaces:
 
 * **P12's ordering constraint disappears.** The recommended Phase 7 order was
   T24 → T27 → T24a → T28, with the promotion wedged between the last new route and the e2e
-  migration. With the routes authored in Phase 5, Phase 7 is **T24 → T24a → T28** and T25/T26
-  float; T24a promotes all seven routes at once, because all seven already exist.
+  migration. With the routes authored in Phase 5, Phase 7 is **T24 → T24a → T28**, with
+  T25 → T26 running alongside it — T25 on T24, T26 on T25, since T26 deletes the trait T25's
+  gears are still on. T24a promotes all seven routes at once, because all seven already exist.
 * **The changelog entries stay in Phase 7, with T24a.** T27 carried them, but the break they
   describe happens at the promotion — a changelog entry announcing a v1 break in a release where
   v1 still works is simply wrong. T24a already required both entries as *"one release, two
@@ -893,8 +941,8 @@ behave as Checkpoint 5 proved them, now on the promoted v1 paths. All 16 success
 
 ## Parallelization
 
-- **Parallel:** T16 with T14/T15. T22 with T21. T25 and T26 are independent gear groups once
-  T24 lands. T30 with T28 — it needs the new models (T26) and the database read path (T24), and
+- **Parallel:** T16 with T14/T15. T22 with T21. T25 and T26 split per gear, but T26 deletes the
+  shared trait and so lands after T25 — the split is within each, not between them. T30 with T28 — it needs the new models (T26) and the database read path (T24), and
   nothing in the e2e task touches the client cache.
 - **Sequential:** T2→T5 (foundation), T7→T8, T13→T14→T15, T19→T20→T27 in Phase 5 (P17 — the
   deletion routes are one pair over T20's path), T22→T23→T24, and in Phase 7 T24→T24a→T28: the

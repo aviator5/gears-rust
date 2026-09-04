@@ -26,21 +26,35 @@ use crate::domain::admission::fingerprint::ScopeHash;
 use crate::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use crate::domain::family::FamilyKey;
 use crate::domain::ports::{
-    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentTypeSchemaRow,
-    DependencyClosure, DependencyStore, EntityRow, EntityStore, InstanceStore, NewCurrentInstance,
-    NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewOperation, NewOperationItem,
-    NewRevision, OperationItemRow, OperationRow, OperationStore, ReverseImpact, TypeSchemaStore,
-    VersionFamilyRow, VersionFamilyStore,
+    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
+    CurrentTypeSchemaRow, DependencyClosure, DependencyStore, EntityRow, EntityStore,
+    EntityWriteOrderStore, InstanceStore, NewCurrentInstance, NewCurrentTypeSchema, NewEntity,
+    NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
+    OperationRow, OperationStore, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
+    VersionFamilyStore,
 };
 
 use super::repo::{
-    DependencyRepo, EntityRepo, InstanceRepo, OperationRepo, TypeSchemaRepo, VersionFamilyRepo,
+    CoordinationStateRepo, DependencyRepo, EntityRepo, InstanceRepo, OperationRepo, TypeSchemaRepo,
+    VersionFamilyRepo,
 };
 
 /// The database-backed implementation of every port. Stateless, so it costs
 /// nothing to construct and can be shared as an `Arc`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Repos;
+
+#[async_trait]
+impl EntityWriteOrderStore for Repos {
+    async fn claim_entity_write_order(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        now: OffsetDateTime,
+    ) -> Result<(), ScopeError> {
+        CoordinationStateRepo::claim_entity_write_order(tx, scope, now).await
+    }
+}
 
 #[async_trait]
 impl VersionFamilyStore for Repos {
@@ -177,8 +191,9 @@ impl TypeSchemaStore for Repos {
         tx: &DbTx<'_>,
         scope: &AccessScope,
         new: NewCurrentTypeSchema,
+        expected: CurrentSchemaCas,
     ) -> Result<bool, ScopeError> {
-        TypeSchemaRepo::update_current(tx, scope, new).await
+        TypeSchemaRepo::update_current(tx, scope, new, expected).await
     }
 }
 

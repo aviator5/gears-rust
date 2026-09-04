@@ -156,8 +156,7 @@ fn an_instance_conforms_to_its_type_and_carries_nothing_else() {
 
 #[test]
 fn an_instance_values_ref_shaped_data_is_data_and_not_an_edge() {
-    // An Instance is a *value*: `$ref` and `x-gts-ref` are schema keywords, so the same strings
-    // inside a value name nothing.
+    // Schema keywords inside an Instance value create no edges.
     let value = json!({
         "$ref": OTHER,
         "x-gts-ref": "not-an-identifier",
@@ -235,9 +234,7 @@ fn the_edge_kinds_over_their_fixtures() {
 
 #[test]
 fn only_the_ref_targets_seed_the_closure() {
-    // Derivation and conformance targets are chain members, which the closure already seeds from
-    // the identifier — and an `x-gts-ref` target is not seeded at all, because validating the
-    // keyword never reads the target document.
+    // Only `$ref` targets require extra closure roots.
     let doc = schema(
         DERIVED,
         json!({

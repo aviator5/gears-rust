@@ -9,6 +9,7 @@
 //! - **gts-rust integration**: Uses the official GTS library for all operations
 //! - **`ClientHub` registration**: Other gears access via `hub.get::<dyn TypesRegistryClient>()?`
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 // The admission path nests async futures deeply — handler, service, worker,

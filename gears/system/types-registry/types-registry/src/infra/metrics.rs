@@ -9,8 +9,7 @@ use opentelemetry::{InstrumentationScope, KeyValue};
 use crate::domain::admission::vector::VectorDrift;
 use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage, TerminalStatus};
 
-/// The instrumentation scope every instrument here is declared on — the crate name, as the other
-/// gears' meters use.
+/// Instrumentation scope shared by this gear's metrics.
 pub const SCOPE: &str = "cf-gears-types-registry";
 
 /// Bucket boundaries for `types_registry_activation_write_set`.
@@ -28,22 +27,20 @@ const fn drift_label(drift: &VectorDrift) -> &'static str {
         VectorDrift::Vanished { .. } => "vanished",
         VectorDrift::Moved { .. } => "moved",
         VectorDrift::Refreshed { .. } => "refreshed",
+        VectorDrift::CurrentProjectionMoved { .. } => "current_projection_moved",
     }
 }
 
 /// The OpenTelemetry rendering of [`AdmissionMetrics`].
 #[derive(Debug)]
 pub struct AdmissionMetricsMeter {
-    /// `types_registry_candidates_total{status}` — one increment per candidate **this pass**
-    /// terminalized.
+    /// Candidates terminalized by this pass, by status.
     candidates: Counter<u64>,
     /// `types_registry_refusals_total{stage,reason}`.
     refusals: Counter<u64>,
-    /// `types_registry_revalidations_total{drift}` — one increment per *retry* taken, so a
-    /// candidate that committed on its first attempt contributes nothing.
+    /// Revalidation retries, by drift.
     revalidations: Counter<u64>,
-    /// `types_registry_activation_write_set` — dependents rewritten by one revision (SPEC §8.1 step
-    /// 4.6).
+    /// Dependents rewritten by one revision (SPEC §8.1 step 4.6).
     activation_write_set: Histogram<f64>,
     /// `types_registry_operation_duration_seconds` — one admission pass, wall-clock.
     operation_duration: Histogram<f64>,
@@ -72,7 +69,7 @@ impl AdmissionMetricsMeter {
                 .u64_counter(format!("{prefix}_revalidations_total"))
                 .with_description(
                     "Revalidation retries taken after the commit-time revision-vector guard \
-                     fired, by drift shape",
+                     or an artifact write's compare-and-swap fired, by drift shape",
                 )
                 .build(),
             activation_write_set: meter
@@ -100,8 +97,7 @@ impl AdmissionMetrics for AdmissionMetricsMeter {
             1,
             &[
                 KeyValue::new("stage", stage.label()),
-                // `&'static str` straight into the label: the parameter type is the
-                // closed-vocabulary guarantee, so no owned copy is needed.
+                // The static type enforces a closed label vocabulary.
                 KeyValue::new("reason", reason),
             ],
         );
@@ -113,9 +109,7 @@ impl AdmissionMetrics for AdmissionMetricsMeter {
     }
 
     fn observe_activation_write_set(&self, refreshed: usize) {
-        // The bound is `limits.activation_write_set`, whose default is 512 and whose configured
-        // ceiling is far inside f64's exact-integer range, so this conversion cannot lose a digit
-        // in practice.
+        // The configured bound fits exactly in `f64` in practice.
         #[allow(clippy::cast_precision_loss)]
         self.activation_write_set.record(refreshed as f64, &[]);
     }
@@ -125,9 +119,7 @@ impl AdmissionMetrics for AdmissionMetricsMeter {
     }
 }
 
-/// Build the adapter on whatever `MeterProvider` is installed globally at the moment this runs,
-/// ready for `TypesRegistryGear::init` to inject into the service as an `Arc<dyn
-/// AdmissionMetrics>`.
+/// Build the adapter from the current global `MeterProvider`.
 #[must_use]
 pub fn default_adapter(prefix: &str) -> Arc<AdmissionMetricsMeter> {
     let scope = InstrumentationScope::builder(SCOPE).build();

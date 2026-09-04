@@ -647,9 +647,13 @@ CREATE TABLE types_registry__instance (
 -- derivation with stored edges would require another branch or an index-defeating
 -- OR. These edges are written once from immutable identifiers.
 --
--- The relation is a DAG by construction (ADR-0012): a circular $ref has no resolved
--- form and GTS refuses it, derivation strictly shortens the ~-chain, and nothing
--- references an Instance. Traversal nonetheless MUST use UNION, never UNION ALL --
+-- The relation is a DAG, and admission is what keeps it one (ADR-0012). Two of the
+-- three edge kinds cannot close a cycle on their own: derivation strictly shortens
+-- the ~-chain, and nothing references an Instance. $ref can, and so can $ref
+-- *combined* with derivation -- a base that $refs a schema derived from it is a cycle
+-- with no circular $ref in it. Both are refused over the combined edge set, because
+-- an effective form inlines both kinds and neither cycle has a resolved form.
+-- Traversal nonetheless MUST use UNION, never UNION ALL --
 -- a DAG whose paths converge is enumerated once per path under UNION ALL, which on a
 -- fan-in-heavy graph is exponential in the path count rather than linear in the rows,
 -- and a row contradicting the invariant would not terminate at all.
@@ -719,22 +723,72 @@ CREATE INDEX idx_tr_dependency_to
     ON types_registry__dependency (to_entity_id, from_entity_id);
 
 
--- Singleton routing state. Lock it for every claim mutation because wildcard
--- overlap is not expressible as a unique constraint and the conflicting row may
--- not yet exist. The lock serializes validation and commit.
+-- The installation-global coordination rows: one row per cross-cutting sequence,
+-- named by `state_name`. Rows are created and seeded by migrations; runtime code
+-- never creates a state implicitly and fails closed unless an update affects
+-- exactly one row. The domain reaches a state only through purpose-specific
+-- methods, never by passing an arbitrary `state_name`.
 --
--- Bump generation in the same transaction. Federated cursors bind to it and the
--- in-memory claim set uses it for reload detection. A counter is correct here
--- because every claim mutation changes routing.
-CREATE TABLE types_registry__routing_config (
-    id          smallint    NOT NULL,
-    generation  bigint      NOT NULL,
+-- `entity_write_order` is the row every commit that writes entity state advances as
+-- the FIRST statement of its transaction. Nothing reads it for a decision: the write
+-- is the mechanism. P0 seeds this one state and nothing else.
+--
+-- One commit runs at a time per installation, and that is a correctness
+-- requirement rather than a throughput choice. The reverse-impact scan and the
+-- revision-vector guard both run inside the commit transaction, so serializing
+-- commits gives them a total order: an edge is either already visible to a mover's
+-- scan, or belongs to a unit that has not committed and whose own guard will see
+-- the mover's revision when it does. Without that order both halves run blind to
+-- each other and a dependant keeps an artifact built from a revision that is no
+-- longer current, with a fingerprint that matches it -- so nothing reports drift.
+--
+-- A row and not an advisory lock: advisory keys live on a session separate from
+-- the transaction's connection, so losing that session releases the key while the
+-- transaction carries on. A row lock ends with COMMIT or ROLLBACK and nothing else.
+--
+-- FIRST statement, not merely early. Claimed after any read, it would order the
+-- writes and leave those reads outside the serialized region.
+--
+-- state_seq is incremented rather than merely touched so the row is also a
+-- monotone count of committed admissions: a writer that forgot to claim it shows
+-- up as a count that did not move. Nothing branches on the value. updated_at is
+-- observability metadata -- when the state last moved -- and is never read for a
+-- decision.
+CREATE TABLE types_registry__coordination_state (
+    state_name  varchar(64) NOT NULL,
+    state_seq   bigint      NOT NULL,
     updated_at  timestamptz NOT NULL,
 
-    CONSTRAINT pk_tr_routing_config PRIMARY KEY (id),
-    CONSTRAINT ck_tr_routing_config_singleton CHECK (id = 1),
-    CONSTRAINT ck_tr_routing_config_generation CHECK (generation >= 1)
+    CONSTRAINT pk_tr_coordination_state PRIMARY KEY (state_name),
+    CONSTRAINT ck_tr_coordination_state_seq CHECK (state_seq >= 0)
 );
+
+
+-- Routing state. There is no standalone routing table in any phase: routing is the
+-- `routing` row of `types_registry__coordination_state`, seeded by the federation
+-- migration together with `source_claim`. P0 seeds only `entity_write_order`.
+--
+-- `routing.state_seq` is the routing generation. Federated cursors bind to it and
+-- the in-memory claim set uses it for reload detection; a counter is correct here
+-- because every claim mutation changes routing. `routing.updated_at` is routing
+-- observability metadata.
+--
+-- The `routing` row is NOT an independent correctness lock. Overlap between
+-- wildcard patterns is not expressible as a unique constraint, which is why the
+-- validation and the commit must be serialized at all -- and what serializes them
+-- is the `entity_write_order` claim every writer of entity state makes first,
+-- before any read. The protocol for every routing writer is therefore:
+--
+--   advance `entity_write_order` (first statement, before any read)
+--     -> the family/entity rows and the Source Claim changes, in the writer's own
+--        dependency-safe order -- a revision precedes the claim projection that
+--        references it on insert, while purge removes that claim before its revision
+--     -> advance `routing.state_seq` (the FINAL mutation, after every
+--        routing-affecting and entity mutation is done; a generation change)
+--
+-- all in one transaction. Because every routing writer already holds
+-- `entity_write_order`, advancing `routing` invalidates caches and federated
+-- cursors; it adds no exclusion the claim has not already provided.
 
 
 -- Active claims and retired reservations share one row because both block managed
@@ -754,17 +808,19 @@ CREATE TABLE types_registry__routing_config (
 --
 -- Deleting the Instance writes retired_at and nothing else. The projection stays
 -- intact, so a reservation still records which plugin revision issued it. Purge
--- removes the claim row before the revision it references, under the same
--- routing_config lock, so ON DELETE RESTRICT never fires and no column has to be
--- nulled in advance. Retirement and removal bump routing_config.generation under
--- that lock.
+-- removes the claim row before the revision it references, inside the transaction
+-- the `entity_write_order` claim opened, so ON DELETE RESTRICT never fires and no
+-- column has to be nulled in advance. Retirement and removal advance the `routing`
+-- row of `types_registry__coordination_state` after their claim changes -- last in
+-- the same transaction, as a generation change.
 --
 -- Liveness does not retire claims. An unreachable plugin keeps them and requests
 -- fail closed; only Instance deletion writes retired_at. Therefore this table has
 -- no health or last-seen field (ADR-0011).
 --
 -- There is no claim takeover: active claims cannot replace retired reservations
--- (ADR-0011). Manual retargeting must bump generation under lock and keep the
+-- (ADR-0011). Manual retargeting must claim `entity_write_order` first, before any
+-- read, and advance the routing generation last in the same transaction, keeping the
 -- successor plugin document consistent with this projection; see DESIGN §3.2.
 --
 -- priority belongs to the plugin, so all its projected claims repeat one value;

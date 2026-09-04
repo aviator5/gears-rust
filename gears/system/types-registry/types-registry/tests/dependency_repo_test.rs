@@ -206,6 +206,37 @@ async fn reverse_impact_refuses_a_set_over_the_bound() {
     );
 }
 
+/// A dependent reached at multiple depths still counts once.
+#[tokio::test]
+async fn reverse_impact_counts_a_dependent_reached_at_different_depths_once() {
+    let db = test_db().await;
+    let root = gts_id!("acme.rev.converging_root.type.v1~");
+    let middle = gts_id!("acme.rev.converging_middle.type.v1~");
+    let leaf = gts_id!("acme.rev.converging_leaf.type.v1~");
+    let ids = seed(&db, &[root, middle, leaf]).await;
+
+    // middle -> root, while leaf reaches root both directly and through middle.
+    edge(&db, ids[1], ids[0]).await;
+    let conn = db.conn().expect("conn");
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &allow_all(),
+        ids[2],
+        &[
+            (DependencyKind::SchemaRef, ids[0]),
+            (DependencyKind::SchemaRef, ids[1]),
+        ],
+    )
+    .await
+    .expect("converging leaf edges");
+
+    assert_eq!(
+        impact(&db, &[ids[0]], 2).await,
+        vec![leaf.to_owned(), middle.to_owned()],
+        "the leaf is one dependent even though the CTE reaches it at depths zero and one"
+    );
+}
+
 #[tokio::test]
 async fn reverse_impact_refuses_rather_than_truncating_a_chain_deeper_than_the_bound() {
     let db = test_db().await;

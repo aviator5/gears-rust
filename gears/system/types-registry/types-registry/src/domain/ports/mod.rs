@@ -284,6 +284,8 @@ pub struct CurrentDocument {
     /// (ADR-0012): equality proposes redundancy, the bytes confirm it — which is why
     /// the text travels beside the digest rather than instead of it.
     pub content_hash: Vec<u8>,
+    /// The projection state to use when writing artifacts derived from this document.
+    pub projection: CurrentSchemaCas,
 }
 
 /// The result of a reverse-impact read.
@@ -346,6 +348,14 @@ pub struct NewRevision {
     pub compat_forced: bool,
     pub operation_item_id: i64,
     pub now: OffsetDateTime,
+}
+
+/// The revision and fingerprint a current-schema write expects to replace.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct CurrentSchemaCas {
+    pub revision_no: i32,
+    pub resolution_fingerprint: Vec<u8>,
 }
 
 /// The current-state row to write: the revision pointer plus D3's materialized
@@ -465,6 +475,18 @@ pub struct NewOperationItem {
 // ---------------------------------------------------------------------------
 // Ports
 // ---------------------------------------------------------------------------
+
+/// The write path's serialization point.
+#[async_trait]
+pub trait EntityWriteOrderStore: Send + Sync {
+    /// Advance `entity_write_order` as the transaction's first statement.
+    async fn claim_entity_write_order(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        now: OffsetDateTime,
+    ) -> Result<(), ScopeError>;
+}
 
 /// The version family: the lock the family-wide rules are serialized by.
 #[async_trait]
@@ -600,12 +622,15 @@ pub trait TypeSchemaStore: Send + Sync {
     ///
     /// Separate from [`Self::insert_current_schema`] rather than one upsert: an
     /// insert that finds a row and an update that finds none are different bugs, and
-    /// collapsing them would silence both. `false` means no row matched.
+    /// collapsing them would silence both. `Ok(false)` means no row matched.
+    ///
+    /// `expected` makes every artifact update a mandatory compare-and-swap.
     async fn update_current_schema(
         &self,
         tx: &DbTx<'_>,
         scope: &AccessScope,
         new: NewCurrentTypeSchema,
+        expected: CurrentSchemaCas,
     ) -> Result<bool, ScopeError>;
 }
 
@@ -777,16 +802,17 @@ pub trait DependencyStore: Send + Sync {
     ) -> Result<(), ScopeError>;
 }
 
-/// Every port in one handle, so a caller wires one value rather than six.
+/// Every port in one handle, so a caller wires one value rather than seven.
 ///
-/// Because all six are reached through one handle, no two ports may share a method
+/// Because all seven are reached through one handle, no two ports may share a method
 /// name — hence `insert_schema_revision` against `insert_instance_revision`. Which
 /// also puts the kind where a reader of a commit path needs it: the call site.
 ///
-/// The blanket implementation means an adapter implementing the six traits
+/// The blanket implementation means an adapter implementing the seven traits
 /// satisfies this for free.
 pub trait Stores:
-    VersionFamilyStore
+    EntityWriteOrderStore
+    + VersionFamilyStore
     + EntityStore
     + TypeSchemaStore
     + InstanceStore
@@ -796,7 +822,8 @@ pub trait Stores:
 }
 
 impl<T> Stores for T where
-    T: VersionFamilyStore
+    T: EntityWriteOrderStore
+        + VersionFamilyStore
         + EntityStore
         + TypeSchemaStore
         + InstanceStore

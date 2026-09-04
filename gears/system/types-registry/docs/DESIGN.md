@@ -246,7 +246,7 @@ An installation has one authoritative database served by many pods; every guaran
 
 Storage behaves identically on SQLite, PostgreSQL, and MySQL. The repository layer owns explicit identifier-range bounds, UUID representation, backend-safe set chunking, and compare-and-swap; none leaks into the domain.
 
-Reverse-impact queries use one repository-owned recursive CTE over `dependency`, built through `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001) so the scope predicate is embedded in both the seed and the recursive member and no raw SQL leaves the migration layer. No closure is materialized. ToolKit outbox already requires MySQL 8.0+ for `FOR UPDATE SKIP LOCKED`, so the recursive CTE does not raise the backend floor; MySQL is also the only backend that caps recursion (`cte_max_recursion_depth`, default 1000), and the query's own cap sits under it. The CTE uses `UNION`, never `UNION ALL`: the relation is acyclic (ADR-0012), but its paths converge, and `UNION ALL` would enumerate a fan-in-heavy graph once per path. It carries a depth column, which the builder makes mandatory because a termination cap has to be a predicate on the recursive member; the cap is `limits.activation_write_set`, which is also the write-set refusal threshold — see [p0/SPEC.md](./p0/SPEC.md) §D5 for why that pairing makes a silently truncated walk unreachable. The normative query constraints live beside the table in [database.sql](./database.sql).
+Reverse-impact queries use one repository-owned recursive CTE over `dependency`, built through `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001) so the scope predicate is embedded in both the seed and the recursive member and no raw SQL leaves the migration layer. No closure is materialized. ToolKit outbox already requires MySQL 8.0+ for `FOR UPDATE SKIP LOCKED`, so the recursive CTE does not raise the backend floor; MySQL is also the only backend that caps recursion (`cte_max_recursion_depth`, default 1000), and the query's own cap sits under it. The CTE uses `UNION`, never `UNION ALL`: the relation is acyclic (ADR-0012), but its paths converge, and `UNION ALL` would enumerate a fan-in-heavy graph once per path. It carries a depth column, which the builder makes mandatory because a termination cap has to be a predicate on the recursive member. `UNION` deduplicates whole rows and the depth is one of them, so a dependent reached at two depths is still expanded twice: re-expansion is bounded at (rows × depth) rather than by path count, which is the price of the cap. The *set* is not: the outer projection selects the dependent's entity id `DISTINCT`, so both the returned set and the count compared against the bound are per entity, and a diamond cannot inflate either. The cap is `limits.activation_write_set`, which is also the refusal threshold for that set — see [p0/SPEC.md](./p0/SPEC.md) §D5 for why that pairing makes a silently truncated walk unreachable. The normative query constraints live beside the table in [database.sql](./database.sql).
 
 **ADRs**: `cpt-cf-types-registry-adr-storage-identity-query-model`
 
@@ -299,7 +299,7 @@ A managed GTS Identifier names a logical entity that is mutable when major-only 
 | Version Family | The set of Version Successors of one another, named by the family key of ADR-0004. Holds an ownership scope and nothing else | `version_family` |
 | Dependency | A direct edge between two Registry Entities: `$ref`, immediate derivation base, or Instance conformance. An `x-gts-ref` target is not one. Nothing transitive is stored | `dependency` |
 | Operation | One accepted mutation: its scoped request identity, its client-visible progress, and one durable outcome per candidate identifier | `operation`, `operation_item` |
-| Registry Source | Where an identifier is authoritative — managed storage, or an External Registry Source behind a claim. Managed storage is implicit; a claim is a projection of a plugin's registered Instance and outlives it as a reservation | `source_claim`, `routing_config` |
+| Registry Source | Where an identifier is authoritative — managed storage, or an External Registry Source behind a claim. Managed storage is implicit; a claim is a projection of a plugin's registered Instance and outlives it as a reservation | `source_claim`, plus the `routing` state row of `coordination_state` |
 
 #### Current state is not a cache of the revision
 
@@ -338,7 +338,7 @@ erDiagram
     OPERATION_ITEM   ||--o| TYPE_SCHEMA_REVISION : "produced"
     OPERATION_ITEM   ||--o| INSTANCE_REVISION : "produced"
     INSTANCE_REVISION ||--o{ SOURCE_CLAIM : "plugin instance projected as"
-    ROUTING_CONFIG   ||--o{ SOURCE_CLAIM : "serializes mutation of"
+    ROUTING_STATE    ||--o{ SOURCE_CLAIM : "one generation covers"
 ```
 
 Four of these carry an invariant worth stating outright, because none of them is enforced by the relationship alone.
@@ -485,7 +485,7 @@ The sweep reaches no admitted content, identity, or tombstone and therefore does
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-input-bounds`
 
-All five bounds are deployment configuration (§3.8); this section fixes their defaults and purpose.
+All six bounds are deployment configuration (§3.8); this section fixes their defaults and purpose.
 
 | Input | Default | Purpose |
 |---|---:|---|
@@ -494,17 +494,18 @@ All five bounds are deployment configuration (§3.8); this section fixes their d
 | Resolution closure | **64 documents** | Bounds reference resolution and composition work. This also bounds derivation depth because each level contributes a document. |
 | Batch | **100 candidates** | Rejected synchronously before storage. It covers the largest current gear (26 definitions), which is the figure that matters: every candidate is its own admission unit, so a batch is split at no cost to correctness and only to the candidate overlay (see below). |
 | Type-filter expansion | **1000 references** | Bounds the server-side result; about 36 KB of JSON and practical to chunk into a consumer's `IN` predicate. |
+| Reverse-impact set | **512 entities** | Bounds what one revision may refresh, and with it the rows the refresh writes, since the written set is a subset of the walked one. Set against the largest reverse-impact set measured in the repository — 27, for the hottest base type on the platform — not against the declared population. |
 
-Dependents and retained revisions remain unbounded *as a relation*; what one admission may refresh is bounded by `limits.activation_write_set`. Capping dependents themselves would prevent new uses of widely shared base types; their recursive-CTE processing already runs off the request path. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Entities per tenant is an abuse-control or billing quota, not a correctness guard, and is outside this design.
+Dependents and retained revisions remain unbounded *as a relation*; what one admission may refresh is bounded by `limits.activation_write_set`, which bounds the reverse-impact set the walk returns — the refresh writes a subset of it, so the same number bounds both. Capping dependents themselves would prevent new uses of widely shared base types; their recursive-CTE processing already runs off the request path. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Entities per tenant is an abuse-control or billing quota, not a correctness guard, and is outside this design.
 
 ##### Dependency-aware partial admission
 
 The P1 batch mode is **dependency-aware partial admission**, deterministic for one committed baseline:
 
-1. build the candidate graph from the authored references between candidates, plus the one implicit edge described below;
-2. process it in topological order — the graph is a DAG by construction (ADR-0012), so one exists for every batch and no component needs atomic admission;
+1. build the candidate graph: authored references between candidates, each candidate's identifier-derived immediate derivation base and Instance conformance target, plus the one implicit edge described below. Ordering needs all of them; only `$ref` and derivation can carry a cycle, because those are the two an effective form inlines;
+2. process it in topological order over the whole ordering graph, refusing any cycle in its `$ref`-and-derivation part — the *admitted* relation is a DAG (ADR-0012), so past that refusal an order exists for every batch and no component needs atomic admission;
 3. treat each candidate as one admission unit;
-4. validate each unit outside a long-lived transaction and commit only database rechecks and writes; §4 records the still-open bound for an unbounded reverse-impact write set;
+4. validate each unit outside a long-lived transaction and commit only database rechecks and writes; §3.2's `limits.activation_write_set` bounds the reverse-impact set one such commit may refresh, and §4 records what remains open above that bound;
 5. record a durable outcome for every candidate GTS Identifier.
 
 Independent passing branches commit despite failures elsewhere. In-batch references resolve against the candidate overlay, never a previously committed revision. A failed selected dependency produces `blocked_by_dependency` for everything downstream of it.
@@ -515,16 +516,16 @@ For determinism, the graph adds an implicit edge `vM.(n-1)~` → `vM.n~`. It mak
 
 Outside the transaction, the worker runs parsing, resolution, compatibility, derivation, reference, and dependent-revalidation checks through `gts-rust`, recording the target revision, the complete reverse-impact identifier set for each updated schema, and a revision vector for every correctness-relevant dependency or dependant. That vector contains each entity's `resource_version` and, where effective Type Schema content was consumed, its `resolution_fingerprint`.
 
-For the managed–external boundary, the worker also classifies every candidate `x-gts-ref` that names an entity and checks the identifier against active and retired Source Claims. A match refuses the candidate without loading the target document and without creating a dependency edge. The commit-side `routing_config` recheck below closes a concurrent claim activation over the classified target just as it closes one over the candidate's own identifier.
+For the managed–external boundary, the worker also classifies every candidate `x-gts-ref` that names an entity and checks the identifier against active and retired Source Claims. A match refuses the candidate without loading the target document and without creating a dependency edge. The commit-side routing recheck below closes a concurrent claim activation over the classified target just as it closes one over the candidate's own identifier.
 
 A registered Instance is rejected when its conforming Type Schema is in the major-0 unstable profile, even though the minor or major marker is in a preceding identifier segment rather than the Instance's own last segment. This is distinct from the stable-reference quarantine: an unstable schema cannot carry a registered Instance because later unchecked evolution would make its current validation record untruthful (ADR-0006, ADR-0015).
 
 The registration commit transaction then:
 
-1. enforces the caller precondition: creation requires the exact identifier to remain absent; update requires `entity.resource_version == expected_resource_version`;
-2. locks or creates every candidate family in canonical order; where a per-entity lock is required it is taken after the family locks, in canonical identifier order, and deletion uses that same family-then-entity order;
+1. claims the `entity_write_order` row of `types_registry__coordination_state`. This is the **first statement** and nothing may precede it, reads included: every step below is an answer about committed state, and a read taken before the claim answers about state that can still move. It is what orders commits, and the order is total only because it comes first. Deletion and the operator purge job open the same way;
+2. enforces the caller precondition: creation requires the exact identifier to remain absent; update requires `entity.resource_version == expected_resource_version`. Where family, per-entity or routing state participates, the locks and mutations follow in order: families first in canonical order, then entity rows, then the Source Claim changes, with any `routing` generation advance held for the transaction's final mutation, after every other step;
 3. re-derives each update target's reverse-impact identifier set and compares both membership and the complete revision vector; a new, removed, or moved dependency/dependant rolls the transaction back and restarts validation within the bounded retry policy. **This comparison is not performed under locks on the compared rows, and must not be** — see the third bullet below;
-4. when a new managed identifier or a classified entity-naming `x-gts-ref` participates, locks `routing_config` after all family locks and rechecks that no active or retired Source Claim covers the candidate identifier or any classified target, respectively;
+4. when a new managed identifier or a classified entity-naming `x-gts-ref` participates, rechecks, after all family locks, that no active or retired Source Claim covers the candidate identifier or any classified target, respectively; a concurrent claim activation cannot commit inside the recheck, because its own writer claimed `entity_write_order` first;
 5. repeats the predecessor test for each minor-bearing candidate;
 6. inserts the immutable revision, replaces the current-state projection, and replaces the entity's dependency edges;
 7. refreshes the affected current effective schemas;
@@ -534,15 +535,19 @@ The three guards cover distinct races:
 
 - The caller precondition detects target movement since the caller's read; mismatch is terminal per-item `precondition_failed`, with no silent rebase.
 - The reverse-impact set and revision vector detect both movement of a known dependency/dependant and a phantom dependant created after the initial scan; the worker reloads and revalidates within a bounded retry policy.
-- Canonically ordered `version_family` locks serialize first registration under competing owners, predecessor removal by purge, and multi-family units. When routing state also participates, every path takes family locks, then the entity rows it needs, then the singleton routing lock.
+- Canonically ordered `version_family` locks serialize first registration under competing owners, predecessor removal by purge, and multi-family units. When routing state also participates, every path holds `entity_write_order` first, then takes family locks, then the entity rows it needs, then makes the Source Claim changes, and advances the `routing` generation only as the transaction's final mutation, after every other step — a generation change, not a second correctness lock.
 
 **Locks are not the guard's mechanism, and locking the revision vector would be the wrong tool.** A lock guarantees only that nothing moves *after* it is taken; movement between the checks outside the transaction and the moment of locking is exactly the case the revision vector exists to catch, so the comparison is required whether or not rows are locked, and the lock is purely additive. What it would buy is that a contended admission waits instead of rolling back — liveness, not correctness — and what it costs is one round trip per vector member inside the commit transaction, on a set the activation bound allows to reach the hundreds, plus a deadlock surface that is the only reason the canonical ordering above extends past families. It is also the wrong shape for the rest of this design, which is optimistic throughout: `resource_version` compare-and-swap, per-unit transient stores, validation outside any transaction. Registrations are rare against reads, so conflicts are rare, which is the regime optimistic detection is for.
 
-What holds instead, and it is sufficient: the target's own row is serialized by the compare-and-swap that writes it, since the precondition travels in the statement's `WHERE`. A **dependency** that moves is serialized by the effective-artifact refresh that mover owes its dependants: it writes each affected dependant's current-state row, which is the same row this commit writes, so the two block on one another in the database and the later one recomputes against what the earlier one committed. Where the mover's change leaves a dependant's `resolution_fingerprint` unmoved, no write and no conflict occur — and that fingerprint equality is itself the proof that nothing this commit consumed went stale.
+What holds instead, and it is sufficient for an **existing** dependant: the target's own row is serialized by the compare-and-swap that writes it, since the precondition travels in the statement's `WHERE`. A **dependency** that moves is serialized by the effective-artifact refresh that mover owes its dependants: it writes each affected dependant's current-state row, which is the same row this commit writes, so the two block on one another in the database. The block only orders them: a refresh computes its artifacts before it writes, and a resumed `UPDATE` re-evaluates its predicate rather than its payload. So the refresh's write carries the revision and fingerprint it read — a compare-and-swap — and the loser rolls back and recomputes instead of overwriting the winner. Where the mover's change leaves a dependant's `resolution_fingerprint` unmoved, no write and no conflict occur — and that fingerprint equality is itself the proof that nothing this commit consumed went stale.
 
-**One per-entity lock is genuinely required, and it belongs to deletion.** Adding an edge does not move the target's `resource_version` and writes only to `dependency`, while deletion writes the target's `entity` row: two different rows, so nothing serializes an edge write against a concurrent deletion of its target, in the order where the edge commits second. Deletion's *"no direct registered dependants"* recheck is a check-then-act on a predicate no compare-and-swap carries. So the target of each new edge must be serialized against deletion — one lock per **edge target**, taken by both paths, not a lock over the whole revision vector.
+An **edge newer than the mover's scan** has no such row, and that is the case the argument above does not reach — whether the dependant is new or already existed, since what matters is the age of the edge and not of the entity. The edge is a phantom: the mover's reverse-impact scan cannot see it, and inserting it writes only `dependency`, so nothing either side writes is a row the other writes either. Both commits would pass their own guards and the dependant would keep an effective artifact inlined from a revision that is no longer current, carrying a `resolution_fingerprint` that matches that artifact and therefore reporting no drift — the failure the whole guard exists to prevent, reachable precisely because nothing ordered the two. What orders them is the **serialized write path** below.
 
-Deletion has its own short commit protocol. It requires a positive `expected_resource_version`, locks the target family and entity row, rechecks the target is `ACTIVE` at that version and has no direct registered dependants, then changes lifecycle to `DELETED`, increments `resource_version`, and records the outcome atomically. A new dependant must not be able to appear between the deletion check and the lifecycle transition, and this is the one place the design requires a per-entity lock rather than an optimistic recheck: admission takes the lock on each edge target it is about to write, deletion takes it on the target it is about to withdraw, and both take it after their family locks. Deleting a Registry Source Plugin additionally locks `routing_config` after the family and entity locks, stamps `retired_at` on its active claims — the only column deletion touches, so each reservation keeps the projection recording which plugin revision issued it — and increments the routing generation in the same transaction; source unreachability never triggers this path.
+**What is genuinely required serializes commits, and every writer of entity state takes part.** One commit at a time per installation, obtained by advancing the `entity_write_order` row of `types_registry__coordination_state` as the first statement of the commit transaction. It is not a lock over the revision vector, which stays the optimistic guard the paragraphs above argue for — it is an ordering over *commits*, and it works because both the reverse-impact scan and the vector guard already run inside the commit transaction. A row rather than an advisory lock, because advisory keys live on a session separate from the transaction's connection: losing that session would release the key while the transaction carried on, and mutual exclusion would lapse silently. Either an edge is in `dependency` when a mover's scan runs, and the scan finds it, or the unit writing that edge has committed nothing and its own guard will see the mover's revision when it does. Two cases, no third. Deletion needs the same order for its *"no direct registered dependants"* recheck, which is a check-then-act on a predicate no compare-and-swap carries, and the operator purge job needs it for the same recheck.
+
+The cost is named, and it is admission throughput alone: validation stays outside the lock, so what is serialized is the commit transaction — for its whole length and for every outcome, since even an `unchanged` re-submission writes its item outcome under it. What varies is the dependents' re-materialization the commit performs: zero for an `unchanged` and for a creation, which has no dependants yet, and bounded by the activation write set otherwise. Registrations are rare against reads. A commit queued behind another waits on the database; whether that wait is bounded is a deployment setting (`lock_timeout` and its equivalents), and exceeding it is retryable contention rather than a verdict on the candidate. The upgrade path, if the serialized section is ever measured to matter, is a graph generation compare-and-swapped at commit, which restores parallelism and subsumes the lock.
+
+Deletion has its own short commit protocol. It requires a positive `expected_resource_version`, locks the target family and entity row, rechecks the target is `ACTIVE` at that version and has no direct registered dependants, then changes lifecycle to `DELETED`, increments `resource_version`, and records the outcome atomically. A new dependant must not be able to appear between the deletion check and the lifecycle transition, and what prevents it is the commit ordering above: deletion is a writer of entity state like admission, so it claims the same row and no admission can commit an edge inside its recheck. Deleting a Registry Source Plugin additionally stamps `retired_at` on its active claims after the family and entity locks — the only column deletion touches, so each reservation keeps the projection recording which plugin revision issued it — and advances the `routing` generation last in the same transaction, as a generation change rather than an independent correctness lock; source unreachability never triggers this path.
 
 The unique family row is the ownership authority. Creation uses backend-specific insert-if-absent followed by a locked read; admission requires the requested owner to equal the stored one. The entity's owner is only a SecureORM projection and changes while this lock is held.
 
@@ -881,18 +886,19 @@ Registration is ordinary platform-plane Instance admission under ADR-0012, inclu
 
 The commit transaction atomically:
 
-1. takes every affected `version_family` lock, then locks `routing_config`;
-2. rechecks the proposed patterns against active and retired claims and against managed `entity.gts_id` rows while no competing claim or managed creation can commit;
-3. admits the Instance and writes its `source_claim` projection;
-4. increments `routing_config.generation`.
+1. advances `entity_write_order` — the transaction's **first statement, before any read**, exactly as every writer of entity state does;
+2. takes every affected `version_family` lock;
+3. rechecks the proposed patterns against active and retired claims and against managed `entity.gts_id` rows while no competing claim or managed creation can commit;
+4. admits the Instance and writes its `source_claim` projection;
+5. advances `routing.state_seq` — the routing generation — as the transaction's closing mutation.
 
-The lock serializes overlap validation because intersecting patterns such as `gts.acme.*` and `gts.acme.foo.*` cannot be constrained by string uniqueness. The generation reloads in-memory claims and invalidates federated cursors. P1 compilation into the same binary changes neither this contract nor ADR-0011's managed–external boundary.
+What serializes overlap validation is the `entity_write_order` claim of step 1, because intersecting patterns such as `gts.acme.*` and `gts.acme.foo.*` cannot be constrained by string uniqueness and the whole commit transaction must therefore be exclusive. The `routing` advance of step 5 is a generation change, not a second correctness lock: it reloads in-memory claims and invalidates federated cursors, and every competing claim writer is already serialized by the claim they made first. P1 compilation into the same binary changes neither this contract nor ADR-0011's managed–external boundary.
 
 Retirement is explicit governance, never a liveness reaction: an unreachable plugin retains its claims and dependent requests fail closed. A retired reservation cannot transfer at runtime. The registry stores none of the predecessor's external identifiers, revisions, or hashes with which to verify a successor's continuity claim, so ADR-0011 defines no takeover operation.
 
 Replacing code behind the same plugin GTS Identity is an ordinary Instance revision: projection and generation change, with no reservation. Changing the plugin identity instead requires either ADR-0013 purge, which releases the namespace, or preferably a shipped migration that retargets it while continuously reserved. Such a migration must:
 
-- increment `routing_config.generation` under its row lock, reloading routing and invalidating cursors and freshness validators;
+- claim `entity_write_order` as the transaction's first statement, before any read, then advance `routing.state_seq` last in the same transaction, reloading routing and invalidating cursors and freshness validators;
 - keep the successor Instance document consistent with `source_claim`, because ordinary validation later re-derives the projection and would remove undeclared rows.
 
 The P2 Validation Hook declaration remains D1 in §4.
@@ -907,7 +913,7 @@ These policy-free adapters and maintenance job are defined together to avoid emp
 | Operation Store | `cpt-cf-types-registry-component-operation-store` | Public async operations with scoped key/fingerprint, per-ID preconditions, state, results, and diagnostics; atomically enqueues operation UUIDs through dedicated `toolkit-db` outbox tables. Times out stalled operations and sweeps retained, unpinned terminal ones | The operation is the request receipt. Outbox tables own leases, attempts, retries, and dead letters; registry tables own client-visible state. Payloads contain no candidate content. Sweeping touches neither admitted content nor identity and is not ADR-0013 purge |
 | Tenant Hierarchy Client | `cpt-cf-types-registry-component-tenant-hierarchy-client` | Ancestor chain of a tenant from `tenant-resolver` with barrier traversal disabled, cached with a version participating in the resolution validator | Does not interpret tenancy semantics; supplies the chain only |
 | Plugin Client Adapter | `cpt-cf-types-registry-component-plugin-client-adapter` | Scoped ClientHub access to Registry Source Plugins, timeouts, concurrency limits, and per-source failure classification | Applies no platform policy to responses; conformance validation belongs to the federation router |
-| Purge Job | `cpt-cf-types-registry-component-purge-job` | Synchronous operator purge/dry run by GTS pattern on the platform plane. Expands the pattern; locks all affected `version_family` rows in canonical order through commit; when purging a Registry Source Plugin, locks `routing_config` next and removes that plugin's claims first, so the rows go before the revisions they reference; then removes Instances before Type Schemas, their revisions, entity rows, and empty families, and increments the routing generation in the same transaction. It leaves operation history to ordinary retention and returns a per-ID report | Never scheduled; disabled by default. Rechecks deletion preconditions and refuses to release a minor below another admitted minor (ADR-0013). The family-then-routing lock order matches admission. Creates no operation, candidate, or request-identity row: the sole mutation outside ADR-0012's async path |
+| Purge Job | `cpt-cf-types-registry-component-purge-job` | Synchronous operator purge/dry run by GTS pattern on the platform plane. Expands the pattern; claims `entity_write_order` as its transaction's first statement, before any read; acquires all affected `version_family` locks in canonical order, then the entity rows it needs; when purging a Registry Source Plugin, removes that plugin's `source_claim` rows before the revisions they reference, so `ON DELETE RESTRICT` never fires; then removes Instances before Type Schemas, their revisions, entity rows, and empty families; and — only after every claim and entity mutation is done — advances the `routing` generation of `types_registry__coordination_state` as the transaction's actual final mutation, so cached routing and federated cursors observe the whole purge in one generation step. It leaves operation history to ordinary retention and returns a per-ID report | Never scheduled; disabled by default. Rechecks deletion preconditions and refuses to release a minor below another admitted minor (ADR-0013). Its own no-dependent recheck is a check-then-act like deletion's, and what serializes it against a concurrent edge write is §3.7's commit ordering, which it joins like every other writer of entity state. The claim-then-families-then-routing order matches admission; the routing advance is a generation change, not a second correctness lock. Creates no operation, candidate, or request-identity row: the sole mutation outside ADR-0012's async path |
 
 ### 3.3 API Contracts
 
@@ -2094,10 +2100,10 @@ The P1 reference schema is a PostgreSQL document, not a migration; backend migra
 | `type_schema` | Current Type Schema state: artifacts resolved against dependencies current now |
 | `instance` | Current Instance state: the current-revision pointer, with no derived artifact to hold |
 | `dependency` | The single direct dependency relation between Managed Entities |
-| `routing_config` | Singleton row serializing claim mutation and carrying the routing generation |
+| `coordination_state` | One row per coordination sequence, named by `state_name`: `entity_write_order` serializes every commit that writes entity state; `routing` (federation) carries the routing generation — its writers claim `entity_write_order` first, so advancing it is a generation change rather than a correctness lock |
 | `source_claim` | Active claims and permanent retired reservations |
 
-`database.sql` is the normative physical-schema target except for the explicitly identified platform-principal alignment prerequisite below; implementation must update that file before treating the schema as ready. The inventory above supplies table purpose without duplicating its blocks. The initial migration must seed `routing_config` with `(id = 1, generation = 1)` before any claim mutation; a singleton constraint alone does not create the row that `SELECT … FOR UPDATE` must lock.
+`database.sql` is the normative physical-schema target except for the explicitly identified platform-principal alignment prerequisite below; implementation must update that file before treating the schema as ready. The inventory above supplies table purpose without duplicating its blocks. The federation migration must seed the `routing` row of `coordination_state` before any claim mutation; a schema alone does not create the row a writer must advance.
 
 #### Persistence alignment
 
@@ -2134,7 +2140,7 @@ The leased ToolKit outbox gives multi-pod exclusion without leader election. Dat
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-deployment-config`
 
-Two capability switches, one retention window, one registration policy, and five input bounds are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
+Two capability switches, one retention window, one registration policy, and six input bounds are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
 
 ```yaml
 gears:
@@ -2149,6 +2155,7 @@ gears:
         resolution_closure: 64
         batch_candidates: 100
         expansion_references: 1000
+        activation_write_set: 512
       registration_policy:               # §3.2, Registration policy
         "gts.acme.*":                     # onboard one vendor
           allowed_vendors: [acme]
@@ -2169,7 +2176,7 @@ gears:
 | `allow_compatibility_force` | bool | `false` | Enables candidate `force`. When disabled, real and Dry Run requests receive a deployment-configuration refusal rather than silent ignore |
 | `allow_purge` | bool | `false` | Whether the operator purge-job entry point exists in this deployment. Where false the job refuses execution before scanning |
 | `operation_retention` | duration | `30d` | How long a terminal, unpinned operation is kept before the sweep may remove it |
-| `limits.*` | size or count | §3.2 | The five admission and query bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
+| `limits.*` | size or count | §3.2 | The six admission and query bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
 | `registration_policy` | map of GTS pattern to `allowed_vendors` and `tenant_ownable` | empty | Opens otherwise closed regions (§3.2). Invalid patterns or parameters fail startup. `allowed_vendors: ["*"]` admits every vendor; omitted parameters inherit by the per-parameter resolution rule. Operators document effective values; refusals name region and parameter |
 
 Limits change request admissibility, so Dry Run is relative to both installation state and configuration (`cpt-cf-types-registry-constraint-single-installation`). A refusal names the bound and configured value.
@@ -2206,7 +2213,7 @@ Only P2 construction questions belong here. Known P1 blockers are stated separat
 
 ### Implementation prerequisites
 
-Eight prerequisites block implementation: the benchmark profile above; three external confirmations below; and the four protocol/contract/schema alignments below.
+Seven prerequisites block implementation: the benchmark profile above; three external confirmations below; and the three protocol/contract/schema alignments below. The activation write set is no longer among them — §3.2 carries the bound as deployment configuration, and what is left of it below is an upgrade path above that bound, which blocks nothing.
 
 The ADR-0015 quarantine preflight is **not** among them. A scan for stable schemas whose immediate base or `$ref` target carries major 0 would establish the rule's base case over pre-existing state, and there is no pre-existing state: the release that introduces the check is the release that first persists a managed entity. The obligation it leaves behind is a negative one — the rule must not be enabled against a registry populated by a build that had the storage but not the check, because those edges were admitted under no rule at all.
 
@@ -2216,7 +2223,7 @@ The ADR-0015 quarantine preflight is **not** among them. A scan for stable schem
 
 **Bound worker liveness.** Fix the operation timeout and the maximum dependency-revalidation attempts, their configuration/defaults, and the atomic terminalization rule that marks every unfinished item `failed` after exhaustion. The public status vocabulary is settled; these remaining values decide when it reaches a terminal state.
 
-**Resolve the unbounded activation write set.** Semantic validation stays outside the transaction, but a widely used schema may have an unbounded reverse-impact set whose effective projections must become current consistently with the new revision. Before implementation, choose and document either the permitted transaction-size/timeout profile for that atomic write or a generation/staging protocol that exposes no mixed current state; “short transaction” alone is not a bound.
+**A staging protocol above the activation write set — recorded here, not blocking.** Semantic validation stays outside the transaction, but a widely used schema has a reverse-impact set whose effective projections must become current consistently with the new revision. The profile chosen is a single transaction with a configured ceiling: `limits.activation_write_set` (§3.2, default **512**) bounds the reverse-impact set, a candidate over it is refused with a structured reason rather than committed partially, and “short transaction” is therefore backed by a bound rather than by intent. What stays open is the upgrade path for an installation that reaches the ceiling legitimately: a generation/staging protocol that exposes no mixed current state, which is what would let the bound rise instead of refusing.
 
 **Confirm these eight GTS implementation capabilities** required by `cpt-cf-types-registry-constraint-gts-implementation`. Missing behavior requires an upstream change, never local approximation:
 

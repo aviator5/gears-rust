@@ -27,7 +27,7 @@ use uuid::Uuid;
 use super::errors::{ItemFailure, WorkerError};
 use super::fingerprint::canonical_text;
 use super::refresh::refresh_dependents;
-use super::vector::{self, RevisionVector};
+use super::vector::{self, RevisionVector, VectorDrift};
 use crate::domain::artifacts::{MaterializedArtifacts, content_hash, materialize};
 use crate::domain::dependency::{DependencyEdge, extract_edges};
 use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
@@ -35,8 +35,8 @@ use crate::domain::family::{FamilyKey, admits_new_member, family_key};
 use crate::domain::gts_store::{UnitDocument, UnitStore, load_unit_store};
 use crate::domain::ports::metrics::AdmissionMetrics;
 use crate::domain::ports::{
-    NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewRevision, Stores,
-    snapshot_read,
+    CurrentSchemaCas, NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision,
+    NewRevision, Stores, snapshot_read,
 };
 
 /// The owning gear recorded on a P0 admission.
@@ -92,6 +92,19 @@ pub struct EvaluatedUnit {
     pub edges: Vec<DependencyEdge>,
     /// The database state on which this evaluation's verdict rests.
     pub vector: RevisionVector,
+}
+
+/// Claim the write order as the first statement of every commit transaction.
+///
+/// The database owns the wait timeout; cancelling a client-side timeout would not
+/// cancel the statement. See SPEC §4.
+async fn claim_entity_write_order(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    now: OffsetDateTime,
+) -> Result<(), WorkerError> {
+    Ok(stores.claim_entity_write_order(tx, scope, now).await?)
 }
 
 /// The commit's result for one item that wrote a revision.
@@ -203,9 +216,7 @@ pub async fn evaluate(
                     }
                     None => None,
                 };
-                // In this transaction, not a later one: the vector must describe the same state as
-                // the documents that are about to be validated, or the commit's comparison would be
-                // measuring a gap that opened *before* the evaluation rather than after it (D4).
+                // Derive the vector from the same snapshot as the validated documents (D4).
                 let vector = vector::derive_from(
                     stores.as_ref(),
                     tx,
@@ -311,8 +322,7 @@ fn evaluate_loaded(
     }))
 }
 
-/// Replace the admitted entity's outgoing edges, resolving each target identifier to the row it
-/// names.
+/// Resolve and replace an admitted entity's outgoing edges.
 async fn replace_edges(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -320,9 +330,7 @@ async fn replace_edges(
     entity_id: i64,
     edges: &[DependencyEdge],
 ) -> Result<(), WorkerError> {
-    // Called even for an empty edge set: on a revision that dropped its last reference, the
-    // *delete* is the whole point, and skipping it would leave the previous revision's rows
-    // standing.
+    // An empty set must still delete the previous revision's edges.
     let targets: Vec<String> = edges.iter().map(|e| e.target.clone()).collect();
     let rows = stores.find_by_gts_ids(tx, scope, &targets).await?;
     let resolved: std::collections::HashMap<&str, i64> =
@@ -364,6 +372,7 @@ pub async fn commit_creation(
     activation_write_set: usize,
     now: OffsetDateTime,
 ) -> Result<Result<CommittedUnit, ItemFailure>, WorkerError> {
+    claim_entity_write_order(stores, tx, scope, now).await?;
     if stores
         .find_by_gts_id(tx, scope, &unit.gts_id)
         .await?
@@ -378,13 +387,7 @@ pub async fn commit_creation(
         )));
     }
 
-    // Created here if absent: ownership must be fixed before the first member, and
-    // the family and that member commit together.
-    //
-    // `uq_tr_version_family_key` decides which of two concurrent admissions founds
-    // the family, and nothing more — the rules below are check-then-act reads. What
-    // serializes *those* is the advisory lock `admission::worker` holds on the
-    // family key across the whole of this transaction.
+    // Create the family with its first member; the write-order claim serializes its rules.
     let (family, created) = stores
         .create_or_get(
             tx,
@@ -396,8 +399,8 @@ pub async fn commit_creation(
         )
         .await?;
 
-    // Step 4.3: the revision vector, re-derived and compared under the family lock this transaction
-    // holds.
+    // Step 4.3: the revision vector, re-derived and compared inside this transaction, which the
+    // `entity_write_order` claim above made exclusive.
     if let Err(failure) = vector::guard(
         stores,
         tx,
@@ -604,7 +607,7 @@ async fn read_current_content(
     scope: &AccessScope,
     unit: &EvaluatedUnit,
     entity_id: i64,
-) -> Result<(i32, String, Vec<u8>), WorkerError> {
+) -> Result<CurrentContent, WorkerError> {
     let missing = || WorkerError::CurrentStateMissing {
         gts_id: unit.gts_id.clone(),
         entity_id,
@@ -616,11 +619,12 @@ async fn read_current_content(
                 .await?
                 .pop()
                 .ok_or_else(missing)?;
-            (
-                current.revision_no,
-                current.raw_schema,
-                current.content_hash,
-            )
+            CurrentContent::TypeSchema {
+                revision_no: current.revision_no,
+                body: current.raw_schema,
+                hash: current.content_hash,
+                cas: current.projection,
+            }
         }
         EvaluatedOutcome::Instance { .. } => {
             let current = stores
@@ -628,17 +632,55 @@ async fn read_current_content(
                 .await?
                 .pop()
                 .ok_or_else(missing)?;
-            (
-                current.revision_no,
-                current.canonical_value,
-                current.content_hash,
-            )
+            CurrentContent::Instance {
+                revision_no: current.revision_no,
+                body: current.canonical_value,
+                hash: current.content_hash,
+            }
         }
     })
 }
 
-/// The `unchanged` outcome: the authored content already equals the current revision, so there is
-/// nothing to write but the item's own result.
+/// Current authored content; Type Schemas also carry their mandatory artifact CAS token.
+#[domain_model]
+#[derive(Clone, Debug)]
+enum CurrentContent {
+    TypeSchema {
+        revision_no: i32,
+        body: String,
+        hash: Vec<u8>,
+        /// The compare-and-swap token for the artifact write below.
+        cas: CurrentSchemaCas,
+    },
+    Instance {
+        revision_no: i32,
+        body: String,
+        hash: Vec<u8>,
+    },
+}
+
+impl CurrentContent {
+    /// The current revision's number, whichever kind the candidate is: the next
+    /// revision is allocated from it before the outcome kind picks the write.
+    fn revision_no(&self) -> i32 {
+        match self {
+            Self::TypeSchema { revision_no, .. } | Self::Instance { revision_no, .. } => {
+                *revision_no
+            }
+        }
+    }
+
+    /// Whether the current content still equals the candidate's authored content —
+    /// the `unchanged` test.
+    fn matches_authored(&self, hash: &[u8], body: &str) -> bool {
+        let (current_hash, current_body) = match self {
+            Self::TypeSchema { hash, body, .. } | Self::Instance { hash, body, .. } => (hash, body),
+        };
+        current_hash == hash && current_body == body
+    }
+}
+
+/// Record an unchanged candidate without creating a revision.
 async fn commit_unchanged(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -648,8 +690,7 @@ async fn commit_unchanged(
     expected_resource_version: i64,
     now: OffsetDateTime,
 ) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
-    // `EntityVanished`, not `CurrentStateMissing`: the row that disappeared is the *entity*, read
-    // twice in one transaction.
+    // This re-read detects a vanished entity, not missing kind-specific state.
     let still = stores
         .find_by_gts_id(tx, scope, &unit.gts_id)
         .await?
@@ -701,6 +742,7 @@ pub async fn commit_revision(
     now: OffsetDateTime,
     metrics: &Arc<dyn AdmissionMetrics>,
 ) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
+    claim_entity_write_order(stores, tx, scope, now).await?;
     let Some(entity) = stores.find_by_gts_id(tx, scope, &unit.gts_id).await? else {
         return Ok(Err(ItemFailure::new(
             "precondition_failed",
@@ -734,14 +776,14 @@ pub async fn commit_revision(
         )));
     }
 
-    let (current_revision_no, current_body, current_hash) =
-        read_current_content(stores, tx, scope, unit, entity.id).await?;
+    // Keep the artifact CAS token with the content that supplied it.
+    let current = read_current_content(stores, tx, scope, unit, entity.id).await?;
 
     // The hash is a prefilter and the bytes are the decision (ADR-0012): a digest
     // collision would otherwise silently swallow a real edit. Equality against an
     // *older* revision is deliberately not asked — that is an ordinary update which
     // allocates a new number rather than moving the pointer backwards (ADR-0005).
-    if current_hash == unit.content_hash && current_body == unit.canonical_body {
+    if current.matches_authored(&unit.content_hash, &unit.canonical_body) {
         return commit_unchanged(
             stores,
             tx,
@@ -760,8 +802,7 @@ pub async fn commit_revision(
         });
     }
 
-    // Step 4.3: the revision vector, re-derived from the database and compared — membership and
-    // every column, dependencies and dependents alike.
+    // Step 4.3: re-derive and compare the complete revision vector.
     if let Err(failure) = vector::guard(
         stores,
         tx,
@@ -792,15 +833,21 @@ pub async fn commit_revision(
             ),
         )));
     };
-    let revision_no =
-        current_revision_no
-            .checked_add(1)
-            .ok_or_else(|| WorkerError::RevisionNumberExhausted {
-                gts_id: unit.gts_id.clone(),
-            })?;
+    let revision_no = current.revision_no().checked_add(1).ok_or_else(|| {
+        WorkerError::RevisionNumberExhausted {
+            gts_id: unit.gts_id.clone(),
+        }
+    })?;
 
     match &unit.outcome {
         EvaluatedOutcome::TypeSchema { artifacts } => {
+            let CurrentContent::TypeSchema { cas, .. } = &current else {
+                // A mismatched variant means the stored kind-specific rows disagree.
+                return Err(WorkerError::CurrentStateMissing {
+                    gts_id: unit.gts_id.clone(),
+                    entity_id: entity.id,
+                });
+            };
             stores
                 .insert_schema_revision(
                     tx,
@@ -831,13 +878,16 @@ pub async fn commit_revision(
                         resolution_fingerprint: artifacts.resolution_fingerprint.clone(),
                         now,
                     },
+                    cas.clone(),
                 )
                 .await?
             {
-                return Err(WorkerError::CurrentStateMissing {
-                    gts_id: unit.gts_id.clone(),
-                    entity_id: entity.id,
-                });
+                // A CAS miss is retryable drift, not corrupt state.
+                return Err(WorkerError::RevalidationRequired(
+                    VectorDrift::CurrentProjectionMoved {
+                        gts_id: unit.gts_id.clone(),
+                    },
+                ));
             }
         }
         EvaluatedOutcome::Instance {
@@ -885,9 +935,7 @@ pub async fn commit_revision(
         }
     }
 
-    // The authored document decided the edges, so they are replaced on every revision that wrote
-    // one — including a revision whose references did not change, where the replacement is the same
-    // set written again.
+    // Every authored revision replaces its outgoing edges.
     replace_edges(stores, tx, scope, entity.id, &unit.edges).await?;
 
     refresh_reverse_impact(
@@ -926,8 +974,7 @@ pub async fn commit_revision(
     })))
 }
 
-/// Step 4.6: re-materialize the artifacts of everything that depends on the entity this revision
-/// just moved.
+/// Step 4.6: re-materialize artifacts of all dependents.
 #[allow(clippy::too_many_arguments)]
 async fn refresh_reverse_impact(
     stores: &dyn Stores,
@@ -944,9 +991,7 @@ async fn refresh_reverse_impact(
     }
     match refresh_dependents(stores, tx, scope, &[entity_id], activation_write_set, now).await? {
         Ok(outcome) => {
-            // Observed here rather than inside `refresh_dependents`, which also returns the
-            // over-bound refusal: a refused revision commits nothing, so recording its would-be
-            // write set would put a value in the histogram that never became a write.
+            // Record only write sets that actually commit.
             metrics.observe_activation_write_set(outcome.refreshed.len());
             tracing::debug!(
                 gts_id = %unit.gts_id,

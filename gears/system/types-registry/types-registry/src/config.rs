@@ -120,8 +120,7 @@ pub struct Limits {
     ///
     /// **Enforced** — acceptance step 1 (`AcceptanceError::BatchTooLarge`).
     pub batch_candidates: usize,
-    /// Maximum dependents refreshed by one admission (SPEC §4).
-    /// Also caps reverse-impact CTE depth; overflow refuses the revision.
+    /// Maximum dependents reached by one revision; also caps CTE depth (SPEC §4).
     pub activation_write_set: usize,
     /// Default `GET /entities` page size; not consumed in P0.
     pub page_size_default: u32,
@@ -147,9 +146,6 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerSettings {
-    /// Wait budget for an inline admission's version-family lock.
-    #[serde(with = "toolkit_utils::humantime_serde")]
-    pub family_lock_timeout: Duration,
     /// Wall-clock admission bound; accepted but not enforced in P0.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub operation_timeout: Duration,
@@ -160,7 +156,6 @@ pub struct WorkerSettings {
 impl Default for WorkerSettings {
     fn default() -> Self {
         Self {
-            family_lock_timeout: Duration::from_secs(5),
             operation_timeout: Duration::from_mins(5),
             max_revalidation_attempts: 8,
         }
@@ -373,11 +368,6 @@ impl TypesRegistryConfig {
                 "limits.activation_write_set must be positive: 0 refuses every revision of a \
                  type anything depends on"
                     .to_owned(),
-            ));
-        }
-        if self.worker.family_lock_timeout.is_zero() {
-            return Err(ConfigError::Worker(
-                "worker.family_lock_timeout must be positive".to_owned(),
             ));
         }
         // At least one evaluation attempt is required.

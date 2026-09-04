@@ -1,5 +1,4 @@
-//! Dependency-edge extraction: the three direct edges one candidate implies, from its authored
-//! content and its identifier (DESIGN §3.2, SPEC §3.2).
+//! Direct dependency-edge extraction (DESIGN §3.2, SPEC §3.2).
 
 use gts::{ExtractRefsError, GtsId, extract_gts_refs};
 use serde_json::Value;
@@ -16,8 +15,7 @@ pub struct DependencyEdge {
     pub target: String,
 }
 
-/// The one way extraction can fail: the strict `$ref` extractor refused a reference — a malformed
-/// or bare-id `$ref`, or a document nested past its scan cap.
+/// A `$ref` extraction failure.
 #[domain_model]
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("the references of '{gts_id}' cannot be extracted: {source}")]
@@ -52,8 +50,7 @@ pub fn extract_edges(
             target,
         }));
     } else if let Some(type_id) = id.get_type_id() {
-        // `None` only for a single-segment identifier, which `GtsId::try_new` refuses for an
-        // Instance before this function is ever reached.
+        // Parsed Instances always have a conforming type.
         edges.push(DependencyEdge {
             kind: DependencyKind::InstanceOf,
             target: type_id,
@@ -65,8 +62,7 @@ pub fn extract_edges(
     Ok(edges)
 }
 
-/// The targets a store build must seed its dependency closure with: the `$ref` targets, and only
-/// those.
+/// Return the `$ref` targets that seed dependency closure.
 #[must_use]
 pub fn reference_targets(edges: &[DependencyEdge]) -> Vec<String> {
     let mut targets: Vec<String> = edges

@@ -5,9 +5,8 @@
 //! Nine of the eleven tables are created, in FK-dependency order:
 //! `version_family`, `operation`, `operation_item`, `entity`,
 //! `type_schema_revision`, `instance_revision`, `type_schema`, `instance`,
-//! `dependency`. `source_claim` and `routing_config` belong to federation and
-//! are deliberately **not** created; when federation lands, its own migration
-//! adds them and seeds `routing_config (id = 1, generation = 1)`.
+//! `dependency`. A later migration adds `coordination_state`; federation will add
+//! `source_claim` and the `routing` state. No standalone `routing_config` exists.
 //!
 //! Outbox tables are not here either — they come from
 //! `outbox_migrations_with_prefix("types_registry_outbox")`.

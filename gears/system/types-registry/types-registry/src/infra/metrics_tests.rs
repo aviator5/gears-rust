@@ -265,13 +265,22 @@ fn revalidation_retries_are_counted_by_drift_shape() {
     metrics.revalidation_retried(&VectorDrift::Refreshed {
         gts_id: "w".to_owned(),
     });
+    metrics.revalidation_retried(&VectorDrift::CurrentProjectionMoved {
+        gts_id: "v".to_owned(),
+    });
     provider.force_flush().unwrap();
 
     assert_eq!(
         counter_sum(&exporter, "types_registry_revalidations_total"),
-        4,
+        5,
     );
-    for shape in ["moved", "appeared", "vanished", "refreshed"] {
+    for shape in [
+        "moved",
+        "appeared",
+        "vanished",
+        "refreshed",
+        "current_projection_moved",
+    ] {
         assert_eq!(
             counter_sum_where(
                 &exporter,

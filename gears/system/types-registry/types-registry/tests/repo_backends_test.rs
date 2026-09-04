@@ -52,7 +52,7 @@ use common::{
 };
 use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use types_registry::domain::ports::{
-    NewCurrentTypeSchema, NewEntity, ReverseImpact, commit_write, snapshot_read,
+    CurrentSchemaCas, NewCurrentTypeSchema, NewEntity, ReverseImpact, commit_write, snapshot_read,
 };
 use types_registry::infra::storage::entity::type_schema;
 use types_registry::infra::storage::repo::{
@@ -565,6 +565,10 @@ async fn a_revision_moves_the_pointer_and_can_report_unchanged(
                 resolution_fingerprint: fingerprint.clone(),
                 now: NOW,
             },
+            CurrentSchemaCas {
+                revision_no: 1,
+                resolution_fingerprint: vec![0x11],
+            },
         )
         .await
         .expect("move the pointer"),
@@ -601,6 +605,10 @@ async fn a_revision_moves_the_pointer_and_can_report_unchanged(
                 effective_traits_schema: "{}".to_owned(),
                 resolution_fingerprint: vec![0x01],
                 now: NOW,
+            },
+            CurrentSchemaCas {
+                revision_no: 1,
+                resolution_fingerprint: vec![0x11],
             },
         )
         .await

@@ -272,9 +272,10 @@ The candidate dependency graph is resolved with the submitted candidates as an o
 
 This is called **dependency-aware partial admission**, not best effort. “Best effort” does not state dependency ordering or overlay resolution.
 
-**The dependency graph is acyclic, and by construction rather than by rule.** A topological order exists for every batch, and no component ever has to be admitted as an atomic group, because none of the three edge kinds can close a cycle:
+**The admitted dependency graph is acyclic, and admission is what keeps it so.** Two of the three edge kinds cannot close a cycle at all; the third can, alone or combined with the second, and is refused. Past that refusal a topological order exists for every batch and no component ever has to be admitted as an atomic group:
 
 * **`$ref`.** An effective artifact is materialized by *inlining* the referenced schema, and inlining has no fixpoint over a cycle — a circular `$ref` has no resolved form to store or serve. GTS refuses it during validation, so such a candidate is never admitted: not in one batch, where the overlay makes both members visible to each other, and not across operations, where revising a schema to reference its own dependent is refused for the same reason.
+* **`$ref` combined with derivation.** A base that `$ref`s a schema derived from it is a cycle with no circular `$ref` in it, and an effective form inlines both edge kinds, so it has no resolved form either. The check is therefore over the **combined** edge set, not over `$ref` alone. Ordering, separately, runs over the whole graph including conformance and the predecessor edge below: an Instance must not commit ahead of a Type Schema that may then be refused.
 * **Derivation.** `base~derived~` consumes `base~`, which is strictly shorter. Chain length decreases along every derivation edge, so the relation is a partial order.
 * **Instance conformance.** The edge runs from an Instance to its Type Schema, and nothing points back: both reference-bearing keywords name schemas, so an Instance is always a leaf.
 

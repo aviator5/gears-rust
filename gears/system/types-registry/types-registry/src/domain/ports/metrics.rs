@@ -36,8 +36,7 @@ pub enum TerminalStatus {
 }
 
 impl TerminalStatus {
-    /// The snake-case label value — deliberately not `Debug`, so a derive's output cannot become
-    /// the series contract.
+    /// Stable snake-case label value, independent of `Debug`.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
@@ -55,8 +54,7 @@ impl TryFrom<OperationItemStatus> for TerminalStatus {
             OperationItemStatus::Succeeded => Ok(Self::Succeeded),
             OperationItemStatus::Unchanged => Ok(Self::Unchanged),
             OperationItemStatus::Failed => Ok(Self::Failed),
-            // The caller learns which status was not terminal rather than a bare "no": the
-            // distinction is the whole reason this conversion can fail.
+            // Preserve the non-terminal status in the error.
             non_terminal => Err(non_terminal),
         }
     }
@@ -64,19 +62,16 @@ impl TryFrom<OperationItemStatus> for TerminalStatus {
 
 /// The admission path's instrument set.
 pub trait AdmissionMetrics: std::fmt::Debug + Send + Sync {
-    /// `types_registry_candidates_total{status}` — one increment per candidate **this pass**
-    /// terminalized, under its terminal status.
+    /// Count candidates terminalized by this pass, by status.
     fn candidate_terminalized(&self, status: TerminalStatus);
 
     /// `types_registry_refusals_total{stage,reason}` — one increment per refusal.
     fn refused(&self, stage: RefusalStage, reason: &'static str);
 
-    /// `types_registry_revalidations_total{drift}` — one increment per *retry* taken, so a
-    /// candidate that committed on its first attempt contributes nothing.
+    /// Count revalidation retries by drift.
     fn revalidation_retried(&self, drift: &VectorDrift);
 
-    /// `types_registry_activation_write_set` — dependents rewritten by one revision (SPEC §8.1 step
-    /// 4.6), including zero.
+    /// Record dependents rewritten by one revision, including zero.
     fn observe_activation_write_set(&self, refreshed: usize);
 
     /// `types_registry_operation_duration_seconds` — one admission pass, wall-clock.

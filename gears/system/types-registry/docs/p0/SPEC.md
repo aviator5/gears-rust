@@ -65,7 +65,7 @@ without re-registration.
 | Tenant ownership, visibility, tenant plane | User decision. Columns are kept, never populated with scope=2 |
 | `PlatformSecurityContext` in the contract, a separate platform listener, `PlatformIdentity` enforcement | User decision, and the platform does not offer either to an in-process gear yet (§8.4, C8). The platform-plane **API itself** — SDK trait, async REST, global-entity reads and writes — is **in** P0; only the identity and the listener are deferred |
 | PDP / `PolicyEnforcer`, read & write grants, declared permissions | Depends on the deferred identity-to-permission binding (§4 DESIGN) |
-| Federation: `source_claim`, `routing_config`, Registry Source Plugins, Control-Plane Validator | Whole subsystem |
+| Federation: `source_claim`, the `routing` coordination state, Registry Source Plugins, Control-Plane Validator | Whole subsystem |
 | Availability Evaluator, `tenant-resolver` dependency | Needs tenancy |
 | Validator inputs that only a tenant or external read has: subject visibility-chain version, Context Tenant availability-chain version, routing generation, `external_revision` | Each is `tenant plane only`, availability-conditional or external, so **none participates in a platform-plane read** — the validator itself is in P0, see §8.5 |
 | Arbitrary `$select` projections | The **default** field set is in P0 — that is what makes discovery content-free (§10.2). Caller-chosen sets additionally need optional fields across the models and a normalized field-set digest inside the validator, and buy nothing while there is one representation to select from (ceiling C7) |
@@ -88,8 +88,8 @@ correctness core, not scope.
 | D1 | **Async write path per DESIGN** — `202` + operation UUID + polling | `operation` / `operation_item` tables, `toolkit-db` outbox, admission worker. Kept as a contract that does not break when revalidation later becomes genuinely unbounded, even though the P0 worker completes in milliseconds |
 | D2 | **A transient `gts-rust` store per admission unit**, built from the database; reads are served from the database | Resolution, compat, chain validation and derivation need a `GtsStore`, so one is built from the unit's dependency closure and dropped after the unit. Reads need rows, not a store (§8.2), so nothing is held between units. Commit re-verifies under locks |
 | D3 | **Materialize effective artifacts** | `type_schema` current-state row is populated at admission. Read path shape identical to P1, no later backfill of `resolution_fingerprint` |
-| D4 | **Multi-pod** | Commit transaction re-reads `resource_version` of the candidate and the revision vector of everything consumed, and re-derives the reverse-impact set from the database; a difference rolls back and revalidates within `worker.max_revalidation_attempts`. The comparison is **not** taken under locks on the compared rows — §8.1 step 4.2 argues why locking the vector is the wrong tool, what serializes those rows instead, and which single per-entity lock is genuinely required (deletion's, T20) |
-| D5 | **Reverse impact by one scoped recursive CTE, refresh by an iterative loop** | `DependencyRepo::reverse_impact` is a single `WITH RECURSIVE` over `dependency` through `SecureCteSelect` (ADR-0001, `toolkit-db`) — no raw SQL — depth-capped at `limits.activation_write_set`, which is also the refusal threshold. The refresh stays a domain loop because the fingerprint-stability stop decides the write set by recomputation, which no closure query can express. See [§D5](#d5-splits-the-traversal-from-the-refresh) |
+| D4 | **Multi-pod** | Commit transaction re-reads `resource_version` of the candidate and the revision vector of everything consumed, and re-derives the reverse-impact set from the database; a difference rolls back and revalidates within `worker.max_revalidation_attempts`. The comparison is **not** taken under locks on the compared rows — §8.1 step 4.2 argues why locking the vector is the wrong tool and what serializes those rows instead. Ordering is provided by the **`entity_write_order` row** of `types_registry__coordination_state`, advanced as each commit transaction's first statement: one commit at a time per installation, which is what lets the in-transaction scan and guard see each other's work. A row rather than an advisory lock because advisory keys live on a separate session that can be lost while the transaction carries on. Every writer of entity state must claim it — deletion at T20, the purge job under ADR-0013 |
+| D5 | **Reverse impact by one scoped recursive CTE, refresh by an iterative loop** | `DependencyRepo::reverse_impact` is a single `WITH RECURSIVE` over `dependency` through `SecureCteSelect` (ADR-0001, `toolkit-db`) — no raw SQL — depth-capped at `limits.activation_write_set`, which is also the refusal threshold for the set it returns. The refresh stays a domain loop because the fingerprint-stability stop decides the write set by recomputation, which no closure query can express. See [§D5](#d5-splits-the-traversal-from-the-refresh) |
 | D6 | **The old `TypesRegistryClient` is removed in P0**; every consumer migrates inside this effort | ~50 call sites across 20+ gears move. Forced by two facts: async admission makes the old synchronous `register()` a lie in its own signature, and the old models' `Arc`-linked object graphs cannot cross a wire, so keeping them keeps an out-of-process blocker. Migration is split by gear group — see `plan.md` P5 |
 | D7 | `operation.plane = 1` (platform), `tenant_id = NULL`, `principal_id` a hardcoded constant with a `TODO` | Idempotency scope becomes global — see §9 ceiling C2 |
 | D8 | **`gts`, `gts-id` and `gts-macros` are pinned at 0.12.0 and move together** | A split pin puts the identifier crate and the semantics crate on different specifications. `gts-dylint` / `gts-macros-cli` must not lag either — see §7 |
@@ -105,9 +105,22 @@ correctness core, not scope.
 DESIGN §4 lists eight implementation prerequisites. P0 closes two of them and must
 record how.
 
-**Unbounded activation write set.** DESIGN: *"choose and document either the permitted
-transaction-size/timeout profile for that atomic write or a generation/staging protocol
-… 'short transaction' alone is not a bound."*
+**A per-transaction lock timeout in `toolkit-db`.** The write path serializes on the
+`entity_write_order` row (§8.1), so every commit queues on a database row lock whose wait only the
+backend bounds — and `PostgreSQL`'s default is unbounded. The gear cannot bound it itself: it
+issues no raw SQL outside migrations, and `tokio::time::timeout` around the claim is not a
+bound, since cancelling the future leaves the statement running and the rollback queues behind
+it. What closes this is `TxConfig` gaining a backend-aware lock timeout — `SET LOCAL
+lock_timeout` after `BEGIN` on `PostgreSQL`, the session variable set and restored on `MySQL` —
+together with contention classification for `55P03` and `1205` so the refusal keeps a shape a
+client can branch on. Until then the bound is a deployment setting and this gear documents it
+as one.
+
+**Unbounded activation write set.** DESIGN asked for either a permitted
+transaction-size/timeout profile for that atomic write or a generation/staging protocol,
+"short transaction" alone not being a bound. P0 answers with the first, and DESIGN §3.2
+now carries the bound as deployment configuration while §4 keeps only the staging upgrade
+path open.
 
 Measured over every chained GTS identifier declared in the repository, the largest
 reverse-impact set of any base type is **27** (`gts.cf.core.events.event_type.v1~`; next:
@@ -117,9 +130,13 @@ is set against **27**, not against the size of the declared population — a re-
 latter does not move it.
 
 **P0 profile: single transaction, no staging.** Configured bound
-`limits.activation_write_set` = **512** rows; exceeding it fails the candidate with a
-structured reason rather than committing a partial refresh. Upgrade path when the bound
-is reached: the generation/staging protocol DESIGN describes. Not built.
+`limits.activation_write_set` = **512** entities in the reverse-impact set — the set the
+walk returns, before the fingerprint filter decides which of them are rewritten. The
+written set is a subset of it, so one number bounds both, and it is the walked set the
+bound is *checked* against because that is the number the commit knows before it writes.
+Exceeding it fails the candidate with a structured reason rather than committing a partial
+refresh. Upgrade path when the bound is reached: the generation/staging protocol DESIGN
+describes. Not built.
 
 **Parameterized recursive CTE in `sea-query`.** **Closed, and by verification rather
 than by dissolution.** `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001) builds a
@@ -328,7 +345,7 @@ out of scope):
 
 Ordering invariant that must not be reordered: step 3 precedes any existence lookup, so
 a refusal cannot probe the namespace. Steps 4 and 6 are request-static; family shape and
-whether a waived comparison would fail remain worker decisions under the family lock.
+whether a waived comparison would fail remain worker decisions inside the commit transaction.
 
 Replay of a matching fingerprint under the same key returns the stored operation —
 `202` while active, `200` when terminal. A different fingerprint under the same key
@@ -369,12 +386,21 @@ the exception both ways: types-registry accepts and admits it itself, inline, wi
 
 **Worker, per admission unit:**
 
-1. Build the candidate graph from authored references between candidates, plus the
-   implicit `vM.(n-1)~ → vM.n~` edge (not stored in `dependency`).
-2. Process in topological order; one candidate is one unit. The relation is acyclic by
-   construction (ADR-0012) — a circular `$ref` has no resolved form and GTS refuses it,
-   derivation strictly shortens the `~`-chain, and nothing references an Instance — so
-   there is no condensation step and no atomic group.
+1. Build the candidate graph. Two edge sets, and they are not the same set:
+   - the **ordering** graph is authored `$ref`s between candidates, each candidate's
+     identifier-derived immediate derivation base, its Instance conformance target, and the
+     implicit `vM.(n-1)~ → vM.n~` edge (not stored in `dependency`). Conformance cannot close
+     a cycle and is still needed here: an Instance must not commit ahead of the Type Schema
+     that may then be refused;
+   - the **cycle-bearing** graph is `$ref` and derivation. Those are the two an effective form
+     inlines, so those are the two a cycle can be built from.
+2. Process in topological order; one candidate is one unit. The *admitted* relation is
+   acyclic (ADR-0012): derivation strictly shortens the `~`-chain, nothing references an
+   Instance, and every cycle over the combined `$ref`-and-derivation edge set is refused
+   because it has no resolved form. The in-batch graph is not acyclic by construction — the
+   overlay lets candidates see each other — so the ordering detects a cycle and fails its
+   members with `invalid_schema`. Past that refusal there is no condensation step and no
+   atomic group.
 3. Build the unit's transient `gts-rust` store (D2): the candidates, plus the transitive
    closure of what they consume, read `gts_id`-sorted from the database. Evaluate outside
    any transaction against it: resolution, compat vs
@@ -386,15 +412,17 @@ the exception both ways: types-registry accepts and admits it itself, inline, wi
    transaction as the store build, so the state it records is the state the documents
    being validated came from; only the validation itself is outside a transaction.
 4. Commit transaction:
-   1. enforce the caller precondition — creation requires the identifier absent, update
+   1. **claim the `entity_write_order` row.** This is the transaction's first statement and
+      nothing may precede it, reads included: every step below is an answer about
+      committed state, and a read taken before the claim is an answer about state that
+      can still move. It is what orders commits, and the order is total only because it
+      comes first. No other lock is taken — T15 retired the family advisory locks, and
+      the reasoning is below;
+   2. enforce the caller precondition — creation requires the identifier absent, update
       requires `entity.resource_version == expected_resource_version`. An update whose
       authored content equals the current revision's is **`unchanged`** and terminates
       here: it writes no revision, moves no version and refreshes no dependent, so the
       guard below does not apply to it and is not asked;
-   2. lock or create every candidate family in canonical order (T12, the advisory lock
-      `types_registry::family:<key>`, taken for a **new member** only — a revision adds
-      nobody to a family and asks none of its rules). Entity and current rows are not
-      separately locked; what serializes them is named below;
    3. re-derive the revision vector from the database — the dependency closure from the
       same roots evaluation used, and the reverse-impact set (D5) — and compare
       **membership and every column**: `resource_version` throughout, plus
@@ -437,42 +465,178 @@ the compare-and-swap that writes it: the precondition travels in the statement's
 so there is no gap between checking the version and moving it. A **dependency** that moves
 is serialized by the refresh its mover owes the dependants (D5): that refresh writes each
 affected dependant's `type_schema` row — the same row this commit writes — so the two
-block on one another in the database, and whichever commits second recomputes against what
-the first committed. Where the mover's change leaves a dependant's `resolution_fingerprint`
-unmoved it writes nothing and no conflict arises, and that equality is itself the proof
-that nothing this commit consumed went stale.
+block on one another in the database. The block orders them; what makes the loser *notice*
+is the compare-and-swap described next, not the block. Where the mover's change leaves a
+dependant's `resolution_fingerprint` unmoved it writes nothing and no conflict arises, and
+that equality is itself the proof that nothing this commit consumed went stale.
 
-The residual window is between step 4.3's comparison and this transaction's `COMMIT`. A
-dependency committing inside it refreshes this candidate's artifacts against the revision
-this transaction is writing, because its refresh statement re-reads under `READ COMMITTED`
-once this transaction's row lock is released — so the final state is the one a serial order
-would have produced. What step 4.3 buys on top is that an evaluation is never committed
-against a state it did not see, which is what makes the transient-store design (D2) safe.
+**The row conflict orders the writes; it does not recompute the loser.** That is worth
+stating precisely, because the earlier form of this paragraph claimed it did. Artifacts are
+computed in Rust and only then written: the row lock makes the second writer wait, and the
+wait re-evaluates the predicate, not the payload. A write that lost the race would therefore
+apply artifacts computed before the winner landed — and pair them with a `revision_no` read
+afterwards, which is exactly the row `update_current`'s contract forbids.
 
-Canonical identifier order is kept where it is observable: family keys are sorted and
-deduplicated before their locks are taken (`domain::family::lock_order`), and the vector is
-`(gts_id, role)`-sorted on both sides so the comparison and the drift it reports are
-deterministic rather than row-order dependent.
+So **every artifact write carries a compare-and-swap** on `(revision_no,
+resolution_fingerprint)`, and a miss is drift (`current_projection_moved`): the evaluation is
+void and the retry redoes it, under `worker.max_revalidation_attempts` like every other drift.
+What the token *is* differs between the two writing paths, and the difference matters:
+
+- **The refresh** recomputes each dependent inside this transaction, so its token is the
+  projection state those artifacts were computed against — taken from the read that selected
+  the document, never from a later one, because a later read would adopt whatever moved in
+  between and confirm it.
+- **The candidate's own revision** computed its artifacts at *evaluation*, outside any
+  transaction, so no token could be their input. Its token is read inside the commit, before
+  step 4.3, and is a **post-guard sentinel**: the guard is what establishes that the
+  evaluation's view still holds, and the sentinel is what establishes that nothing wrote this
+  row between the guard and the write. Composition is the argument — token read, then guard,
+  then swap — not a claim about where the artifacts came from. It is needed because the entity
+  compare-and-swap does not cover this row: a refresh owed by a *transitive* dependency shares
+  no lock with this commit and writes exactly here.
+
+Only a write whose artifacts cannot be stale goes unconditional, which in P0 is an Instance,
+having no artifact row at all.
+
+**Both compare-and-swaps are unreachable while commits are serialized**, and are kept anyway.
+Nothing can move a row under a commit when no second commit is in flight, so neither swap can
+lose. They are depth, not the mechanism: they are what a narrower ordering protocol would rely
+on if the global lock is ever replaced, and they cost one predicate on a statement that is
+issued regardless. Their known limit belongs with them — the swap is
+`(revision_no, resolution_fingerprint)` rather than a monotonic version, so an `ABA` return to
+an identical fingerprint would defeat it. Under the lock that is unreachable; a protocol that
+relaxes the lock has to introduce the monotonic version with it.
+
+What step 4.3 buys on top of the lock is that an evaluation is never committed against a state
+it did not see, which is what makes the transient-store design (D2) safe.
+
+Canonical identifier order is kept where it is observable. P0 takes no family locks, so what
+remains observable is the vector: it is `(gts_id, role)`-sorted on both sides, which is what
+makes the comparison one merge walk and the drift it reports deterministic rather than row-order
+dependent. `domain::family::lock_order` survives for the writer that needs it next — DESIGN's
+per-family ordering, which deletion and purge inherit.
 
 **The liveness cost is real and named.** A dependant of a base that is being revised
 constantly can exhaust `worker.max_revalidation_attempts` and terminalize as
 `revalidation_exhausted` where a lock-holding commit would have waited and succeeded. The
 answer to that is the attempt budget and, if it is ever observed, backoff between attempts
 — not locks over the vector. P0 does not observe it: the only writer is the registry's own
-seeding, and the retry arrives under the caller's `Idempotency-Key`.
+seeding, and the retry arrives under the caller's `Idempotency-Key`. The commit ordering below
+adds a second cost of the same kind: a unit whose commit is queued behind another waits on the
+database, and if the backend's own lock timeout cuts that wait, the result is a transient
+storage error — contention, never a verdict on the candidate, recovered by a replay under the
+caller's `Idempotency-Key` until T21 wires the outbox and by redelivery after it.
 
-**One per-entity lock *is* required, and it belongs to deletion — T20.** DESIGN §4 states
-that *"a new dependant cannot appear between the deletion check and lifecycle transition"*
-and, until this task, rested that on admission locking every dependency target. It does
-not, and the optimistic mechanism above does not cover this case either: adding an edge
-does not move the target's `resource_version` and writes only to `dependency`, while
-deletion writes the target's `entity` row — two different rows, so in the order where the
-edge commits second, nothing serializes them, and deletion's *"no direct registered
-dependants"* recheck is a check-then-act on a predicate no compare-and-swap carries. The
-requirement is therefore **one lock per edge target**, taken by both paths after their
-family locks, and it is T20's to implement along with deletion. Nothing is exposed in the
-meantime: P0 has no deletion path yet. DESIGN §4 has been corrected to state the
-requirement where it is actually needed rather than as a property of admission.
+**The write path is serialized, and that is a correctness requirement.** The optimistic
+mechanisms above cover everything that meets on a row: a dependant that already exists is
+reached by the mover's refresh and one of the two compare-and-swaps loses. What they cannot
+cover is **reachability the mover's reverse scan did not see** — an edge committed after that
+scan, whether by an entity that did not exist when it ran or by an existing one adding a
+reference. Adding an edge writes only `dependency` and moves no `resource_version`, so the two
+commits write no row in common and no swap can lose. Both pass their own guards, and the
+dependant keeps an artifact inlined from a revision that is no longer current, carrying a
+`resolution_fingerprint` that matches that artifact and therefore reports no drift. Nothing
+later repairs it.
+
+The mechanism that closes it is a **serialized write path**: every commit claims the
+`entity_write_order` row of `types_registry__coordination_state` as the **first statement** of
+its transaction, so one commit runs
+at a time per installation. Both the reverse-impact scan and the vector guard run *inside* the
+transaction, so that ordering gives them a total order, and the argument is two cases with no
+third:
+
+- **The edge commits first.** It is in `dependency` when the mover claims the row, so the
+  mover's scan — running after that claim — finds the dependant and refreshes it.
+- **The mover commits first.** The unit writing the edge has committed nothing yet. When it
+  does, its own guard re-derives its vector after its own claim and sees the mover's new
+  `resource_version` on a member of its closure: drift, rollback, re-evaluation against the
+  new revision.
+
+Neither side needs to know about the other. Without the total order both halves can be in
+flight at once, each blind to the other, which is exactly the schedule above.
+
+**A row, and not an advisory lock.** `toolkit-db` holds advisory keys on a session separate
+from the commit transaction's connection, so losing that session releases the key server-side
+while the transaction carries on — mutual exclusion would lapse, and silently, since the
+generation epoch is only consulted at release. A row lock ends with `COMMIT` or `ROLLBACK` and
+with nothing else, which is the property this rests on.
+
+**First statement, not merely early.** Claimed after any read, the row would order the writes
+and leave those reads outside the serialized region — which is the interleaving it exists to
+prevent.
+
+**Why the guard is still required, and is not redundant.** Evaluation runs *outside* the
+transaction, so a commit that landed between this unit's evaluation and its own claim leaves the
+evaluation stale. That is what the vector catches, and it stays the only thing that can:
+`a_dependency_mutated_between_evaluation_and_commit_costs_one_rollback_and_one_retry` holds a
+pass at its evaluation closure read for exactly that reason. The claim closes what the guard
+could not see; the guard closes what the claim does not cover.
+
+**Why the dependency side of the vector needs no fingerprint.** An artifact is a pure function
+of the **authored** documents of the closure — `load_unit_store` and the refresh both read
+`current_documents`, never materialized artifacts, because those are outputs of the resolution
+the store performs (D3). An authored document changes only with a new revision, which moves
+`resource_version`. So `resource_version` per closure member is a complete staleness detector
+for dependencies, and `resolution_fingerprint` is recorded only for *dependents*, whose
+artifacts the refresh consumes directly.
+
+**What it costs, and where it lands.** Admission throughput, and only that: evaluation —
+parsing, resolution, compatibility, derivation — stays outside the transaction. What is
+serialized is the commit transaction, for its whole length, for **every** outcome: an
+`unchanged` re-submission claims the row and writes its item outcome, and a creation writes an
+entity, a revision and a current row. Unrelated registrations queue behind both.
+
+**The queue wait is the database's, and the gear states no bound on it.** `lock_timeout` on
+`PostgreSQL`, `innodb_lock_wait_timeout` on `MySQL`, `busy_timeout` on `SQLite` — deployment
+settings this gear does not own, and an operator running an installation with concurrent
+registrants should set the first, since `PostgreSQL` waits forever by default. Exceeding one
+surfaces as an ordinary database error, which leaves the operation non-terminal — recovered by
+a replay under the same `Idempotency-Key` until T21 wires the outbox, and by redelivery after
+it.
+
+A gear-side budget was tried and removed, and the reason is worth keeping: wrapping the claim
+in `tokio::time::timeout` bounds nothing. Cancelling the future leaves the statement running on
+the connection and the rollback queues behind it, so the caller waits exactly as long and only
+gets a different error at the end — the container test written against that version deadlocked
+instead of reporting a refusal. A per-transaction lock timeout on `toolkit-db`'s `TxConfig`
+(`SET LOCAL lock_timeout` after `BEGIN`) is what would give the gear a bound it can state; §4
+records it.
+
+What varies is the expensive part, the dependents' re-materialization the commit performs in a
+blocking task while the transaction is open, bounded by `limits.activation_write_set`. That
+part *is* zero for `unchanged` and for a creation — the first refreshes nothing, the second has
+no dependants yet — so the serialized section is short except when revising something already
+depended on, whose measured maximum in the repository is 27 dependents. If the serialized
+section is ever measured to matter, the upgrade path is a graph generation compare-and-swapped
+at commit, which restores parallelism and subsumes this lock; it is not built, and nothing
+depends on it being built.
+
+**Every writer of entity state must claim the row**, or the order it provides is not total.
+Today that is this path alone. Deletion (T20) and the operator purge job (ADR-0013) join it,
+and each is a correctness obligation of its own task rather than an optimization.
+`a_creation_claims_the_entity_write_order_row_exactly_once` and its revision and
+`unchanged` siblings are what makes an omission visible: the row is a
+monotone count of committed admissions, so a writer that skipped it shows up as a count that
+did not move.
+
+**P0 takes no family advisory locks, and this is a deviation from DESIGN §3.7 worth naming.**
+DESIGN has the commit lock or create every candidate family in canonical order; T12 implemented
+that with advisory keys held across the transaction. The claim retires them for three reasons,
+in order of weight:
+
+- They are **redundant**: their whole window — `create_or_get`, the three family rules, the
+  entity insert — is inside the commit transaction, which the claim makes exclusive. The
+  check-then-act they serialized is already serialized.
+- They **invert an order**. Admission took them *before* its transaction, while ADR-0013's purge
+  claims the row and then takes family locks. Two writers acquiring the same two things in
+  opposite orders is a deadlock, and keeping a redundant lock is a poor reason to have one.
+- They **turn a wait into a refusal**. Taken before the transaction, two passes could collide on
+  a family key while neither had claimed the row, and the loser answered `503` where it would
+  otherwise have queued and succeeded.
+
+What DESIGN describes stays right for the design it describes: a narrower ordering protocol,
+one that does not serialize every commit, needs per-family ordering again and would reintroduce
+them — together with the entity and routing tiers DESIGN orders after them.
 
 **The write-set bound is asked twice.** `limits.activation_write_set` bounds the
 reverse-impact read in the vector as well as in the refresh, so an over-bound candidate
@@ -480,9 +644,13 @@ is refused with `activation_write_set_exceeded` at **evaluation**, before a tran
 has written anything, and the refresh's own refusal (step 4.6) remains as the backstop
 for a set that grew in between.
 
-Deletion has its own short protocol: positive `expected_resource_version`, lock family
-and entity, recheck `ACTIVE` at that version with no direct registered dependents, set
-`DELETED`, increment `resource_version`, record the outcome.
+Deletion has its own short protocol, and it opens the same way: a transaction whose **first
+statement** claims the `entity_write_order` row, then the positive `expected_resource_version`
+precondition, the recheck that the target is `ACTIVE` at that version with no direct
+registered dependents, `DELETED`, the version increment, the outcome. The claim is not
+optional and it is not merely early — a deletion whose recheck runs before it is a
+check-then-act on state that can still move, which is the failure the recheck exists to
+prevent.
 
 Dry Run follows the same path in a rollback-only evaluation transaction, then records
 the predicted outcome in a separate short transaction.
@@ -799,8 +967,20 @@ it. What the write path emits is therefore part of the contract, not a by-produc
 
 ## 9. Database
 
-`database.sql` is the normative target. P0 creates **9 of its 11 tables**, omitting only
-`source_claim` and `routing_config` (federation).
+`database.sql` is the normative target. P0 creates **10 of its 11 tables**, omitting only
+`source_claim` (federation). The exception is `coordination_state`, which arrives in its
+own second migration rather than the initial one, because the initial migration is
+already applied on every existing installation and would never deliver a new table to it.
+
+- **`coordination_state` exists** — one table for every installation-global
+  coordination sequence, named by `state_name`.
+- **Only `entity_write_order` is seeded and used in P0**; nothing at runtime seeds or
+  addresses any other state.
+- **`source_claim` is not created** in P0.
+- **The `routing` state row arrives with federation**: its migration seeds `routing`
+  together with `source_claim`, and `routing.state_seq` is the routing generation.
+- **No standalone `routing_config` table will be created** — in P0 or ever; the
+  routing generation lives in the `routing` row above.
 
 **Tenant columns are created and constrained exactly as specified, and never populated
 with tenant scope.** Every P0 row carries `ownership_scope = 1`, `owner_tenant_id = NULL`.
@@ -819,17 +999,21 @@ every P0 entity.
 | `dependency` | full — written and read (D5) |
 | `operation` | full; `plane = 1`, `tenant_id = NULL` |
 | `operation_item` | full |
-| `source_claim`, `routing_config` | **not created** |
+| `coordination_state` | full — `entity_write_order` seeded at 0; `routing` deferred to federation |
+| `source_claim` | **not created** |
 
 Migration notes:
 
 - One initial migration, `m2026NNNN_000001_initial.rs`, mapping identity, UUID, binary,
   boolean, timestamp and binary-collation types per backend. Identifier columns:
   `varchar(1024)`, binary collation, ASCII charset where the default is multi-byte.
+- `coordination_state` in its own second migration, `m2026NNNN_000002_coordination_state.rs`,
+  seeding `entity_write_order` at sequence zero with a migration timestamp; re-running it
+  against a database that already has the table and row preserves both.
 - Outbox tables come from `outbox_migrations_with_prefix("types_registry_outbox")`,
   not from this migration.
-- `routing_config` is not seeded, because it is not created. When federation lands, its
-  migration seeds `(id = 1, generation = 1)`.
+- `routing` is not seeded, because federation has not landed: its migration will seed
+  the `routing` row together with `source_claim`.
 
 ### Declared ceilings
 
@@ -1082,12 +1266,11 @@ gears:
         resolved_document: 1MB
         resolution_closure: 64
         batch_candidates: 100
-        activation_write_set: 512      # P0-specific, see §4
+        activation_write_set: 512      # DESIGN §3.2; the profile is §4
         page_size_default: 100         # `GET /entities`, DESIGN §3.3
         page_size_max: 1000
       registration_policy: {}          # closed by default; global `cf` implicit
       worker:
-        family_lock_timeout: 5s        # lock retry budget, below gateway timeout
         operation_timeout: 5m          # accepted, not enforced until T21
         max_revalidation_attempts: 8   # the revalidation loop's bound, §8.1 step 4.3
       local_client:
@@ -1256,9 +1439,12 @@ the candidate's row is locked — where round trips are paid for in contention, 
 **The refresh is a loop, and could not be anything else.** Which dependents get *written* is
 decided by recomputing each one and comparing `resolution_fingerprint` against the stored
 digest — a function of the recomputation, not of the graph. A closure query cannot consult
-it, so a CTE can only ever return the *candidate* set that a loop then filters. Nor can the
-bound be checked against a query result: §4's `activation_write_set` bounds the rows an
-admission **writes**, and that number does not exist until the loop has run.
+it, so a CTE can only ever return the *candidate* set that a loop then filters. The bound is
+therefore stated over that returned set rather than over the rows the loop ends up writing
+(§4): the written set is a subset, so the same number bounds it, and only the walked set is
+a number the query itself can refuse on. A candidate whose walk is over the bound is refused
+even where the filter would have written fewer — deliberately, because the alternative is
+running the whole unbounded refresh to find out.
 
 **The depth cap is the bound, and that pairing is load-bearing.** `recursive_cte` requires a
 `max_depth`, and a cap truncates *silently* — a dependent missing from the set keeps stale
@@ -1270,9 +1456,11 @@ dependents is nearer and therefore already in the set — which puts the set ove
 where the refusal has already fired. A returned set is complete; an incomplete walk is an
 error.
 
-**The relation is acyclic, and the walk still deduplicates.** No edge kind can close a cycle
-(ADR-0012): a circular `$ref` has no resolved form and GTS refuses it, derivation strictly
-shortens the `~`-chain, and nothing references an Instance. `UNION` is nevertheless required
+**The relation is acyclic, and the walk still deduplicates.** Two edge kinds cannot close a
+cycle at all (ADR-0012): derivation strictly shortens the `~`-chain, and nothing references an
+Instance. What can is `$ref`, alone or combined with derivation — a base that `$ref`s a schema
+derived from it — and admission refuses both over the combined edge set, because an effective
+form inlines both kinds and neither cycle has a resolved form. `UNION` is nevertheless required
 rather than `UNION ALL`, because a DAG's paths converge and `UNION ALL` would enumerate a
 fan-in-heavy graph once per path. The depth cap then does double duty: it bounds the
 re-expansion `UNION`-with-depth allows, and it keeps a row that contradicted the acyclicity
@@ -1416,7 +1604,11 @@ identifier profile refusals, topological order, baseline selection.
 | Dependent created, or refreshed, after the reverse-impact scan | detected — the first on membership, the second on `resolution_fingerprint` alone, since a refresh moves no `resource_version` |
 | `unchanged` re-submission while a dependency moves | still `unchanged`: an outcome that writes nothing is not guarded, so a genuine no-op cannot be turned into a failure |
 | Revalidation budget exhausted | item terminal `failed` with reason `revalidation_exhausted`, naming the last drift, and nothing written |
-| Edge added to a target being deleted concurrently (**T20**) | one of the two refuses; a tombstone never stands over a live registered dependant. This needs the per-entity lock on the edge target that §8.1 step 4.2 identifies — the optimistic guard does not cover it |
+| Two commits in flight at once | impossible: each claims the `entity_write_order` row as its first statement, so the second waits on it until the first ends. Not observable on `SQLite`, which serializes write transactions regardless — **owed as a container-backend test**. What is asserted here is that every commit claims the row at all (`a_creation_claims_the_entity_write_order_row_exactly_once` and its revision / `unchanged` siblings), which is the invariant a future writer can omit |
+| Edge committed after a mover's reverse scan | the mover's scan runs after its own claim, so the edge is either already visible to it or belongs to a unit that has not committed — and that unit's own guard sees the mover's revision when it does |
+| Dependent's projection moves under an artifact write | the write is a compare-and-swap on the projection state its artifacts were computed against. Unreachable while commits are serialized, since no second commit can move that row; kept as depth for the day a narrower ordering protocol replaces the claim |
+| New dependant created while its dependency is being revised | the two serialize on the `entity_write_order` row: whichever commits second sees the first, so either the revision refreshes the new dependant or the dependant revalidates against the new revision. Never two commits and a stale artifact with a matching fingerprint |
+| Edge added to a target being deleted concurrently (**T20**) | one of the two refuses; a tombstone never stands over a live registered dependant. The same claim, which deletion makes like every other writer of entity state — the optimistic guard does not cover this either |
 | Restart | every entity and its artifacts identical, byte for byte |
 | Two pods, commit on A | B's first post-commit read sees it (`nfr-multi-pod-correctness`). Under D2 this holds by construction — B reads the database, and no process-local copy can go stale |
 | Second admission after a committed revision | the unit's transient store is rebuilt from the database and sees the new revision without any invalidation step |
@@ -1501,7 +1693,7 @@ references.
 **Never**
 
 - Populate `ownership_scope = 2` or a non-null `owner_tenant_id` in P0.
-- Create `source_claim` or `routing_config`.
+- Create `source_claim` or seed the `routing` coordination state.
 - Approximate a compatibility, resolution, or matching semantic locally.
 - Take an authoritative admission decision from process-local state without the
   commit-time database recheck (D2, D4).

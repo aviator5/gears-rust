@@ -1,6 +1,4 @@
-//! `reason_label`: the closed-vocabulary bridge between a stored failure and the refusal counter's
-//! `reason` label — a pure function, pinned here so the `other` fallback cannot be "simplified"
-//! into an unbounded label or dropped without a test noticing.
+//! Tests for the bounded failure-to-metric label mapping.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

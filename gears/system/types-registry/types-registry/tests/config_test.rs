@@ -61,7 +61,6 @@ fn the_defaults_are_the_ones_the_spec_documents() {
     assert_eq!(cfg.limits.activation_write_set, 512);
     assert_eq!(cfg.limits.page_size_default, 100);
     assert_eq!(cfg.limits.page_size_max, 1000);
-    assert_eq!(cfg.worker.family_lock_timeout, Duration::from_secs(5));
     assert_eq!(cfg.worker.operation_timeout, Duration::from_mins(5));
     assert_eq!(cfg.worker.max_revalidation_attempts, 8);
 }
@@ -131,7 +130,6 @@ fn the_documented_configuration_block_parses_and_validates() {
             },
         },
         "worker": {
-            "family_lock_timeout": "5s",
             "operation_timeout": "5m",
             "max_revalidation_attempts": 8,
         },
@@ -302,15 +300,6 @@ fn a_zero_page_size_fails_startup() {
             "a zero page size must fail startup: {pair}"
         );
     }
-}
-
-#[test]
-fn a_zero_family_lock_timeout_fails_startup() {
-    let cfg = parse(json!({ "worker": { "family_lock_timeout": "0s" } }));
-    let err = cfg
-        .validate()
-        .expect_err("a zero lock wait budget cannot give contention a fair attempt");
-    assert!(matches!(err, ConfigError::Worker(_)), "got {err}");
 }
 
 // ---------------------------------------------------------------------------

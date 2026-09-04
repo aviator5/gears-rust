@@ -1,5 +1,4 @@
-//! The `dependency` repository: one entity's outgoing edges, the transitive closure the transient
-//! `gts-rust` store is built from, and the reverse-impact read a revision refreshes against.
+//! Dependency edges, forward closure, and reverse impact.
 
 use std::collections::{HashMap, HashSet};
 
@@ -80,8 +79,7 @@ impl DependencyRepo {
         Ok(())
     }
 
-    /// Candidate identifiers and their transitive dependencies, sorted by `gts_id`.
-    /// Identifier-chain prefixes and caller-supplied `$ref` targets seed one recursive CTE.
+    /// Candidate identifiers and transitive dependencies, sorted by `gts_id`.
     ///
     /// # Errors
     /// Propagates the reads, and [`ScopeError::Invalid`] when the closure exceeds
@@ -118,12 +116,10 @@ impl DependencyRepo {
         let seed_ids: Vec<i64> = resolved.iter().map(|r| r.id).collect();
         let mut by_id: HashMap<i64, EntityRow> = resolved.into_iter().map(|r| (r.id, r)).collect();
 
-        // The bound covers the seeded roots on their own: a batch of chained identifiers can exceed
-        // it before a single edge is followed, and the walk below would then never run to check it.
+        // Roots count toward the bound even if no edge is followed.
         Self::ensure_within_bound(roots, by_id.len())?;
 
-        // The walk returns everything reachable, which includes any seed another seed consumes;
-        // those rows are already in hand, and `by_id` is the filter.
+        // Filter seeds already returned by the walk.
         let fresh: Vec<i64> = Self::forward_reachable(runner, scope, roots, &seed_ids)
             .await?
             .into_iter()
@@ -141,8 +137,7 @@ impl DependencyRepo {
         })
     }
 
-    /// Follow outgoing edges from `seed_ids`, including reachable seeds.
-    /// The CTE reads one row past [`CLOSURE_BOUND`] so depth or row truncation becomes an error.
+    /// Follow outgoing edges, reading one row past [`CLOSURE_BOUND`] to detect overflow.
     ///
     /// # Errors
     /// Propagates the read, and [`ScopeError::Invalid`] past [`CLOSURE_BOUND`].
@@ -161,22 +156,18 @@ impl DependencyRepo {
         if seed_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // `u32::MAX` is unreachable for this bound and would refuse below long before the cap
-        // mattered; saturating keeps the cast infallible.
+        // Saturation keeps the unreachable depth conversion infallible.
         let max_depth = u32::try_from(CLOSURE_BOUND).unwrap_or(u32::MAX);
         let read_limit = u64::try_from(CLOSURE_BOUND.saturating_add(1)).unwrap_or(u64::MAX);
 
-        // Seeded with the roots because the bound counts the whole closure, not only what the walk
-        // adds, and because a seed reached through another seed must not be counted twice.
+        // Seed the set so roots count once toward the closure bound.
         let mut reachable: HashSet<i64> = seed_ids.iter().copied().collect();
-        // Chunked for the same reason every other `IN (…)` here is: the seed predicate binds one
-        // parameter per root.
+        // Chunk roots to stay within backend parameter limits.
         for chunk in seed_ids.chunks(IN_CHUNK) {
             let walk = RecursiveCte::<dependency::Entity>::new(
                 FORWARD_CLOSURE_CTE,
                 Condition::all().add(dependency::Column::FromEntityId.is_in(chunk.iter().copied())),
-                // The next row's `from_entity_id` points at a walked row's `to_entity_id`: the
-                // dependency of a dependency.
+                // Follow each dependency's own outgoing edges.
                 dependency::Column::FromEntityId,
                 dependency::Column::ToEntityId,
                 max_depth,
@@ -193,13 +184,10 @@ impl DependencyRepo {
                             .equals((entity::Entity, entity::Column::Id)),
                     ),
                 )
-                // The seeds are *not* excluded in SQL, unlike the reverse read's roots: there can
-                // be `CLOSURE_BOUND` of them, and a `NOT IN` that wide would push the statement
-                // past `SQLite`'s parameter limit — which is what `IN_CHUNK` exists to stay under.
+                // Exclude seeds in memory to avoid another wide SQL parameter list.
                 .select_only()
                 .column(entity::Column::Id)
-                // `join_cte` is an inner join and an entity is reached by as many rows as there are
-                // paths to it, so without this a diamond would return the same id once per path.
+                // Collapse entities reached through multiple paths.
                 .distinct()
                 // One row past the bound is all the refusal needs to see.
                 .limit(read_limit)
@@ -233,8 +221,7 @@ impl DependencyRepo {
         Ok(())
     }
 
-    /// Every entity that transitively depends on any of `roots`, `gts_id`-sorted, with the roots
-    /// themselves excluded.
+    /// Transitive dependents of `roots`, excluding roots and sorted by `gts_id`.
     pub async fn reverse_impact(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -250,21 +237,17 @@ impl DependencyRepo {
         if roots.is_empty() {
             return Ok(ReverseImpact::Within(Vec::new()));
         }
-        // `u32::MAX` is unreachable for any configured bound and would refuse below long before the
-        // cap mattered; saturating keeps the cast from being a fallible operation with no
-        // meaningful error.
+        // Saturation keeps the unreachable depth conversion infallible.
         let max_depth = u32::try_from(bound).unwrap_or(u32::MAX);
         let read_limit = u64::try_from(bound.saturating_add(1)).unwrap_or(u64::MAX);
 
         let mut dependents: HashSet<i64> = HashSet::new();
-        // Chunked for the same reason every other `IN (…)` here is: the seed predicate binds one
-        // parameter per root.
+        // Chunk roots to stay within backend parameter limits.
         for chunk in roots.chunks(IN_CHUNK) {
             let walk = RecursiveCte::<dependency::Entity>::new(
                 REVERSE_IMPACT_CTE,
                 Condition::all().add(dependency::Column::ToEntityId.is_in(chunk.iter().copied())),
-                // The next row's `to_entity_id` points at a walked row's `from_entity_id`: the
-                // dependent of a dependent.
+                // Follow dependents of each dependent.
                 dependency::Column::ToEntityId,
                 dependency::Column::FromEntityId,
                 max_depth,
@@ -285,9 +268,7 @@ impl DependencyRepo {
                 .filter(Condition::all().add(entity::Column::Id.is_not_in(roots.iter().copied())))
                 .select_only()
                 .column(entity::Column::Id)
-                // `join_cte` is an inner join and a dependent is reached by as many rows as there
-                // are paths to it, so without this a hub-shaped graph would return the same id many
-                // times over.
+                // Collapse dependents reached through multiple paths.
                 .distinct()
                 // One row past the bound is all the refusal needs to see.
                 .limit(read_limit)
@@ -301,8 +282,7 @@ impl DependencyRepo {
         }
 
         let mut ids: Vec<i64> = dependents.into_iter().collect();
-        // Sorted so the follow-up read's `IN (…)` chunks are stable; the returned order is
-        // `gts_id`, set below.
+        // Stabilize follow-up `IN (…)` chunks; final order is by `gts_id`.
         ids.sort_unstable();
         let mut rows = EntityRepo::find_by_ids(runner, scope, &ids).await?;
         rows.sort_by(|a, b| a.gts_id.cmp(&b.gts_id));

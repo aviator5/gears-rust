@@ -98,15 +98,13 @@ impl UnitStore {
         &self.load_order
     }
 
-    /// The closure roots this store was read from: the candidate identifiers plus their documents'
-    /// reference targets.
+    /// Candidate and reference roots used to build this store.
     #[must_use]
     pub fn roots(&self) -> &[String] {
         &self.roots
     }
 
-    /// The entity rows the closure resolved, `gts_id`-sorted, exactly as `DependencyStore::closure`
-    /// returned them.
+    /// Resolved closure rows, sorted by `gts_id`.
     #[must_use]
     pub fn closure_entities(&self) -> &[EntityRow] {
         &self.closure
@@ -273,8 +271,7 @@ pub fn build_store(mut documents: Vec<UnitDocument>) -> Result<UnitStore, StoreB
     Ok(UnitStore {
         store,
         load_order,
-        // Empty: this constructor is handed a document set, not a closure to read, so it has
-        // neither roots nor resolved rows of its own.
+        // This constructor receives documents, not a resolved closure.
         roots: Vec::new(),
         closure: Vec::new(),
         missing_candidates: Vec::new(),
@@ -285,8 +282,7 @@ pub fn build_store(mut documents: Vec<UnitDocument>) -> Result<UnitStore, StoreB
 /// Build the store one admission unit needs: the candidates, plus the transitive
 /// closure of what they consume, read from the database.
 ///
-/// Candidate documents and their `$ref` edges override committed versions. All reads share the
-/// caller's snapshot transaction.
+/// Load a snapshot store with candidate documents overriding committed versions.
 ///
 /// # Errors
 /// Propagates the closure and document reads, and every [`StoreBuildError`] the
@@ -306,8 +302,7 @@ pub async fn load_unit_store(
     roots.dedup();
 
     let closure = stores.closure(tx, scope, &roots).await?;
-    // Kept for `UnitStore::closure_entities`, before the loops below borrow and consume what they
-    // need from it.
+    // Preserve closure rows before the loops consume their data.
     let closure_entities = closure.entities.clone();
 
     // Authored text lives in a different table per kind, and `entity_kind` is the

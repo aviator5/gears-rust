@@ -42,6 +42,7 @@ const LATER: OffsetDateTime = datetime!(2026-08-21 10:20:40 UTC);
 
 const SUBJECT: &str = gts_id!("cf.core.obsv.subject.v1~");
 const REFERRER: &str = gts_id!("cf.core.obsv.referrer.v1~");
+const MIDDLE: &str = gts_id!("cf.core.obsv.middle.v1~");
 const ABSENT: &str = gts_id!("cf.core.obsv.absent.v1~");
 
 type Provider = Arc<DBProvider<DbError>>;
@@ -223,6 +224,29 @@ fn referencing_schema(marker: &str) -> Value {
         "type": "object",
         "properties": {
             "subject": { "$ref": format!("gts://{SUBJECT}") },
+            marker: { "type": "string" },
+        },
+    })
+}
+
+fn middle_schema() -> Value {
+    json!({
+        "$id": format!("gts://{MIDDLE}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": { "subject": { "$ref": format!("gts://{SUBJECT}") } },
+    })
+}
+
+/// A referrer that reaches `SUBJECT` transitively through `MIDDLE`, leaving the
+/// revision-vector guard to detect its movement.
+fn chained_schema(marker: &str) -> Value {
+    json!({
+        "$id": format!("gts://{REFERRER}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "middle": { "$ref": format!("gts://{MIDDLE}") },
             marker: { "type": "string" },
         },
     })
@@ -512,8 +536,7 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
     let db = test_db().await;
     reset_metrics();
 
-    // A client refusal, with an identifier unique to this test so its warn line is filterable out
-    // of the shared log: the `warn` carries the error `Display`, which names it.
+    // Use a unique identifier so this refusal is filterable in the shared log.
     let client = gts_id!("cf.core.obsv.warnclient.v1~");
     let refused = submit(
         &db,
@@ -552,8 +575,7 @@ async fn an_infrastructure_failure_is_counted_but_not_warned_as_a_refusal() {
         "a client refusal is warned; captured:\n{}",
         captured_log()
     );
-    // The suppressed warn was the only place the dispatch error's `Display` would reach the log
-    // from `accept`, so its absence proves the suppression.
+    // Absence proves the dispatch error was not logged by `accept`.
     assert!(
         !captured_log().contains("observability-dispatch-outage"),
         "an infrastructure arm must not be logged as a refusal; captured:\n{}",
@@ -650,25 +672,21 @@ async fn a_revalidation_retry_is_counted_by_its_drift_shape() {
     let dir = TestDir::new("types-registry-obsv-retry");
     let db = test_db_file(&dir.path().join("registry.db")).await;
     admit(&db, "k-subject", SUBJECT, subject_schema("name"), None).await;
-    admit(
-        &db,
-        "k-referrer",
-        REFERRER,
-        referencing_schema("note"),
-        None,
-    )
-    .await;
+    admit(&db, "k-middle", MIDDLE, middle_schema(), None).await;
+    admit(&db, "k-referrer", REFERRER, chained_schema("note"), None).await;
 
     let operation_id = submit(
         &db,
         "k-referrer-2",
-        vec![candidate(REFERRER, referencing_schema("tag"), Some(1))],
+        vec![candidate(REFERRER, chained_schema("tag"), Some(1))],
     )
     .await
     .expect("acceptance");
     reset_metrics();
 
-    let (paused, reached, resume) = PausingStores::new(PausePoint::RevisionEntityRead);
+    // Held after evaluation and immediately before the commit's first statement — see
+    // `revalidation_test.rs`.
+    let (paused, reached, resume) = PausingStores::new(PausePoint::BeforeEntityWriteOrderClaim);
     let ports: Arc<dyn Stores> = paused;
     let provider = worker(&db);
     let pass = tokio::spawn(async move {
@@ -796,8 +814,7 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
     .expect("the worker must not fail on infrastructure");
     let first_pass_lines = lines_mentioning(&operation_id.to_string()).len();
 
-    // Discard the first pass's counts, so what the exporter holds below is the redelivered pass
-    // alone.
+    // Keep only the redelivered pass's counts.
     reset_metrics();
 
     run_operation(
@@ -816,8 +833,7 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
     .expect("the worker must not fail on infrastructure");
     flush();
 
-    // Lines are appended to a shared buffer and the filter is by needle, so the second pass's lines
-    // are exactly the ones past the first pass's count.
+    // Inspect only lines appended by the second pass.
     let all_lines = lines_mentioning(&operation_id.to_string());
     let redelivered_lines = &all_lines[first_pass_lines..];
     assert!(
@@ -834,9 +850,7 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
         redelivered_lines.join("\n")
     );
 
-    // And that pass is observationally a no-op beyond the duration it spent: no candidate is
-    // terminalized a second time, because the counter counts decisions and the redelivery reported
-    // one another pass decided.
+    // Redelivery records duration but does not terminalize the candidate again.
     assert_eq!(
         counter_sum_where("types_registry_candidates_total", &[]),
         0,

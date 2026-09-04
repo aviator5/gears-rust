@@ -87,14 +87,17 @@ nothing in this phase can regress another gear.
 `version_family`, `entity`, `type_schema_revision`, `instance_revision`, `type_schema`,
 `instance`, `dependency`, `operation`, `operation_item`. Tenant columns and their CHECK
 constraints are created exactly as specified and never populated with tenant scope, so P1
-tenancy needs no migration. `source_claim` and `routing_config` are not created.
+tenancy needs no migration. The database scope, stated once: `coordination_state` exists
+(the second migration), only `entity_write_order` is seeded and used in P0,
+`source_claim` is not created, the `routing` state row arrives with federation, and a
+standalone `routing_config` table is never created in any phase.
 
 **Acceptance criteria:**
 - [x] All 9 tables, their PKs, FKs, UNIQUE and CHECK constraints, and the 4 indexes from `database.sql` are created — `idx_tr_operation_status`, `idx_tr_entity_family`, `idx_tr_entity_visibility`, `idx_tr_dependency_to`. Conformance was **measured**, not argued: the Postgres list reproduced `database.sql`'s P0 constraint set 48 for 48 and all three dialects declared the same columns in the same order. That was a one-time measurement — the standing guard behind it was removed after Checkpoint 1
 - [x] Identifier columns are `varchar(1024)` with binary collation and ASCII charset where the backend default is multi-byte — `family_key`, `entity.gts_id`, `operation_item.gts_id`: `varchar(1024) COLLATE "C"` on Postgres, `VARCHAR(1024) CHARACTER SET ascii COLLATE ascii_bin` on `MySQL`, `TEXT COLLATE BINARY` on `SQLite` (its default, stated so a later `COLLATE NOCASE` cannot creep in)
 - [x] Enumerations stored as smallint with CHECKs enumerating allowed values. Two forms, both present and both tested: an explicit `IN` list for `kind`, `status`, `entity_kind` and `dependency.kind`; and the branch CHECK for `ownership_scope`, `plane` and `lifecycle_status`, where no branch matches a third value — `ck_tr_version_family_owner`, `ck_tr_entity_owner`, `ck_tr_operation_plane` and `ck_tr_entity_lifecycle` already close those domains, so adding an `IN` list would have been a constraint `database.sql` does not have
 - [x] `DatabaseCapability::migrations()` returns the Migrator; outbox tables come from `outbox_migrations_with_prefix("types_registry_outbox")`, not from this migration. Both halves are tested: one test asserts the initial migration alone creates **no** outbox table, another applies the gear capability's full set and asserts the 9 managed tables and the prefixed outbox tables all exist
-- [x] Raw SQL appears only here (`11_database_patterns.md` invariant) — the three statement lists plus the drop list live in `m20260817_000001_initial.rs`; no other file gained SQL
+- [x] Raw SQL appears only in migration infrastructure (`11_database_patterns.md` invariant) — the three statement lists plus the drop list live in `m20260817_000001_initial.rs`, and `m20260904_000002_coordination_state.rs` carries its own three lists plus drop list the same way; no gear code gained SQL
 
 **Verification:**
 - [x] Migration up and down on **SQLite** — `tests/migration_test.rs`, 41 tests, in-memory `SQLite` with `PRAGMA foreign_keys = ON`, including a full `up` → `down` → `up` roundtrip
@@ -137,7 +140,7 @@ tenancy needs no migration. `source_claim` and `routing_config` are not created.
 - [x] **Known open gap, by decision.** `every_core_entity_declares_exactly_the_columns_database_sql_defines` was written, mutation-checked by deleting `operation.request_fingerprint`, then removed after Checkpoint 1 along with the shared `database.sql` parser. The gap it closed is therefore open: the round-trip tests in `tests/entity_test.rs` prove the columns an entity *names* exist, and cannot notice one it **omits**, because `SeaORM` simply never selects it and the read succeeds. `every_core_entity_binds_to_its_table_in_the_migration` survives in `entity/columns_tests.rs` — it needs no DDL parser
 - [x] Added: `tests/entity_test.rs`, 7 tests writing and reading every core entity against the real migrated schema. The timestamp round-trip is the specific risk worth covering — `timestamptz` lowers to `TEXT` on `SQLite`, so an `OffsetDateTime` through `SeaORM` is a real conversion — and two tests write shapes `ck_tr_entity_lifecycle` and `ck_tr_operation_item_state` constrain, so a successful write is itself evidence the mapping agrees with the DDL
 
-**Three of the nine tables have no entity yet, deliberately.** `instance` and
+**Three of the tables have no entity yet, deliberately.** `instance` and
 `instance_revision` arrive with Registered Instances (T10), `dependency` with edge extraction
 (T13). An entity with no reader is code the compiler cannot check against the DDL, which is
 exactly the drift these mirrors exist to prevent.
@@ -282,7 +285,7 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 - [x] `tenant_ownable` is **parsed and validated but inert** (SPEC §10.3). `RegistrationPolicy::tenant_ownable` resolves it by the same rules as the vendor set and is asserted to return the configured value — which is what makes it inert rather than dropped — while `admits` refuses any candidate asking for tenant ownership whatever the entry says. §9 makes that request shape unreachable, so it is a fail-closed assertion, not a feature
 - [x] Per-parameter resolution implemented: longest literal prefix wins, an exact key beats any pattern, entries omitting a parameter are skipped, closed default otherwise. Specificity is `(is_exact, literal_prefix_len)` — the exact-beats-pattern rule is a separate tuple element rather than left to fall out of prefix lengths, because DESIGN states it separately
 - [x] Global `cf` vendor is implicitly admitted; nothing else is. Keyed on the **last** segment's vendor, so a `cf`-rooted identifier with an `acme` derivation is an `acme` candidate — tested, since reading the first segment would open the whole platform namespace to derivations
-- [x] `worker.family_lock_timeout` is positive, defaults to 5s and is enforced by the admission worker; unlike the future lease timeout it is not reported as inert
+- [x] ~~`worker.write_lock_timeout` is positive, defaults to 5s and is enforced by the admission worker~~ — **the key is gone.** It bounded the family advisory locks, which T15 retired; the `entity_write_order` claim's wait is the database's own (`lock_timeout`, `innodb_lock_wait_timeout`, `busy_timeout`) and a gear-side budget is not expressible — see SPEC §8.1 and the `TxConfig` ask in §4
 
 **Verification:**
 - [x] `cargo test -p cf-gears-types-registry` — 255 lib + 259 integration tests on SQLite; the operator-facing configuration boundary has 21 `config_test.rs` cases
@@ -709,7 +712,7 @@ flat is how the root reaches 25 files.
 | Concept | Directory at | Contents then |
 |---|---|---|
 | `family/` | **T10 + T12** | `key.rs` (today's `family_key`), `rules.rs` (kind at T10, shape and contiguity at T12), tests |
-| `dependency/` | **T13 + T14** | `extraction.rs` (three edge kinds), `worklist.rs` (reverse impact), tests |
+| `dependency/` | ~~T13 + T14~~ | **Not taken.** The traversal turned out to be SQL, so there was no second file to put beside `extraction.rs`: `domain/dependency.rs` stays one pure file and T14's admission step went to `domain/admission/refresh.rs`. See T14's *Not `TR/src/domain/dependency/`* |
 | `compat/` | **T17 + T18** | `baseline.rs` (selection + resolved comparison), `derivation.rs` (chain + major-0 quarantine), tests |
 
 Staying flat: `policy.rs`, `artifacts.rs`, `validator.rs`, `gts_store.rs`, `enums.rs`,
@@ -812,7 +815,7 @@ correction is the point: all three rules now read as one list, rather than one r
 - [x] A `DELETED` predecessor still counts; the predecessor test is re-asked inside the commit transaction. Both fall out of one primitive: `find_by_gts_id` returns tombstones and every rule runs inside `commit_creation`'s transaction, so there is no way for the two rules to disagree about what a tombstone means
 - [x] Family ownership is write-once; the entity's owner columns are a projection maintained under the lock. `NewEntity` now takes `family.ownership_scope` / `family.owner_tenant_id` instead of re-reading the request — a copy taken from the row it is verified against **cannot** disagree with it, which is stronger than verifying two independent readings. Write-once is structural: `create_or_get` has no update path, so this is the only writer of either column
 - [x] The predecessor is excluded from `dependency` and from the revision vector — a **negative** criterion, and the only discharge available now: T13 does not write edges yet and T15's vector does not exist. `a_predecessor_is_not_a_dependency_edge` asserts the table stays empty after `v1.0~` then `v1.1~`, so T13 inherits a failing test if it adds the edge
-- [x] Family locks use the configured 5s retry budget; timeout is a retryable `503` with `Retry-After`, and both successful commits and partial acquisition failures explicitly release every acquired guard
+- [x] ~~Family locks use the configured 5s retry budget; timeout is a retryable `503` with `Retry-After`~~ — **retired at T15 with the family locks.** `worker.write_lock_timeout` is gone, and so is the `503`: the write path serializes on the `entity_write_order` row, whose wait only the backend bounds (SPEC §8.1, and the `TxConfig` ask in §4)
 
 **Both rules are scoped to one MAJOR**, as the compatibility chain is, so a family may hold a
 major-only `v1~` beside a minor-bearing `v2.0~` (`database.sql`). Three of the twelve table rows
@@ -831,11 +834,11 @@ own family and that an Instance probes Instance spellings.
 - [x] Table-driven test over shape and contiguity combinations — twelve rows, each its own database, `shape_and_contiguity_over_the_combinations`. Genuine RED→GREEN
 - [x] Test: family key derivation maps `v1~`, `v1.4~`, `v2~` to one row, and a preceding-segment minor survives verbatim — the pure half in `key_tests.rs` (unchanged from T8), the *one row* half in `one_family_row_holds_every_version_and_owns_its_members`, which also pins the owner projection
 - [x] ~~Test: concurrent first registration under two owners yields one winner~~ — **already covered, and deliberately not duplicated on `SQLite`.** `repo_backends_test.rs::family_race_yields_one_row` (eight concurrent callers, exactly one `created`) and `family_race_inside_a_transaction_yields_one_row` (the loser keeps reading in the same transaction) are T4's, on both container backends. A `SQLite` version cannot exist: a second concurrent writer fails the whole transaction with `database is locked` rather than losing a unique-key race — measured, not assumed. `family_test.rs` carries a named placeholder test pointing at the two that do cover it. *"Two owners"* is P1 language; P0 fixes every row to `ownership_scope = 1` (ceiling C6)
-- [x] Tests: a creation holds the family lock across its transaction; configured contention returns `FamilyLockUnavailable`, then the same operation succeeds after the blocker releases. Lock tests use unique file-backed SQLite DSNs so their toolkit lock namespaces cannot collide under parallel test execution
+- [x] ~~Tests: a creation holds the family lock across its transaction; configured contention returns a refusal~~ — **retired at T15 with the family locks themselves.** The `entity_write_order` claim makes the whole commit transaction exclusive, so the family rules those locks serialized are already serialized; keeping them also inverted the lock order against ADR-0013's purge protocol
 
-**Family-lock gap closed.** `worker::lock_families` takes toolkit advisory locks in canonical
+**Family-lock gap closed, and later retired.** T12's `worker::lock_families` took toolkit advisory locks in canonical
 `family::lock_order` before opening the commit transaction and holds them through every family
-rule and entity insert. Acquisition uses the enforced `worker.family_lock_timeout`; contention
+rule and entity insert. Acquisition used the then-enforced `worker.write_lock_timeout`; contention
 returns retryable `503 Service Unavailable` with `Retry-After`, while any guards accumulated
 before either timeout or a fatal acquisition error are explicitly released through the same
 helper as the successful commit path. `SQLite` keeps its toolkit-defined DSN-keyed lock scope, so
@@ -983,7 +986,7 @@ express. SPEC §D5 records the split.
 - [x] Every affected dependent's artifacts become current in the same transaction as the new revision — the refresh takes the caller's `&DbTx`, and `commit_revision` calls it after `replace_edges`, so a dependent sees this revision's reference set
 - [x] Exceeding `limits.activation_write_set` fails the candidate with a structured reason (`activation_write_set_exceeded`) and commits nothing partial
 - [x] `ponytail:` comment names the measured max fan-out (27), the bound (512) and the staging upgrade path — on `DependencyRepo::reverse_impact`
-- [x] The traversal terminates on a row that contradicts acyclicity. **The criterion was "terminates on a cyclic graph", and the graph cannot be cyclic** — no edge kind can close a cycle (ADR-0012, rewritten here with PRD/DESIGN/`database.sql`): a circular `$ref` has no resolved form and gts-rust refuses it with `Circular $ref detected`, derivation strictly shortens the `~`-chain, and nothing references an Instance. The termination property is kept as defence in depth, since a contradicting row would otherwise hang a commit transaction, and the invariant itself is now pinned where it is enforced
+- [x] The traversal terminates on a row that contradicts acyclicity. **The criterion was "terminates on a cyclic graph", and an admitted graph cannot be cyclic** — admission is what keeps it acyclic (ADR-0012, rewritten here with PRD/DESIGN/`database.sql`): derivation strictly shortens the `~`-chain and nothing references an Instance, so those two cannot close a cycle at all, while `$ref` can — alone, or combined with derivation, where a base `$ref`s a schema derived from it. gts-rust refuses the first with `Circular $ref detected`, and T19 refuses both over the combined edge set. The termination property is kept as defence in depth, since a contradicting row would otherwise hang a commit transaction, and the invariant itself is now pinned where it is enforced
 
 **What made a depth-capped CTE safe.** `recursive_cte` requires a `max_depth` and truncates
 **silently** past it — a dependent left out keeps stale artifacts marked current, the one
@@ -1085,18 +1088,39 @@ serializes the rows instead was already there: the candidate's own row by the
 compare-and-swap that writes it, and a dependency by the write-write conflict its own
 refresh creates on the candidate's `type_schema` row precisely when the move affects it —
 and where it does not, the fingerprint-stability stop is the proof the staleness is inert.
-The missing `FOR UPDATE` is corroboration, not the reason. The family lock is unchanged —
-still taken for a **new member** only, since a revision asks none of the family rules (T12).
+That conflict *orders* the two writes and nothing more: a refresh computes its artifacts
+before it writes, so the resumed `UPDATE` re-evaluates its predicate, not its payload. The
+refresh's write therefore carries the revision and fingerprint its own read saw, and the
+loser rolls back rather than overwriting the winner. **Found in review after this task**, and
+corrected here rather than left as a claim the code did not make good on. The missing
+`FOR UPDATE` is corroboration, not the reason.
 
-**One per-entity lock does survive the argument, and it is T20's.** DESIGN §4 rested
-deletion's *"no new dependant between the check and the tombstone"* on admission locking
-every dependency target. It does not, and the optimistic mechanism does not reach that case:
-adding an edge moves no `resource_version` and writes only `dependency`, while deletion
-writes the target's `entity` row, so in the order where the edge commits second nothing
-serializes them. The requirement is one lock per **edge target**, taken by both paths after
-their family locks. Recorded on T20 and in SPEC §13; P0 has no deletion path, so nothing is
-exposed meanwhile. **Found by review of this task, not by a test** — which is the honest
-provenance.
+**One lock does survive the argument, and it orders commits.** The optimistic mechanism
+reaches everything that meets on a row. It does not reach an edge committed *after* a mover's
+reverse scan: adding an edge moves no `resource_version` and writes only `dependency`, so the
+two commits write no row in common, both pass their own guards, and the dependant keeps an
+artifact inlined from a revision that is no longer current with a fingerprint that matches it
+— no drift to report and nothing later to repair it. The requirement is a **serialized write path**:
+every commit claims the `entity_write_order` row of `types_registry__coordination_state` as its
+transaction's first statement.
+Either the edge is in `dependency` when the mover's scan runs after that claim, or the unit
+writing it has committed nothing and its own guard sees the mover's revision when it does —
+two cases, no third. A row rather than an advisory lock, because advisory keys live on a
+session separate from the transaction's connection: losing it releases the key while the
+transaction carries on, and the exclusion lapses silently.
+
+Consequences for this task: the family lock is no longer taken for a new member only, since
+the family advisory locks are gone entirely — the claim makes the transaction exclusive, so
+the rules they serialized already are, and keeping them inverted the lock order against
+ADR-0013's purge protocol. The vector guard stays load-bearing
+for the window the lock does not cover — evaluation runs outside it, so a commit landing
+between evaluation and lock acquisition is exactly what
+`a_dependency_mutated_between_evaluation_and_commit_costs_one_rollback_and_one_retry` holds a
+pass at its evaluation closure read to produce. Every other writer of entity state must take
+the lock too, or the order is not total: deletion at T20, the purge job under ADR-0013.
+**Found by review, not by a test** — which is the honest provenance;
+`a_new_dependant_cannot_commit_while_its_dependency_is_being_revised` is the test it should
+have had.
 
 **The `unchanged` branch is not guarded, and that is the decision, not an oversight.** It
 writes no revision, moves no version and refreshes no dependent, and the one thing it
@@ -1126,22 +1150,41 @@ T14's refusal stays as the backstop for a set that grew in between.
   `VectorDrift::{Appeared, Vanished, Moved, Refreshed}`, travelling as
   `WorkerError::RevalidationRequired`, which is what rolls it back. `Refreshed` is the
   fourth shape and not a redundant one: a refreshed dependent moves no version
+- [x] Every artifact write carries a compare-and-swap on `(revision_no,
+  resolution_fingerprint)` — `CurrentSchemaCas` — and a miss is
+  `VectorDrift::CurrentProjectionMoved`. The two paths differ in what the token is: for the
+  **refresh** it is the state its artifacts were computed against, carried out of the read
+  that selected the document (`CurrentDocument::projection`); for the **candidate's own
+  revision** the artifacts predate any transaction, so its token is read inside the commit and
+  is a post-guard sentinel — guard establishes the evaluation still holds, sentinel establishes
+  nothing wrote the row since. It is needed because the entity compare-and-swap does not cover
+  that row.
+  **Found in review, not by a test**: the row lock orders two writes and recomputes neither,
+  so the unconditional write let the loser put artifacts from before the winner over it,
+  paired with a `revision_no` read afterwards.
+  `a_refresh_write_is_a_compare_and_swap_on_the_fingerprint_it_read` pins the predicate.
+  **Two interleavings are owed on the container backends** and neither can run on `SQLite`:
+  a dependent revising itself under a refresh, and a candidate refreshed by the edge it
+  drops. Both were written and both passed unfixed — `SQLite` either refuses the concurrent
+  writer with `database is locked` or forces a transaction retry that re-reads the token, so
+  the stale-token window never opens. `PausingStores::new_at_occurrence` was added for them
+  and is what the container versions need
 - [x] Retries are bounded by `worker.max_revalidation_attempts`; exhaustion terminalizes
   the item as `failed` — reason `revalidation_exhausted`, message naming the last drift.
   The key moved off `inert_limit_keys` and gained a zero-refusal in `validate()`, as
   `activation_write_set` did at T14
-- [x] Lock order is family → entity/current rows, in canonical identifier order, everywhere.
-  **The family half holds; the row half is retired as mistaken rather than deferred** — a
-  lock over the revision vector cannot do the guard's job and costs a round trip per member
-  inside the commit transaction (`plan.md` P15, SPEC §8.1 step 4.2, DESIGN §4 corrected).
-  Canonical order is kept where it is observable and where locks are actually many:
-  `lock_order` sorts and dedups family keys, and the vector is `(gts_id, role)`-sorted on
+- [x] ~~Lock order is family → entity/current rows, in canonical identifier order,
+  everywhere.~~ **Both halves are retired, for different reasons.** The row half was mistaken:
+  a lock over the revision vector cannot do the guard's job and costs a round trip per member
+  inside the commit transaction (`plan.md` P15, SPEC §8.1 step 4.2). The family half became
+  redundant and then harmful — see the lock paragraph above. What replaced both: the
+  `entity_write_order` claim orders commits, and no family lock is taken on either commit
+  path — the claim makes the whole transaction exclusive, so the family rules are already
+  serialized. Canonical order is kept where it is observable and where locks are actually many:
+  the currently uncalled `lock_order` helper sorts and dedups family keys for the next writer,
+  and the vector is `(gts_id, role)`-sorted on
   both sides, which is what makes the comparison one merge walk and the reported drift
-  deterministic. The one per-entity lock the argument leaves standing is deletion's, and it
-  is T20's
-  Canonical order is kept where it is observable: `lock_order` sorts and dedups family
-  keys, and the vector is `(gts_id, role)`-sorted on both sides, which is what makes the
-  comparison one merge walk and the reported drift deterministic
+  deterministic
 
 **Verification:**
 - [x] Gear tests, all three backends — `cargo nextest run -p cf-gears-types-registry`:
@@ -1216,8 +1259,10 @@ matter.
   `types_registry_revalidations_total{drift}`, `types_registry_activation_write_set` and
   `types_registry_operation_duration_seconds`. **Every label value comes from a closed
   vocabulary** and no identifier is ever a label: the `drift` label is the *shape* of the
-  drift (`appeared` / `vanished` / `moved` / `refreshed`), not the `gts_id` that drifted,
-  because that one is unbounded and belongs on a span
+  drift (`appeared` / `vanished` / `moved` / `refreshed` / `current_projection_moved` — the
+  last one added with the refresh compare-and-swap, and the only shape raised by a write
+  rather than by the vector guard), not the `gts_id` that drifted, because that one is
+  unbounded and belongs on a span
 - [x] Every refusal reason in the acceptance path is countable and distinguishable —
   `AcceptanceError::reason()`, one arm per variant over an exhaustive match, so a refusal
   a later task adds cannot compile until it has a reason — demonstrated by the rebase onto
@@ -1336,12 +1381,64 @@ reads as scope rather than as silence.
 ---
 
 ### Checkpoint 3
-- [ ] Dependent refresh is atomic with the new revision; identical recomputation is a no-op
-- [ ] Activation bound refuses rather than partially commits
-- [ ] Multi-pod read-after-commit holds
+- [x] Dependent refresh is atomic with the new revision; identical recomputation is a no-op —
+  `refresh_test.rs::revising_a_base_refreshes_every_dependent_schema` and
+  `a_dependent_whose_artifacts_are_identical_is_not_rewritten`
+- [x] Activation bound refuses rather than partially commits —
+  `refresh_test.rs::an_over_bound_write_set_commits_nothing`, with the earlier evaluation-side
+  refusal from T15 in front of it
+- [x] Multi-pod read-after-commit holds —
+  `revalidation_test.rs::a_commit_on_one_pod_is_visible_to_the_others_first_read`, two
+  `DBProvider`s with their own pools over one database file
 - [x] Admission emits spans and metrics — T16, verified at runtime as well as in tests
-- [ ] `make dylint` — full workspace, once for the phase (P13)
-- [ ] Human review
+- [x] `make dylint` — full workspace, once for the phase (P13). Exit 0. Two DE1201 warnings stand,
+  both on crates this branch does not touch (`cf-gears-simple-user-settings`,
+  `cf-gears-file-storage`): `git log main..HEAD` over their directories is empty, so they are
+  pre-existing and not this phase's to clear
+- [x] Gear tests at the checkpoint: **617 passed** on SQLite; **6 passed** on the PostgreSQL and
+  MySQL container suites, `revision_race_backends_test` included
+- [x] **`make test-types-registry-db` did not run `revision_race_backends_test`, and now does.**
+  The suite that proves the `entity_write_order` claim on a backend with real row locking was
+  reachable only by hand, so `make ci` never ran it — the container test the last commit added to
+  close a P0 blocker was outside the gate meant to protect it. One line in the `Makefile` target
+- [ ] Human review — the four items checked below, one decision open
+
+**Handoff review (commit `319eb16a5`), item by item.**
+
+1. **The migration and its upgrade test — sound.** `Migrator::up(&db, Some(1))` applies exactly
+   one pending migration, so on a fresh database it stops where a deployment that only ran the
+   initial migration stops; the test then asserts the table is *absent* before applying the rest,
+   which is what makes it an upgrade test rather than a fresh-install one. Nothing else assumes
+   the table exists at initial-migration time: `m20260817_000001_initial_tests`'s `P0_TABLES` and
+   constraint counts exclude it, and `claim_entity_write_order` fails closed with a message naming
+   the migration when the row is missing (`claiming_a_missing_entity_write_order_row_fails_closed`).
+   **One gap worth naming:** `the_coordination_state_migration_absorbs_a_table_that_already_exists`
+   pins that a pre-created table is left alone — which means such a table keeps whatever shape it
+   was created with and never gains `ck_tr_coordination_state_seq`. Correct for the seed, silently
+   weaker for the constraint. No path in this repository pre-creates it, so this is a note, not a
+   defect.
+2. **The claim really is unpreceded, in the code and in the normative text.** `commit_creation`
+   (`unit.rs:375`) and `commit_revision` (`unit.rs:745`) both open with
+   `claim_entity_write_order`, and the transaction closure in `worker.rs` calls one or the other
+   as its only statement — there is no read between `transaction_with_retry` and the claim on
+   either branch. SPEC §8.1 step 4.1 says *"nothing may precede it, reads included"* and gives the
+   reason; the deletion protocol (§8.1, before Dry Run) repeats it as *"not optional and not
+   merely early"*. Both read as instructions T20 and the ADR-0013 purge can follow literally.
+   The mechanism is right too: an `UPDATE … SET state_seq = state_seq + 1` holds an exclusive row
+   lock to commit, and `#[secure(unrestricted)]` matches every other P0 table.
+3. **`ClaimSignallingStores` — the duplication is real and should become a macro, but not here.**
+   `tests/common/mod.rs` is 1552 lines, of which roughly 1150 are three decorator stacks —
+   `PausingStores`, `ClaimSignallingStores`, `CasMissStores` — each forwarding the same seven port
+   traits and each differing in one or two methods. Rust has no trait delegation, so the shape
+   that removes it is a declarative `forward_stores!` macro generating the pass-through, with the
+   wrapper writing only what it intercepts. T19 and T20 each add interleavings and will each want
+   a fourth and fifth wrapper, so the cost compounds. **Decision open:** do it now as a test-only
+   refactor, or take the fourth wrapper first and let the macro's shape be argued by three
+   examples rather than two.
+4. **No stale text survives.** No "wait budget" wording anywhere in the gear. Every remaining
+   mention of redelivery either carries the "until T21 … after it" caveat (SPEC lines 528, 594;
+   `errors.rs`'s `ConformingTypeAbsent`) or describes ADR-0012's target design, which is where it
+   belongs.
 
 ---
 
@@ -1462,17 +1559,28 @@ reasoning about it.
 
 ### - [ ] T19: Dependency-aware partial admission
 
-**Description:** Batch admission: build the candidate graph from authored references between
-candidates plus the implicit `vM.(n-1)~ → vM.n~` edge, process it in topological order with
-one candidate per unit, and record an outcome for every candidate. The relation is acyclic by
-construction (ADR-0012), so there is no condensation step and no atomic group. The ordering
-stays a pure function over a candidate set.
+**Description:** Batch admission over two edge sets, which are not the same set. The
+**ordering** graph is authored `$ref`s between candidates, each candidate's
+identifier-derived immediate derivation base, its Instance conformance target, and the
+implicit `vM.(n-1)~ → vM.n~` edge; the topological sort runs over all of it, because an
+Instance must not commit ahead of a Type Schema that may then be refused. The
+**cycle-bearing** graph is `$ref` and derivation only — the two an effective form inlines,
+so the two a cycle can be built from, and a `$ref`-only check would order a mixed cycle and
+admit it. Process in topological order with one candidate per unit, and record an outcome for
+every candidate. What ADR-0012 makes acyclic
+is the *admitted* relation, not this graph: the overlay makes in-batch candidates visible to
+each other, so a batch can author a cycle that nothing has refused yet. The ordering function
+therefore detects one and fails its members with `invalid_schema` rather than assuming a
+topological order exists. What follows from acyclicity is only what happens after that refusal:
+no condensation step and no atomic group. The ordering stays a pure function over a candidate
+set.
 
 **Acceptance criteria:**
 - [ ] Independent passing branches commit despite failures elsewhere
 - [ ] In-batch references resolve against the candidate overlay, never a previously committed revision
 - [ ] A failed selected dependency yields `blocked_by_dependency`; a failed lower minor yields `blocked_by_predecessor`
 - [ ] A circular `$ref` between two candidates in one batch is refused as `invalid_schema` — the overlay makes both visible to each other, so this is where the acyclicity invariant is actually tested
+- [ ] A cycle mixing `$ref` with derivation — a base candidate `$ref`ing a schema derived from it — is refused the same way: the ordering runs over the combined edge set, not over `$ref` alone
 - [ ] The implicit predecessor edge is not written to `dependency`
 - [ ] The ordering is exposed as a pure function over a candidate set, usable without a database — required for unit testing without a fixture DB
 
@@ -1496,19 +1604,21 @@ stays a pure function over a candidate set.
 
 ### - [ ] T20: Deletion and Dry Run
 
-**Inherited from T15 — read before designing the deletion protocol.** DESIGN §4 used to
-rest deletion's *"a new dependant cannot appear between the deletion check and the lifecycle
-transition"* on admission locking every dependency target entity. **Admission does not lock
-them**, and T15 established that locking the revision vector is the wrong tool (`plan.md`
-P15). The optimistic guard does not cover this case either: adding an edge moves no
-`resource_version` and writes only `dependency`, while deletion writes the target's `entity`
-row — two different rows, so in the order where the edge commits second nothing serializes
-them, and the *"no direct registered dependants"* recheck is a check-then-act on a predicate
-no compare-and-swap carries. The requirement is **one advisory lock per edge target**, taken
-by admission before `replace_edges` and by deletion before its check, both after their
-family locks and in canonical identifier order. DESIGN §4 and SPEC §8.1 step 4.2 now state
-it as deletion's requirement; SPEC §13 carries the test. Nothing is exposed until this task,
-because P0 has no deletion path.
+**Inherited from T15 — this is a correctness obligation, not a nicety.** Deletion's *"a new
+dependant cannot appear between the deletion check and the lifecycle transition"* rests on the
+**`entity_write_order` claim**, not on the optimistic guard: adding an edge moves no `resource_version`
+and writes only `dependency`, while deletion writes the target's `entity` row — two different
+rows, so nothing serializes them, and the *"no direct registered dependants"* recheck is a
+check-then-act on a predicate no compare-and-swap carries.
+
+**Deletion must claim the `entity_write_order` row** as its transaction's first statement, exactly as
+admission does, or the order that claim provides stops being total and admission's guarantee
+degrades with it. `EntityWriteOrderStore::claim_entity_write_order` is the call;
+`EntityWriteOrderStore::claim_entity_write_order` is the whole of it — there is no family half any
+more, and T15 retired the advisory locks it would have been.
+Locking the revision vector is the wrong tool for a different problem (`plan.md` P15) and is
+not what this is. DESIGN §3.7 and SPEC §8.1 step 4.2 state the rule; SPEC §13 carries the
+test.
 
 **`EntityRepo::mark_deleted` already exists**, written and unit-tested at T4 with no caller; this is the task that gives it one.
 
@@ -1518,6 +1628,7 @@ and entity locks, recheck `ACTIVE` with no direct registered dependents, lifecyc
 deletion, running every check in a rollback-only transaction.
 
 **Acceptance criteria:**
+- [ ] Deletion claims the `entity_write_order` row as its transaction's first statement — without it the commit order admission's correctness rests on is no longer total, and `a_creation_claims_the_entity_write_order_row_exactly_once` (with its revision / `unchanged` siblings) is the shape of the test that catches an omission
 - [ ] Deletion with a live direct registered dependent is refused, reporting a count without identities
 - [ ] A transitive-only dependent does not block
 - [ ] A schema whose `x-gts-ref` names the target does **not** block: the keyword creates no edge, so there is no registered dependent to find
@@ -1803,6 +1914,11 @@ remains the deployment-time escape hatch for identities that no gear can own.
       `POST /v1/entities` (`types_registry.register`), `GET /v1/entities/{gts_id}`
       (`types_registry.get`) and the in-memory `GET /v1/entities` list. A route left pointing at a
       deleted repository is the failure mode; T24a then promotes v2 onto those paths
+- [ ] `TypesRegistryClient` survives this task over the database, not over the repository it
+      deletes: its `register` becomes a submit-then-poll shim for the T24–T26 window, so the
+      ~13 `register(...)` sites and every read site keep working while T25/T26 migrate them
+      (`plan.md` P17). The shim is one store and one write path — not a dual path — and T26
+      deletes it with the trait
 - [ ] Ready mode and the in-memory repository are gone; `ready_mode_tests.rs` deleted. The old model-typed cache goes with the old models, and the four `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys become accepted-and-ignored with a warning naming their T30 replacements
 - [ ] `owning_gear` comes from T22's inventory field, not a constant — ceiling C3 is struck from SPEC §9 in this task
 - [ ] No entity-derived state survives `init()` — no `ArcSwap`, no entity map, no `GtsOps` field on the gear or the service. Grep-checkable, and the ceilings C1/C4 struck by D2 depend on it
@@ -1841,7 +1957,8 @@ onto the `/types-registry/v1/` paths, so P0 ends on **one** version rather than 
 (`:batchGet`, `:batchDelete`, `DELETE /entities/{entity_key}`, the paged content-free
 `GET /entities`) back in **Phase 5**, on v2 — so this task promotes all seven routes at once and
 nothing is authored on paths that change under it. The Phase 7 order is therefore
-**T24 → T24a → T28**, with T25/T26 floating (they depend on T24 alone); P12's earlier
+**T24 → T24a → T28**, with T25 then T26 alongside it: T25 needs T24, T26 needs T25 — it
+deletes the shared trait, so it cannot run beside it. P12's earlier
 T24 → T27 → T24a → T28 constraint is gone with the move.
 
 **The e2e window is a consequence of this ordering, not of a defect.** `make e2e-local` goes red
@@ -1854,7 +1971,7 @@ T27 preserved by not touching an e2e file.
 - [ ] No `/v2/` path remains in the crate, in OpenAPI or in `QUICKSTART.md`
 - [ ] The promotion changes paths only: registration and deletion routes remain internal-only
       (`exposed = false`) until C8's platform listener and authorization gate exist
-- [ ] `operation_id`s are unchanged by the move — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T27's additions keep their names, so the promotion is a path change and nothing else. A client that already followed v2 sees only the prefix move
+- [ ] `operation_id`s are unchanged by the move — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T27's additions keep their names, so the promotion is a path change and nothing else. It is still a *breaking* path change for anything on `/v2/`: every such route is removed here, so a caller must move its base path. What the unchanged `operation_id`s buy is that nothing but the path moves — bodies, statuses and semantics are the ones it already had, and the interim surface was never exposed beyond the platform listener
 - [ ] All **seven** routes promote together, because all seven exist by Phase 5 (P17)
 - [ ] Old v1 handlers, DTOs and routes are **deleted**, not repointed — verified by T24's own criterion that the in-memory repository is gone; `grep -r 'types_registry\.register\|RegisterEntitiesRequest'` finds nothing outside history
 - [ ] Every surviving v1 route reads the database; none reads process memory

@@ -145,11 +145,18 @@ Purge requires the entity to be `DELETED`, and re-evaluates the deletion precond
 
 **A minor may be purged only from the top of its major.** Where ADR-0004's minors are in use, the minors of one major that a purge releases **MUST** form a suffix of that major's admitted sequence: releasing `v1.1~` while `v1.2~` is still admitted is refused, with the higher minors listed, exactly as an exact identifier still pinned by an Instance is refused with those Instances listed below.
 
-**Purge and admission serialize on the same row; the protocol is part of this decision.**
+**Purge and admission serialize on the same locks; the protocol is part of this decision.**
 
-* Before evaluating eligibility, purge **MUST** acquire every `version_family` row touched by its pattern and hold those rows through commit.
+* Purge **MUST** advance the `entity_write_order` row of `types_registry__coordination_state`
+  as the **first statement** of its
+  transaction, exactly as admission does. It is a writer of entity state, and the order that
+  claim provides is total only if every such writer makes it — a purge that commits without it
+  silently degrades admission's own guarantee. Claiming it after any read is no better than not
+  claiming it: the reads it was meant to order would stay outside the serialized region.
+* Only then, and before evaluating eligibility, purge **MUST** acquire every `version_family` row touched by its pattern and hold those rows through commit.
 * Multi-family purge **MUST** acquire them in deterministic order.
-* Admission **MUST** use the same order because an atomic cyclic unit may span families.
+* Any other writer that needs family locks **MUST** use the same order, because an atomic cyclic unit may span families. P0's admission needs none: the `entity_write_order` claim makes the whole commit transaction exclusive, so the family rules it would have serialized already are (SPEC §8.1).
+* The full order for every writer is therefore **the `entity_write_order` claim, first statement, before any read → families in canonical order → entity rows → routing** (the `routing` row of the same `coordination_state` table, once federation lands).
 
 One shared order makes the pair deadlock-free, not merely each operation internally consistent.
 
@@ -200,7 +207,7 @@ This dry run belongs to the purge job, not ADR-0012's general write path. It kee
 
 It needs no request-identity rule because purge stores no replayable request. It also guarantees nothing about a later invocation; eligibility may change in between.
 
-Purging a Registry Source Plugin removes its Source Claims with it. No extra ordering is needed: deleting the plugin Instance — a precondition of purging it — already retired those claims and released the foreign key by which they pinned its revisions. The job deletes the claim rows and bumps the routing generation in the same transaction, so cached routing and live federated cursors observe the change.
+Purging a Registry Source Plugin removes its Source Claims with it. No extra precondition is needed: deleting the plugin Instance — a precondition of purging it — already retired those claims by stamping `retired_at`, the only column deletion touches. Retirement releases nothing on its own: the retired claim row keeps referencing the plugin revision it was projected from, and it is purge itself that removes the claim row before the revision row it references, so `ON DELETE RESTRICT` never fires and no column has to be nulled in advance. The transaction sequence is fixed and total: the `entity_write_order` claim first, the family locks, the claim-row deletions, the removal of the matched Instances and Type Schemas with their revisions, and only then — after every claim and entity mutation is done — the routing generation advance as the transaction's final mutation. It is a generation change, not a second correctness lock, since the job already holds `entity_write_order`; cached routing and live federated cursors observe the whole purge in one generation step.
 
 Purge never runs on a schedule, on a timer, or as a consequence of any retention rule. Every execution is an explicit act with an operator behind it.
 

@@ -1,42 +1,17 @@
-//! The revision vector: what evaluation's verdict rests on, and the commit-time guard that refuses
-//! to write when any of it has moved (SPEC §8.1 steps 3 and 4.3 — D4).
+//! Revision-vector derivation and commit-time drift detection (SPEC §8.1, D4).
 
 use std::collections::HashMap;
 
 use toolkit_db::DbTx;
 use toolkit_db::secure::AccessScope;
-use toolkit_macros::domain_model;
 
 use super::errors::{ItemFailure, WorkerError};
 use crate::domain::enums::{EntityKind, LifecycleStatus};
 use crate::domain::ports::{EntityRow, ReverseImpact, Stores};
 
-/// Which side of the candidate an entry stands on.
-#[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum VectorRole {
-    /// Evaluation consumed this entity's authored document while building the transient store.
-    Dependency,
-    /// This entity depends on the candidate, so the commit's refresh consumes its effective
-    /// artifacts.
-    Dependent,
-}
+use toolkit_macros::domain_model;
 
-impl VectorRole {
-    /// The word a drift message uses.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Dependency => "dependency",
-            Self::Dependent => "dependent",
-        }
-    }
-}
-
-impl std::fmt::Display for VectorRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+pub use super::drift::{VectorDrift, VectorRole};
 
 /// One entity as of the read that recorded it.
 #[domain_model]
@@ -53,62 +28,14 @@ pub struct VectorEntry {
 #[domain_model]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RevisionVector {
-    /// The closure roots — the candidate identifier plus its document's reference targets — carried
-    /// so the commit asks the same question evaluation did.
+    /// Candidate and reference roots used during evaluation.
     pub roots: Vec<String>,
     /// One entry per dependency and dependent, `(gts_id, role)`-sorted.
     entries: Vec<VectorEntry>,
 }
 
-/// The first difference between a recorded vector and a freshly-derived one.
-#[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum VectorDrift {
-    /// Not there when evaluation looked.
-    Appeared { gts_id: String, role: VectorRole },
-    /// There when evaluation looked, gone now.
-    Vanished { gts_id: String, role: VectorRole },
-    /// A new revision landed: `resource_version` moved.
-    Moved {
-        gts_id: String,
-        role: VectorRole,
-        recorded: i64,
-        found: i64,
-    },
-    /// Someone else's commit re-materialized this dependent's artifacts.
-    Refreshed { gts_id: String },
-}
-
-impl std::fmt::Display for VectorDrift {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Appeared { gts_id, role } => {
-                write!(f, "{role} '{gts_id}' appeared after evaluation")
-            }
-            Self::Vanished { gts_id, role } => {
-                write!(f, "{role} '{gts_id}' disappeared after evaluation")
-            }
-            Self::Moved {
-                gts_id,
-                role,
-                recorded,
-                found,
-            } => write!(
-                f,
-                "{role} '{gts_id}' moved from resource_version {recorded} to {found} after \
-                 evaluation"
-            ),
-            Self::Refreshed { gts_id } => write!(
-                f,
-                "dependent '{gts_id}' had its effective artifacts refreshed after evaluation"
-            ),
-        }
-    }
-}
-
 impl RevisionVector {
-    /// The only constructor: takes the entries in whatever order they were collected and sorts them
-    /// into the canonical `(gts_id, role)` order the comparison below is a merge walk over.
+    /// Sort collected entries into canonical `(gts_id, role)` order.
     #[must_use]
     pub fn new(roots: Vec<String>, mut entries: Vec<VectorEntry>) -> Self {
         entries.sort_by(|a, b| key(a).cmp(&key(b)));
@@ -192,8 +119,7 @@ fn moved(recorded: &VectorEntry, found: &VectorEntry) -> Option<VectorDrift> {
     None
 }
 
-/// Derive the vector for one candidate: its dependency closure and its reverse-impact set, as the
-/// database holds them right now.
+/// Derive a candidate's dependency and reverse-impact vector.
 pub async fn derive(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
@@ -241,8 +167,7 @@ pub async fn derive_from(
         });
     }
 
-    // Empty for a creation, which has no row for anything to depend on: a `$ref` to an absent
-    // target has no resolved form, so nothing can already point here.
+    // A creation has no row that existing entities can depend on.
     let dependent_roots: Vec<i64> = candidate_id.into_iter().collect();
     let dependents = match stores
         .reverse_impact(tx, scope, &dependent_roots, write_set_bound)
@@ -253,15 +178,16 @@ pub async fn derive_from(
             return Ok(Err(ItemFailure::new(
                 "activation_write_set_exceeded",
                 format!(
-                    "this revision would refresh at least {at_least} dependents, over the \
-                     configured activation write set bound of {bound}; nothing was committed"
+                    "this revision reaches at least {at_least} dependents, over the \
+                     configured activation write set bound of {bound}; the bound is on the \
+                     set a revision reaches, of which what it rewrites is a subset; nothing \
+                     was committed"
                 ),
             )));
         }
     };
 
-    // One batched read for every dependent that carries artifacts, rather than one per row: at
-    // recheck time this runs inside the commit transaction.
+    // Batch artifact reads inside the commit transaction.
     let artifact_bearing: Vec<i64> = dependents
         .iter()
         .filter(|row| {
@@ -282,8 +208,7 @@ pub async fn derive_from(
             gts_id: row.gts_id.clone(),
             role: VectorRole::Dependent,
             resource_version: row.resource_version,
-            // Absent for an Instance or a tombstone, which the refresh skips, and absent for a Type
-            // Schema whose current row has gone missing — a corruption the refresh reports by name.
+            // Instances and tombstones have no refreshable artifacts.
             resolution_fingerprint: fingerprints.remove(&row.id),
         });
     }
@@ -291,8 +216,7 @@ pub async fn derive_from(
     Ok(Ok(RevisionVector::new(roots.to_vec(), entries)))
 }
 
-/// Step 4.3: re-derive the vector inside the commit transaction, compare, and refuse to continue
-/// when anything has moved.
+/// Step 4.3: re-derive the vector and refuse any drift.
 pub async fn guard(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
