@@ -111,7 +111,7 @@ There is therefore no **registered or platform-observable** external dependent f
 
 **Managed to external** fails on each of the platform's four guarantees independently, and this half of the decision is unchanged:
 
-The four guarantees below concern resolution-bearing dependencies. An entity-naming `x-gts-ref` engages none of them: it is refused by the identifier-space disjointness rule itself. That is why admission checks its classified identifier against Source Claims without resolving the target, recording an edge, or adding it to a revision vector.
+The four guarantees below concern resolution-bearing dependencies. `x-gts-ref` creates none, but the disjointness rule still covers its authority identifier: Managed admission checks current Source Claims, and claim activation reclassifies current Managed Type Schema content. Neither path stores a dependency.
 
 * **Compatibility.** ADR-0004 makes a managed `$ref` float to the current revision, and ADR-0005 requires the affected dependency closure to be revalidated before a referenced revision becomes current. A source publishes a new revision without telling the platform, so the revalidation that makes floating references safe never runs. ADR-0003 already concluded that a managed schema referencing an external one inherits the weakest guarantee in its closure; with no per-revision monotonicity assertion, that is no guarantee.
 * **Deletion safety.** A source may delete its entity unilaterally. The managed entity that references it breaks with no registry event and no opportunity to block.
@@ -174,7 +174,7 @@ The cost that remains is real and must be documented for vendors: **an external 
 
 Deletion of a Managed Entity is decided from managed storage alone. It calls no plugin, reads no plugin-supplied data, and depends on neither plugin uptime nor plugin diligence.
 
-What it examines is exactly what Types Registry owns and can enumerate as dependencies: types derived from the target, read from the identifier chain; schemas holding a `$ref` to it; and registered Instances conforming to it. There is no fourth category. A schema whose `x-gts-ref` names the target is not a category: the keyword creates no dependency under `cpt-cf-types-registry-fr-ref-tracking`, so there is nothing to refuse.
+Types Registry examines only dependencies it owns and can enumerate: derived types, schemas holding a `$ref` to the target, and registered Instances conforming to it. `x-gts-ref` creates no dependency and therefore does not block deletion.
 
 **Live reverse-impact query is not retained at all,** and closing the boundary is what emptied it. It could report nothing **platform-authoritative** about a Managed Entity: no externally managed entity may depend on one, so any dependent a source named would be one the rule forbids and the platform does not recognize — and, because a reference from inside an external document is undetectable here, the platform could neither confirm nor refute it. What remained was external dependents of an *externally managed* entity: a question entirely inside the source's own universe, which the source's own tooling answers better.
 
@@ -212,7 +212,7 @@ Two paths remain for reusing a reserved space, and neither is an ordinary operat
 * **Purge the plugin Instance** (ADR-0013), which removes the reservation and releases the space to whoever asks next, including a managed registration. Disabled by default.
 * **A database migration shipped with Types Registry**, which retargets the claim rows to a named successor. This is the narrower of the two — the space is never unreserved and never becomes registrable by an unrelated party — and its cost of entry is an operator with database access and a reviewed migration, which is the ceremony proportional to an act that silently rebinds persisted domain references.
 
-Two obligations the ordinary write path would have discharged fall on whoever writes that migration. The first is the routing-writer protocol, in one transaction: claim `entity_write_order` as the first statement, before any read; retarget the claim rows and the successor's plugin projection consistently; and advance `routing.state_seq` as the transaction's final mutation, after every other step. The advance is a generation change, not an independent correctness lock — the `entity_write_order` claim already serialized the migration against every competing claim writer — and it is what stops pods routing to a plugin that no longer owns the space and what invalidates previously issued freshness validators. The second obligation is leaving the successor's Instance document and the claim projection in agreement, without which the next routine plugin upgrade silently undoes the retargeting. Both are stated in [DESIGN §3.2, *Registry Source Plugin registration*](../DESIGN.md#registry-source-plugin-registration).
+The migration must follow the routing-writer protocol and keep the successor's Instance document consistent with the claim projection; otherwise pods may retain stale routing or a later plugin revision may undo the retargeting. [DESIGN §3.2, *Registry Source Plugin registration*](../DESIGN.md#registry-source-plugin-registration) defines the transaction order.
 
 Ordinary plugin replacement does not need either. A Registry Source Plugin is a registered Instance and its content is mutable under ADR-0006, so upgrading the implementation behind a claim is a new content revision of the same Instance and touches no reservation. Only a change of the plugin's own GTS Identity reaches this rule, and that is rare enough to be worth an operator.
 
@@ -252,6 +252,7 @@ The composition story therefore sits on the managed side of the boundary rather 
 This decision is confirmed when:
 
 * admission rejects a managed Type Schema containing a `$ref` or `x-gts-ref` to an externally managed target, and rejects a managed identifier deriving from an externally managed base, with diagnostics naming the offending reference;
+* Source Claim activation rejects a pattern covering an `x-gts-ref` authority identifier in current Managed Type Schema content;
 * no admitted managed revision contains an external revision token or content hash in its provenance record;
 * Types Registry storage contains no external entity identifier in any column, including on dependency edges;
 * an externally managed entity cannot be admitted as derived from a managed base, and the impossibility follows from claim selection on the first segment rather than from a check that could be bypassed;

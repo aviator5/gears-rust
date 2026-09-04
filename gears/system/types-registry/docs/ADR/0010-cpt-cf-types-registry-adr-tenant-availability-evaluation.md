@@ -112,8 +112,6 @@ Applying this rule to the relationships known today:
 
 The rule and the classifications above are normative. A new relationship kind must be explicitly classified by applying the same semantic-contract test; it does not become blocking merely because it is stored in the dependency graph.
 
-`x-gts-ref` is non-blocking because validation matches a value against the authored pattern without looking up the named entity. The target is never inlined, and revising or deleting it changes neither the constraining schema nor whether a value is structurally valid. Tenant policy over the target therefore cannot be bypassed merely by using the schema; only a runtime value can name the target, and Types Registry does not observe those values.
-
 **Every blocking relationship holds between two Managed Entities.** ADR-0011 closes the managed–external boundary in both directions, so no blocking edge crosses it: a Managed Entity has no external target, and an Externally Managed Entity has no managed one. Were the second direction permitted and listed as blocking, one relationship kind would be evaluated live by a source while every other was evaluated against managed storage; the closed boundary leaves one mechanism for one semantic. The availability of an Externally Managed Entity is asserted live by its owning source under ADR-0002 and composes with nothing stored here.
 
 ### Propagation semantics

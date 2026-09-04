@@ -83,7 +83,7 @@ Route paths, DTO field layout, operation retention, and table definitions belong
 * A stale writer must not overwrite a newer revision.
 * Expensive GTS checks must not hold a database transaction open.
 * Independent valid candidates should not fail only because another branch in the same batch is invalid.
-* Interdependent candidates must be registrable in one batch without exposing an inconsistent intermediate state.
+* Candidates with admission-order dependencies must be registrable in one batch without exposing an inconsistent intermediate state.
 * Types Registry must not depend on a global startup census.
 * P1 safety must not require P2 hooks.
 
@@ -106,7 +106,7 @@ For batch failure:
 
 * all-or-nothing;
 * unconstrained best effort;
-* dependency-aware partial admission with atomic dependency groups.
+* dependency-aware partial admission in dependency order.
 
 For startup:
 
@@ -272,14 +272,7 @@ The candidate dependency graph is resolved with the submitted candidates as an o
 
 This is called **dependency-aware partial admission**, not best effort. “Best effort” does not state dependency ordering or overlay resolution.
 
-**The admitted dependency graph is acyclic, and admission is what keeps it so.** Two of the three edge kinds cannot close a cycle at all; the third can, alone or combined with the second, and is refused. Past that refusal a topological order exists for every batch and no component ever has to be admitted as an atomic group:
-
-* **`$ref`.** An effective artifact is materialized by *inlining* the referenced schema, and inlining has no fixpoint over a cycle — a circular `$ref` has no resolved form to store or serve. GTS refuses it during validation, so such a candidate is never admitted: not in one batch, where the overlay makes both members visible to each other, and not across operations, where revising a schema to reference its own dependent is refused for the same reason.
-* **`$ref` combined with derivation.** A base that `$ref`s a schema derived from it is a cycle with no circular `$ref` in it, and an effective form inlines both edge kinds, so it has no resolved form either. The check is therefore over the **combined** edge set, not over `$ref` alone. Ordering, separately, runs over the whole graph including conformance and the predecessor edge below: an Instance must not commit ahead of a Type Schema that may then be refused.
-* **Derivation.** `base~derived~` consumes `base~`, which is strictly shorter. Chain length decreases along every derivation edge, so the relation is a partial order.
-* **Instance conformance.** The edge runs from an Instance to its Type Schema, and nothing points back: both reference-bearing keywords name schemas, so an Instance is always a leaf.
-
-Traversals over the relation still deduplicate rather than assuming the invariant holds. That is not doubt about acyclicity — a DAG whose paths converge would otherwise be enumerated once per path rather than once per node — but it does mean a row contradicting the invariant costs bounded work instead of a hung transaction.
+**Admission keeps the dependency graph acyclic.** It rejects cycles in the combined `$ref` and derivation graph because both edge kinds are inlined into the effective artifact. Derivation alone is acyclic because each edge shortens the identifier chain, and Instance conformance cannot close a cycle. The full graph, including conformance and the predecessor edge below, is then processed topologically, one candidate per admission unit. Traversals still deduplicate converging paths and bound work if stored data violates the invariant.
 
 **The graph carries one implicit edge kind alongside authored edges.** Two minors of one major do not reference each other, yet `vM.n~` must follow `vM.(n-1)~` when both occur in a batch. An identifier-derived predecessor edge supplies that order. If the lower minor fails, it blocks the higher one rather than admitting it over a gap.
 
@@ -345,7 +338,7 @@ This decision is confirmed when:
 * a failed in-batch dependency blocks its dependants;
 * the operation status takes only `pending`, `running`, or `completed`, and no operation-level field states whether the batch succeeded — a caller establishes that from the candidate statuses, and a mixed batch is `completed` exactly as a wholly successful one is;
 * an operation completed after its worker gave up is indistinguishable at the operation level from one whose candidates were rejected on their merits, and distinguishable per candidate, which is the level at which the difference is real;
-* a circular `$ref` is refused during validation, so no admitted graph carries a cycle — asserted for a batch carrying both members and for a revision that would close the cycle across two operations;
+* cycles in the combined `$ref` and derivation graph are refused, both within one batch and by a revision that would close a cycle across operations;
 * concurrent first-family admission leaves exactly one owner;
 * the retention sweep removes a terminal operation exactly when no revision reaches any of its items, which is exercised on a successful deletion and a successful dry run — both of which carry `succeeded` items and no revision — as well as on an operation in which nothing succeeded;
 * a gear with current definitions performs only the batch read and reports `UpToDate`;
@@ -398,7 +391,7 @@ This decision is confirmed when:
 
 ### Dependency-aware partial admission
 
-* Good, because it preserves independent progress and explicitly protects dependency units.
+* Good, because it preserves independent progress, orders dependencies, and blocks downstream candidates when a selected dependency fails.
 * Bad, because clients must inspect per-GTS-ID results and handle partial success.
 
 ### Sub-choices within the selected option

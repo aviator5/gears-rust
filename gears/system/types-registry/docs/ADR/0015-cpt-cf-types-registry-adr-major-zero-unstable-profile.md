@@ -107,7 +107,7 @@ Nothing else about the relation reaches a v0 entity either: ADR-0003 records the
 * a `$ref` target;
 * the immediate derivation base.
 
-`x-gts-ref` is outside this rule in every form. It constrains an instance value to match a GTS identifier pattern; validation does not resolve or inline the entity named by that value. A stable schema may therefore use an exact major-0 identifier, a pattern whose valid prefix carries major 0, `gts.*`, or a relative JSON pointer such as `/$id`. It may also accept a runtime value naming an unstable entity. None of these cases lets a change to the unstable entity alter what the stable schema accepts, and none creates a target-existence, availability, lifecycle, or referential-integrity guarantee.
+`x-gts-ref` is outside this rule because it validates an Instance value without resolving or inlining the named entity. This includes exact and patterned major-0 identifiers, `gts.*`, and relative JSON pointers. None creates a dependency or guarantee over the target.
 
 The whole resolution closure follows by induction. Any transitive path to v0 must contain a stable entity with a direct resolution-bearing dependency on v0, which admission refuses. ADR-0003 uses the same argument shape to derive a whole-history guarantee from candidate-versus-baseline checks.
 
