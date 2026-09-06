@@ -246,7 +246,7 @@ An installation has one authoritative database served by many pods; every guaran
 
 Storage behaves identically on SQLite, PostgreSQL, and MySQL. The repository layer owns explicit identifier-range bounds, UUID representation, backend-safe set chunking, and compare-and-swap; none leaks into the domain.
 
-Reverse-impact queries use a repository-owned recursive CTE over `dependency`, built with `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001); no closure or raw query is maintained separately. The CTE uses `UNION`, applies a depth cap below MySQL's default recursion limit, and returns distinct entity IDs for converging paths. Admissions exceeding `limits.activation_write_set` are refused; [database.sql](./database.sql) defines the exact query constraints.
+Reverse-impact queries use a repository-owned recursive CTE over `dependency`, built with `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001); no closure or raw query is maintained separately. The CTE uses `UNION`, applies `limits.activation_write_set` as its depth cap, and returns distinct entity IDs for converging paths. Admissions exceeding that set bound are refused; [database.sql](./database.sql) defines the exact query constraints. To guarantee that every traversal allowed by the application bound can complete on `MySQL`, every Types Registry session must have `cte_max_recursion_depth` at least as large as that bound. This is an operational capacity prerequisite over the actual session value, not validation against a vendor default. A shallower traversal can still complete with a lower database limit; if a traversal exhausts it, the ordinary storage error aborts and rolls back the admission transaction.
 
 **ADRs**: `cpt-cf-types-registry-adr-storage-identity-query-model`
 
@@ -2173,6 +2173,8 @@ gears:
 | `registration_policy` | map of GTS pattern to `allowed_vendors` and `tenant_ownable` | empty | Opens otherwise closed regions (§3.2). Invalid patterns or parameters fail startup. `allowed_vendors: ["*"]` admits every vendor; omitted parameters inherit by the per-parameter resolution rule. Operators document effective values; refusals name region and parameter |
 
 Limits change request admissibility, so Dry Run is relative to both installation state and configuration (`cpt-cf-types-registry-constraint-single-installation`). A refusal names the bound and configured value.
+
+On `MySQL`, operators must configure `@@SESSION.cte_max_recursion_depth >= limits.activation_write_set` on every pooled connection to guarantee support for the full configured application bound. Configure the global or persisted value before Types Registry opens its pool, then verify the session value. Types Registry neither assumes the vendor default nor changes this database-owned guard. MySQL checks the limit while a recursive CTE runs, not when it receives the application bound: a traversal that finishes earlier still succeeds. If the database stops a traversal at its own recursion limit, the error follows the ordinary storage-error path: the transaction rolls back, the database error is logged, and the caller receives only an opaque internal error. It is never recorded as `activation_write_set_exceeded`, because the interrupted query did not establish the size of the impact set.
 
 Configuration is read at process start and requires restart to change. Disabled controls are explicit:
 

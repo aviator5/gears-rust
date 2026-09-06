@@ -143,8 +143,7 @@ than by dissolution.** `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001
 scoped `WITH RECURSIVE` through the typed builder with no raw SQL, and the emitted shape
 executes on all three backends — `toolkit-db`'s own `cte_shapes_are_valid_sql_{sqlite,
 postgres,mysql}` plus this gear's `reverse_impact_walks_back_up_a_chain`, which runs in
-the `PostgreSQL` and `MySQL` container suites. `MySQL` is the only backend that caps
-recursion (`cte_max_recursion_depth`, default 1000) and the depth cap sits under it.
+the `PostgreSQL` and `MySQL` container suites.
 
 Two of DESIGN's constraints on the query are honoured as stated and one is not. `UNION`
 rather than `UNION ALL`: kept, and it is the builder's default. No per-row accumulator
