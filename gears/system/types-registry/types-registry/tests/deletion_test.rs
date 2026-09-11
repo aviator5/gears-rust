@@ -609,3 +609,118 @@ async fn a_deletion_batch_reports_its_outcomes_in_submission_order() {
     let reported: Vec<&str> = outcome.items.iter().map(|i| i.gts_id.as_str()).collect();
     assert_eq!(reported, vec![TARGET, HOLDER]);
 }
+
+// ---------------------------------------------------------------------------
+// The two arms a real race and a corrupt row reach
+// ---------------------------------------------------------------------------
+
+/// Run one operation through a substituted set of ports.
+async fn run_with(
+    db: &Provider,
+    stores: &Arc<dyn types_registry::domain::ports::Stores>,
+    operation_id: Uuid,
+) -> OperationOutcome {
+    run_operation(
+        stores,
+        &worker(db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: false,
+        },
+        operation_id,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail")
+}
+
+/// Both of `mark_deleted`'s preconditions live in the statement's `WHERE`, so
+/// matching no row means the entity moved after this transaction read it.
+/// Refused rather than reported as done — and refused as `precondition_failed`,
+/// because that is what a caller with a stale version should retry against.
+#[tokio::test]
+async fn a_deletion_whose_write_matches_no_row_is_refused_not_reported_as_done() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+    let entity_id = entity_of(&db, TARGET).await.expect("row").id;
+
+    let op = submit(
+        &db,
+        "del",
+        OperationKind::Deletion,
+        vec![Candidate {
+            gts_id: TARGET.to_owned(),
+            content: None,
+            expected_resource_version: Some(1),
+            force: false,
+        }],
+    )
+    .await
+    .expect("accepted");
+    let hooked: Arc<dyn types_registry::domain::ports::Stores> =
+        common::TestStores::deletion_miss(entity_id);
+    let outcome = run_with(&db, &hooked, op).await;
+
+    refused(
+        &outcome.items[0],
+        &AdmissionFailureReason::PreconditionFailed,
+    );
+    assert!(
+        outcome.items[0]
+            .failure
+            .as_ref()
+            .expect("failure")
+            .message
+            .contains("moved while"),
+        "the message must say the row moved, not that the version was wrong: {:?}",
+        outcome.items[0].failure,
+    );
+    assert_eq!(
+        entity_of(&db, TARGET).await.expect("row").lifecycle_status,
+        LifecycleStatus::Active,
+        "nothing was written",
+    );
+}
+
+/// Acceptance refuses a deletion with no `expected_resource_version`, so a
+/// stored item in that shape disagrees with the rules that admitted it. The
+/// worker still owes it an outcome, and answers `precondition_failed` rather
+/// than deleting at whatever version it finds.
+#[tokio::test]
+async fn a_stored_deletion_item_with_no_version_is_refused_rather_than_obeyed() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+
+    // `0` is storage's spelling of must-not-exist, which no deletion can mean.
+    let op = {
+        let conn = db.conn().expect("conn");
+        common::seed_pending_deletion_item(&conn, TARGET, 0, NOW)
+            .await
+            .0
+    };
+
+    let outcome = run(&db, op).await;
+
+    refused(
+        &outcome.items[0],
+        &AdmissionFailureReason::PreconditionFailed,
+    );
+    assert!(
+        outcome.items[0]
+            .failure
+            .as_ref()
+            .expect("failure")
+            .message
+            .contains("no expected_resource_version"),
+        "{:?}",
+        outcome.items[0].failure,
+    );
+    assert_eq!(
+        entity_of(&db, TARGET).await.expect("row").lifecycle_status,
+        LifecycleStatus::Active,
+        "a contradictory stored item deletes nothing",
+    );
+}

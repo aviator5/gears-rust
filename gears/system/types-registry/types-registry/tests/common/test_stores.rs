@@ -50,6 +50,15 @@ pub trait StoreHooks: Send + Sync {
     fn refuse_schema_cas(&self, _entity_id: i64) -> bool {
         false
     }
+
+    /// Return `true` to simulate a deletion losing its race: the entity read
+    /// inside the commit saw `ACTIVE` at the expected version, and the write
+    /// then matched nothing. Both preconditions live in the statement's
+    /// `WHERE`, so this is the only way to reach that arm without a second
+    /// writer that ignores the `entity_write_order` claim — and there is none.
+    fn refuse_deletion(&self, _entity_id: i64) -> bool {
+        false
+    }
 }
 
 /// Pauses one matching call until the test resumes it.
@@ -113,6 +122,18 @@ pub struct CasMissHooks {
 
 impl StoreHooks for CasMissHooks {
     fn refuse_schema_cas(&self, entity_id: i64) -> bool {
+        entity_id == self.refuse_for_entity_id
+    }
+}
+
+/// Refuses every `mark_deleted` for one entity, so the deletion commit sees the
+/// row move between its read and its write.
+pub struct DeletionMissHooks {
+    refuse_for_entity_id: i64,
+}
+
+impl StoreHooks for DeletionMissHooks {
+    fn refuse_deletion(&self, entity_id: i64) -> bool {
         entity_id == self.refuse_for_entity_id
     }
 }
@@ -193,6 +214,19 @@ impl TestStores<CasMissHooks> {
         Arc::new(Self {
             inner: stores(),
             hooks: CasMissHooks {
+                refuse_for_entity_id,
+            },
+        })
+    }
+}
+
+impl TestStores<DeletionMissHooks> {
+    /// Refuse `refuse_for_entity_id`'s lifecycle transition to `DELETED`.
+    #[must_use]
+    pub fn deletion_miss(refuse_for_entity_id: i64) -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            hooks: DeletionMissHooks {
                 refuse_for_entity_id,
             },
         })
@@ -305,6 +339,10 @@ impl<H: StoreHooks> EntityStore for TestStores<H> {
         expected_resource_version: i64,
         now: OffsetDateTime,
     ) -> Result<Option<i64>, ScopeError> {
+        if self.hooks.refuse_deletion(entity_id) {
+            // Simulate the row moving after the commit read it.
+            return Ok(None);
+        }
         self.inner
             .mark_deleted(tx, scope, entity_id, expected_resource_version, now)
             .await

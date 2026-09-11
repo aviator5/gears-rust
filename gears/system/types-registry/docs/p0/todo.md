@@ -1876,8 +1876,8 @@ pins it. Mutation-checked: blinding the order to the stored edges fails the two 
 and nothing else.
 
 **Verification run:**
-- `cargo nextest run -p cf-gears-types-registry` — **834/834**, up from 781 by this task's 53
-  tests (5 instrument-contract, 9 deletion acceptance, 15 deletion, 11 dry run, 6 emission and
+- `cargo nextest run -p cf-gears-types-registry` — **837/837**, up from 781 by this task's 56
+  tests (5 instrument-contract, 9 deletion acceptance, 17 deletion, 12 dry run, 6 emission and
   span, 7 deletion-order, 4 `edges_within`, less 4 retired placeholders)
 - container suites — **27/27 green**, but only **binary by binary**. The combined
   `make test-types-registry-db` selection now spins 27 databases and this machine's Docker
@@ -1893,11 +1893,27 @@ and nothing else.
   5 emission); dropping the deletion's `candidate_terminalized` call fails 3
 - `cargo fmt`, `cargo clippy --all-targets --all-features --no-deps -D warnings -D clippy::perf` — clean
 
-**Known open, deliberately.** Four narrow branches carry no test: the
-`more than {bound}` message (needs more than 512 live dependants), the lost `mark_deleted`
-race, the unreachable `MustNotExist` guard inside `process_deletion`, and a forced dry run
-under a deployment that *permits* force. None changes a committed outcome; each is a message
-or an unreachable arm.
+**Known open, deliberately.** One narrow branch carries no test: the `more than {bound}`
+message, which needs more than 512 live direct dependants to reach. It is a refusal message
+rather than a decision — the refusal itself is tested — so the cost of reaching it exceeds
+what it would prove.
+
+**The other three narrow branches are now closed**, each with the machinery its shape needed:
+- the **lost `mark_deleted` race** — both preconditions live in the statement's `WHERE`, and
+  the `entity_write_order` claim means no second writer can slip between the read and the
+  write, so the arm is unreachable from a real concurrent pass. `StoreHooks::refuse_deletion`
+  (the shape `refuse_schema_cas` already had) makes the write match no row, and the test
+  asserts the message says the row *moved* rather than that the version was wrong.
+  Mutation-checked by treating the miss as a success;
+- the **contradictory stored item** — acceptance refuses a deletion with no
+  `expected_resource_version`, so the shape only exists if a stored row disagrees with the
+  rules that admitted it. `common::seed_pending_deletion_item` writes one directly.
+  Mutation-checked by removing the guard: the item is then obeyed at version 0 instead of
+  refused;
+- the **forced dry run under a deployment that permits force** — the same candidate is run
+  twice in one test, unforced and forced, so the waiver is the only difference between
+  `incompatible_with_baseline` and a clean pass. It carries its own control rather than
+  needing a mutation, and still asserts that the waived dry run wrote nothing.
 
 **And nothing outside the domain can delete yet.** `handlers.rs` fixes the submitted kind to
 `Registration`, so deletion has no REST surface until T27 adds `:batchDelete` and
@@ -1926,8 +1942,10 @@ Dry Run *is* reachable, because it is a field on `POST /entities`.
 - `TR/src/infra/storage/repo/operation_repo.rs`, `store.rs` — optional success results, `mark_deleted`
 - `TR/src/observability.rs` — `blocked_dependents` on the unit span
 - `TR/src/api/rest/error.rs` — the two new refusals; two obsolete mappings removed
-- `TR/tests/deletion_test.rs` — NEW, 15 `SQLite` tests, 4 of them the batch order
-- `TR/tests/dry_run_test.rs` — NEW, 11 `SQLite` tests
+- `TR/tests/deletion_test.rs` — NEW, 17 `SQLite` tests, 4 of them the batch order
+- `TR/tests/common/test_stores.rs`, `mod.rs` — `StoreHooks::refuse_deletion` and
+  `seed_pending_deletion_item`, the two shapes the unreachable arms need
+- `TR/tests/dry_run_test.rs` — NEW, 12 `SQLite` tests
 - `TR/tests/deletion_backends_test.rs` — NEW, 3 tests behind `integration`
 - `TR/tests/observability_test.rs` — 5 emission tests
 - `TR/tests/api_rest_test.rs`, `TR/tests/operation_idempotency_test.rs` — the retired placeholders

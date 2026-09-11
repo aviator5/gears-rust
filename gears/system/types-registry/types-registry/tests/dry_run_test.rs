@@ -450,3 +450,122 @@ async fn a_second_pass_over_a_dry_run_is_a_no_op() {
     assert_eq!(second.items[0].status, OperationItemStatus::Succeeded);
     assert!(entity_of(&db, FRESH).await.is_none());
 }
+
+/// A dry run waives nothing of its own, and it does not exempt the candidate
+/// from the force gate either — it runs it. With the deployment **permitting**
+/// force, a forced cross-minor dry run is therefore accepted and reaches the
+/// waived verdict, exactly as the committing pass would, and still writes
+/// nothing. The disallowed half of this pair lives in `acceptance_tests`.
+#[tokio::test]
+async fn a_forced_dry_run_is_waived_where_the_deployment_permits_force() {
+    let db = test_db().await;
+    let v2_0 = gts_id!("cf.core.dry.minor.v2.0~");
+    let v2_1 = gts_id!("cf.core.dry.minor.v2.1~");
+
+    // An **open** schema: adding a property to it is incompatible, so the later
+    // minor below needs the waiver rather than merely being allowed one.
+    let open = |gts_id: &str, extra: bool| {
+        let mut properties = json!({ "a": { "type": "string" } });
+        if extra {
+            properties["b"] = json!({ "type": "string" });
+        }
+        json!({
+            "$id": format!("gts://{gts_id}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "properties": properties,
+        })
+    };
+
+    let seeded = pass(
+        &db,
+        "minor-0",
+        OperationKind::Registration,
+        false,
+        creation(v2_0, open(v2_0, false)),
+    )
+    .await;
+    assert_eq!(seeded.status, OperationItemStatus::Succeeded, "{seeded:?}");
+
+    // Without the waiver the same candidate is refused; with it, admitted.
+    let unforced = pass(
+        &db,
+        "minor-1-plain",
+        OperationKind::Registration,
+        true,
+        creation(v2_1, open(v2_1, true)),
+    )
+    .await;
+    assert_eq!(
+        unforced.failure.as_ref().map(|f| &f.reason),
+        Some(&AdmissionFailureReason::IncompatibleWithBaseline),
+        "the dry run must reach the comparison and fail it: {unforced:?}",
+    );
+
+    let forced = forced_dry_run(&db, "minor-1-forced", v2_1, open(v2_1, true)).await;
+
+    assert_eq!(
+        forced.status,
+        OperationItemStatus::Succeeded,
+        "the waiver applies in a dry run exactly as it does in a commit: {forced:?}",
+    );
+    assert_eq!(forced.resource_version, None);
+    assert!(
+        entity_of(&db, v2_1).await.is_none(),
+        "and the waived dry run still wrote nothing",
+    );
+}
+
+/// One forced dry-run pass under a deployment that permits force.
+async fn forced_dry_run(db: &Provider, key: &str, gts_id: &str, content: Value) -> ItemOutcome {
+    let config = TypesRegistryConfig {
+        allow_compatibility_force: true,
+        ..TypesRegistryConfig::default()
+    };
+    let provider: DBProvider<AcceptanceError> = DBProvider::new(db.db());
+    let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
+    let operation_id = accept(
+        &stores(),
+        &provider,
+        &allow_all(),
+        &AcceptanceContext {
+            policy: &RegistrationPolicy::default(),
+            config: &config,
+            metrics: &common::metrics(),
+        },
+        &dispatch,
+        &SubmitRequest {
+            idempotency_key: key.to_owned(),
+            kind: OperationKind::Registration,
+            dry_run: true,
+            candidates: vec![Candidate {
+                gts_id: gts_id.to_owned(),
+                content: Some(content),
+                expected_resource_version: None,
+                force: true,
+            }],
+        },
+        NOW,
+    )
+    .await
+    .expect("a forced dry run is accepted where the deployment permits force")
+    .operation_id;
+
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: true,
+        },
+        operation_id,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail")
+    .items
+    .remove(0)
+}
