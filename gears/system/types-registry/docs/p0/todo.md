@@ -1843,27 +1843,48 @@ the same file, so the test is about the rollback rather than about the claim nev
 - the **verdict counter takes `dry_run` and not `kind`**. A comparison is only ever computed
   for a registration, so a `kind` label there would be one constant series.
 
-**Batch deletion ordering is deliberately not implemented, and T19 left the question here.**
-A deletion batch's order is the *reverse* of a registration's — a dependant must go before
-the base it consumes — but the ordering function is pure and a deletion carries no document,
-so it could only order by identifier-derived edges. That would silently fail on `$ref`
-dependants, which is the common case. Every item still earns its own correct outcome
-(`has_registered_dependents`), so the cost is a caller re-submitting in a different order,
-not a wrong answer. Ordering deletions properly needs the stored `dependency` edges read in
-the worker before the per-item loop; that is a new read path with its own tests and nothing
-in P0 asks for it. `graph_tests::a_candidate_without_content_carries_no_edge` pins the
-current behaviour with this reason.
+**Batch deletion ordering, the question T19 left here — implemented, by the reverse
+relation over stored edges.** A deletion batch orders a dependant *before* what it consumes,
+the mirror of a registration's order. The first attempt was to reuse `order_batch` with its
+edges flipped, and that cannot work: a deletion submits no document, so identifier-derived
+edges are all a pure function could see and every `$ref` dependant — the common case — would
+be missed silently. A partly-correct order is worse than none, because it looks like an order.
+
+So the edges come from where they actually are: `DependencyRepo::edges_within` reads the
+stored `dependency` rows **between** the batch's own entities, in the one snapshot that
+resolves its identifiers. `graph::order_deletion_batch` is then pure over
+`(identifiers, links)` and tested with no database, exactly as the registration order is.
+
+Three properties it deliberately does **not** have:
+- **no blocking.** If a deletion fails, the entity it consumed is refused by the commit-time
+  recheck with `has_registered_dependents`, which names the real problem and counts it.
+  A second, vaguer reason invented here would be worse — and the direction is inverted, so
+  `blocked_by_dependency` would be the wrong word for it;
+- **no refusals.** The committed dependency relation is acyclic (ADR-0012), so a cycle here
+  is corrupt state rather than a candidate error. Members the sort cannot place are appended
+  in submission order under a `warn!` and left to earn their own outcomes;
+- **no reach outside the batch.** An edge whose other end is not being deleted orders
+  nothing: that dependant survives, and refusing on it is the recheck's job.
+
+The one guarantee is that every candidate is placed exactly once — an item the order dropped
+is an item the operation never answers — and `every_deletion_candidate_is_placed_exactly_once`
+pins it. Mutation-checked: blinding the order to the stored edges fails the two batch tests
+and nothing else.
 
 **Verification run:**
-- `cargo nextest run -p cf-gears-types-registry` — **818/818**, up from 781 by this task's 37
-  tests (5 instrument-contract, 9 deletion acceptance, 11 deletion, 11 dry run, 5 emission,
-  less 4 retired placeholders)
+- `cargo nextest run -p cf-gears-types-registry` — **829/829**, up from 781 by this task's 48
+  tests (5 instrument-contract, 9 deletion acceptance, 15 deletion, 11 dry run, 5 emission,
+  7 deletion-order, less 4 retired placeholders)
 - container suites — **27/27 green**, but only **binary by binary**. The combined
   `make test-types-registry-db` selection now spins 27 databases and this machine's Docker
   runs out of published ports (`PortNotExposed`) partway through; each of the eight binaries
-  passes on its own, including `deletion_backends_test` on PostgreSQL and MySQL. Not a code
-  failure and not specific to this task — it is the selection outgrowing one laptop, and CI
-  should either cap `--test-threads` or share one container per backend
+  passes on its own, including `deletion_backends_test` — deletion, the batch order, and both
+  dry-run kinds — on PostgreSQL and MySQL. Not a code failure and not specific to this task:
+  it is the selection outgrowing one laptop, and CI should either cap `--test-threads` or
+  share one container per backend
+- `cargo nextest run --workspace` — types-registry is clean. `cf-gears-oagw` fails 119 of its
+  785 tests in this environment, and **that is pre-existing**: measured on a clean `HEAD` with
+  this task's changes stashed. Its proxy and WebSocket suites want DNS and listening ports
 - mutation checks: dropping both labels from `candidates_total` fails 9 tests (4 unit,
   5 emission); dropping the deletion's `candidate_terminalized` call fails 3
 - `cargo fmt`, `cargo clippy --all-targets --all-features --no-deps -D warnings -D clippy::perf` — clean
@@ -1882,11 +1903,13 @@ current behaviour with this reason.
 - `TR/src/domain/ports/mod.rs` — `mark_deleted`, `live_direct_dependents`,
   `OperationItemRow::pass_labels`, optional success results
 - `TR/src/infra/metrics.rs`, `metrics_tests.rs` — the labels and their contract
-- `TR/src/infra/storage/repo/dependency_repo.rs` — `live_direct_dependents`
+- `TR/src/infra/storage/repo/dependency_repo.rs` — `live_direct_dependents`, `edges_within`
+- `TR/src/domain/admission/graph.rs`, `graph_tests.rs` — `order_deletion_batch`,
+  `DependencyLink`, and 7 tests over the reverse relation
 - `TR/src/infra/storage/repo/operation_repo.rs`, `store.rs` — optional success results, `mark_deleted`
 - `TR/src/observability.rs` — `blocked_dependents` on the unit span
 - `TR/src/api/rest/error.rs` — the two new refusals; two obsolete mappings removed
-- `TR/tests/deletion_test.rs` — NEW, 11 `SQLite` tests
+- `TR/tests/deletion_test.rs` — NEW, 15 `SQLite` tests, 4 of them the batch order
 - `TR/tests/dry_run_test.rs` — NEW, 11 `SQLite` tests
 - `TR/tests/deletion_backends_test.rs` — NEW, 3 tests behind `integration`
 - `TR/tests/observability_test.rs` — 5 emission tests

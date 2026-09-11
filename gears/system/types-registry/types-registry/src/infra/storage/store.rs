@@ -388,6 +388,15 @@ impl DependencyStore for Repos {
         DependencyRepo::live_direct_dependents(tx, scope, entity_id, bound).await
     }
 
+    async fn edges_within(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<(i64, i64)>, ScopeError> {
+        DependencyRepo::edges_within(tx, scope, entity_ids).await
+    }
+
     async fn closure(
         &self,
         tx: &DbTx<'_>,

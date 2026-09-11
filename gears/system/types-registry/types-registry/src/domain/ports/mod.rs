@@ -840,6 +840,15 @@ pub trait DependencyStore: Send + Sync {
         bound: usize,
     ) -> Result<usize, ScopeError>;
 
+    /// The stored edges between the given entities, as `(from, to)` pairs, for
+    /// the deletion order (T20). Edges leaving the set are dropped.
+    async fn edges_within(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<(i64, i64)>, ScopeError>;
+
     /// The roots plus everything they transitively consume.
     async fn closure(
         &self,

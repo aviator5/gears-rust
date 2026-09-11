@@ -141,6 +141,52 @@ impl DependencyRepo {
         Ok(rows.len())
     }
 
+    /// The stored edges **between** the given entities, as `(from, to)` pairs.
+    ///
+    /// Deletion order needs them (T20): a deletion submits no document, so the
+    /// only place its edges exist is this table. Edges leaving the set are
+    /// dropped — that dependant survives the deletion, and refusing on it is
+    /// the commit-time recheck's job, not the ordering's.
+    ///
+    /// Only `from_entity_id` is filtered in SQL; the far end is matched in Rust.
+    /// Two `IN (…)` lists would bind twice the parameters for the same rows, and
+    /// the set's own outgoing edges are what a deletion batch reads anyway.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure.
+    pub async fn edges_within(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<(i64, i64)>, ScopeError> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let within: HashSet<i64> = entity_ids.iter().copied().collect();
+        let mut pairs: Vec<(i64, i64)> = Vec::new();
+        for chunk in entity_ids.chunks(IN_CHUNK) {
+            let rows = dependency::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(
+                    Condition::all()
+                        .add(dependency::Column::FromEntityId.is_in(chunk.iter().copied())),
+                )
+                .all(runner)
+                .await?;
+            pairs.extend(
+                rows.into_iter()
+                    .filter(|row| within.contains(&row.to_entity_id))
+                    .map(|row| (row.from_entity_id, row.to_entity_id)),
+            );
+        }
+        // One dependant can hold two edge kinds to one target; the order cares
+        // only that it waits.
+        pairs.sort_unstable();
+        pairs.dedup();
+        Ok(pairs)
+    }
+
     /// Replace one entity's outgoing edges.
     ///
     /// Admission replaces only the admitted entity's outgoing rows, never anyone

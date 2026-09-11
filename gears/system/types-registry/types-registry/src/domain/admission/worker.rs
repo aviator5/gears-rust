@@ -30,6 +30,7 @@
 //! content revisions both land here — the item's stored precondition chooses which
 //! commit runs.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,7 +43,10 @@ use uuid::Uuid;
 
 use super::deletion;
 pub use super::errors::{DryRunResult, ItemFailure, WorkerError};
-use super::graph::{BatchCandidate, BatchOrder, BlockKind, Blocker, order_batch};
+use super::graph::{
+    BatchCandidate, BatchOrder, BlockKind, Blocker, DependencyLink, order_batch,
+    order_deletion_batch,
+};
 use super::revision::{CommittedUnit, RevisionCommit};
 use super::unchanged;
 use super::unit::{EvaluationTarget, PreparedUnit, commit_creation, commit_revision, evaluate};
@@ -153,9 +157,16 @@ async fn run_operation_inner(
     }
 
     // Steps 1–2: order the batch before touching any candidate. One candidate is
-    // one unit, but *which* unit runs next is a property of the whole batch.
-    let batch: Vec<BatchCandidate> = items.iter().map(batch_candidate).collect();
-    let order = order_batch(&batch);
+    // one unit, but *which* unit runs next is a property of the whole batch —
+    // and the two kinds order by opposite relations. A registration puts what it
+    // consumes first; a deletion puts what consumes **it** first, or the target
+    // is refused for a dependant the same batch was about to remove.
+    let order = if operation.kind == OperationKind::Deletion {
+        deletion_order(stores, db, scope, &items).await?
+    } else {
+        let batch: Vec<BatchCandidate> = items.iter().map(batch_candidate).collect();
+        order_batch(&batch)
+    };
     // Indexed by position in `items`, so the report keeps submission order while
     // the work follows dependency order.
     let mut outcomes: Vec<Option<ItemOutcome>> = vec![None; items.len()];
@@ -209,20 +220,57 @@ async fn run_operation_inner(
 fn batch_candidate(item: &OperationItemRow) -> BatchCandidate {
     BatchCandidate {
         gts_id: item.gts_id.clone(),
-        // A deletion's stored payload is JSON `null` — the recorded absence of a
-        // document — and it must not be read as one: a deletion batch's order is
-        // the *reverse* of a registration's, and the ordering function has no
-        // document to derive `$ref` edges from anyway. See the `order_batch`
-        // note; deletions are ordered by nothing today, and each still earns its
-        // own correct outcome.
-        content: (item.kind != OperationKind::Deletion)
-            .then(|| {
-                item.request_payload
-                    .as_deref()
-                    .and_then(|payload| serde_json::from_str(payload).ok())
-            })
-            .flatten(),
+        content: item
+            .request_payload
+            .as_deref()
+            .and_then(|payload| serde_json::from_str(payload).ok()),
     }
+}
+
+/// Order a deletion batch from the edges already in `dependency`.
+///
+/// The read a registration does not need: a deletion submits no document, so
+/// the only place its `$ref`, derivation and conformance edges exist is the
+/// table. One snapshot, two statements — resolve the batch's identifiers to
+/// entity ids, then take the edges between them.
+///
+/// An identifier the registry does not hold resolves to no row and therefore to
+/// no edge. That is correct rather than lenient: its own commit refuses it with
+/// `precondition_failed`, and nothing in the batch waits on a deletion that was
+/// never going to happen.
+async fn deletion_order(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<WorkerError>,
+    scope: &AccessScope,
+    items: &[OperationItemRow],
+) -> Result<BatchOrder, WorkerError> {
+    let gts_ids: Vec<String> = items.iter().map(|item| item.gts_id.clone()).collect();
+    let stores_tx = Arc::clone(stores);
+    let scope_tx = scope.clone();
+    let read_ids = gts_ids.clone();
+    let links = db
+        .transaction_with_config(snapshot_read(&db.db()), move |tx| {
+            Box::pin(async move {
+                let rows = stores_tx.find_by_gts_ids(tx, &scope_tx, &read_ids).await?;
+                let entity_ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+                let named: HashMap<i64, String> =
+                    rows.into_iter().map(|row| (row.id, row.gts_id)).collect();
+                let edges = stores_tx
+                    .edges_within(tx, &scope_tx, &entity_ids)
+                    .await?
+                    .into_iter()
+                    .filter_map(|(from, to)| {
+                        Some(DependencyLink {
+                            dependant: named.get(&from)?.clone(),
+                            target: named.get(&to)?.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(edges)
+            })
+        })
+        .await?;
+    Ok(order_deletion_batch(&gts_ids, &links))
 }
 
 fn unit_span(operation_id: Uuid, item: &OperationItemRow) -> Span {

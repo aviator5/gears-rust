@@ -564,6 +564,15 @@ impl<H: StoreHooks> DependencyStore for TestStores<H> {
             .await
     }
 
+    async fn edges_within(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<(i64, i64)>, ScopeError> {
+        self.inner.edges_within(tx, scope, entity_ids).await
+    }
+
     async fn closure(
         &self,
         tx: &DbTx<'_>,

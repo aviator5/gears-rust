@@ -199,6 +199,14 @@ async fn entity_write_sequence(db: &Provider) -> i64 {
         .expect("the migration seeds the state row")
 }
 
+fn item<'a>(outcome: &'a OperationOutcome, gts_id: &str) -> &'a ItemOutcome {
+    outcome
+        .items
+        .iter()
+        .find(|item| item.gts_id == gts_id)
+        .unwrap_or_else(|| panic!("the operation owes {gts_id} an outcome"))
+}
+
 #[track_caller]
 fn refused(item: &ItemOutcome, reason: &AdmissionFailureReason) {
     assert_eq!(item.status, OperationItemStatus::Failed, "{item:?}");
@@ -478,4 +486,117 @@ async fn the_same_key_for_a_dry_run_and_a_commit_is_a_conflict_not_a_replay() {
         matches!(conflict, Err(AcceptanceError::FingerprintConflict { .. })),
         "a commit is not a replay of the dry run that preceded it: {conflict:?}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Batch order (T20)
+// ---------------------------------------------------------------------------
+
+async fn delete_batch(db: &Provider, key: &str, targets: &[(&str, i64)]) -> OperationOutcome {
+    let candidates = targets
+        .iter()
+        .map(|(gts_id, expected)| Candidate {
+            gts_id: (*gts_id).to_owned(),
+            content: None,
+            expected_resource_version: Some(*expected),
+            force: false,
+        })
+        .collect();
+    let op = submit(db, key, OperationKind::Deletion, candidates)
+        .await
+        .expect("accepted");
+    run(db, op).await
+}
+
+#[track_caller]
+fn all_succeeded(outcome: &OperationOutcome) {
+    for item in &outcome.items {
+        assert_eq!(
+            item.status,
+            OperationItemStatus::Succeeded,
+            "{} must be deleted: {:?}",
+            item.gts_id,
+            item.failure,
+        );
+    }
+}
+
+/// A deletion batch orders by the **reverse** relation: the dependant goes
+/// first, or the target is refused for a dependant the same batch was about to
+/// remove. Submitted target-first, which is the order that fails without it.
+#[tokio::test]
+async fn a_batch_deletes_a_dependant_before_its_target() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+    register(&db, "reg-holder", HOLDER, referencing(HOLDER, TARGET)).await;
+
+    let outcome = delete_batch(&db, "del", &[(TARGET, 1), (HOLDER, 1)]).await;
+
+    all_succeeded(&outcome);
+    assert_eq!(
+        entity_of(&db, TARGET).await.expect("row").lifecycle_status,
+        LifecycleStatus::Deleted,
+    );
+    assert_eq!(
+        entity_of(&db, HOLDER).await.expect("row").lifecycle_status,
+        LifecycleStatus::Deleted,
+    );
+}
+
+/// The order is transitive, and the edges come from `dependency` rather than
+/// from any document — a deletion submits none.
+#[tokio::test]
+async fn a_batch_deletes_a_chain_from_its_far_end() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+    register(&db, "reg-middle", MIDDLE, referencing(MIDDLE, TARGET)).await;
+    register(&db, "reg-holder", HOLDER, referencing(HOLDER, MIDDLE)).await;
+
+    // Submitted in exactly the wrong order.
+    let outcome = delete_batch(&db, "del", &[(TARGET, 1), (MIDDLE, 1), (HOLDER, 1)]).await;
+
+    all_succeeded(&outcome);
+    for gts_id in [TARGET, MIDDLE, HOLDER] {
+        assert_eq!(
+            entity_of(&db, gts_id).await.expect("row").lifecycle_status,
+            LifecycleStatus::Deleted,
+            "{gts_id} must be deleted",
+        );
+    }
+}
+
+/// A dependant left **outside** the batch still refuses the target: the order
+/// only decides what this batch does first, never what it is allowed to strand.
+#[tokio::test]
+async fn a_dependant_outside_the_batch_still_refuses_the_target() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+    register(&db, "reg-holder", HOLDER, referencing(HOLDER, TARGET)).await;
+    register(&db, "reg-other", OTHER, schema(OTHER)).await;
+
+    let outcome = delete_batch(&db, "del", &[(TARGET, 1), (OTHER, 1)]).await;
+
+    refused(
+        item(&outcome, TARGET),
+        &AdmissionFailureReason::HasRegisteredDependents,
+    );
+    assert_eq!(
+        item(&outcome, OTHER).status,
+        OperationItemStatus::Succeeded,
+        "the unrelated deletion still commits",
+    );
+}
+
+/// Reported in submission order, worked in dependency order — the same split
+/// the registration path makes.
+#[tokio::test]
+async fn a_deletion_batch_reports_its_outcomes_in_submission_order() {
+    let db = test_db().await;
+    register(&db, "reg", TARGET, schema(TARGET)).await;
+    register(&db, "reg-holder", HOLDER, referencing(HOLDER, TARGET)).await;
+
+    let outcome = delete_batch(&db, "del", &[(TARGET, 1), (HOLDER, 1)]).await;
+
+    let reported: Vec<&str> = outcome.items.iter().map(|i| i.gts_id.as_str()).collect();
+    assert_eq!(reported, vec![TARGET, HOLDER]);
 }

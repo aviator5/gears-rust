@@ -43,6 +43,8 @@ const TARGET: &str = gts_id!("cf.core.delback.target.v1~");
 const HOLDER: &str = gts_id!("cf.core.delback.holder.v1~");
 const DRY: &str = gts_id!("cf.core.delback.dry.v1~");
 const FRESH: &str = gts_id!("cf.core.delback.fresh.v1~");
+const BATCH_BASE: &str = gts_id!("cf.core.delback.batchbase.v1~");
+const BATCH_HOLDER: &str = gts_id!("cf.core.delback.batchholder.v1~");
 
 struct NoDispatch;
 
@@ -298,8 +300,87 @@ async fn assert_dry_run(db: &Arc<DBProvider<DbError>>, backend: &str) {
     );
 }
 
+/// A deletion batch orders by the reverse relation, and its edges come from
+/// `dependency` — a read, so it is worth running against the real engines.
+async fn assert_batch_order(db: &Arc<DBProvider<DbError>>, backend: &str) {
+    assert_succeeded(
+        &pass(
+            db,
+            "batch-base",
+            OperationKind::Registration,
+            false,
+            creation(BATCH_BASE, schema(BATCH_BASE)),
+        )
+        .await,
+        backend,
+    );
+    assert_succeeded(
+        &pass(
+            db,
+            "batch-holder",
+            OperationKind::Registration,
+            false,
+            creation(BATCH_HOLDER, referencing(BATCH_HOLDER, BATCH_BASE)),
+        )
+        .await,
+        backend,
+    );
+
+    // Submitted target-first, which is the order that fails without ordering.
+    let config = TypesRegistryConfig::default();
+    let provider = DBProvider::<AcceptanceError>::new(db.db());
+    let operation_id = accept(
+        &stores(),
+        &provider,
+        &allow_all(),
+        &AcceptanceContext {
+            policy: &RegistrationPolicy::default(),
+            config: &config,
+            metrics: &common::metrics(),
+        },
+        &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
+        &SubmitRequest {
+            idempotency_key: "batch-del".to_owned(),
+            kind: OperationKind::Deletion,
+            dry_run: false,
+            candidates: vec![removal(BATCH_BASE, 1), removal(BATCH_HOLDER, 1)],
+        },
+        NOW,
+    )
+    .await
+    .expect("the batch reaches the worker")
+    .operation_id;
+    let outcome = run_operation(
+        &stores(),
+        &DBProvider::<WorkerError>::new(db.db()),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: false,
+        },
+        operation_id,
+        LATER,
+    )
+    .await
+    .expect("the admission pass completes");
+
+    for item in &outcome.items {
+        assert_succeeded(item, backend);
+    }
+    for gts_id in [BATCH_BASE, BATCH_HOLDER] {
+        assert_eq!(
+            lifecycle_of(db, gts_id).await,
+            Some(LifecycleStatus::Deleted),
+            "{gts_id} must be deleted on {backend}",
+        );
+    }
+}
+
 async fn assert_t20(db: &Arc<DBProvider<DbError>>, backend: &str) {
     assert_deletion(db, backend).await;
+    assert_batch_order(db, backend).await;
     assert_dry_run(db, backend).await;
 }
 
