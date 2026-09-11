@@ -1052,8 +1052,12 @@ pub async fn commit_creation(
             tx,
             scope,
             unit.operation_item_id,
-            revision_no,
-            entity.resource_version,
+            // A dry run's transaction is rolled back, but its statements still
+            // execute — and `ck_tr_operation_item_state` fires at statement
+            // time, not at commit. So the values have to be the dry-run ones
+            // here too, even though this write is about to be discarded.
+            (!unit.labels.dry_run).then_some(revision_no),
+            (!unit.labels.dry_run).then_some(entity.resource_version),
             now,
         )
         .await?
@@ -1323,8 +1327,10 @@ pub async fn commit_revision(
             tx,
             scope,
             unit.operation_item_id,
-            revision_no,
-            resource_version,
+            // See `commit_creation`: a dry run's discarded write must still
+            // satisfy the item CHECK.
+            (!unit.labels.dry_run).then_some(revision_no),
+            (!unit.labels.dry_run).then_some(resource_version),
             now,
         )
         .await?

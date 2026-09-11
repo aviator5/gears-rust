@@ -296,6 +296,19 @@ impl<H: StoreHooks> EntityStore for TestStores<H> {
             .compare_and_swap_version(tx, scope, entity_id, expected_resource_version, now)
             .await
     }
+
+    async fn mark_deleted(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+        expected_resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<Option<i64>, ScopeError> {
+        self.inner
+            .mark_deleted(tx, scope, entity_id, expected_resource_version, now)
+            .await
+    }
 }
 
 #[async_trait]
@@ -490,8 +503,8 @@ impl<H: StoreHooks> OperationStore for TestStores<H> {
         tx: &DbTx<'_>,
         scope: &AccessScope,
         item_id: i64,
-        revision_no: i32,
-        resource_version: i64,
+        revision_no: Option<i32>,
+        resource_version: Option<i64>,
         now: OffsetDateTime,
     ) -> Result<bool, ScopeError> {
         self.inner
@@ -536,6 +549,18 @@ impl<H: StoreHooks> DependencyStore for TestStores<H> {
     ) -> Result<bool, ScopeError> {
         self.inner
             .has_live_direct_instances(tx, scope, type_schema_entity_id)
+            .await
+    }
+
+    async fn live_direct_dependents(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+        bound: usize,
+    ) -> Result<usize, ScopeError> {
+        self.inner
+            .live_direct_dependents(tx, scope, entity_id, bound)
             .await
     }
 
