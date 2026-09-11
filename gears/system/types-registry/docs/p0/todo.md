@@ -1763,8 +1763,10 @@ deletion, running every check in a rollback-only transaction.
 - [x] A schema whose `x-gts-ref` names the target does **not** block: the keyword creates no edge, so there is no registered dependent to find
 - [x] Paired public-service deletion scenarios prove the distinction: an otherwise equivalent
   `$ref` holder blocks target deletion, while an `x-gts-ref` holder permits it and stays
-  readable. Tenant disable/unavailability scenarios belong to the deferred Availability
-  Evaluator, not T20 or P0
+  readable. **Otherwise equivalent literally**: one `holder` fixture parameterised by the
+  keyword alone, both carrying `type: "string"`, so the tests compare two keywords rather
+  than two schemas. Tenant disable/unavailability scenarios belong to the deferred
+  Availability Evaluator, not T20 or P0
 - [x] A deleted entity is still exact-readable as deleted, and absent from lists
 - [x] Dry Run commits nothing, moves no `resource_version`, and its mode is part of the fingerprint
 - [x] Dry-run `succeeded` omits `resource_version`; dry-run `unchanged` reports the existing one
@@ -1790,7 +1792,9 @@ deletion, running every check in a rollback-only transaction.
 - [x] Deletion's refusals each carry their own `Reason` const from T17's vocabulary —
       `has_registered_dependents`, `not_active`, beside the existing `precondition_failed`
 - [x] The blocked dependent **count** goes on the unit span (`blocked_dependents`), never in a
-      label and never with identities — the same rule the refusal message itself follows
+      label and never with identities — the same rule the refusal message itself follows.
+      Asserted in both directions on the refusal log line: the number is there and the
+      dependant's identifier is not. Mutation-checked by dropping the `record` call
 
 **Verification:**
 - [x] Gear tests, all three backends (see [Commands](#commands))
@@ -1872,9 +1876,9 @@ pins it. Mutation-checked: blinding the order to the stored edges fails the two 
 and nothing else.
 
 **Verification run:**
-- `cargo nextest run -p cf-gears-types-registry` — **829/829**, up from 781 by this task's 48
-  tests (5 instrument-contract, 9 deletion acceptance, 15 deletion, 11 dry run, 5 emission,
-  7 deletion-order, less 4 retired placeholders)
+- `cargo nextest run -p cf-gears-types-registry` — **834/834**, up from 781 by this task's 53
+  tests (5 instrument-contract, 9 deletion acceptance, 15 deletion, 11 dry run, 6 emission and
+  span, 7 deletion-order, 4 `edges_within`, less 4 retired placeholders)
 - container suites — **27/27 green**, but only **binary by binary**. The combined
   `make test-types-registry-db` selection now spins 27 databases and this machine's Docker
   runs out of published ports (`PortNotExposed`) partway through; each of the eight binaries
@@ -1888,6 +1892,17 @@ and nothing else.
 - mutation checks: dropping both labels from `candidates_total` fails 9 tests (4 unit,
   5 emission); dropping the deletion's `candidate_terminalized` call fails 3
 - `cargo fmt`, `cargo clippy --all-targets --all-features --no-deps -D warnings -D clippy::perf` — clean
+
+**Known open, deliberately.** Four narrow branches carry no test: the
+`more than {bound}` message (needs more than 512 live dependants), the lost `mark_deleted`
+race, the unreachable `MustNotExist` guard inside `process_deletion`, and a forced dry run
+under a deployment that *permits* force. None changes a committed outcome; each is a message
+or an unreachable arm.
+
+**And nothing outside the domain can delete yet.** `handlers.rs` fixes the submitted kind to
+`Registration`, so deletion has no REST surface until T27 adds `:batchDelete` and
+`DELETE /entities/{entity_key}` — which is T27's declared reason for depending on this task.
+Dry Run *is* reachable, because it is a field on `POST /entities`.
 
 **Dependencies:** T19
 **Files touched:**
@@ -1904,6 +1919,8 @@ and nothing else.
   `OperationItemRow::pass_labels`, optional success results
 - `TR/src/infra/metrics.rs`, `metrics_tests.rs` — the labels and their contract
 - `TR/src/infra/storage/repo/dependency_repo.rs` — `live_direct_dependents`, `edges_within`
+- `TR/tests/dependency_repo_test.rs` — 4 direct `edges_within` cases: the dropped outward
+  edge, two kinds collapsing to one link, a chain, and the empty set
 - `TR/src/domain/admission/graph.rs`, `graph_tests.rs` — `order_deletion_batch`,
   `DependencyLink`, and 7 tests over the reverse relation
 - `TR/src/infra/storage/repo/operation_repo.rs`, `store.rs` — optional success results, `mark_deleted`

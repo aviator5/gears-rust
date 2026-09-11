@@ -1733,3 +1733,60 @@ fn subject_like(gts_id: &str, marker: &str) -> Value {
     doc["title"] = json!(marker);
     doc
 }
+
+/// The blocked-dependant **count** goes on the unit span, and the identities go
+/// nowhere. A count is bounded and safe to read; the identities are unbounded
+/// and the caller may not be entitled to them. Asserted on the refusal line, in
+/// both directions — the number is there and the holder's identifier is not.
+#[tokio::test]
+async fn a_blocked_deletion_puts_the_dependant_count_on_its_span_and_no_identities() {
+    let _serial = SERIAL.lock().await;
+    recorder();
+    let db = test_db().await;
+    let subject = gts_id!("cf.core.obsv.spansubject.v1~");
+    let holder = gts_id!("cf.core.obsv.spanholder.v1~");
+    one_pass(
+        &db,
+        "span-seed",
+        domain_enums::OperationKind::Registration,
+        false,
+        candidate(subject, plain(subject), None),
+    )
+    .await;
+    one_pass(
+        &db,
+        "span-holder",
+        domain_enums::OperationKind::Registration,
+        false,
+        candidate(holder, referencing_target(holder, subject), None),
+    )
+    .await;
+
+    let item = one_pass(
+        &db,
+        "span-del",
+        domain_enums::OperationKind::Deletion,
+        false,
+        removal_of(subject, 1),
+    )
+    .await;
+    assert_eq!(item.status, OperationItemStatus::Failed, "{item:?}");
+
+    let refusal = lines_mentioning(subject)
+        .into_iter()
+        .find(|line| line.contains("candidate refused"))
+        .unwrap_or_else(|| panic!("no refusal line; captured:\n{}", captured_log()));
+
+    assert!(
+        refusal.contains("blocked_dependents=1"),
+        "the count must be on the unit span: {refusal}"
+    );
+    assert!(
+        !refusal.contains(holder),
+        "and the dependant's identity must not be anywhere on it: {refusal}"
+    );
+    assert!(
+        refusal.contains(r#"kind="deletion""#),
+        "the span still carries the operation kind: {refusal}"
+    );
+}

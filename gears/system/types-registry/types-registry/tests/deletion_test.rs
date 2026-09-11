@@ -66,19 +66,28 @@ fn schema(gts_id: &str) -> Value {
     })
 }
 
-/// A schema whose sole property `$ref`s `target` — a real dependency edge.
-fn referencing(gts_id: &str, target: &str) -> Value {
+/// One holder shape, parameterised by the **only** thing that differs between
+/// the two deletion-blocking cases: the keyword that names the target.
+///
+/// The pair has to be otherwise equivalent, or the tests below would be
+/// comparing two schemas rather than two keywords. Both carry `type: "string"`
+/// on the property — `x-gts-ref` constrains a string-valued instance, and a
+/// `$ref` alongside a sibling `type` resolves the same way it does alone.
+fn holder(gts_id: &str, keyword: &str, value: &Value) -> Value {
     let mut doc = schema(gts_id);
-    doc["properties"] = json!({ "target": { "$ref": format!("gts://{target}") } });
+    doc["properties"] = json!({ "target": { "type": "string", keyword: value } });
     doc
+}
+
+/// A real dependency edge: the schema inlines the target.
+fn referencing(gts_id: &str, target: &str) -> Value {
+    holder(gts_id, "$ref", &json!(format!("gts://{target}")))
 }
 
 /// The same shape with `x-gts-ref`, which is an instance-value constraint and
 /// creates **no** dependency edge (T18).
 fn constraining(gts_id: &str, pattern: &str) -> Value {
-    let mut doc = schema(gts_id);
-    doc["properties"] = json!({ "target": { "type": "string", "x-gts-ref": pattern } });
-    doc
+    holder(gts_id, "x-gts-ref", &json!(pattern))
 }
 
 async fn submit(
