@@ -44,7 +44,7 @@ use crate::config::TypesRegistryConfig;
 use crate::domain::compat::{normalize_dialect, select_baseline};
 use crate::domain::enums::{OperationKind, OwnershipScope, Plane};
 use crate::domain::policy::{PolicyRefusal, RegistrationPolicy};
-use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage};
+use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage};
 use crate::domain::ports::{NewOperation, NewOperationItem, OperationRow, Stores};
 
 /// Largest `Idempotency-Key` the column accepts (`varchar(255)`).
@@ -456,7 +456,13 @@ pub async fn accept(
     // Count at the shared exit so every refusal is covered.
     if let Err(error) = &accepted {
         let reason = error.reason();
-        ctx.metrics.refused(RefusalStage::Acceptance, reason);
+        // The request's own kind and mode: a synchronous refusal has no stored item
+        // to read them from, and both are top-level fields it always carries.
+        ctx.metrics.refused(
+            RefusalStage::Acceptance,
+            reason,
+            PassLabels::new(request.kind, request.dry_run),
+        );
         // The `warn` is for client refusals only.
         let infrastructure = matches!(
             error,

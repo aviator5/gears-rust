@@ -35,7 +35,7 @@ use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::Stores;
-use types_registry::domain::ports::metrics::{AdmissionMetrics, RefusalStage};
+use types_registry::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage};
 use types_registry::infra::metrics::{AdmissionMetricsMeter, SCOPE};
 
 const NOW: OffsetDateTime = datetime!(2026-08-21 09:15:30 UTC);
@@ -619,7 +619,11 @@ async fn an_unknown_stored_failure_reason_counts_under_other_and_creates_no_new_
         matches!(failure.reason, AdmissionFailureReason::Unknown(_)),
         "unknown stored codes must be preserved"
     );
-    metrics().refused(RefusalStage::Admission, reason_label(&failure.reason));
+    metrics().refused(
+        RefusalStage::Admission,
+        reason_label(&failure.reason),
+        PassLabels::new(domain_enums::OperationKind::Registration, false),
+    );
     flush();
 
     assert_eq!(

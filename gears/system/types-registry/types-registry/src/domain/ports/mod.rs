@@ -252,6 +252,17 @@ pub struct OperationItemRow {
     pub completed_at: Option<OffsetDateTime>,
 }
 
+impl OperationItemRow {
+    /// The metric labels every outcome of this item is counted under (T20).
+    ///
+    /// Read from the stored row rather than from the request, so a redelivered
+    /// pass labels its counts exactly as the first pass did.
+    #[must_use]
+    pub const fn pass_labels(&self) -> metrics::PassLabels {
+        metrics::PassLabels::new(self.kind, self.dry_run)
+    }
+}
+
 /// One `type_schema` current-state row: the revision pointer plus D3's
 /// materialized artifacts.
 #[domain_model]

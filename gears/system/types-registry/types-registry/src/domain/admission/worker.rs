@@ -326,6 +326,7 @@ async fn prepare(
             operation_item_id: item.id,
             precondition: item.precondition,
             force: effective_force(item.compat_forced, &tuning),
+            labels: item.pass_labels(),
         },
         tuning.limits,
         tuning.metrics,
@@ -476,6 +477,7 @@ async fn process_item(
                         operation_item_id: item.id,
                         precondition: item.precondition,
                         force: effective_force(item.compat_forced, &tuning),
+                        labels: item.pass_labels(),
                     },
                     tuning.limits,
                     tuning.metrics,
@@ -624,7 +626,7 @@ fn committed_outcome(
                 attempt,
                 "types_registry candidate admitted"
             );
-            metrics.candidate_terminalized(TerminalStatus::Succeeded);
+            metrics.candidate_terminalized(TerminalStatus::Succeeded, item.pass_labels());
             ItemOutcome {
                 gts_id: item.gts_id.clone(),
                 status: OperationItemStatus::Succeeded,
@@ -649,7 +651,7 @@ fn committed_outcome(
                 attempt,
                 "types_registry candidate content already current"
             );
-            metrics.candidate_terminalized(TerminalStatus::Unchanged);
+            metrics.candidate_terminalized(TerminalStatus::Unchanged, item.pass_labels());
             ItemOutcome {
                 gts_id: item.gts_id.clone(),
                 status: OperationItemStatus::Unchanged,
@@ -706,8 +708,12 @@ async fn record_failure(
 
     if recorded {
         // Count only the pass that won the item CAS.
-        metrics.candidate_terminalized(TerminalStatus::Failed);
-        metrics.refused(RefusalStage::Admission, reason_label(&failure.reason));
+        metrics.candidate_terminalized(TerminalStatus::Failed, item.pass_labels());
+        metrics.refused(
+            RefusalStage::Admission,
+            reason_label(&failure.reason),
+            item.pass_labels(),
+        );
         tracing::warn!(
             %operation_id,
             operation_item_id = item.id,
