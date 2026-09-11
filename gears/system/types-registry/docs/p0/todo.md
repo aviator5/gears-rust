@@ -1731,7 +1731,7 @@ outcome vector depends on.
 
 ---
 
-### - [ ] T20: Deletion and Dry Run
+### - [x] T20: Deletion and Dry Run
 
 **Inherited from T15 — this is a correctness obligation, not a nicety.** Deletion's *"a new
 dependant cannot appear between the deletion check and the lifecycle transition"* rests on the
@@ -1757,55 +1757,140 @@ and entity locks, recheck `ACTIVE` with no direct registered dependents, lifecyc
 deletion, running every check in a rollback-only transaction.
 
 **Acceptance criteria:**
-- [ ] Deletion claims the `entity_write_order` row as its transaction's first statement — without it the commit order admission's correctness rests on is no longer total, and `a_creation_claims_the_entity_write_order_row_exactly_once` (with its revision / `unchanged` siblings) is the shape of the test that catches an omission
-- [ ] Deletion with a live direct registered dependent is refused, reporting a count without identities
-- [ ] A transitive-only dependent does not block
-- [ ] A schema whose `x-gts-ref` names the target does **not** block: the keyword creates no edge, so there is no registered dependent to find
-- [ ] Paired public-service deletion scenarios prove the distinction: an otherwise equivalent
+- [x] Deletion claims the `entity_write_order` row as its transaction's first statement — without it the commit order admission's correctness rests on is no longer total, and `a_creation_claims_the_entity_write_order_row_exactly_once` (with its revision / `unchanged` siblings) is the shape of the test that catches an omission
+- [x] Deletion with a live direct registered dependent is refused, reporting a count without identities
+- [x] A transitive-only dependent does not block
+- [x] A schema whose `x-gts-ref` names the target does **not** block: the keyword creates no edge, so there is no registered dependent to find
+- [x] Paired public-service deletion scenarios prove the distinction: an otherwise equivalent
   `$ref` holder blocks target deletion, while an `x-gts-ref` holder permits it and stays
   readable. Tenant disable/unavailability scenarios belong to the deferred Availability
   Evaluator, not T20 or P0
-- [ ] A deleted entity is still exact-readable as deleted, and absent from lists
-- [ ] Dry Run commits nothing, moves no `resource_version`, and its mode is part of the fingerprint
-- [ ] Dry-run `succeeded` omits `resource_version`; dry-run `unchanged` reports the existing one
+- [x] A deleted entity is still exact-readable as deleted, and absent from lists
+- [x] Dry Run commits nothing, moves no `resource_version`, and its mode is part of the fingerprint
+- [x] Dry-run `succeeded` omits `resource_version`; dry-run `unchanged` reports the existing one
 
 **Observability — this task owns the label sweep (`plan.md` P16 rule 2):**
-- [ ] **A dry run is distinguishable from a commit in every series it touches.** `dry_run`
+- [x] **A dry run is distinguishable from a commit in every series it touches.** `dry_run`
       becomes a label on `candidates_total`, `refusals_total` and T17's verdict counter. Without
       it a rollback-only pass increments `candidates_total{status="succeeded"}` beside admissions
       that actually wrote, and "how many registrations succeeded today" answers with a number
       that includes passes which wrote nothing
-- [ ] The activation-write-set histogram is **either labelled or not observed** for a dry run —
+- [x] The activation-write-set histogram is **either labelled or not observed** for a dry run —
       decided here and tested either way, with the reason recorded next to the call. A
       hypothetical write set recorded beside real ones misreports how close the deployment runs
       to `limits.activation_write_set`
-- [ ] **A deletion is distinguishable from a registration:** `kind` becomes a label on
+- [x] **A deletion is distinguishable from a registration:** `kind` becomes a label on
       `candidates_total` and `refusals_total`. Deletions are rare and irreversible, and a success
       series that blends them cannot answer *what did this deployment delete*. Both spans already
       carry `kind` and `dry_run` (T16) — the gap is metrics-only, which is why nothing here
       touches a span constructor
-- [ ] Both labels are **required parameters** on the port's methods, so every existing call site
+- [x] Both labels are **required parameters** on the port's methods, so every existing call site
       is a compile error until it says which mode and which kind it is. No defaulting to
       `registration` / `false`, which is exactly how a mislabelled series gets shipped
-- [ ] Deletion's refusals each carry their own `Reason` const from T17's vocabulary —
+- [x] Deletion's refusals each carry their own `Reason` const from T17's vocabulary —
       `has_registered_dependents`, `not_active`, beside the existing `precondition_failed`
-- [ ] The blocked dependent **count** goes on the unit span (`blocked_dependents`), never in a
+- [x] The blocked dependent **count** goes on the unit span (`blocked_dependents`), never in a
       label and never with identities — the same rule the refusal message itself follows
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Tests: blocked deletion, transitive non-blocking, tombstone readability, dry run for both kinds
-- [ ] Test: reusing one key for dry run then commit is a fingerprint mismatch, not a replay
-- [ ] Test: instrument contract — the two new label keys and their vocabularies against an
+- [x] Gear tests, all three backends (see [Commands](#commands))
+- [x] Tests: blocked deletion, transitive non-blocking, tombstone readability, dry run for both kinds
+- [x] Test: reusing one key for dry run then commit is a fingerprint mismatch, not a replay
+- [x] Test: instrument contract — the two new label keys and their vocabularies against an
       `InMemoryMetricExporter` (T16's bar)
-- [ ] Test: emission — a committed deletion, a refused deletion, a dry-run registration and a
+- [x] Test: emission — a committed deletion, a refused deletion, a dry-run registration and a
       dry-run deletion each land under the right label pair, asserted as a per-pass delta rather
       than a total
-- [ ] Test: no counter from a dry-run pass appears under `dry_run="false"`
-- [ ] Mutation check: dropping either label, or the deletion emission, fails the suite
+- [x] Test: no counter from a dry-run pass appears under `dry_run="false"`
+- [x] Mutation check: dropping either label, or the deletion emission, fails the suite
+
+**Two synchronous refusals are gone, not repurposed.** `UnsupportedOperationKind`
+and `DryRunNotAccepted` were placeholders for exactly this task, and neither condition
+exists any more: `OperationKind` is a closed pair, so there is no unsupported kind to name,
+and Dry Run is a mode of the ordinary path. Both variants, their `reason()` codes and their
+REST mappings were removed rather than left dead. The three tests that asserted them were
+retired, and `a_forced_dry_run_is_refused_for_being_a_dry_run_before_force_is_considered`
+became `a_forced_dry_run_reaches_the_force_gate_and_is_refused_there` — it now asserts the
+ordering T17 asked it to re-point at.
+
+**A deletion's stored payload is JSON `null`.** `ck_tr_operation_item_state` requires a
+non-null `request_payload` while an item is pending, and a deletion submits no document.
+`null` is the JSON spelling of that absence rather than a placeholder something might later
+try to parse — and the worker reads `item.kind` rather than the payload, so nothing does.
+
+**The item CHECK fires per statement, not at commit** — which is what shaped Dry Run's
+implementation. A dry run runs the real commit path and then rolls it back, but the
+`mark_item_succeeded` *inside* that transaction still executes, so it has to satisfy the
+dry-run column rules before it can be discarded. `mark_item_succeeded` therefore takes
+`Option<i32>` and `Option<i64>`, which is the same change a deletion needs (no revision) and
+the compile-error sweep that forced every call site to say which it was. The terminal write
+then happens **again** outside the transaction, where nothing can discard it.
+
+**`WorkerError::DryRunRolledBack` is not a failure.** Returning an error is the only way to
+make the transaction roll back, so the result the pass computed travels out in the error
+position and is unwrapped immediately by the same function. `retryable_db_err` answers `None`
+for it, so the retry loop short-circuits instead of re-running the pass.
+
+**The write-order claim is taken and rolled back with everything else**, so a dry run leaves
+the coordination row exactly where it found it — asserted together with a committing pass in
+the same file, so the test is about the rollback rather than about the claim never happening.
+
+**Two label decisions, both recorded next to the call:**
+- the **activation-write-set histogram is not observed at all** for a dry run. It answers how
+  close a deployment runs to `limits.activation_write_set`, and a pass that rewrote no
+  dependents is not a data point about that pressure. Exceeding the bound stays visible,
+  because it is a refusal and refusals carry `dry_run`;
+- the **verdict counter takes `dry_run` and not `kind`**. A comparison is only ever computed
+  for a registration, so a `kind` label there would be one constant series.
+
+**Batch deletion ordering is deliberately not implemented, and T19 left the question here.**
+A deletion batch's order is the *reverse* of a registration's — a dependant must go before
+the base it consumes — but the ordering function is pure and a deletion carries no document,
+so it could only order by identifier-derived edges. That would silently fail on `$ref`
+dependants, which is the common case. Every item still earns its own correct outcome
+(`has_registered_dependents`), so the cost is a caller re-submitting in a different order,
+not a wrong answer. Ordering deletions properly needs the stored `dependency` edges read in
+the worker before the per-item loop; that is a new read path with its own tests and nothing
+in P0 asks for it. `graph_tests::a_candidate_without_content_carries_no_edge` pins the
+current behaviour with this reason.
+
+**Verification run:**
+- `cargo nextest run -p cf-gears-types-registry` — **818/818**, up from 781 by this task's 37
+  tests (5 instrument-contract, 9 deletion acceptance, 11 deletion, 11 dry run, 5 emission,
+  less 4 retired placeholders)
+- container suites — **27/27 green**, but only **binary by binary**. The combined
+  `make test-types-registry-db` selection now spins 27 databases and this machine's Docker
+  runs out of published ports (`PortNotExposed`) partway through; each of the eight binaries
+  passes on its own, including `deletion_backends_test` on PostgreSQL and MySQL. Not a code
+  failure and not specific to this task — it is the selection outgrowing one laptop, and CI
+  should either cap `--test-threads` or share one container per backend
+- mutation checks: dropping both labels from `candidates_total` fails 9 tests (4 unit,
+  5 emission); dropping the deletion's `candidate_terminalized` call fails 3
+- `cargo fmt`, `cargo clippy --all-targets --all-features --no-deps -D warnings -D clippy::perf` — clean
 
 **Dependencies:** T19
-**Files likely touched:** `TR/src/domain/admission/deletion.rs`, `TR/src/domain/admission/worker.rs`, `TR/src/domain/admission/reasons.rs`, `TR/src/domain/ports/metrics.rs`, `TR/src/infra/metrics.rs`, `TR/src/api/rest/routes.rs`, `TR/tests/deletion_test.rs`
+**Files touched:**
+- `TR/src/domain/admission/deletion.rs` — NEW, the short protocol
+- `TR/src/domain/admission/worker.rs` — the deletion pass, the dry-run rollback and its
+  terminal writes
+- `TR/src/domain/admission/acceptance.rs` — the deletion rules; the two placeholder refusals removed
+- `TR/src/domain/admission/errors.rs` — `DryRunRolledBack`, `DryRunResult`
+- `TR/src/domain/admission/reasons.rs`, `reasons_tests.rs` — `HasRegisteredDependents`,
+  `NotActive`; `KNOWN_VARIANTS` 27 → 29
+- `TR/src/domain/admission/unit.rs` — dry-run values in the discarded item write
+- `TR/src/domain/ports/metrics.rs` — `PassLabels`; `kind` and `dry_run` required
+- `TR/src/domain/ports/mod.rs` — `mark_deleted`, `live_direct_dependents`,
+  `OperationItemRow::pass_labels`, optional success results
+- `TR/src/infra/metrics.rs`, `metrics_tests.rs` — the labels and their contract
+- `TR/src/infra/storage/repo/dependency_repo.rs` — `live_direct_dependents`
+- `TR/src/infra/storage/repo/operation_repo.rs`, `store.rs` — optional success results, `mark_deleted`
+- `TR/src/observability.rs` — `blocked_dependents` on the unit span
+- `TR/src/api/rest/error.rs` — the two new refusals; two obsolete mappings removed
+- `TR/tests/deletion_test.rs` — NEW, 11 `SQLite` tests
+- `TR/tests/dry_run_test.rs` — NEW, 11 `SQLite` tests
+- `TR/tests/deletion_backends_test.rs` — NEW, 3 tests behind `integration`
+- `TR/tests/observability_test.rs` — 5 emission tests
+- `TR/tests/api_rest_test.rs`, `TR/tests/operation_idempotency_test.rs` — the retired placeholders
 **Scope:** M
 
 ---
