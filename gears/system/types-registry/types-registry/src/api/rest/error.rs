@@ -6,7 +6,7 @@ use types_registry_sdk::{field, precondition};
 use crate::domain::admission::acceptance::{AcceptanceError, MAX_IDEMPOTENCY_KEY};
 use crate::domain::admission::worker::WorkerError;
 use crate::domain::error::DomainError;
-use crate::domain::registry_service::ServiceError;
+use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, ServiceError};
 
 #[resource_error(gts_id!("cf.types_registry.registry.type.v1~"))]
 pub struct TypeRegistryError;
@@ -140,6 +140,31 @@ impl From<ServiceError> for CanonicalError {
             )
             .with_resource(gts_uuid.to_string())
             .create(),
+            // The three read-surface envelope refusals (T22a). Each names the
+            // request field the caller has to change, and each states the bound
+            // rather than the configuration key holding it — as
+            // `AcceptanceError::BatchTooLarge` does, and for the same reason.
+            ServiceError::BatchReadOutOfRange { count } => invalid_field(
+                violation_field::ITEMS,
+                format!(
+                    "a batch read must name between 1 and {MAX_BATCH_GET_KEYS} keys; \
+                     this one named {count}"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            ServiceError::PageSizeOutOfRange { limit, max } => invalid_field(
+                violation_field::LIMIT,
+                format!("a page size must be between 1 and {max}; this request asked for {limit}"),
+                field::VALIDATION_FAILED,
+            ),
+            // `gts-rust`'s own message: it names the position and the token it
+            // refused, which is what a caller fixing a wildcard needs, and it
+            // describes the caller's input rather than anything of ours.
+            ServiceError::InvalidPattern { message } => invalid_field(
+                violation_field::PATTERN,
+                format!("the pattern is not a GTS identifier pattern: {message}"),
+                field::INVALID_QUERY,
+            ),
         }
     }
 }
@@ -247,14 +272,22 @@ impl From<WorkerError> for CanonicalError {
     }
 }
 
-/// The three field names this mapping keys violations by, beyond the two
-/// `field::` constants the SDK already publishes.
+/// The field names this mapping keys violations by, beyond the two `field::`
+/// constants the SDK already publishes.
+///
+/// Header and query-parameter names are spelled exactly as the caller sent them,
+/// `$select` included, so a caller greps the violation for the thing it wrote.
 mod violation_field {
     pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
     pub const IF_MATCH: &str = "If-Match";
+    pub const IF_NONE_MATCH: &str = "If-None-Match";
     pub const ITEMS: &str = "items";
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
+    pub const PATTERN: &str = "pattern";
+    pub const LIMIT: &str = "limit";
+    pub const CURSOR: &str = "cursor";
+    pub const SELECT: &str = "$select";
 }
 
 /// One invalid-argument problem keyed by a field, with no resource attached.
@@ -289,6 +322,57 @@ pub fn if_match_not_supported() -> CanonicalError {
         "If-Match is not supported on this route; name the precondition in \
          expected_resource_version, whose failure is reported on the operation item"
             .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject the `If-None-Match` **header** on a batch read.
+///
+/// Refused rather than ignored: validators and `unchanged` results are per key,
+/// one header cannot carry a batch of them, and a caller that sent one believes
+/// its request is conditional (DESIGN §3.3). The per-item slot is named in the
+/// message, so the fix is in the refusal.
+#[must_use]
+pub fn if_none_match_not_supported() -> CanonicalError {
+    invalid_field(
+        violation_field::IF_NONE_MATCH,
+        "If-None-Match is not supported on a batch read; carry each key's validator \
+         in that item's if_none_match, because one header cannot represent a batch"
+            .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject `$select` rather than answering with the default set.
+///
+/// Silently returning a full representation to a caller that asked for one field is
+/// worse than a refusal on three counts: the caller gets bytes it did not ask for,
+/// it may build on behaviour P1 will change under it, and a validator would be
+/// computed over a projection it does not believe it has (SPEC §10.2,
+/// `principle-fail-closed`).
+#[must_use]
+pub fn select_not_supported() -> CanonicalError {
+    invalid_field(
+        violation_field::SELECT,
+        "$select is not supported at this version; each read surface has one fixed \
+         field set: a discovery page is identity and metadata, an exact or batch \
+         read is the full representation"
+            .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a cursor this build cannot use: unreadable, of an unknown version, or
+/// issued for a different query.
+///
+/// Splicing two traversals would return a page that is neither complete for the
+/// old query nor for the new one, so a mismatch is refused rather than reinterpreted.
+/// `detail` comes from `toolkit-odata`, which distinguishes the cases.
+#[must_use]
+pub fn cursor_not_usable(detail: &str) -> CanonicalError {
+    invalid_field(
+        violation_field::CURSOR,
+        format!("the cursor cannot be used for this request: {detail}"),
         field::VALIDATION_FAILED,
     )
 }

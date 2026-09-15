@@ -11,8 +11,9 @@ use toolkit::api::operation_builder::{
 };
 
 use super::dto::{
-    DeleteEntitiesRequest, EntityDto, GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto,
-    OperationDto, RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
+    BatchGetRequest, DeleteEntitiesRequest, EntityDto, EntityLookupsDto, EntityPageDto,
+    GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto, OperationDto,
+    RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
 };
 use super::handlers;
 pub use super::paths::{V1, V2};
@@ -61,6 +62,8 @@ pub fn register_routes(
     router = register_v1(router, openapi);
     router = register_submit(router, openapi);
     router = register_reads(router, openapi);
+    router = register_batch_get(router, openapi);
+    router = register_discovery(router, openapi);
     router = register_batch_delete(router, openapi);
     router = register_delete_entity(router, openapi);
 
@@ -293,6 +296,95 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .handler(handlers::get_entity_by_key)
         .json_response_with_schema::<EntityDto>(openapi, StatusCode::OK, "The requested entity")
         .problem_response(openapi, StatusCode::NOT_FOUND, "Entity not found")
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    router
+}
+
+/// `POST {V2}/entities:batchGet` (T22a).
+fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    // A read-only custom action, and a `POST` for two reasons that are about the
+    // transport rather than the semantics: an identifier runs to 1024 characters,
+    // which a query string cannot carry safely, and portable `GET` has no body
+    // (DESIGN §3.3). It is still a read — no `Idempotency-Key`, nothing to replay.
+    router = OperationBuilder::post(format!("{V2}/entities:batchGet"))
+        .operation_id("types_registry.batch_get_entities")
+        .summary("Read a set of GTS entities by key")
+        .description(
+            "Read up to 100 entities in one round trip. Each item names one entity in `key` \
+             (a canonical GTS identifier or the Registry Reference UUID derived from it), \
+             resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. \
+             Returns 200 with one result per requested key, in request order and echoing the \
+             key it was asked by: `found` with the full representation, or `not_found`. A key \
+             named twice collapses onto its first mention; the two spellings of one entity are \
+             two keys and get two results. An absent key is not a 404: one missing key must \
+             not lose the answers for the others. The If-None-Match header is refused rather \
+             than ignored: validators are per key and belong in each item's `if_none_match`.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<BatchGetRequest>(openapi, "Keys to read")
+        .handler(handlers::batch_get_entities)
+        .json_response_with_schema::<EntityLookupsDto>(
+            openapi,
+            StatusCode::OK,
+            "One result per requested key",
+        )
+        .standard_errors(openapi)
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    router
+}
+
+/// `GET {V2}/entities` — the bounded, content-free discovery page (D12, T22a).
+fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    router = OperationBuilder::get(format!("{V2}/entities"))
+        .operation_id("types_registry.list_entities")
+        .summary("Discover GTS entities")
+        .description(
+            "Return one bounded page of active entities, ordered by canonical identifier, \
+             with the cursor for the next page. Deleted entities are excluded: a tombstone \
+             stays readable by key and leaves discovery. A page is content-free: identity \
+             and metadata only, with no authored content, no materialized artifacts and no \
+             validator, so a caller that wants any of those asks \
+             POST /types-registry/v2/entities:batchGet for the identifiers this page gave it. \
+             `limit` defaults to 100 and may not exceed 1000. `cursor` is opaque, versioned \
+             and bound to the query it was issued for; replaying one under a different \
+             pattern is refused rather than spliced. `$select` is refused at this version: \
+             each read surface has one fixed field set.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param(
+            "pattern",
+            false,
+            "A GTS wildcard pattern (e.g. gts.acme.core.*). Decided by gts-rust; a string it \
+             refuses is a 400, not an empty page",
+        )
+        // `query_param_typed` takes description before type; swapping them silently emits `string`.
+        .query_param_typed(
+            "limit",
+            false,
+            "Page size, 1 to 1000. Defaults to 100",
+            "integer",
+        )
+        .query_param(
+            "cursor",
+            false,
+            "The previous page's page_info.next_cursor. Absent starts at the beginning",
+        )
+        .handler(handlers::discover_entities)
+        .json_response_with_schema::<EntityPageDto>(
+            openapi,
+            StatusCode::OK,
+            "One page and, while more remains, its cursor",
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);

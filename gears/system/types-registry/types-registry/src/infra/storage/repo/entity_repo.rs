@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{IN_CHUNK, conflict_do_nothing};
 use crate::domain::enums::EntityKind;
-use crate::domain::ports::{EntityRow, NewEntity};
+use crate::domain::ports::{EntityPage, EntityRow, NewEntity, PageRequest};
 use crate::infra::storage::entity::entity;
 use crate::infra::storage::entity::enums::LifecycleStatus;
 
@@ -58,45 +58,6 @@ fn row(m: entity::Model) -> EntityRow {
         created_at: m.created_at,
         updated_at: m.updated_at,
     }
-}
-
-/// One keyset page request: resume after a stored `gts_id`, not at an offset.
-#[derive(Clone, Debug)]
-pub struct PageRequest {
-    /// Exclusive lower bound. `None` starts at the beginning.
-    pub after: Option<String>,
-    pub limit: u32,
-}
-
-impl PageRequest {
-    #[must_use]
-    pub fn first(limit: u32) -> Self {
-        Self { after: None, limit }
-    }
-
-    #[must_use]
-    pub fn after(after: String, limit: u32) -> Self {
-        Self {
-            after: Some(after),
-            limit,
-        }
-    }
-}
-
-/// One page of a keyset traversal.
-#[derive(Clone, Debug)]
-pub struct EntityPage {
-    pub items: Vec<EntityRow>,
-    /// The last `gts_id` the SQL prefilter **consumed**, which is what the next
-    /// request resumes after. It is not necessarily the last item returned: rows
-    /// the pattern rejected were still consumed, and skipping them again would
-    /// re-scan them on every page.
-    pub next_after: Option<String>,
-    /// `true` when the scan stopped on the page limit or the scan budget rather
-    /// than on exhausting the range. It may over-report — stopping exactly on the
-    /// last row of a range looks the same as stopping early — which is the safe
-    /// direction: the caller asks once more and gets an empty page.
-    pub has_more: bool,
 }
 
 pub struct EntityRepo;

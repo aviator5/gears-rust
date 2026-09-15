@@ -7,8 +7,9 @@
 //! Every method takes and returns the types in [`crate::domain::ports`], mapping
 //! its own `SeaORM` models at the edge — as `credstore` and `mini-chat` do.
 //! [`super::store`] therefore holds no mapping, only the `&DbTx` port signatures
-//! the domain's dyn-safe traits need. [`EntityPage`] and [`PageRequest`] stay here
-//! because paging is not a port yet.
+//! the domain's dyn-safe traits need. [`EntityPage`] and [`PageRequest`] are port
+//! types too since T22a made discovery a port; they are re-exported here so a
+//! repository caller names one module.
 //!
 //! Every method takes `runner: &impl DBRunner`, never `&SecureConn`, so one body
 //! serves both a pooled connection and a transaction — which is how the admission
@@ -35,9 +36,10 @@ pub mod operation_repo;
 pub mod type_schema_repo;
 pub mod version_family_repo;
 
+pub use crate::domain::ports::{EntityPage, PageRequest};
 pub use coordination_state_repo::CoordinationStateRepo;
 pub use dependency_repo::DependencyRepo;
-pub use entity_repo::{EntityPage, EntityRepo, PageRequest};
+pub use entity_repo::EntityRepo;
 pub use instance_repo::InstanceRepo;
 pub use operation_repo::OperationRepo;
 pub use type_schema_repo::TypeSchemaRepo;

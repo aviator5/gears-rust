@@ -610,6 +610,47 @@ pub trait VersionFamilyStore: Send + Sync {
     ) -> Result<(VersionFamilyRow, bool), ScopeError>;
 }
 
+/// One keyset page request: resume after a stored `gts_id`, not at an offset.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct PageRequest {
+    /// Exclusive lower bound. `None` starts at the beginning.
+    pub after: Option<String>,
+    pub limit: u32,
+}
+
+impl PageRequest {
+    #[must_use]
+    pub fn first(limit: u32) -> Self {
+        Self { after: None, limit }
+    }
+
+    #[must_use]
+    pub fn after(after: String, limit: u32) -> Self {
+        Self {
+            after: Some(after),
+            limit,
+        }
+    }
+}
+
+/// One page of a keyset traversal.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct EntityPage {
+    pub items: Vec<EntityRow>,
+    /// The last `gts_id` the SQL prefilter **consumed**, which is what the next
+    /// request resumes after. It is not necessarily the last item returned: rows
+    /// the pattern rejected were still consumed, and skipping them again would
+    /// re-scan them on every page.
+    pub next_after: Option<String>,
+    /// `true` when the scan stopped on the page limit or the scan budget rather
+    /// than on exhausting the range. It may over-report — stopping exactly on the
+    /// last row of a range looks the same as stopping early — which is the safe
+    /// direction: the caller asks once more and gets an empty page.
+    pub has_more: bool,
+}
+
 /// Entity identity and lifecycle.
 #[async_trait]
 pub trait EntityStore: Send + Sync {
@@ -660,6 +701,23 @@ pub trait EntityStore: Send + Sync {
         scope: &AccessScope,
         gts_uuids: &[Uuid],
     ) -> Result<Vec<EntityRow>, ScopeError>;
+
+    /// One bounded keyset page of **active** entities, optionally narrowed by a
+    /// GTS pattern. Tombstones are excluded: a deleted entity stays exact-readable
+    /// and leaves discovery (ADR-0008).
+    ///
+    /// The pattern is `gts-rust`'s, never SQL's: the implementation may narrow with
+    /// a range over the identifier, but only [`gts::GtsId::matches_pattern`] decides
+    /// what a page contains (`constraint-gts-implementation`). One call is bounded
+    /// in work as well as in results, so a page may come back short of its limit
+    /// with [`EntityPage::has_more`] still set.
+    async fn list_page(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        pattern: Option<&gts::GtsIdPattern>,
+        request: PageRequest,
+    ) -> Result<EntityPage, ScopeError>;
 
     /// The kind of one member of a family, or `None` when the family is empty.
     /// The input to T10's one-kind-per-family rule.
@@ -735,6 +793,18 @@ pub trait TypeSchemaStore: Send + Sync {
         scope: &AccessScope,
         entity_id: i64,
     ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError>;
+
+    /// The current-state row of each named entity, artifacts included,
+    /// `entity_id`-sorted. Entities with no current row are simply absent.
+    ///
+    /// The batched form of [`Self::find_current_schema`], so a batch read costs a
+    /// bounded number of queries rather than one per key (DESIGN §3.3).
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError>;
 
     /// Current revision numbers and fingerprints, `entity_id`-sorted, without artifacts.
     /// Entities with no current row are simply absent.
