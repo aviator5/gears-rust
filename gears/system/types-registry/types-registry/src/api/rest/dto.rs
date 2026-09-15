@@ -9,7 +9,9 @@ use crate::domain::enums::{
     EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
 };
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
-use crate::domain::registry_service::{EntityRecord, OperationItemRecord, OperationRecord};
+use crate::domain::registry_service::{
+    EntityLookup, EntityRecord, EntitySummary, OperationItemRecord, OperationRecord,
+};
 
 /// DTO for a GTS ID segment.
 #[derive(Debug, Clone)]
@@ -783,6 +785,182 @@ impl From<EntityRecord> for EntityDto {
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,
             effective_traits_schema: record.effective_traits_schema,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two read surfaces: `:batchGet` and content-free discovery (T22a)
+// ---------------------------------------------------------------------------
+//
+// One default field set per surface, not one per caller: discovery answers *what
+// exists* with identity and metadata, while an exact read and `batchGet` answer
+// *what is in it* with the authored content and D3's artifacts. `$select` is
+// refused rather than honoured, so these two sets are the only two (SPEC §10.2).
+
+/// One key in a batch read.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct BatchGetItemDto {
+    /// A canonical GTS identifier or a Registry Reference UUID, classified exactly
+    /// as `GET /entities/{entity_key}` classifies its path segment.
+    pub key: String,
+    /// This key's validator from an earlier read, which makes just this key
+    /// conditional. The field the two header names lowercase to — `if_none_match`
+    /// going out, `etag` coming back — because one `If-None-Match` header cannot
+    /// represent a batch of them (DESIGN §3.3).
+    ///
+    /// **No read emits a validator yet:** T29 adds `etag` to a result and the
+    /// comparison behind it. Until then no value a caller could hold can match, so
+    /// every present key is read unconditionally and answers `found` — which is
+    /// what a stale validator does after T29 too. The field is declared now so the
+    /// wire shape does not change under the callers T23 migrates.
+    #[serde(default)]
+    pub if_none_match: Option<String>,
+}
+
+/// A batch read.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+pub struct BatchGetRequest {
+    /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, enforced by
+    /// `RegistryService::batch_get` before it reads anything. Stated in one place,
+    /// as `DeleteEntitiesRequest` states its own.
+    ///
+    /// [`MAX_BATCH_GET_KEYS`]: crate::domain::registry_service::MAX_BATCH_GET_KEYS
+    #[schema(min_items = 1)]
+    pub items: Vec<BatchGetItemDto>,
+}
+
+/// `found` or `not_found`.
+///
+/// DESIGN's `unchanged` arrives with T29's validators and its `failed` needs
+/// federation, which is out of P0 (SPEC §2). Declaring either now would publish a
+/// vocabulary value this gear never emits, which a generated client would
+/// type-check against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum EntityLookupStatusDto {
+    Found,
+    NotFound,
+}
+
+impl From<&EntityLookup> for EntityLookupStatusDto {
+    fn from(lookup: &EntityLookup) -> Self {
+        match lookup {
+            EntityLookup::Found(_) => Self::Found,
+            EntityLookup::NotFound => Self::NotFound,
+        }
+    }
+}
+
+/// One key's answer, echoing the key it was asked by.
+///
+/// The echo is not redundant: a caller that mixed identifiers and Registry
+/// References matches answers to questions without re-deriving either, and an
+/// absence has no entity to carry the key for it.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityLookupDto {
+    pub key: String,
+    pub status: EntityLookupStatusDto,
+    /// The full representation, exactly as the exact read returns it. Absent on
+    /// `not_found`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity: Option<EntityDto>,
+}
+
+/// The results of one batch read, in request order.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityLookupsDto {
+    pub items: Vec<EntityLookupDto>,
+}
+
+/// Query parameters of the content-free discovery page (D12).
+#[derive(Debug, Clone, Default)]
+#[toolkit_macros::api_dto(request)]
+pub struct DiscoverEntitiesQuery {
+    /// A GTS wildcard pattern. Compiled and decided by `gts-rust`; a string it
+    /// refuses is a `400`, not an empty page.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Page size. Defaults to `limits.page_size_default` and may not exceed
+    /// `limits.page_size_max`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The previous page's `page_info.next_cursor`. Opaque, versioned and bound to
+    /// the query it was issued for.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Bound only so it can be **refused**: axum drops query keys nothing claims,
+    /// and answering a caller that asked for one field with the whole default set is
+    /// worse than refusing (SPEC §10.2).
+    #[serde(default, rename = "$select")]
+    pub select: Option<String>,
+}
+
+/// One entity as a page names it: identity and metadata only.
+///
+/// No `content`, no `resolved_schema`, no `effective_traits`,
+/// no `effective_traits_schema` and no validator — a page is a changing set rather
+/// than an answer about an exact key (§8.5). A caller that wants any of those asks
+/// `:batchGet` for the identifiers the page gave it.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntitySummaryDto {
+    pub gts_id: String,
+    /// The Registry Reference: a deterministic `UUIDv5` of the identifier.
+    pub gts_uuid: Uuid,
+    pub kind: EntityKindDto,
+    /// Always `active` on a page; tombstones leave discovery. Carried so a page item
+    /// and a full representation name the same fields the same way.
+    pub lifecycle_status: LifecycleStatusDto,
+    pub resource_version: i64,
+    /// Caller-declared attribution. It MUST NOT be used to authorize.
+    pub owning_gear: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+}
+
+/// Where the next page starts.
+///
+/// `next_cursor` and the page size only. No `prev_cursor`, because discovery pages
+/// forward only, and no total, because counting a set this page did not read would
+/// be a second unbounded query.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct PageInfoDto {
+    /// Present while the traversal has more to give. Absent means this page is the
+    /// last one — the only end-of-traversal signal, so a caller stops on its
+    /// absence rather than on a short page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// The page size actually applied, which is the default when the caller named none.
+    pub limit: u32,
+}
+
+/// One bounded page of discovery results (SPEC §10.1's `EntityPage`).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityPageDto {
+    pub items: Vec<EntitySummaryDto>,
+    pub page_info: PageInfoDto,
+}
+
+impl From<EntitySummary> for EntitySummaryDto {
+    fn from(summary: EntitySummary) -> Self {
+        Self {
+            gts_id: summary.gts_id,
+            gts_uuid: summary.gts_uuid,
+            kind: summary.kind.into(),
+            lifecycle_status: summary.lifecycle_status.into(),
+            resource_version: summary.resource_version,
+            owning_gear: summary.owning_gear,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
         }
     }
 }

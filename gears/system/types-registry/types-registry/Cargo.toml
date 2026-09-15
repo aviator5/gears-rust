@@ -65,6 +65,9 @@ toolkit = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-gts = { workspace = true }
+# Versioned base64url keyset cursors for content-free discovery (D12): `CursorV1`
+# refuses an unknown version, which is the property the page contract needs.
+toolkit-odata = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-utils = { workspace = true }
 # Derives the default metric prefix from the gear name.
