@@ -7,6 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use toolkit::api::{OpenApiRegistry, ParamLocation, ResponseHeaderType};
+use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::{gts_id, gts_uri};
 use tower::ServiceExt;
 
@@ -14,7 +15,7 @@ use types_registry::api::rest::routes::{V1, V2};
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::OperationDispatch;
 use types_registry::domain::policy::RegistrationPolicy;
-use types_registry::domain::registry_service::RegistryService;
+use types_registry::domain::registry_service::{MAX_BATCH_GET_KEYS, RegistryService};
 use types_registry::domain::service::TypesRegistryService;
 use types_registry::infra::InMemoryGtsRepository;
 use types_registry::infra::outbox::OutboxDispatch;
@@ -168,6 +169,17 @@ async fn router_with_v1_ready() -> TestApi {
 }
 
 async fn router_with(v1_ready: bool) -> TestApi {
+    router_and_db_with(v1_ready).await.0
+}
+
+/// The router plus the provider behind it, for the discovery tests that seed
+/// `entity` rows directly. A content-free page reads nothing but `entity`, and the
+/// scan-budget case needs more rows than the admission path can admit in a test.
+async fn router_and_db() -> (TestApi, Arc<DBProvider<DbError>>) {
+    router_and_db_with(false).await
+}
+
+async fn router_and_db_with(v1_ready: bool) -> (TestApi, Arc<DBProvider<DbError>>) {
     // WAL: the partition workers must not lock out the request under test.
     let dir = common::TestDir::new("tr-api");
     let dsn = format!(
@@ -202,11 +214,12 @@ async fn router_with(v1_ready: bool) -> TestApi {
         legacy,
         Some(registry),
     );
-    TestApi {
+    let api = TestApi {
         router,
         _handle: handle,
         _dir: dir,
-    }
+    };
+    (api, db)
 }
 
 /// The same routes with no database bound — `no-db.yaml` and `--mock`. Ready,
@@ -328,6 +341,40 @@ fn assert_candidate_refusal(
     assert_eq!(violations.len(), 1, "got: {:?}", response.body);
     assert_eq!(violations[0]["field"], json!(expected_field));
     assert_eq!(violations[0]["reason"], json!(expected_reason));
+}
+
+/// A refusal the gear itself composed: no resource, one field violation naming the
+/// request field the caller has to change.
+///
+/// Distinct from [`assert_invalid_argument_rejection`], which asserts the canonical
+/// *extractor*'s shape — that one reports `cf.core.http.request` as the resource
+/// type, and the two `400`s must stay tellable apart rather than both reading as
+/// the domain's.
+fn assert_field_refusal(response: &Response, expected_field: &str, expected_reason: &str) {
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "got: {:?}",
+        response.body
+    );
+    assert_eq!(
+        response.content_type.as_deref(),
+        Some("application/problem+json"),
+    );
+    assert_eq!(response.body["type"], json!(INVALID_ARGUMENT_TYPE));
+    let violations = response.body["context"]["field_violations"]
+        .as_array()
+        .expect("field_violations is an array");
+    assert_eq!(violations.len(), 1, "got: {:?}", response.body);
+    assert_eq!(violations[0]["field"], json!(expected_field));
+    assert_eq!(violations[0]["reason"], json!(expected_reason));
+    assert!(
+        violations[0]["description"]
+            .as_str()
+            .is_some_and(|description| !description.is_empty()),
+        "the refusal carries a public description: {:?}",
+        response.body,
+    );
 }
 
 fn assert_invalid_argument_rejection(
@@ -1181,6 +1228,16 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
             "/types-registry/v2/entities/{entity_key}",
             "types_registry.delete_entity",
         ),
+        (
+            "POST",
+            "/types-registry/v2/entities:batchGet",
+            "types_registry.batch_get_entities",
+        ),
+        (
+            "GET",
+            "/types-registry/v2/entities",
+            "types_registry.list_entities",
+        ),
     ];
     expected.sort_unstable();
 
@@ -1363,6 +1420,7 @@ fn json_extractor_error_statuses_are_declared_for_both_post_operations() {
         "types_registry.register",
         "types_registry.submit_entities",
         "types_registry.batch_delete_entities",
+        "types_registry.batch_get_entities",
     ] {
         let declared = responses
             .iter()
@@ -2315,4 +2373,715 @@ async fn the_operation_polling_response_refuses_to_be_cached() {
          or private, may retain it for reuse: {:?}",
         polled.body,
     );
+}
+// ---------------------------------------------------------------------------
+// The two read routes: `:batchGet` and content-free discovery (T22a)
+// ---------------------------------------------------------------------------
+//
+// Both are driven through `register_routes` like every other case here, so the
+// assertions cover the declared paths, the extractors and the problem documents
+// rather than the domain methods behind them.
+
+/// A second Type Schema in the same namespace, one identifier ahead of
+/// [`CF_TYPE`] in byte order (`o` < `t`), so discovery ordering is assertable.
+const CF_OTHER_TYPE: &str = gts_id!("cf.core.example.other.v1~");
+/// A well-formed identifier nothing ever registers.
+const CF_ABSENT_TYPE: &str = gts_id!("cf.core.example.absent.v1~");
+/// Not an identifier at all, and not a UUID: `EntityKey::parse` classifies it as
+/// an identifier that cannot exist.
+const IMPOSSIBLE_KEY: &str = "not-a-gts-id";
+
+/// A keyset cursor carrying `"v": 2`. Decoded plaintext:
+/// `{"v":2,"k":["gts.cf.core.example.type.v1~"],"o":"asc","s":"+gts_id","d":"fwd"}`.
+/// Written as a literal rather than encoded in the test, because the point is a
+/// version this build does not support and so cannot construct through `CursorV1`.
+const CURSOR_VERSION_2: &str = "eyJ2IjoyLCJrIjpbImd0cy5jZi5jb3JlLmV4YW1wbGUudHlwZS52MX4iXSwibyI6ImFzYyIsInMiOiIrZ3RzX2lkIiwiZCI6ImZ3ZCJ9";
+
+fn post(uri: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(body).expect("serialize")))
+        .expect("request")
+}
+
+/// `POST {V2}/entities:batchGet`. No `Idempotency-Key`: a read is not a mutation.
+fn batch_get(body: &Value) -> Request<Body> {
+    post(&format!("{V2}/entities:batchGet"), body)
+}
+
+/// One `items` envelope of unconditional keys.
+fn keys(keys: &[&str]) -> Value {
+    json!({ "items": keys.iter().map(|k| json!({ "key": k })).collect::<Vec<_>>() })
+}
+
+/// `GET {V2}/entities`, with the query string spelled by the caller.
+fn discover(query: &str) -> Request<Body> {
+    get(&format!("{V2}/entities{query}"))
+}
+
+/// Register [`CF_TYPE`] and an Instance of it, both terminal on return.
+async fn register_type_and_instance(router: &Router) {
+    register_entity(router, "arrange-type", CF_TYPE).await;
+    let accepted = call(
+        &router.clone(),
+        submit(
+            Some("arrange-instance"),
+            &json!({ "items": [{ "gts_id": CF_INSTANCE, "content": { "name": "first" } }] }),
+        ),
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED, "{:?}", accepted.body);
+    let operation = poll(router, &accepted).await;
+    assert_eq!(operation["items"][0]["status"], json!("succeeded"));
+}
+
+/// The identifiers a discovery page returned, in page order.
+fn page_ids(body: &Value) -> Vec<String> {
+    body["items"]
+        .as_array()
+        .expect("a page carries an items array")
+        .iter()
+        .map(|item| {
+            item["gts_id"]
+                .as_str()
+                .expect("every page item names its identifier")
+                .to_owned()
+        })
+        .collect()
+}
+
+// --- `:batchGet` ------------------------------------------------------------
+
+/// One explicit result per requested key, absence included, echoing the key it was
+/// asked by and in request order (DESIGN §3.3).
+#[tokio::test]
+async fn a_batch_read_answers_every_key_including_the_absent_one() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+
+    let response = call(
+        &router,
+        batch_get(&keys(&[CF_ABSENT_TYPE, CF_TYPE, CF_INSTANCE])),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    let items = response.body["items"].as_array().expect("items").to_owned();
+    assert_eq!(items.len(), 3, "one result per requested key: {items:?}");
+
+    assert_eq!(items[0]["key"], json!(CF_ABSENT_TYPE));
+    assert_eq!(items[0]["status"], json!("not_found"));
+    assert!(
+        items[0].get("entity").is_none() || items[0]["entity"].is_null(),
+        "an absence carries no entity: {:?}",
+        items[0],
+    );
+
+    assert_eq!(items[1]["key"], json!(CF_TYPE));
+    assert_eq!(items[1]["status"], json!("found"));
+    let schema = &items[1]["entity"];
+    assert_eq!(schema["gts_id"], json!(CF_TYPE));
+    assert_eq!(schema["kind"], json!("type_schema"));
+    assert_eq!(schema["resource_version"], json!(1));
+    assert!(
+        schema["content"].is_object()
+            && schema["resolved_schema"].is_object()
+            && schema["effective_traits"].is_object()
+            && schema["effective_traits_schema"].is_object(),
+        "a batch read returns the full representation, D3 artifacts included: {schema:?}",
+    );
+
+    assert_eq!(items[2]["key"], json!(CF_INSTANCE));
+    assert_eq!(items[2]["status"], json!("found"));
+    assert_eq!(items[2]["entity"]["content"], json!({ "name": "first" }));
+}
+
+/// Both key spellings resolve one row, and each result echoes the spelling it was
+/// asked by — the two are not duplicates of each other.
+#[tokio::test]
+async fn a_batch_read_answers_identifiers_and_registry_references_alike() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+    let uuid = gts::GtsId::try_new(CF_TYPE)
+        .expect("identifier")
+        .to_uuid()
+        .to_string();
+
+    let response = call(&router, batch_get(&keys(&[&uuid, CF_TYPE]))).await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    let items = response.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(items[0]["key"], json!(uuid));
+    assert_eq!(items[1]["key"], json!(CF_TYPE));
+    for item in items {
+        assert_eq!(item["status"], json!("found"), "{item:?}");
+        assert_eq!(item["entity"]["gts_id"], json!(CF_TYPE));
+        assert_eq!(item["entity"]["gts_uuid"], json!(uuid));
+    }
+}
+
+/// A key named twice is one result: the answer is per key, not per mention.
+#[tokio::test]
+async fn duplicate_keys_collapse_to_one_result() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+
+    let response = call(
+        &router,
+        batch_get(&keys(&[CF_TYPE, CF_ABSENT_TYPE, CF_TYPE])),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    let items = response.body["items"].as_array().expect("items");
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["key"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(CF_TYPE), json!(CF_ABSENT_TYPE)],
+        "the duplicate collapses onto its first mention: {items:?}",
+    );
+}
+
+/// An identifier that cannot exist is an absence, not a validation failure, and
+/// both read surfaces say so the same way: the exact read answers with the same
+/// problem it gives a well-formed absent identifier, and the batch reports
+/// `not_found` for both. Neither surface validates the key and refuses early while
+/// the other looks it up.
+#[tokio::test]
+async fn an_impossible_identifier_is_classified_alike_by_both_read_surfaces() {
+    let router = router_with_db().await;
+
+    let impossible = call(&router, get(&format!("{V2}/entities/{IMPOSSIBLE_KEY}"))).await;
+    let absent = call(&router, get(&format!("{V2}/entities/{CF_ABSENT_TYPE}"))).await;
+    assert_eq!(impossible.status, StatusCode::NOT_FOUND);
+    assert_eq!(absent.status, impossible.status);
+    assert_eq!(absent.content_type, impossible.content_type);
+    assert_eq!(
+        absent.body["type"], impossible.body["type"],
+        "one problem type for 'no such entity', whatever the key looked like",
+    );
+
+    let batched = call(&router, batch_get(&keys(&[IMPOSSIBLE_KEY, CF_ABSENT_TYPE]))).await;
+    assert_eq!(batched.status, StatusCode::OK, "{:?}", batched.body);
+    let items = batched.body["items"].as_array().expect("items");
+    assert_eq!(items[0]["key"], json!(IMPOSSIBLE_KEY));
+    assert_eq!(items[0]["status"], json!("not_found"));
+    assert_eq!(items[1]["status"], json!("not_found"));
+}
+
+/// One header cannot represent a batch of validators, so `If-None-Match` is refused
+/// rather than ignored (DESIGN §3.3).
+#[tokio::test]
+async fn a_batch_read_refuses_an_if_none_match_header() {
+    let router = router_with_db().await;
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("{V2}/entities:batchGet"))
+        .header("content-type", "application/json")
+        .header("if-none-match", "\"anything\"")
+        .body(Body::from(
+            serde_json::to_vec(&keys(&[CF_TYPE])).expect("serialize"),
+        ))
+        .expect("request");
+    let response = call(&router, request).await;
+
+    assert_field_refusal(&response, "If-None-Match", "VALIDATION_FAILED");
+}
+
+/// An empty batch is an envelope error: there is no key to answer about.
+#[tokio::test]
+async fn an_empty_batch_read_is_refused() {
+    let router = router_with_db().await;
+
+    let response = call(&router, batch_get(&json!({ "items": [] }))).await;
+
+    assert_field_refusal(&response, "items", "VALIDATION_FAILED");
+}
+
+/// The batch ceiling is **100 keys**, matching the write ceiling rather than
+/// DESIGN §3.3's 500 (SPEC §9 ceiling C10).
+///
+/// Pinned as a literal on purpose: the boundary test below reads the constant, so
+/// it would stay green through a value change. This is the test that fails if the
+/// number moves, which is what makes the number a decision rather than a default.
+#[test]
+fn the_batch_read_ceiling_is_one_hundred_keys() {
+    assert_eq!(MAX_BATCH_GET_KEYS, 100);
+}
+
+/// A batch read is bounded, like every other batch on this surface: exactly at the
+/// ceiling is served, one key past it is refused.
+///
+/// Driven by the constant rather than by a literal, so the boundary stays asserted
+/// wherever the ceiling sits.
+#[tokio::test]
+async fn a_batch_read_is_bounded_at_its_ceiling() {
+    let router = router_with_db().await;
+    let ids: Vec<String> = (0..=MAX_BATCH_GET_KEYS)
+        .map(|i| format!("{}cf.core.example.k{i:04}.v1~", gts::GTS_ID_PREFIX))
+        .collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+
+    let at_ceiling = call(&router, batch_get(&keys(&refs[..MAX_BATCH_GET_KEYS]))).await;
+    assert_eq!(
+        at_ceiling.status,
+        StatusCode::OK,
+        "exactly {MAX_BATCH_GET_KEYS} keys must be served: {:?}",
+        at_ceiling.body,
+    );
+    assert_eq!(
+        at_ceiling.body["items"].as_array().expect("items").len(),
+        MAX_BATCH_GET_KEYS,
+        "one result per requested key, even when every one is absent",
+    );
+
+    let past_ceiling = call(&router, batch_get(&keys(&refs))).await;
+    assert_field_refusal(&past_ceiling, "items", "VALIDATION_FAILED");
+}
+
+// --- content-free discovery -------------------------------------------------
+
+/// A page carries identity and metadata only: no authored content and none of D3's
+/// artifacts (§8.5, D12). Ordering is by canonical identifier.
+#[tokio::test]
+async fn a_discovery_page_is_content_free_and_ordered_by_identifier() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange-other", CF_OTHER_TYPE).await;
+    register_type_and_instance(&router).await;
+
+    let response = call(&router, discover("")).await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    assert_eq!(
+        page_ids(&response.body),
+        vec![CF_OTHER_TYPE, CF_TYPE, CF_INSTANCE],
+        "sorted by canonical identifier",
+    );
+    assert_eq!(response.body["page_info"]["limit"], json!(100));
+    for item in response.body["items"].as_array().expect("items") {
+        assert!(item["gts_uuid"].is_string(), "{item:?}");
+        assert!(item["kind"].is_string(), "{item:?}");
+        assert!(item["resource_version"].is_number(), "{item:?}");
+        assert!(item["created_at"].is_string(), "{item:?}");
+        for absent in [
+            "content",
+            "resolved_schema",
+            "effective_traits",
+            "effective_traits_schema",
+            "etag",
+        ] {
+            assert!(
+                item.get(absent).is_none(),
+                "a discovery page must not carry `{absent}`: {item:?}",
+            );
+        }
+    }
+}
+
+/// A tombstone stays exact-readable and leaves discovery (ADR-0008).
+#[tokio::test]
+async fn discovery_excludes_tombstones() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+    let deleted = call(
+        &router,
+        delete_one(Some("delete-1"), CF_TYPE, "?expected_resource_version=1"),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED, "{:?}", deleted.body);
+    assert_eq!(
+        poll(&router, &deleted).await["items"][0]["status"],
+        json!("succeeded")
+    );
+
+    let page = call(&router, discover("")).await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    assert!(
+        page_ids(&page.body).is_empty(),
+        "the tombstone must not appear on a page: {:?}",
+        page.body,
+    );
+
+    let exact = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    assert_eq!(exact.status, StatusCode::OK, "{:?}", exact.body);
+    assert_eq!(exact.body["lifecycle_status"], json!("deleted"));
+}
+
+/// The cursor traverses a stable set exactly once, and the traversal ends with a
+/// page that carries no cursor.
+#[tokio::test]
+async fn a_cursor_traverses_the_set_exactly_once() {
+    let (router, db) = router_and_db().await;
+    let ids = seed_entities(&db, 5).await;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut query = "?limit=2".to_owned();
+    let mut first_page = true;
+    for _ in 0..8 {
+        let page = call(&router, discover(&query)).await;
+        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+        assert!(page.body["items"].as_array().expect("items").len() <= 2);
+        if first_page {
+            assert_eq!(
+                page.body["page_info"]["limit"],
+                json!(2),
+                "page_info.limit must reflect the caller-supplied limit, not the default",
+            );
+            first_page = false;
+        }
+        seen.extend(page_ids(&page.body));
+        let Some(cursor) = page.body["page_info"]["next_cursor"].as_str() else {
+            assert_eq!(seen, ids, "every row exactly once, in identifier order");
+            return;
+        };
+        query = format!("?limit=2&cursor={cursor}");
+    }
+    panic!("the cursor walk did not terminate; saw {seen:?}");
+}
+
+/// `limit` defaults to `page_size_default` and may not exceed `page_size_max` (D12).
+#[tokio::test]
+async fn a_page_size_outside_the_configured_range_is_refused() {
+    let router = router_with_db().await;
+
+    for query in ["?limit=1001", "?limit=0"] {
+        let response = call(&router, discover(query)).await;
+        assert_field_refusal(&response, "limit", "VALIDATION_FAILED");
+    }
+}
+
+/// The boundary value `limit=page_size_max` (1000) is served, not refused.
+#[tokio::test]
+async fn a_page_size_at_the_configured_maximum_is_served() {
+    let router = router_with_db().await;
+
+    let response = call(&router, discover("?limit=1000")).await;
+
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "limit=page_size_max must be served: {:?}",
+        response.body,
+    );
+    assert_eq!(
+        response.body["page_info"]["limit"],
+        json!(1000),
+        "page_info.limit must reflect the caller-supplied value",
+    );
+}
+
+/// `toolkit-odata` cursors are versioned, and an unknown version is refused rather
+/// than read as a position this build understands.
+#[tokio::test]
+async fn an_unknown_cursor_version_is_refused() {
+    let router = router_with_db().await;
+
+    let response = call(&router, discover(&format!("?cursor={CURSOR_VERSION_2}"))).await;
+
+    assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
+}
+
+/// The cursor binds the query it was issued for: replaying one under a different
+/// pattern would splice two traversals.
+#[tokio::test]
+async fn a_cursor_is_refused_under_a_different_pattern() {
+    let (router, db) = router_and_db().await;
+    _ = seed_entities(&db, 3).await;
+
+    let first = call(&router, discover("?limit=1")).await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    let cursor = first.body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a short page carries a cursor")
+        .to_owned();
+
+    let pattern = format!("{}cf.core.example.*", gts::GTS_ID_PREFIX);
+    let response = call(
+        &router,
+        discover(&format!("?limit=1&pattern={pattern}&cursor={cursor}")),
+    )
+    .await;
+
+    assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
+}
+
+/// `$select` is refused, not ignored: a caller that asked for one field must not be
+/// answered with the whole default set (§10.2, `principle-fail-closed`).
+#[tokio::test]
+async fn select_is_refused_naming_the_parameter() {
+    let router = router_with_db().await;
+
+    let response = call(&router, discover("?$select=gts_id")).await;
+
+    assert_field_refusal(&response, "$select", "VALIDATION_FAILED");
+}
+
+/// The pattern is compiled by `gts-rust`, and a string it refuses is a `400` naming
+/// the parameter rather than an empty page.
+#[tokio::test]
+async fn an_unparsable_pattern_is_refused() {
+    let router = router_with_db().await;
+
+    let response = call(&router, discover("?pattern=not-a-pattern")).await;
+
+    assert_field_refusal(&response, "pattern", "INVALID_QUERY");
+}
+
+/// SQL only narrows. The prefix range admits the sibling major that the pattern
+/// then rejects, and excludes the identifier outside it — `GtsId::matches_pattern`
+/// is the only authority on what a page contains (`repo/mod.rs`).
+#[tokio::test]
+async fn a_pattern_narrows_by_prefix_range_and_is_decided_in_rust() {
+    let (router, db) = router_and_db().await;
+    seed_ids(
+        &db,
+        &[CF_OTHER_TYPE, CF_TYPE, gts_id!("cf.core.example.type.v2~")],
+    )
+    .await;
+
+    let page = call(&router, discover(&format!("?pattern={CF_TYPE}"))).await;
+
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    assert_eq!(
+        page_ids(&page.body),
+        vec![CF_TYPE],
+        "`other.v1~` is outside the prefix range and `type.v2~` inside it but not a \
+         match: {:?}",
+        page.body,
+    );
+}
+
+/// One `list_page` call is bounded by its scan budget, so a page over a sparse
+/// pattern can find nothing and still ask to be called again. A read that
+/// materialized the range would return the match immediately.
+///
+/// `v9~` sorts after every `v2xxxx~` in byte order, which puts the single match
+/// beyond the first scan; the decoy count only has to exceed the budget.
+#[tokio::test]
+async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
+    const MATCH: &str = gts_id!("cf.core.example.type.v9~");
+    const DECOYS: u32 = 2100;
+
+    let (router, db) = router_and_db().await;
+    let mut ids: Vec<String> = (0..DECOYS)
+        .map(|i| format!("{}cf.core.example.type.v2{i:04}~", gts::GTS_ID_PREFIX))
+        .collect();
+    ids.push(MATCH.to_owned());
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    seed_ids(&db, &refs).await;
+
+    let mut found: Vec<String> = Vec::new();
+    let mut empty_pages = 0;
+    let mut query = format!("?limit=10&pattern={MATCH}");
+    let mut completed = false;
+    for _ in 0..64 {
+        let page = call(&router, discover(&query)).await;
+        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+        let ids = page_ids(&page.body);
+        if ids.is_empty() {
+            empty_pages += 1;
+        }
+        found.extend(ids);
+        let Some(cursor) = page.body["page_info"]["next_cursor"].as_str() else {
+            completed = true;
+            break;
+        };
+        query = format!("?limit=10&pattern={MATCH}&cursor={cursor}");
+    }
+
+    assert!(
+        completed,
+        "the bounded page walk exhausted its request budget"
+    );
+    assert!(
+        empty_pages > 0,
+        "a bounded scan must return at least one page that found nothing",
+    );
+    assert_eq!(
+        found,
+        vec![MATCH.to_owned()],
+        "the match arrives exactly once"
+    );
+}
+
+/// The read routes degrade with the database like every other v2 route.
+#[tokio::test]
+async fn without_a_database_the_read_routes_report_service_unavailable() {
+    let router = router_without_db();
+
+    for request in [batch_get(&keys(&[CF_TYPE])), discover("")] {
+        let response = call(&router, request).await;
+        assert_eq!(
+            response.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{:?}",
+            response.body
+        );
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some("application/problem+json"),
+        );
+    }
+}
+
+/// Discovery declares the three parameters it binds, with their scalar types.
+#[test]
+fn the_discovery_query_parameters_are_declared() {
+    let openapi = TestOpenApi::default();
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let _router =
+        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+
+    let params = openapi.params.lock().expect("params lock").clone();
+    let declared = params
+        .iter()
+        .find(|(id, _)| id == "types_registry.list_entities")
+        .map(|(_, p)| p.clone())
+        .expect("the discovery operation is registered");
+
+    for expected in [
+        (
+            "pattern".to_owned(),
+            ParamLocation::Query,
+            false,
+            "string".to_owned(),
+            None,
+            None,
+        ),
+        (
+            "limit".to_owned(),
+            ParamLocation::Query,
+            false,
+            "integer".to_owned(),
+            None,
+            None,
+        ),
+        (
+            "cursor".to_owned(),
+            ParamLocation::Query,
+            false,
+            "string".to_owned(),
+            None,
+            None,
+        ),
+    ] {
+        assert!(
+            declared.contains(&expected),
+            "missing parameter {expected:?}: {declared:?}",
+        );
+    }
+}
+
+/// Every one of the seven v2 operations answers with RFC-9457 problems, so a
+/// generated client has an error shape for each.
+#[test]
+fn all_seven_v2_operations_declare_problem_responses() {
+    const V2_OPERATIONS: [&str; 7] = [
+        "types_registry.submit_entities",
+        "types_registry.batch_delete_entities",
+        "types_registry.delete_entity",
+        "types_registry.batch_get_entities",
+        "types_registry.get_entity",
+        "types_registry.list_entities",
+        "types_registry.get_operation",
+    ];
+
+    let openapi = TestOpenApi::default();
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let _router =
+        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+
+    let responses = openapi.responses.lock().expect("responses lock");
+    for operation_id in V2_OPERATIONS {
+        let declared = responses
+            .iter()
+            .find(|(id, _)| id == operation_id)
+            .map(|(_, responses)| responses)
+            .expect("the v2 operation is registered");
+        // `standard_errors` plus the unbound-database `503` every v2 route answers.
+        for status in [400, 401, 403, 500, 503] {
+            assert!(
+                declared.contains(&(status, "application/problem+json".to_owned())),
+                "{operation_id} must declare {status} as a Problem response: {declared:?}",
+            );
+        }
+    }
+}
+
+// --- direct row seeding for the paging cases --------------------------------
+
+/// `count` active Type Schema rows in one family, written straight to `entity`.
+/// Returns their identifiers in byte order.
+///
+/// The admission path is the subject of every other test here; these cases are
+/// about paging over rows, and a content-free page reads nothing but `entity`.
+async fn seed_entities(db: &Arc<DBProvider<DbError>>, count: u32) -> Vec<String> {
+    let ids: Vec<String> = (0..count)
+        .map(|i| format!("{}cf.core.example.seed.v{}~", gts::GTS_ID_PREFIX, i + 1))
+        .collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    seed_ids(db, &refs).await;
+    let mut sorted = ids;
+    sorted.sort();
+    sorted
+}
+
+/// Insert the given identifiers as active global Type Schemas of one family.
+async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
+    use types_registry::domain::enums::{EntityKind, OwnershipScope};
+    use types_registry::domain::ports::NewEntity;
+    use types_registry::infra::storage::repo::{EntityRepo, VersionFamilyRepo};
+
+    let now = time::OffsetDateTime::now_utc();
+    let owned: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+    db.transaction(move |tx| {
+        Box::pin(async move {
+            let scope = common::allow_all();
+            let (family, _) = VersionFamilyRepo::create_or_get(
+                tx,
+                &scope,
+                "gts.cf.core.example.seed",
+                OwnershipScope::Global,
+                None,
+                now,
+            )
+            .await
+            .expect("family");
+            for id in &owned {
+                EntityRepo::insert(
+                    tx,
+                    &scope,
+                    NewEntity {
+                        gts_uuid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, id.as_bytes()),
+                        gts_id: id.clone(),
+                        entity_kind: EntityKind::TypeSchema,
+                        family_id: family.id,
+                        ownership_scope: OwnershipScope::Global,
+                        owner_tenant_id: None,
+                        owning_gear: Some("types-registry".to_owned()),
+                        now,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("seed {id}: {e}"));
+            }
+            Ok::<(), DbError>(())
+        })
+    })
+    .await
+    .expect("seed entity rows");
 }

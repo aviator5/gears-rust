@@ -19,10 +19,10 @@ use crate::domain::family::FamilyKey;
 use crate::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, DependencyClosure, DependencyEdgeRow,
-    DependencyStore, EdgeSide, EntityEdge, EntityRow, EntityStore, EntityWriteOrderStore,
-    InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema, NewEntity,
-    NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
-    OperationRow, OperationStore, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
+    DependencyStore, EdgeSide, EntityEdge, EntityPage, EntityRow, EntityStore,
+    EntityWriteOrderStore, InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema,
+    NewEntity, NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
+    OperationRow, OperationStore, PageRequest, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
     VersionFamilyStore,
 };
 
@@ -127,6 +127,16 @@ impl EntityStore for Repos {
         EntityRepo::find_by_gts_uuids(tx, scope, gts_uuids).await
     }
 
+    async fn list_page(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        pattern: Option<&gts::GtsIdPattern>,
+        request: PageRequest,
+    ) -> Result<EntityPage, ScopeError> {
+        EntityRepo::list_page(tx, scope, pattern, request).await
+    }
+
     async fn kind_in_family(
         &self,
         tx: &DbTx<'_>,
@@ -187,6 +197,15 @@ impl TypeSchemaStore for Repos {
         entity_id: i64,
     ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError> {
         TypeSchemaRepo::find_current(tx, scope, entity_id).await
+    }
+
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        TypeSchemaRepo::current_rows(tx, scope, entity_ids).await
     }
 
     async fn current_schema_projections(

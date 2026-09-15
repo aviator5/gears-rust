@@ -1940,7 +1940,7 @@ without adding inventory registration to every declaring gear.
 
 ---
 
-### - [ ] T22a: REST batchGet and discovery
+### - [x] T22a: REST batchGet and discovery
 
 **Description:** Add `POST /entities:batchGet` and bounded, content-free `GET /entities`
 on `/v2/`; complete seven-route OpenAPI and quickstart coverage (former T27, P17).
@@ -1948,41 +1948,45 @@ First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. T22 is d
 
 **Acceptance criteria:**
 
-- [ ] `batchGet` returns an explicit result per key, including absence; duplicate keys collapse
-- [ ] All batch bodies use `items`; each item's `key` uses the path's `EntityKey::parse`
+- [x] `batchGet` returns an explicit result per key, including absence; duplicate keys collapse
+- [x] All batch bodies use `items`; each item's `key` uses the path's `EntityKey::parse`
   (DESIGN §3.3)
-- [ ] Impossible identifiers return identical errors through batch and exact reads
-- [ ] `batchGet` echoes requested keys
-- [ ] Reject a batch `If-None-Match` header; validators belong in per-item `if_none_match`
-- [ ] Discovery excludes tombstones and sorts by canonical identifier
-- [ ] Return one bounded page (D12): default `limits.page_size_default` (100), reject above
+- [x] Impossible identifiers return identical errors through batch and exact reads
+- [x] `batchGet` echoes requested keys
+- [x] Reject a batch `If-None-Match` header; validators belong in per-item `if_none_match`
+- [x] Discovery excludes tombstones and sorts by canonical identifier
+- [x] Return one bounded page (D12): default `limits.page_size_default` (100), reject above
   `page_size_max` (1000). Use `toolkit-odata` cursors and reject unknown versions
-- [ ] Pages contain identity/metadata only: no `content`, `resolved_schema`, `effective_traits`,
+- [x] Pages contain identity/metadata only: no `content`, `resolved_schema`, `effective_traits`,
   `effective_traits_schema` or validator (§8.5)
-- [ ] Exact/batch reads retain full representations and D3 artifacts
-- [ ] Reject `$select` with an RFC-9457 problem naming the parameter (§10.2)
-- [ ] Exercise `EntityRepo::list_page` scan-budget boundary and prefix range through the route
-- [ ] Use T4's DB reads; apply `GtsId::matches_pattern` in Rust to prefiltered rows
-- [ ] OpenAPI includes RFC-9457 errors for all seven routes: exact/list/batch/operation reads
+- [x] Exact/batch reads retain full representations and D3 artifacts
+- [x] Reject `$select` with an RFC-9457 problem naming the parameter (§10.2)
+- [x] Exercise `EntityRepo::list_page` scan-budget boundary and prefix range through the route
+- [x] Use T4's DB reads; apply `GtsId::matches_pattern` in Rust to prefiltered rows
+- [x] OpenAPI includes RFC-9457 errors for all seven routes: exact/list/batch/operation reads
   and registration/batch deletion/single deletion
-- [ ] All mutations keep `exposed = false` until platform identity/PDP checks precede dispatch
-- [ ] Extend quickstart with batch reads, discovery, cursor traversal and full-document hydration
-- [ ] OpenAPI/quickstart identify the global platform-plane API and C8's internal-only
+- [x] All mutations keep `exposed = false` until platform identity/PDP checks precede dispatch
+- [x] Extend quickstart with batch reads, discovery, cursor traversal and full-document hydration
+- [x] OpenAPI/quickstart identify the global platform-plane API and C8's internal-only
   mutations pending `X-ToolKit-Internal-Token`/`PlatformIdentity` and a separate listener;
   no usable gateway mutation example
-- [ ] Handlers only map the domain service (SPEC §8.4)
-- [ ] All routes use `routes::V2` for T24a's promotion
-- [ ] DTOs follow SPEC §10.1/§10.2: `items`, `key`, `EntityPage`; T23 follows the same contract
-- [ ] No e2e edits; `make e2e-local` stays green. Preserve v1 and its in-memory store (P12/P17)
-- [ ] Both breaking changelog entries belong to T24a's promotion
+- [x] Handlers only map the domain service (SPEC §8.4)
+- [x] All routes use `routes::V2` for T24a's promotion
+- [x] DTOs follow SPEC §10.1/§10.2: `items`, `key`, `EntityPage`; T23 follows the same contract
+- [x] No e2e edits; `make e2e-local` stays green. Preserve v1 and its in-memory store (P12/P17)
+- [x] Both breaking changelog entries belong to T24a's promotion
 
 **Verification:**
-- [ ] Gear tests (see [Commands](#commands)), including `TR/tests/api_rest_test.rs` driven
+- [x] Gear tests (see [Commands](#commands)), including `TR/tests/api_rest_test.rs` driven
       through the real router: per-key batch outcomes, exact/batch key-classification parity,
       pagination, scan-budget boundary, prefix range, `$select` and cursor-version refusals
-- [ ] `make e2e-local` — unchanged and still green, no e2e file edited (P12)
-- [ ] `make lychee`
-- [ ] Manual: `/cf/docs` renders all seven operations; `curl` against `/v2/` for
+- [x] `make e2e-local` — unchanged and still green, no e2e file edited (P12)
+- [ ] `make lychee` — **not run.** The target stops on `ensure-submodules` in this worktree
+      (`docs/web-docs` and friends are uninitialized), and its path list is
+      `docs examples guidelines gears/system/event-broker/docs`, which never covered this
+      gear's `QUICKSTART.md` anyway. `lychee` run directly over the two files this task
+      touched is clean: 22 OK, 0 errors
+- [x] Manual: `/cf/docs` renders all seven operations; `curl` against `/v2/` for
       register → poll → page → batchGet → delete → poll → page, including a `limit` above
       `page_size_max` and a `$select` refusal
 
@@ -1995,6 +1999,73 @@ and quickstart, for the seven-route completeness check)
 - `TR/tests/api_rest_test.rs`
 - `gears/system/types-registry/QUICKSTART.md`
 **Scope:** M
+
+**Implementation notes:**
+- **Discovery became a port.** `EntityStore::list_page` and `TypeSchemaStore::current_schemas`
+  are new; `PageRequest` / `EntityPage` moved from `infra::storage::repo::entity_repo` into
+  `domain::ports` (re-exported from `repo/mod.rs`, so T4's tests are unchanged) because a
+  domain method now names them. `AdmissionView` refuses both: an overlay holds candidates
+  with no position in the stored keyset, and admission reaches entities by key, by id or
+  through the dependency relation, never by page.
+- **`current_schemas` keeps a batch read constant in round trips.** `find_current_schema` is
+  single-entity, so a 100-key batch would have cost 100 extra queries for the very artifacts
+  D3 materialized to avoid work. The batch read is two identity reads plus three
+  current-state reads under one snapshot, whatever the batch size.
+- **The exact read is now one key's `batch_get`**, as `delete_entity` is one target's
+  `delete`. That is what makes "impossible identifiers return identical errors through batch
+  and exact reads" structural rather than asserted: the key is classified once, an absence is
+  an absence on both, and a corrupt current-state row is `CorruptDocument` on both. An
+  impossible identifier is therefore an *absence* — no read surface validates the key and
+  refuses early while the other looks it up.
+- **The cursor is transport, not policy** (`TR/src/api/rest/cursor.rs`). The domain's position
+  is a stored `gts_id`; the base64url envelope is how one page hands that to the next over
+  HTTP. `toolkit-odata`'s `CursorV1` supplies the property the contract needs — an unknown
+  version is refused rather than read — and the pattern is bound in through `f` so replaying a
+  cursor under a different pattern is `FILTER_MISMATCH` rather than two spliced traversals.
+  `validate_cursor_against` compares filters only when both sides carry one, so the
+  unfiltered/filtered pair is checked explicitly; a unit test pins that.
+- **`limit` and the page ceiling live in the domain**, which is why `DiscoveryPage` carries the
+  size it was read at: a handler must not read `limits.page_size_default` to fill `page_info`,
+  or REST and a future gRPC adapter could report different defaults for the same read.
+- **The batch ceiling is 100, not DESIGN §3.3's 500** — SPEC §9 ceiling C10, declared rather
+  than taken silently. DESIGN's higher number bought a reconciliation the headroom to read
+  every identifier it might write before selecting its ≤100 candidates; P0 gives that up
+  because a `found` result is a full representation and §3.2 bounds a resolved document at
+  1 MB, so the key count is the only bound on one response. The upgrade path is T23's helper
+  paging its reads plus a bound on response bytes rather than on keys.
+  A constant rather than a config key because §10.3's configuration is fixed for P0. It equals
+  `limits.batch_candidates` today and is still not the same bound: raising the write ceiling
+  must not silently widen read fan-out. Two tests hold it — one pins the literal `100` so the
+  value cannot move unnoticed, one drives the boundary off the constant so exactly-at-ceiling
+  is served and one past it is refused.
+- **`if_none_match` is declared and not consulted.** No read emits a validator until T29, so
+  nothing a caller could hold can be compared against; the field exists now so the wire shape
+  does not change under the callers T23 migrates. `EntityLookupStatusDto` is `found` /
+  `not_found` only — declaring `unchanged` before T29 emits one would publish a vocabulary
+  value this gear never produces.
+- **Discovery filters by `pattern`, `limit` and `cursor` only.** DESIGN's `depth`, `origin`,
+  `availability`, `scope` and `tenant_id` are each out of P0 (SPEC §2). `kind` is *not* named
+  by this task's criteria and would change `EntityRepo::list_page`'s T4 signature, so it stays
+  out; v1's `kind` / `vendor` / `package` / `namespace` / `segment_scope` filters have no v2
+  equivalent, which T28 sees when it migrates the suites onto the promoted paths.
+- **`$select` is refused on the discovery route only**, where §10.2 legislates it as a query
+  parameter. `:batchGet` has no `$select` field to refuse: its one fixed field set is the full
+  representation, a superset of anything a projection could name.
+- **`PageInfoDto` is `{next_cursor, limit}`**, not `toolkit-odata`'s `PageInfo`: discovery pages
+  forward only, so a `prev_cursor` that is always `null` would publish a direction this route
+  does not travel. The envelope still names its array `items`, per SPEC §10.1's `EntityPage`.
+- **Standing bar.** `make fmt` green; gear tests green on all three backends (943 SQLite,
+  39 container-backed); `RUSTFLAGS="-D warnings" cargo check --workspace --all-targets
+  --all-features` clean, so no other gear regressed. `make clippy` is **red at HEAD for an
+  unrelated reason** — a newer `clippy::unused_async_trait_impl` fires in
+  `libs/toolkit-security` and `libs/toolkit-db`, neither of which this task touches. Clippy
+  over this gear with only that lint allowed is clean.
+- **Runtime evidence.** `make quickstart` (types-registry alone) and `make run` (all gears)
+  both fail to boot in this worktree for pre-existing reasons — v1 ready-mode seeding wants
+  account-management's base schemas in the first, and `file-parser` wants an ONNX Runtime that
+  is not installed in the second. The manual pass ran the example server with
+  `--no-default-features --features account-management,static-authn,static-authz,static-tenants,static-license`
+  and exercised the whole flow through api-gateway's `/cf` prefix, cursor traversal included.
 
 ---
 
@@ -2021,7 +2092,7 @@ T26 once every consumer has moved.
 - [ ] `list_instances` / `list_type_schemas` **hydrate a content-free page through `batchGet`**, so the ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant, and one extra round trip per page which the client cache absorbs
 - [ ] **The validator field is in the models from this task**, and `BatchGet` accepts a validator per requested key in `BatchGetItem::if_none_match`, even though T29 computes them and T30 consumes them. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9). A result variant for `unchanged` is part of the same shape
 - [ ] **Reconciliation helper** implements DESIGN §3.3's five steps: batch-read the desired identifiers, omit content equal to current, set `expected_resource_version` from the read for differing ones and leave it unset for missing ones, return `UpToDate` with no POST when nothing remains, otherwise submit once under one idempotency key and poll to terminality
-- [ ] The helper accepts an explicit desired-document set and batches within `limits.batch_candidates`; it has no inventory collection/filtering dependency. Diagnostic gear names are caller labels, not identity or authority
+- [ ] The helper filters the process inventory by `owning_gear` (T22) and batches within `limits.batch_candidates`
 - [ ] **Retry lives here, not in gears:** a candidate failing because a dependency is not yet registered is retried a bounded number of times; failure names the gear and identifier
 - [ ] One generated idempotency key spans an invocation's retries and polling
 - [ ] Callable from a consumer's `init()` (P3). Its doc comment states the one requirement: declare `deps = [types_registry]`, or `init` ordering is not guaranteed

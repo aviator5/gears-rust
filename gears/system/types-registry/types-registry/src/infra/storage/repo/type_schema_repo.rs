@@ -157,6 +157,33 @@ impl TypeSchemaRepo {
             .map(current_row))
     }
 
+    /// The current-state row of each named entity, artifacts included and
+    /// `entity_id`-sorted. The batched [`Self::find_current`], so one batch read
+    /// costs a bounded number of queries rather than one per key.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure from any chunk.
+    pub async fn current_rows(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        let mut out = Vec::with_capacity(entity_ids.len());
+        for chunk in entity_ids.chunks(IN_CHUNK) {
+            let rows = type_schema::Entity::find()
+                .filter(type_schema::Column::EntityId.is_in(chunk.iter().copied()))
+                .secure()
+                .scope_with(scope)
+                .all(runner)
+                .await?;
+            out.extend(rows.into_iter().map(current_row));
+        }
+        // Sorted here rather than left to the chunk order, as `current_projections`
+        // is, so a caller comparing two reads compares two identical sequences.
+        out.sort_by_key(|row| row.entity_id);
+        Ok(out)
+    }
+
     /// Current revision numbers and fingerprints, `entity_id`-sorted, without artifacts.
     pub async fn current_projections(
         runner: &impl DBRunner,

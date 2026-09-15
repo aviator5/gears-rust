@@ -13,11 +13,11 @@ use types_registry::domain::family::FamilyKey;
 use types_registry::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, DependencyClosure, DependencyEdgeRow,
-    DependencyStore, EdgeSide, EntityEdge, EntityRow, EntityStore, EntityWriteOrderStore,
-    InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema, NewEntity,
-    NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
-    OperationRow, OperationStore, ReverseImpact, Stores, TypeSchemaStore, VersionFamilyRow,
-    VersionFamilyStore,
+    DependencyStore, EdgeSide, EntityEdge, EntityPage, EntityRow, EntityStore,
+    EntityWriteOrderStore, InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema,
+    NewEntity, NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
+    OperationRow, OperationStore, PageRequest, ReverseImpact, Stores, TypeSchemaStore,
+    VersionFamilyRow, VersionFamilyStore,
 };
 use uuid::Uuid;
 
@@ -637,6 +637,16 @@ impl EntityStore for TestStores {
         self.inner.find_by_gts_uuids(tx, scope, gts_uuids).await
     }
 
+    async fn list_page(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        pattern: Option<&gts::GtsIdPattern>,
+        request: PageRequest,
+    ) -> Result<EntityPage, ScopeError> {
+        self.inner.list_page(tx, scope, pattern, request).await
+    }
+
     async fn kind_in_family(
         &self,
         tx: &DbTx<'_>,
@@ -709,6 +719,15 @@ impl TypeSchemaStore for TestStores {
         entity_id: i64,
     ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError> {
         self.inner.find_current_schema(tx, scope, entity_id).await
+    }
+
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        self.inner.current_schemas(tx, scope, entity_ids).await
     }
 
     async fn current_schema_projections(

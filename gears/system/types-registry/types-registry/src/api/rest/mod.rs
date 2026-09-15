@@ -1,5 +1,6 @@
 //! REST API layer for the Types Registry gear.
 
+mod cursor;
 pub mod dto;
 pub mod error;
 pub mod handlers;

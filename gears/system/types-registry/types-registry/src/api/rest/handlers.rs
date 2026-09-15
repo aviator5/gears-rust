@@ -10,15 +10,18 @@ use toolkit::api::rest::extract;
 use uuid::Uuid;
 
 use super::dto::{
-    DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, GtsEntityDto, ListEntitiesQuery,
-    ListEntitiesResponse, OperationAcceptedDto, OperationDto, RegisterEntitiesRequest,
+    BatchGetRequest, DeleteEntitiesRequest, DeleteEntityQuery, DiscoverEntitiesQuery, EntityDto,
+    EntityLookupDto, EntityLookupsDto, EntityPageDto, GtsEntityDto, ListEntitiesQuery,
+    ListEntitiesResponse, OperationAcceptedDto, OperationDto, PageInfoDto, RegisterEntitiesRequest,
     RegisterEntitiesResponse, RegisterResultDto, RegisterSummaryDto, SubmitEntitiesRequest,
 };
 use super::paths::V2;
 use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
 use crate::domain::enums::OperationKind;
 use crate::domain::error::DomainError;
-use crate::domain::registry_service::{DeleteRequest, DeleteTarget, EntityKey, RegistryService};
+use crate::domain::registry_service::{
+    DeleteRequest, DeleteTarget, DiscoveryQuery, EntityKey, EntityLookup, RegistryService,
+};
 use crate::domain::service::TypesRegistryService;
 
 /// POST /api/v1/types-registry/entities
@@ -344,6 +347,135 @@ pub async fn get_entity_by_key(
         .map_err(CanonicalError::from)?
         .ok_or_else(|| CanonicalError::from(DomainError::not_found_by_id(key)))?;
     Ok(Json(record.into()))
+}
+
+/// `POST /types-registry/v2/entities:batchGet`
+///
+/// An exact read of a bounded key set, with one explicit result per key. A `POST`
+/// rather than a `GET`: identifiers run to 1024 characters, which a query string
+/// cannot carry safely, and portable `GET` has no body (DESIGN §3.3).
+///
+/// Absence is a `200` with `not_found` on that key, not a `404`: one missing key
+/// must not lose the answers for the others.
+pub async fn batch_get_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    headers: HeaderMap,
+    extract::Json(req): extract::Json<BatchGetRequest>,
+) -> ApiResult<Json<EntityLookupsDto>> {
+    let service = require_registry(service)?;
+    // Refused before the read, not ignored: a caller that sent one believes its
+    // request is conditional, and answering `200` with full snapshots would be
+    // answering a different question.
+    if headers.contains_key(header::IF_NONE_MATCH) {
+        return Err(super::error::if_none_match_not_supported());
+    }
+
+    // `if_none_match` is carried by the request DTO and not read here: no read
+    // emits a validator until T29, so there is nothing a supplied one could be
+    // compared against. The handler must not invent a comparison the read path
+    // does not perform.
+    // Map each unique EntityKey to its first-occurrence raw spelling so the echo
+    // is driven by the key returned with each result, not a positional iterator
+    // over the (potentially duplicate-containing) request. A positional iterator
+    // diverges when a duplicate key precedes a distinct key in the input.
+    let mut spelling_map: std::collections::HashMap<EntityKey, String> =
+        std::collections::HashMap::with_capacity(req.items.len());
+    let mut keys: Vec<EntityKey> = Vec::with_capacity(req.items.len());
+    for item in req.items {
+        // Bounded before EntityKey::parse so an arbitrarily long string cannot
+        // enter the domain layer. GTS identifiers run to 1024 characters
+        // (DESIGN §3.3); a UUID is 36 bytes; 1024 covers both.
+        if item.key.len() > 1024 {
+            return Err(super::error::key_too_long(item.key.len()));
+        }
+        let key = EntityKey::parse(&item.key);
+        if let std::collections::hash_map::Entry::Vacant(e) = spelling_map.entry(key.clone()) {
+            e.insert(item.key);
+            keys.push(key);
+        }
+    }
+
+    let results = service
+        .batch_get(&keys)
+        .await
+        .map_err(CanonicalError::from)?;
+
+    Ok(Json(EntityLookupsDto {
+        items: results
+            .into_iter()
+            .map(|(key, lookup)| EntityLookupDto {
+                key: spelling_map.remove(&key).unwrap_or_default(),
+                status: (&lookup).into(),
+                entity: match lookup {
+                    EntityLookup::Found(record) => Some(EntityDto::from(record)),
+                    EntityLookup::NotFound => None,
+                },
+            })
+            .collect(),
+    }))
+}
+
+/// `GET /types-registry/v2/entities`
+///
+/// One bounded, content-free page ordered by canonical identifier, plus the cursor
+/// for the next one (D12).
+pub async fn discover_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    extract::Query(query): extract::Query<DiscoverEntitiesQuery>,
+) -> ApiResult<Json<EntityPageDto>> {
+    let service = require_registry(service)?;
+    if query.select.is_some() {
+        return Err(super::error::select_not_supported());
+    }
+
+    // Both bounds are enforced before any decoding or compilation, so an
+    // arbitrarily large string cannot enter the GTS pattern compiler or the
+    // base64url decoder. Pattern shares the 1024-byte GTS identifier ceiling;
+    // the cursor is base64url-encoded JSON, so 4096 bytes is a generous bound
+    // that a real cursor token cannot approach.
+    if let Some(p) = &query.pattern
+        && p.len() > 1024
+    {
+        return Err(super::error::pattern_too_long(p.len()));
+    }
+    if let Some(c) = &query.cursor
+        && c.len() > 4096
+    {
+        return Err(super::error::cursor_too_long(c.len()));
+    }
+
+    let after = query
+        .cursor
+        .as_deref()
+        .map(|token| super::cursor::decode(token, query.pattern.as_deref()))
+        .transpose()?;
+
+    let page = service
+        .discover(&DiscoveryQuery {
+            pattern: query.pattern.clone(),
+            after,
+            limit: query.limit,
+        })
+        .await
+        .map_err(CanonicalError::from)?;
+
+    // A cursor only where the traversal has more to give, so its absence is the
+    // one end-of-traversal signal. `has_more` may over-report, which costs the
+    // caller one empty page rather than a lost row.
+    let next_cursor = match (page.has_more, page.next_after.as_deref()) {
+        (true, Some(after)) => Some(super::cursor::encode(after, query.pattern.as_deref())?),
+        _ => None,
+    };
+    Ok(Json(EntityPageDto {
+        items: page.items.into_iter().map(Into::into).collect(),
+        page_info: PageInfoDto {
+            next_cursor,
+            // The page reports the size it was read at, which is the configured
+            // default when the caller named none. A handler must not read
+            // `limits.page_size_default` to fill this in (SPEC §8.4).
+            limit: page.limit,
+        },
+    }))
 }
 
 /// The database-backed path is only wired where a database is bound to this gear
