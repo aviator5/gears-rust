@@ -9,6 +9,7 @@ use toolkit::api::operation_builder::{
     CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, ParamLocation, ParamSpec,
     ResponseHeaderSpec, ResponseHeaderType,
 };
+use utoipa::openapi::schema::{KnownFormat, SchemaFormat};
 
 use super::dto::{
     DeleteEntitiesRequest, EntityDto, GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto,
@@ -81,6 +82,8 @@ fn idempotency_key_param() -> ParamSpec {
         ),
         param_type: "string".to_owned(),
         array: false,
+        format: None,
+        minimum: None,
     }
 }
 
@@ -395,14 +398,25 @@ fn register_delete_entity(mut router: Router, openapi: &dyn OpenApiRegistry) -> 
             "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry \
              Reference UUID",
         )
-        // `query_param_typed` takes description before type; swapping them silently emits `string`.
-        .query_param_typed(
-            "expected_resource_version",
-            true,
-            "Required and positive: the resource_version the caller observed. Absent, \
-             non-numeric or zero is a 400; a mismatch is reported on the operation item",
-            "integer",
-        )
+        // Declared as a `ParamSpec` rather than through `query_param_typed`: that
+        // helper cannot carry `format`/`minimum`, and its positional `description`
+        // before `param_type` is easy to swap silently into a `string`. Named
+        // fields state the same precondition the batch DTO declares — a positive
+        // `int64` — so a generated client rejects what acceptance would reject.
+        .param(ParamSpec {
+            name: "expected_resource_version".to_owned(),
+            location: ParamLocation::Query,
+            required: true,
+            description: Some(
+                "Required and positive: the resource_version the caller observed. Absent, \
+                 non-numeric or zero is a 400; a mismatch is reported on the operation item"
+                    .to_owned(),
+            ),
+            param_type: "integer".to_owned(),
+            array: false,
+            format: Some(SchemaFormat::KnownFormat(KnownFormat::Int64)),
+            minimum: Some(1.0),
+        })
         .query_param_typed(
             "dry_run",
             false,
