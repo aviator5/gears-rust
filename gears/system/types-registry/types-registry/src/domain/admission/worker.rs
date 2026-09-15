@@ -340,17 +340,6 @@ async fn commit_prepared(
         .await
 }
 
-/// Names deletion's item-CAS race explicitly instead of hiding it in a nested
-/// `Result<Result<Option<_>, _>, _>`; registration uses [`WorkerError::ItemAlreadyTerminal`].
-enum DeletionCommitOutcome {
-    /// The tombstone and the item's terminal outcome were written together.
-    Recorded(deletion::DeletionCommit),
-    /// Another pass terminalized the item first, so this pass wrote no outcome.
-    /// Its entity write is committed either way — the CAS guards the item row, not
-    /// the tombstone — so the stored outcome is the one to report.
-    LostToAnotherPass,
-}
-
 /// Commit deletion or record refusal. Retry contention safely: all decisions
 /// re-read within the transaction and rollback undoes the attempt. No external
 /// evaluation means no revalidation loop.
@@ -413,16 +402,19 @@ async fn process_deletion(
                 .await?;
                 match committed {
                     Ok(commit) => {
-                        // Commit tombstone and outcome together so leased redelivery sees a terminal item.
+                        // Tombstone and item outcome must commit together: if the item
+                        // CAS loses (another pass already terminalized it), rolling back
+                        // the whole transaction ensures the tombstone does not outlive
+                        // the outcome that should accompany it.
                         let outcome = commit.item_outcome(dry_run);
                         let marked = tx_stores
                             .mark_item_succeeded(tx, &tx_scope, item_id, outcome, now)
                             .await?;
-                        Ok(Ok(if marked {
-                            DeletionCommitOutcome::Recorded(commit)
+                        if marked {
+                            Ok(Ok(commit))
                         } else {
-                            DeletionCommitOutcome::LostToAnotherPass
-                        }))
+                            Err(WorkerError::ItemAlreadyTerminal { item_id })
+                        }
                     }
                     Err(failure) => Ok(Err(failure)),
                 }
@@ -432,7 +424,7 @@ async fn process_deletion(
 
     let committed = match committed {
         Ok(committed) => committed,
-        // Another pass terminalized the item; this pass rolled back.
+        // Another pass terminalized the item; this pass rolled back (including tombstone).
         Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
             return stored_item(stores, db, scope, operation_id, item_id).await;
         }
@@ -440,7 +432,7 @@ async fn process_deletion(
     };
 
     match committed {
-        Ok(DeletionCommitOutcome::Recorded(commit)) => {
+        Ok(commit) => {
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
@@ -462,11 +454,6 @@ async fn process_deletion(
                 revision_no,
                 failure: None,
             })
-        }
-        // Another pass terminalized the item while this pass was committing.
-        // The entity write is already committed, so report the stored outcome.
-        Ok(DeletionCommitOutcome::LostToAnotherPass) => {
-            stored_item(stores, db, scope, operation_id, item.id).await
         }
         Err(failure) => {
             record_failure(

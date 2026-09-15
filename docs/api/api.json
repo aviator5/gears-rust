@@ -4651,6 +4651,7 @@
             ]
           },
           "items": {
+            "description": "No `max_items`: the ceiling is `limits.batch_candidates`, which a deployment\nconfigures. A literal here would be a second, fixed number that disagrees\nwith the server the moment anyone changes that setting. `RegistryService::delete`\nenforces the real one before reading anything.",
             "items": {
               "$ref": "#/components/schemas/DeleteEntityDto"
             },

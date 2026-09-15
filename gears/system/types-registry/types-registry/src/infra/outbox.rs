@@ -9,18 +9,24 @@
 //! `worker.max_delivery_attempts` first. Terminalizing as `admission_abandoned`
 //! gives callers a readable outcome and prevents recovery on every boot.
 //!
-//! One gap remains. A delivery cut short by the lease timeout still increments
-//! `attempts`, but the handler's future is dropped before it decides — so it
-//! neither rejects nor counts a delivery outcome. An admission that keeps hanging
-//! keeps timing out and keeps the single partition blocked, however high `attempts`
-//! climbs. Bounding it needs the handler to watch `Batch::remaining()` and give up
-//! on its own; not addressed here.
+//! Deliveries cut short by the lease timeout increment `attempts` without recording
+//! an outcome, so the handler cannot count them itself. Once `attempts` reaches
+//! `max_attempts` the delivery in hand skips `registry.admit()` entirely and decides
+//! from the stored status: it acks a completed operation and dead-letters anything
+//! else. That decision is terminal, so admission runs on at most `max_attempts`
+//! deliveries and the one after them ends the message — a hanging admission cannot
+//! hold the single partition.
+//!
+//! Terminal has to mean *returning*, because the strategy converts a handler future
+//! dropped at the lease deadline back into a retry. Every database call on that path
+//! therefore stops at a [`work_deadline`] taken from the lease `Batch::remaining()`
+//! reports — which is why this is a [`LeasedHandler`] and not a per-message one.
 
 use std::sync::{Arc, OnceLock, Weak};
 
 use toolkit_db::outbox::{
-    EnqueueMessage, LeaseConfig, LeasedMessageHandler, MessageResult, Outbox, OutboxError,
-    OutboxHandle, OutboxMessage, OutboxProfile, Partitions, WorkerTuning,
+    Batch, EnqueueMessage, HandlerResult, LeaseConfig, LeasedHandler, MessageResult, Outbox,
+    OutboxError, OutboxHandle, OutboxMessage, OutboxProfile, Partitions, WorkerTuning,
 };
 use toolkit_db::{Db, DbError, DbTx};
 use tracing::{error, info, warn};
@@ -28,6 +34,7 @@ use uuid::Uuid;
 
 use crate::config::LEASE_HEADROOM;
 use crate::domain::admission::OperationDispatch;
+use crate::domain::enums::OperationStatus;
 use crate::domain::ports::RecoveryCursor;
 use crate::domain::ports::metrics::{AdmissionMetrics, DeliveryOutcome};
 use crate::domain::registry_service::{RegistryService, ServiceError};
@@ -175,16 +182,49 @@ impl AdmissionHandler {
         }
     }
 
-    /// Admit a payload directly for tests; [`LeasedMessageHandler::handle`] first
-    /// checks the envelope type and supplies its `attempts` (retries so far, `0`
-    /// on first delivery). The last allowed transient failure is rejected.
+    /// Decide one message: refuse a foreign envelope, else admit its payload with
+    /// `lease` left before the strategy cancels the handler.
+    ///
+    /// The body [`LeasedHandler::handle`] runs per message, and public so tests can
+    /// reach the envelope guard without a [`Batch`], which only the outbox builds.
+    pub async fn handle_message(
+        &self,
+        msg: &OutboxMessage,
+        lease: std::time::Duration,
+    ) -> MessageResult {
+        if msg.payload_type != PAYLOAD_TYPE {
+            let cause = UnexpectedPayloadType {
+                actual: &msg.payload_type,
+                expected: PAYLOAD_TYPE,
+            };
+            return reject_unusable(self.registry.metrics(), &cause);
+        }
+        self.admit_payload_within(&msg.payload, msg.attempts, lease)
+            .await
+    }
+
+    /// Admit a payload directly for tests, with the lease a full first delivery
+    /// would have. [`LeasedHandler::handle`] checks the envelope type, supplies the
+    /// message's `attempts` (retries so far, `0` on first delivery) and passes the
+    /// lease actually left.
+    pub async fn admit_payload(&self, payload: &[u8], attempts: i16) -> MessageResult {
+        self.admit_payload_within(payload, attempts, self.registry.operation_timeout())
+            .await
+    }
+
+    /// Admit a payload with `lease` left before the strategy cancels this handler.
     ///
     /// **NOT cancel-safe.** `tokio::time::timeout_at` drops this future on lease
     /// expiry, leaving the operation `running`, committed items terminal with
     /// their real outcomes, and others `pending`. Per-candidate transactions
     /// prevent partial entity writes; redelivery skips terminal items and resumes
     /// the rest, making an interrupted pass recoverable.
-    pub async fn admit_payload(&self, payload: &[u8], attempts: i16) -> MessageResult {
+    async fn admit_payload_within(
+        &self,
+        payload: &[u8],
+        attempts: i16,
+        lease: std::time::Duration,
+    ) -> MessageResult {
         let operation_id = match parse_payload(payload) {
             Ok(operation_id) => operation_id,
             // Permanent by construction: no redelivery changes the bytes.
@@ -192,12 +232,111 @@ impl AdmissionHandler {
         };
 
         let now = time::OffsetDateTime::now_utc();
+        // Fixed before the first await, so it is one instant for the whole delivery.
+        // Deriving it later would restart the budget from whatever admission had
+        // already spent, handing the abandonment that follows a failure more lease
+        // than remains — and a write that runs past the real deadline is dropped and
+        // returned as a retry, which is the outcome abandoning exists to avoid.
+        let deadline = work_deadline(lease);
+
+        // Budget exhausted: `max_attempts` deliveries already incremented `attempts`
+        // without the handler reaching a decision, which is what a lease timeout
+        // leaves behind. Skip `registry.admit()` — it timed out before and would
+        // hold the lease again — and decide from the stored status instead.
+        if u64::try_from(attempts).unwrap_or(u64::MAX) >= u64::from(self.max_attempts) {
+            return self
+                .decide_from_stored_status(operation_id, attempts, now, deadline)
+                .await;
+        }
+
         match self.registry.admit(operation_id, now).await {
             Ok(()) => MessageResult::Ok,
             Err(ServiceError::Worker(e)) if e.transient() && self.may_retry(attempts) => {
                 self.retry(operation_id, attempts, &e)
             }
-            Err(e) => self.abandon(operation_id, attempts, &e, now).await,
+            Err(e) => {
+                self.abandon(operation_id, attempts, &e, now, deadline)
+                    .await
+            }
+        }
+    }
+
+    /// Decide a delivery whose budget is spent, reading the stored status instead
+    /// of admitting again.
+    ///
+    /// Every arm is terminal for the message, and that is the whole point:
+    /// `MessageResult::Retry` here would put the next delivery back into this same
+    /// branch, so a status read that keeps failing would hold the single partition
+    /// forever and drive `attempts` past the `i16` the outbox stores it in.
+    ///
+    /// Terminal also has to mean *returning*. `LeasedStrategy` runs the handler
+    /// under `timeout_at` and converts a dropped future into `Retry`, so an await
+    /// that outlives the lease reopens that loop however the arms are written.
+    ///
+    /// `deadline` covers the read and the abandonment that may follow it, rather
+    /// than a budget each: this path can take both in sequence, and two budgets that
+    /// are individually safe still add up to more lease than there is.
+    async fn decide_from_stored_status(
+        &self,
+        operation_id: Uuid,
+        attempts: i16,
+        now: time::OffsetDateTime,
+        deadline: tokio::time::Instant,
+    ) -> MessageResult {
+        let status = tokio::time::timeout_at(deadline, self.registry.operation(operation_id)).await;
+        match status {
+            Ok(Ok(Some(op))) if op.status == OperationStatus::Completed => {
+                info!(
+                    %operation_id,
+                    attempts,
+                    max_attempts = self.max_attempts,
+                    "types_registry admission completed on a prior delivery; acking"
+                );
+                MessageResult::Ok
+            }
+            Ok(Ok(Some(_))) => {
+                self.abandon(
+                    operation_id,
+                    attempts,
+                    &"delivery budget exhausted",
+                    now,
+                    deadline,
+                )
+                .await
+            }
+            Ok(Ok(None)) => {
+                let cause = format!(
+                    "operation {operation_id} not found at budget exhaustion; \
+                     the message cannot be associated with any known operation"
+                );
+                reject_unusable(self.registry.metrics(), &cause)
+            }
+            // No status to go on, so abandon on the assumption it is unfinished.
+            // Safe either way: `abandon` fails only undecided items and
+            // `mark_abandoned` moves only a `pending`/`running` row, so an operation
+            // that did complete keeps its outcomes and loses nothing but a spurious
+            // dead-letter row. If the write fails too, the operation stays
+            // non-terminal and boot recovery re-enqueues it.
+            Ok(Err(e)) => {
+                self.abandon(
+                    operation_id,
+                    attempts,
+                    &format!("delivery budget exhausted; status unreadable: {e}"),
+                    now,
+                    deadline,
+                )
+                .await
+            }
+            Err(_) => {
+                self.abandon(
+                    operation_id,
+                    attempts,
+                    &"delivery budget exhausted; the status read did not answer in time",
+                    now,
+                    deadline,
+                )
+                .await
+            }
         }
     }
 
@@ -235,6 +374,7 @@ impl AdmissionHandler {
         attempts: i16,
         cause: &(dyn std::fmt::Display + Sync),
         now: time::OffsetDateTime,
+        deadline: tokio::time::Instant,
     ) -> MessageResult {
         let reason = cause.to_string();
         error!(
@@ -247,17 +387,47 @@ impl AdmissionHandler {
         self.registry
             .metrics()
             .admission_delivery(DeliveryOutcome::DeadLettered);
-        // Even if terminalization fails, dead-letter now; boot recovery retries it.
-        if let Err(e) = self.registry.abandon(operation_id, now).await {
-            error!(
-                %operation_id,
-                error = %e,
-                "types_registry could not terminalize an abandoned operation; it stays \
-                 non-terminal until the next recovery scan"
-            );
-        }
+        self.terminalize_abandoned(operation_id, now, deadline)
+            .await;
         MessageResult::Reject(reason)
     }
+
+    /// Terminalize an abandoned operation, best effort, stopping at `deadline`.
+    ///
+    /// The dead-letter stands either way — a failure here only means the operation
+    /// stays non-terminal until boot recovery re-enqueues it. Bounded for the same
+    /// reason the status read is: a write that outlives the lease is dropped by
+    /// `timeout_at` and returns as `Retry`, undoing the dead-letter its caller
+    /// exists to produce.
+    async fn terminalize_abandoned(
+        &self,
+        operation_id: Uuid,
+        now: time::OffsetDateTime,
+        deadline: tokio::time::Instant,
+    ) {
+        let written =
+            tokio::time::timeout_at(deadline, self.registry.abandon(operation_id, now)).await;
+        let failure: &dyn std::fmt::Display = match &written {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e,
+            Err(elapsed) => elapsed,
+        };
+        error!(
+            %operation_id,
+            error = %failure,
+            "types_registry could not terminalize an abandoned operation; it stays \
+             non-terminal until the next recovery scan"
+        );
+    }
+}
+
+/// When database work must stop, given the lease left when the delivery began.
+///
+/// A tenth is held back so the handler can return its result and the strategy can
+/// act on it. Without that margin the work would run to the instant `timeout_at`
+/// fires, and a result produced exactly then is a result nobody reads.
+fn work_deadline(lease: std::time::Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + lease.mul_f32(0.9)
 }
 
 /// An unusable payload cannot be retried or identify an operation to terminalize.
@@ -271,17 +441,48 @@ fn reject_unusable(metrics: &dyn AdmissionMetrics, cause: &dyn std::fmt::Display
     MessageResult::Reject(cause.to_string())
 }
 
+/// Drives the batch directly rather than through the [`LeasedMessageHandler`]
+/// blanket impl, which is otherwise the right shape for `batch_size(1)`.
+///
+/// `Batch::remaining()` is the reason. It is the only account of how much lease is
+/// actually left — the strategy starts its clock before acquiring the lease and
+/// reading the batch, and never tells a per-message handler what that cost. Without
+/// it the budget-exhausted path can only guess, and a guess that runs long is
+/// dropped at the deadline and returned as a retry, which is the loop that path
+/// exists to close.
+///
+/// The loop is otherwise the blanket impl's: one message at a time, `ack` or
+/// `reject` per result, and stop starting new work once the lease is spent.
 #[async_trait::async_trait]
-impl LeasedMessageHandler for AdmissionHandler {
-    async fn handle(&self, msg: &OutboxMessage) -> MessageResult {
-        if msg.payload_type != PAYLOAD_TYPE {
-            let cause = UnexpectedPayloadType {
-                actual: &msg.payload_type,
-                expected: PAYLOAD_TYPE,
-            };
-            return reject_unusable(self.registry.metrics(), &cause);
+impl LeasedHandler for AdmissionHandler {
+    async fn handle(&self, batch: &mut Batch<'_>) -> HandlerResult {
+        loop {
+            // Read before taking the message: `next_msg` borrows the batch until the
+            // message is done with, and `OutboxMessage` is not `Clone` to step around
+            // that. The instant between the two costs nothing that the return margin
+            // in `work_deadline` does not already cover.
+            let lease = batch.remaining();
+            let Some(msg) = batch.next_msg() else { break };
+
+            let result = self.handle_message(msg, lease).await;
+
+            match result {
+                MessageResult::Ok => batch.ack(),
+                MessageResult::Retry => {
+                    return HandlerResult::Retry {
+                        reason: "types_registry admission asked for redelivery".to_owned(),
+                    };
+                }
+                MessageResult::Reject(reason) => batch.reject(reason),
+            }
+
+            // The message just handled finished inside its own budget; do not start
+            // another one on a lease that is already spent.
+            if batch.remaining().is_zero() {
+                break;
+            }
         }
-        self.admit_payload(&msg.payload, msg.attempts).await
+        HandlerResult::Success
     }
 }
 
