@@ -168,7 +168,10 @@ authored content plus the materialized artifacts. An absent key is `not_found` i
 `200`, not a `404`: one missing key must not lose the answers for the others.
 
 A key named twice collapses onto its first mention. The two spellings of one entity are two
-keys and get two results. At most 500 keys per request; an empty `items` is a `400`.
+keys and get two results. At most 100 keys per request, the same ceiling registration and
+deletion batches carry; an empty `items` is a `400`. A `found` result carries the authored
+document and all three materialized artifacts, so the key count is what bounds the
+response size.
 
 `If-None-Match` is refused rather than ignored, because validators are per key: each item
 carries its own `if_none_match` slot.

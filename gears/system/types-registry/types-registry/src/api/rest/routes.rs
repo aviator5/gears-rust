@@ -312,7 +312,7 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .operation_id("types_registry.batch_get_entities")
         .summary("Read a set of GTS entities by key")
         .description(
-            "Read up to 500 entities in one round trip. Each item names one entity in `key` \
+            "Read up to 100 entities in one round trip. Each item names one entity in `key` \
              (a canonical GTS identifier or the Registry Reference UUID derived from it), \
              resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. \
              Returns 200 with one result per requested key, in request order and echoing the \

@@ -1106,6 +1106,7 @@ because other documents cite the numbers.
 | C7 | **The validator has no tenant or projection dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and a fixed default-projection marker (§8.5); the SDK cache key likewise carries visibility context and projection as constants. Correct while every read is platform-plane and no `$select` exists, and wrong the moment either arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions and the real projection digest under a new version and refuses to honour a P0 token |
 | C8 | **Platform-plane mutations are internal-only.** Every P0 operation is platform-plane (`plane = 1`), but an in-process gear has no inbound platform-identity validator, api-gateway has no platform listener, and `OperationBuilder` cannot mark a route platform-only (§8.4). Registration and deletion therefore keep `exposed = false`; internal and non-mutating calls retain authentication, because `.anonymous()` without a platform identity would be a regression | A platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity`, a declarative platform-plane route marker, and a platform-principal/PDP decision before mutation dispatch. Only then may mutation routes be exposed. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
 | C9 | **Implementation sequencing.** T14 adds reverse-impact refresh; T17 adds compatibility checks and effective waiver provenance, replacing the temporary `force` refusal. ADR-0004 still permanently forbids content revisions of minor-bearing Type Schemas; creation is admissible (§8.1 step 4). C8 keeps mutations internal | Remove this row when Checkpoints 3 and 4 are complete, before T24 exposes consumers. The ADR-0004 restriction remains |
+| C10 | **`batchGet` names at most 100 keys, not DESIGN §3.3's 500.** DESIGN chose the higher number so a reconciliation could read every identifier it might write before selecting the ≤100 it submits. P0 gives that headroom up: a `found` result carries the authored document plus D3's three artifacts, and §3.2 bounds a resolved document at 1 MB, so the key count is the only thing bounding one response — 500 keys is a response this gear should never be asked to build. The cost is that a reconciliation inspecting more identifiers than it writes must page its reads | T23's reconciliation helper pages `batchGet` rather than read-then-select, and a bound on response **bytes** rather than on keys lifts the count again — the same trade §10.2 makes for the discovery page, whose `limit` is also on items |
 
 
 Each ceiling gets a `ponytail:`-style source comment naming the bound and the upgrade
@@ -1246,6 +1247,11 @@ Business listener, `.authenticated()`, path `/types-registry/v1/...` per DE0801.
 `Idempotency-Key` is required on every mutation, both deletion spellings included. Every `202` carries operation
 `Location` and advisory `Retry-After`. Errors are RFC-9457 via
 `modkit::api::problem` with `.standard_errors(openapi)`.
+
+`POST /entities:batchGet` names **at most 100 keys** — the write ceiling, not DESIGN §3.3's
+500, because a `found` result is a full representation and the key count is the only bound on
+one response (ceiling C10). Absence is a per-key `not_found` inside a `200`, never a `404`:
+one missing key must not lose the answers for the others.
 
 `POST /entities` **breaks** (D10): its success shape changes from `200` + per-item results
 to `202` + operation, on the same path, with no transitional alias. The route's declared

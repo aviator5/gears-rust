@@ -199,12 +199,23 @@ pub struct DiscoveryPage {
 
 /// How many keys one batch read may name.
 ///
-/// DESIGN §3.3's number, deliberately above the write ceiling: a reconciliation
-/// reads every identifier it might write before selecting the at most
-/// `limits.batch_candidates` it actually submits. A constant rather than a
-/// configuration key because §10.3's configuration is fixed for P0, and a second
-/// editable number would let a deployment lower a read bound nothing else names.
-pub const MAX_BATCH_GET_KEYS: usize = 500;
+/// ponytail: ceiling C10 — **100, not DESIGN §3.3's 500.** DESIGN picked the
+/// higher number so a reconciliation could read every identifier it might write
+/// before selecting the at most `limits.batch_candidates` (100) it actually
+/// submits. P0 gives that headroom up deliberately: one `found` result carries the
+/// authored document plus D3's three materialized artifacts, and §3.2 bounds a
+/// resolved document at 1 MB, so the ceiling is what bounds a single response —
+/// 500 keys is a response this gear should never be asked to build. A
+/// reconciliation that wants to inspect more identifiers than it writes pages its
+/// reads instead, which the T23 helper owns. The upgrade path is that helper
+/// plus a bound on response *bytes* rather than on keys; until then the key count
+/// is the only bound there is.
+///
+/// A constant rather than a configuration key because §10.3's configuration is
+/// fixed for P0. Equal to `limits.batch_candidates` today and still not the same
+/// bound: a deployment that raises the write ceiling must not silently widen read
+/// fan-out with it.
+pub const MAX_BATCH_GET_KEYS: usize = 100;
 
 /// What the service can fail with. One layer above the two admission halves, so a
 /// transport adapter maps one type.

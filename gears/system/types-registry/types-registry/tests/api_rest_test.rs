@@ -22,7 +22,9 @@ use types_registry::api::rest::routes::{V1, V2};
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::{NullDispatch, OperationDispatch};
 use types_registry::domain::policy::RegistrationPolicy;
-use types_registry::domain::registry_service::{AdmissionMode, RegistryService};
+use types_registry::domain::registry_service::{
+    AdmissionMode, MAX_BATCH_GET_KEYS, RegistryService,
+};
 use types_registry::domain::service::TypesRegistryService;
 use types_registry::infra::InMemoryGtsRepository;
 use types_registry::infra::outbox::OutboxDispatch;
@@ -2463,18 +2465,45 @@ async fn an_empty_batch_read_is_refused() {
     assert_field_refusal(&response, "items", "VALIDATION_FAILED");
 }
 
-/// A batch read is bounded, like every other batch on this surface.
+/// The batch ceiling is **100 keys**, matching the write ceiling rather than
+/// DESIGN §3.3's 500 (SPEC §9 ceiling C10).
+///
+/// Pinned as a literal on purpose: the boundary test below reads the constant, so
+/// it would stay green through a value change. This is the test that fails if the
+/// number moves, which is what makes the number a decision rather than a default.
+#[test]
+fn the_batch_read_ceiling_is_one_hundred_keys() {
+    assert_eq!(MAX_BATCH_GET_KEYS, 100);
+}
+
+/// A batch read is bounded, like every other batch on this surface: exactly at the
+/// ceiling is served, one key past it is refused.
+///
+/// Driven by the constant rather than by a literal, so the boundary stays asserted
+/// wherever the ceiling sits.
 #[tokio::test]
-async fn a_batch_read_above_its_ceiling_is_refused() {
+async fn a_batch_read_is_bounded_at_its_ceiling() {
     let router = router_with_db().await;
-    let ids: Vec<String> = (0..501)
+    let ids: Vec<String> = (0..=MAX_BATCH_GET_KEYS)
         .map(|i| format!("{}cf.core.example.k{i:04}.v1~", gts::GTS_ID_PREFIX))
         .collect();
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
 
-    let response = call(&router, batch_get(&keys(&refs))).await;
+    let at_ceiling = call(&router, batch_get(&keys(&refs[..MAX_BATCH_GET_KEYS]))).await;
+    assert_eq!(
+        at_ceiling.status,
+        StatusCode::OK,
+        "exactly {MAX_BATCH_GET_KEYS} keys must be served: {:?}",
+        at_ceiling.body,
+    );
+    assert_eq!(
+        at_ceiling.body["items"].as_array().expect("items").len(),
+        MAX_BATCH_GET_KEYS,
+        "one result per requested key, even when every one is absent",
+    );
 
-    assert_field_refusal(&response, "items", "VALIDATION_FAILED");
+    let past_ceiling = call(&router, batch_get(&keys(&refs))).await;
+    assert_field_refusal(&past_ceiling, "items", "VALIDATION_FAILED");
 }
 
 // --- content-free discovery -------------------------------------------------

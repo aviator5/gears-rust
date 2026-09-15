@@ -2064,7 +2064,7 @@ and quickstart, for the seven-route completeness check)
   with no position in the stored keyset, and admission reaches entities by key, by id or
   through the dependency relation, never by page.
 - **`current_schemas` keeps a batch read constant in round trips.** `find_current_schema` is
-  single-entity, so a 500-key batch would have cost 500 extra queries for the very artifacts
+  single-entity, so a 100-key batch would have cost 100 extra queries for the very artifacts
   D3 materialized to avoid work. The batch read is two identity reads plus three
   current-state reads under one snapshot, whatever the batch size.
 - **The exact read is now one key's `batch_get`**, as `delete_entity` is one target's
@@ -2083,9 +2083,17 @@ and quickstart, for the seven-route completeness check)
 - **`limit` and the page ceiling live in the domain**, which is why `DiscoveryPage` carries the
   size it was read at: a handler must not read `limits.page_size_default` to fill `page_info`,
   or REST and a future gRPC adapter could report different defaults for the same read.
-- **The batch ceiling is a constant, not a config key.** `MAX_BATCH_GET_KEYS = 500` is DESIGN
-  §3.3's number, above the write ceiling on purpose. §10.3's configuration is fixed for P0, and
-  a second editable number would let a deployment lower a read bound nothing else names.
+- **The batch ceiling is 100, not DESIGN §3.3's 500** — SPEC §9 ceiling C10, declared rather
+  than taken silently. DESIGN's higher number bought a reconciliation the headroom to read
+  every identifier it might write before selecting its ≤100 candidates; P0 gives that up
+  because a `found` result is a full representation and §3.2 bounds a resolved document at
+  1 MB, so the key count is the only bound on one response. The upgrade path is T23's helper
+  paging its reads plus a bound on response bytes rather than on keys.
+  A constant rather than a config key because §10.3's configuration is fixed for P0. It equals
+  `limits.batch_candidates` today and is still not the same bound: raising the write ceiling
+  must not silently widen read fan-out. Two tests hold it — one pins the literal `100` so the
+  value cannot move unnoticed, one drives the boundary off the constant so exactly-at-ceiling
+  is served and one past it is refused.
 - **`if_none_match` is declared and not consulted.** No read emits a validator until T29, so
   nothing a caller could hold can be compared against; the field exists now so the wire shape
   does not change under the callers T23 migrates. `EntityLookupStatusDto` is `found` /
@@ -2139,6 +2147,10 @@ T26 once every consumer has moved.
 - [ ] **The validator field is in the models from this task**, and `BatchGet` accepts a validator per requested key in `BatchGetItem::if_none_match`, even though T29 computes them and T30 consumes them. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9). A result variant for `unchanged` is part of the same shape
 - [ ] **Reconciliation helper** implements DESIGN §3.3's five steps: batch-read the desired identifiers, omit content equal to current, set `expected_resource_version` from the read for differing ones and leave it unset for missing ones, return `UpToDate` with no POST when nothing remains, otherwise submit once under one idempotency key and poll to terminality
 - [ ] The helper filters the process inventory by `owning_gear` (T22) and batches within `limits.batch_candidates`
+- [ ] **Reads are chunked at `MAX_BATCH_GET_KEYS` (100), not assumed to fit one call** — T22a
+      lowered the batch-read ceiling from DESIGN §3.3's 500 to the write ceiling (SPEC §9
+      ceiling C10), so the batch-read step of the five is itself a paged loop. A gear
+      reconciling more than 100 declarations is the ordinary case, not the edge one
 - [ ] **Retry lives here, not in gears:** a candidate failing because a dependency is not yet registered is retried a bounded number of times; failure names the gear and identifier
 - [ ] One generated idempotency key spans an invocation's retries and polling
 - [ ] Callable from a consumer's `init()` (P3). Its doc comment states the one requirement: declare `deps = [types_registry]`, or `init` ordering is not guaranteed
