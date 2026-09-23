@@ -74,7 +74,7 @@ without re-registration.
 | Availability Evaluator, `tenant-resolver` dependency | Needs tenancy |
 | Validator inputs that only a tenant or external read has: subject visibility-chain version, Context Tenant availability-chain version, routing generation, `external_revision` | Each is `tenant plane only`, availability-conditional or external, so **none participates in a platform-plane read** — the validator itself is in P0, see §8.5 |
 | Availability, reason and Context Tenant ownership-view fields in `$select` | Those values need the tenant availability and visibility work deferred to P1. P0 still supports caller-chosen selection over its managed field allowlist (§10.2, plan P19) |
-| `expand_type_filter` and `limits.expansion_references` | Its DESIGN definition *is* `$select=gts_uuid&availability=available`, with the availability filter fixed by the method rather than supplied by the caller. Availability is out of P0 (needs tenancy), so a P0 method of that name would report retired contracts as usable — a same-named different meaning, which is worse than absence. Paging `list_entities` directly is available to any caller that wants the traversal |
+| `expand_type_filter` | Its DESIGN definition *is* `$select=gts_uuid&availability=available`, with the availability filter fixed by the method rather than supplied by the caller. Availability is out of P0 (needs tenancy), so a P0 method of that name would report retired contracts as usable — a same-named different meaning, which is worse than absence. Paging `list_entities` directly is available to any caller that wants the traversal |
 | Operator purge job, operation-retention sweep | ADR-0013, §3.2 — no P0 consumer |
 | Aliases, Validation Hooks, casting, tenant enablement | P2 in DESIGN |
 
@@ -1247,7 +1247,7 @@ group to reach inside of. Snapshot fields are optional because selection may omi
 `Some` containing JSON `null` still represents a selected document, while `None` means
 unselected or inapplicable. `origin` has only the managed variant in P0 and carries
 `resource_version` and timestamps; `content_hash` and `provenance` follow §10.2. List
-helpers explicitly select the documents they hydrate after the discovery page.
+helpers explicitly select the documents they read, on the page or through `batchGet`.
 
 **The old models' client-side `effective_*` methods are deleted, and duplication is the
 weakest of three reasons.**
@@ -1355,7 +1355,7 @@ end state.
 match in one array, each item carrying full `content`; old exact reads likewise include
 documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field selection:
 
-- **A page, not a list.** `limit` defaults to 100 and may not exceed 1000; the response
+- **A page, not a list.** `limit` defaults to 50 and may not exceed 100; the response
   carries a cursor when more remains. Ordering is by canonical identifier and deleted
   entities are excluded, which is what makes the cursor a plain keyset — `gts_id` is unique
   and immutable, so a page boundary cannot drift or duplicate. Cursors come from
@@ -1449,9 +1449,8 @@ do not amount to an aggregate response-byte budget (C10).
 
 **Consequence for the SDK, stated because it changes consumer code.** `list_instances` and
 `list_type_schemas` are provided helpers over `list_entities` (§10.1), and their ~87 existing
-call sites read payloads from the result. The helpers explicitly select those documents
-and hydrate through `batchGet` — one extra round trip per page, absorbed by the client
-cache (§8.3) on repeat.
+call sites read payloads from the result. The helpers explicitly select those documents,
+on the page itself or through an optional `batchGet` for per-key validators and caching (§8.3).
 The result is complete with respect to the traversal rather than to an instant, which is the
 same trade DESIGN accepts for type-filter expansion.
 
@@ -1470,8 +1469,8 @@ gears:
         resolution_closure: 64
         batch_candidates: 100
         activation_write_set: 512      # DESIGN §3.2; the profile is §4
-        page_size_default: 100         # `GET /entities`, DESIGN §3.3
-        page_size_max: 1000
+        page_size_default: 50          # `GET /entities`, DESIGN §3.3
+        page_size_max: 100
       registration_policy: {}          # closed by default; global `cf` implicit
       worker:
         operation_timeout: 5m          # T21 lease-handler budget; must be > 0. Not
@@ -1876,7 +1875,7 @@ identifier profile refusals, topological order, baseline selection.
 | Cursor resumed with another selection or filter | changing `$select`, `pattern`, `depth` or `kind` is rejected with `400`; absent `$select` and the explicit default field set resume interchangeably |
 | Filtered cursor traversal | mixed depths and kinds across multiple pages produce each matching active entity exactly once, including when the scan budget ends a sparse page |
 | SDK cache under two selections | different normalized sets occupy different entries; reordered/default-equivalent selections reuse one entry |
-| `list_instances` helper over a content-free page | hydrates through `batchGet` and returns payloads, so the call shape consumers use is preserved |
+| `list_instances` helper over a document-free default | selects documents on the page or through `batchGet` and returns payloads, so the call shape consumers use is preserved |
 | Two pods, concurrent dependency change | commit-time revision-vector mismatch rolls back and retries |
 | Dry Run | full check sequence runs, nothing committed, `resource_version` unmoved |
 | Dry Run of a batch | matches real-run statuses/reasons on identical initial state; admits a referrer to an in-batch base and refuses an Instance invalidated by an in-batch revision |

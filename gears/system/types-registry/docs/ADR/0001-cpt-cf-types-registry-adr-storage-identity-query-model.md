@@ -161,11 +161,11 @@ The set:
 * is complete for the validated filter, tenant context, and selected Alias, version-membership, hierarchy, lifecycle, and availability semantics — membership rather than compatibility, which is per edge and is not carried by a reference;
 * contains only references that are **visible and available to the requesting tenant**, so the set is tenant-specific and two tenants may receive different sets for one filter;
 * is semantically unordered, even if Types Registry uses deterministic source-major traversal to build it;
-* is bounded by a documented platform maximum, enforced by the registry as the traversal proceeds rather than by whatever client assembles it;
+* is bounded by a documented platform maximum of distinct references, enforced by the SDK helper that assembles it from paged discovery; a direct REST caller assembling one must apply the same maximum (amended: the registry keeps no expansion count);
 * is never silently truncated;
 * is exhaustive for the filter but is **not a snapshot**: it is assembled from a paged traversal, so entities may be registered or deleted between its first page and its last. Pagination is what keeps a deduplicated set from having to be held whole in server memory, and the atomicity given up for that is an accepted trade rather than an omission.
 
-If expansion exceeds the maximum, Types Registry returns `QUERY_EXPANSION_LIMIT_EXCEEDED` and no usable constraint. If a required Registry Source cannot establish its part of the result, Types Registry fails the operation rather than returning a partial set.
+If expansion exceeds the maximum, it fails with `QUERY_EXPANSION_LIMIT_EXCEEDED` and no usable constraint. If a required Registry Source cannot establish its part of the result, expansion fails rather than returning a partial set.
 
 Domain gears apply the UUIDs to their own storage. The SDK or gear repository may use backend-safe chunking or an equivalent UUID-set mechanism, but the semantic input remains one complete set. An empty set means the domain query has no matching type references.
 

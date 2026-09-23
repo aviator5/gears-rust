@@ -359,7 +359,7 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
              document-free default. A page never carries a validator. `depth` bounds the \
              number of identifier segments and `kind` narrows to Type Schemas or Instances; \
              both intersect with `pattern` before the page limit. `limit` (alias `$top`) \
-             defaults to 100 and may not exceed 1000; a caller selecting documents should \
+             defaults to 50 and may not exceed 100; a caller selecting documents should \
              page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to \
              the pattern, `depth`, `kind` and the normalized `$select` it was issued for: \
              resuming under any of them changed, or with a token of another version, is a \
@@ -395,7 +395,7 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .query_param_typed(
             "limit",
             false,
-            "Page size, 1 to 1000. Defaults to 100. Alias: $top",
+            "Page size, 1 to 100. Defaults to 50. Alias: $top",
             "integer",
         )
         .query_param(

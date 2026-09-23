@@ -2696,7 +2696,7 @@ async fn a_discovery_page_is_content_free_and_ordered_by_identifier() {
         vec![CF_OTHER_TYPE, CF_TYPE, CF_INSTANCE],
         "sorted by canonical identifier",
     );
-    assert_eq!(response.body["page_info"]["limit"], json!(100));
+    assert_eq!(response.body["page_info"]["limit"], json!(50));
     for item in response.body["items"].as_array().expect("items") {
         assert_eq!(
             field_names(item),
@@ -2773,18 +2773,18 @@ async fn a_cursor_traverses_the_set_exactly_once() {
 async fn a_page_size_outside_the_configured_range_is_refused() {
     let router = router_with_db().await;
 
-    for query in ["?limit=1001", "?limit=0"] {
+    for query in ["?limit=101", "?limit=0"] {
         let response = call(&router, discover(query)).await;
         assert_field_refusal(&response, "limit", "VALIDATION_FAILED");
     }
 }
 
-/// The boundary value `limit=page_size_max` (1000) is served, not refused.
+/// The boundary value `limit=page_size_max` (100) is served, not refused.
 #[tokio::test]
 async fn a_page_size_at_the_configured_maximum_is_served() {
     let router = router_with_db().await;
 
-    let response = call(&router, discover("?limit=1000")).await;
+    let response = call(&router, discover("?limit=100")).await;
 
     assert_eq!(
         response.status,
@@ -2794,7 +2794,7 @@ async fn a_page_size_at_the_configured_maximum_is_served() {
     );
     assert_eq!(
         response.body["page_info"]["limit"],
-        json!(1000),
+        json!(100),
         "page_info.limit must reflect the caller-supplied value",
     );
 }

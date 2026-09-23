@@ -396,8 +396,8 @@ reason for it. Examined item by item, the four are not one decision:
 returns `EntityPage`, so deferring the cursor left a page that is a page in name only — the
 spec contradicted itself. DESIGN specifies the route as *"`200` with one page and a cursor"*
 over *"content-free discovery"*. And the cursor's inputs degenerate exactly as the validator's
-did: of the seven DESIGN binds into it — query, subject visibility context, Context Tenant,
-authorization scope, routing generation, per-source position, running item count — P0 keeps
+did: of the six DESIGN binds into it — query, subject visibility context, Context Tenant,
+authorization scope, routing generation, per-source position — P0 keeps
 **two**, query and position, because the rest are tenant-plane, PDP, or federation. Position is
 free: the read route already required ordering by canonical identifier, so the cursor is a
 keyset over a unique immutable column, and `toolkit-odata` (`page.rs`, `pagination.rs`) already encodes
@@ -424,10 +424,9 @@ meaning is worse than absence; a caller wanting the traversal pages `list_entiti
 
 **The consequence to plan for, because it lands in consumer code.** `list_instances` and
 `list_type_schemas` are helpers over `list_entities`, and their call sites read payloads from
-the result. Against a content-free page the helpers hydrate through `batchGet`: one extra round
-trip per page, absorbed by the client cache on repeat, complete with respect to the traversal
-rather than to an instant. That is the same trade DESIGN accepts for expansion, but it means
-T25/T26 migrate call sites onto a two-step read rather than a renamed one-step read.
+the result. The helpers select those documents on the page (P19) or hydrate through an
+optional `batchGet`, complete with respect to the traversal rather than to an instant — the
+same trade DESIGN accepts for expansion.
 
 ### P12. v1 stays intact; the async surface ships as v2 and is promoted at T24a
 
@@ -1065,7 +1064,7 @@ behave as Checkpoints 5 and 6 proved them, now on the promoted v1 paths. All 16 
 | A narrow projection reuses a validator or cache entry for a wider representation | **High** — an incomplete answer can be accepted as current | T22b defines one normalized field set; T29 digests it into the validator and T30 keys representations by it (P19) |
 | A sparse `depth`/`kind` discovery page skips a later match or resumes under changed filters | **High** — incomplete traversal looks successful | T22c filters before page limits, keeps T22a's scan-position progress, binds both filters into the cursor, and tests mixed-depth/mixed-kind traversal across the scan budget (P20) |
 | A materialized `effective_*` value differs from the deleted client-side computation | Medium — reads as a regression, invites a "fix" back to the old wrong answer | 12 call sites in `account-management`, `resource-group`, `credstore` consume those methods today. The old ones resolved only the parent `$ref` and approximated trait defaults (`TODO(#1723)`), so `gts-rust` is authoritative; T25/T26 carry an explicit criterion to accept the new value, and SPEC §13 pins the outside-the-chain `$ref` case as a test |
-| Content-free discovery turns one-step list reads into list + `batchGet` at ~87 call sites | Medium | The SDK helpers hydrate internally, so call shapes survive (P10); the client cache absorbs the second trip; T23 fixes the helper shape before T25/T26 touch a consumer |
+| Document-free discovery default changes list reads at ~87 call sites | Medium | The SDK helpers select documents internally, on the page or via `batchGet`, so call shapes survive (P10); T23 fixes the helper shape before T25/T26 touch a consumer |
 | Read-shape change reaches e2e alongside the `POST` break | Medium | T28 handles paged discovery and explicit document selection on exact/batch reads through its shared helpers; route stability is `unstable`. Under P12 both breaks arrive at once: T24 deletes old v1 and T24a promotes the async surface |
 | Concurrency protocol wrong under the least-tested backend (MySQL) | Medium | Plain gear tests on SQLite plus `make test-types-registry-db` on PostgreSQL/MySQL at every checkpoint |
 | The `POST /entities` 202 break reaches other gears' e2e suites | Medium | Confirmed surface: 6 types-registry e2e files (~95 references to `/entities`) plus `account_management/conftest.py` and — **missed until P12** — `oagw/helpers.py`, which registers a batch of schemas *and* instances and reads them back through the list route. T28 owns the migration behind one shared polling helper, not open-coded loops. The break itself no longer arrives at T9: T9a keeps v1 intact, so the suite goes red at T24 and green at T28 rather than being red for ~19 tasks |

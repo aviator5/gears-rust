@@ -1955,8 +1955,8 @@ First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. T22 is d
 - [x] `batchGet` echoes requested keys
 - [x] Reject a batch `If-None-Match` header; validators belong in per-item `if_none_match`
 - [x] Discovery excludes tombstones and sorts by canonical identifier
-- [x] Return one bounded page (D12): default `limits.page_size_default` (100), reject above
-  `page_size_max` (1000). Use `toolkit-odata` cursors and reject unknown versions
+- [x] Return one bounded page (D12): default `limits.page_size_default` (50), reject above
+  `page_size_max` (100). Use `toolkit-odata` cursors and reject unknown versions
 - [x] Pages contain identity/metadata only: no `content`, `resolved_schema`, `effective_traits`,
   `effective_traits_schema` or validator (§8.5)
 - [x] Exact/batch reads retain full representations and D3 artifacts
@@ -2315,7 +2315,7 @@ T26 once every consumer has moved.
   as typed fields. `list_type_schemas` and `list_instances` request their respective
   `kind` server-side while preserving caller-supplied pattern/depth and cursor;
   they do not fetch the opposite kind and discard it client-side
-- [ ] `list_instances` / `list_type_schemas` **hydrate a content-free page through `batchGet`**, explicitly selecting the documents their callers read. The ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant, and one extra round trip per page which the client cache absorbs
+- [ ] `list_instances` / `list_type_schemas` **explicitly select the documents their callers read**, on the discovery page or through a following `batchGet`. The ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant; `batchGet` is optional, for per-key validators and caching
 - [ ] **The validator field is in the models from this task**, and `BatchGet` accepts a validator per requested key in `BatchGetItem::if_none_match`, even though T29 computes them and T30 consumes them. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9). A result variant for `unchanged` is part of the same shape
 - [ ] **Reconciliation helper** implements DESIGN §3.3's five steps: batch-read the desired identifiers, omit content equal to current, set `expected_resource_version` from the read for differing ones and leave it unset for missing ones, return `UpToDate` with no POST when nothing remains, otherwise submit once under one idempotency key and poll to terminality
 - [ ] The helper accepts an explicit desired-document set, requests `content` for its comparisons,

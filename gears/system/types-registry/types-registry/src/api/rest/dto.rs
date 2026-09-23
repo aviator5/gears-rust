@@ -5,6 +5,7 @@ use uuid::Uuid;
 use gts::GtsIdSegment;
 use types_registry_sdk::RegisterSummary;
 
+use crate::domain::admission::AdmissionFailureReason;
 use crate::domain::enums::{
     EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
 };
@@ -307,6 +308,104 @@ mod tests {
         });
         assert_eq!(serde_json::to_value(dto)?["error"], payload);
         Ok(())
+    }
+
+    fn item_error(stored: Option<&str>) -> serde_json::Value {
+        let dto = OperationItemDto::from(OperationItemRecord {
+            gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
+            status: OperationItemStatus::Failed,
+            resource_version: None,
+            error: stored.map(str::to_owned),
+        });
+        serde_json::to_value(dto).expect("serialize")["error"].clone()
+    }
+
+    #[test]
+    fn operation_item_error_keeps_dependency_and_system_failure_details() {
+        for payload in [
+            serde_json::json!({
+                "reason": "dependency_not_found",
+                "message": "$ref target 'cf.core.absent.type.v1~' is not registered",
+                "dependency_id": "cf.core.absent.type.v1~",
+                "dependency_kind": "ref",
+            }),
+            serde_json::json!({
+                "reason": "system_failure",
+                "message": "admission could not complete because of a system failure",
+                "error_code": "delivery_exhausted",
+                "operation_id": "7f0c3a52-3f58-4c61-9f1e-2d4c2f6c1a10",
+            }),
+            // An unknown future reason passes through verbatim.
+            serde_json::json!({ "reason": "future_refusal", "message": "future details" }),
+        ] {
+            assert_eq!(item_error(Some(&payload.to_string())), payload);
+        }
+    }
+
+    #[test]
+    fn a_corrupt_stored_error_stays_an_object_without_the_raw_payload() {
+        for (stored, reason) in [
+            ("secret not JSON", "unparsable_payload"),
+            (r#""secret string""#, "unrecognized_payload"),
+            (
+                r#"{"reason":42,"message":"secret"}"#,
+                "unrecognized_payload",
+            ),
+            (r#"{"reason":"invalid_schema"}"#, "unrecognized_payload"),
+            (
+                r#"{"reason":"system_failure","message":"secret","operation_id":"secret"}"#,
+                "unrecognized_payload",
+            ),
+            (
+                r#"{"reason":"system_failure","message":"secret","error_code":7}"#,
+                "unrecognized_payload",
+            ),
+            (
+                r#"{"reason":"dependency_not_found","message":"secret","dependency_id":"secret"}"#,
+                "unrecognized_payload",
+            ),
+        ] {
+            let error = item_error(Some(stored));
+            assert_eq!(error["reason"], reason, "{stored}");
+            let message = error["message"].as_str().expect("message is a string");
+            assert!(!message.contains("secret"), "{stored} leaked: {message}");
+            assert!(
+                !message.contains("invalid_schema"),
+                "{stored} leaked: {message}"
+            );
+            assert_eq!(
+                error.as_object().map(serde_json::Map::len),
+                Some(2),
+                "{stored}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_item_without_a_stored_error_has_none() {
+        assert_eq!(item_error(None), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_operation_item_error_schema_is_a_typed_object() {
+        let schema = schema_json::<OperationItemErrorDto>();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["reason", "message"]));
+        let properties = &schema["properties"];
+        for field in [
+            "reason",
+            "message",
+            "dependency_id",
+            "dependency_kind",
+            "error_code",
+        ] {
+            assert_eq!(properties[field]["type"], "string", "{field}: {properties}");
+        }
+        assert_eq!(properties["operation_id"]["format"], "uuid");
+
+        let item = schema_json::<OperationItemDto>();
+        let error = item["properties"]["error"].to_string();
+        assert!(error.contains("OperationItemErrorDto"), "{error}");
     }
 
     fn seg(full_id: &str, idx: usize) -> GtsIdSegment {
@@ -642,12 +741,33 @@ pub struct OperationItemDto {
     pub gts_id: String,
     pub status: OperationItemStatusDto,
     pub resource_version: Option<i64>,
-    /// The refusal as `{reason, message}`, when this candidate failed.
-    /// `reason` is a stable machine-readable code; `message` is an explanation for humans.
-    /// Structured candidate or system-failure details.
-    /// Compatibility messages include causes and schema locations where available.
-    /// Clients must not parse `message` or depend on its wording.
-    pub error: Option<serde_json::Value>,
+    /// Present when this candidate failed.
+    pub error: Option<OperationItemErrorDto>,
+}
+
+/// Why a candidate failed. `reason` is a stable code and may be one the client
+/// does not know; `message` is for humans and must not be parsed.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[toolkit_macros::api_dto(response)]
+pub struct OperationItemErrorDto {
+    pub reason: String,
+    pub message: String,
+    /// The missing dependency, for `dependency_not_found`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub dependency_id: Option<String>,
+    /// `base`, `conforming_type` or `ref`; newer writers may add kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub dependency_kind: Option<String>,
+    /// Stable diagnostic code of a `system_failure`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub error_code: Option<String>,
+    /// The operation a `system_failure` terminalized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub operation_id: Option<Uuid>,
 }
 
 /// An operation as a caller polls it.
@@ -859,16 +979,31 @@ impl From<OperationItemRecord> for OperationItemDto {
             gts_id: item.gts_id,
             status: item.status.into(),
             resource_version: item.resource_version,
-            // The stored payload is already a JSON object; re-parsing it keeps the
-            // response a document rather than a string containing one. A payload
-            // that does not parse is surfaced as a string field rather than
-            // dropped, so a corrupt row is visible instead of invisible.
-            error: item.error.map(|payload| {
-                match serde_json::from_str::<serde_json::Value>(&payload) {
-                    Ok(value) => value,
-                    Err(_) => serde_json::Value::String(payload),
-                }
-            }),
+            error: item
+                .error
+                .as_deref()
+                .map(OperationItemErrorDto::from_payload),
+        }
+    }
+}
+
+impl OperationItemErrorDto {
+    /// A payload that does not have this shape is reported by reason, never echoed.
+    fn from_payload(payload: &str) -> Self {
+        let reason = match serde_json::from_str::<Self>(payload) {
+            Ok(error) if error.dependency_id.is_some() == error.dependency_kind.is_some() => {
+                return error;
+            }
+            Err(error) if !error.is_data() => AdmissionFailureReason::UnparsablePayload,
+            _ => AdmissionFailureReason::UnrecognizedPayload,
+        };
+        Self {
+            reason: reason.as_str().to_owned(),
+            message: "the recorded failure could not be read".to_owned(),
+            dependency_id: None,
+            dependency_kind: None,
+            error_code: None,
+            operation_id: None,
         }
     }
 }

@@ -208,7 +208,7 @@ key count does not bound response bytes once documents are selected.
 `If-None-Match` is refused rather than ignored, because validators are per key: each item
 carries its own `if_none_match` slot.
 
-### Discover what exists, then hydrate
+### Discover what exists
 
 `GET /entities` returns **one bounded page** of active entities, ordered by canonical
 identifier. Deleted entities are excluded — a tombstone stays readable by key and leaves
@@ -236,9 +236,16 @@ curl -s "$BASE/types-registry/v2/entities?limit=2&pattern=gts.cf.core.*" \
 ```
 
 Page items take `$select` exactly as the exact read does; the default is document-free and
-a page never carries a validator. Page with the fields you need, then hydrate documents
-through `:batchGet` in batches of at most 100 keys, keeping the same `$select` on every
-continuation:
+a page never carries a validator. Select documents on the page directly:
+
+```bash
+curl -s "$BASE/types-registry/v2/entities?limit=20&pattern=gts.cf.core.*&\$select=gts_id,content" \
+  | python3 -m json.tool
+```
+
+Or page identifiers first and read documents for the keys you pick through `:batchGet`,
+in batches of at most 100 keys. Keep the same `$select` on every
+continuation and stop only when `next_cursor` is absent; a short page may still carry one:
 
 ```bash
 # Page, collecting identifiers until next_cursor is absent.
@@ -297,6 +304,6 @@ including adding or dropping a filter — or with a token of an unknown version,
 rather than a page spliced out of two traversals. An absent `$select` and the explicit
 default set are the same selection.
 
-`limit` (alias `$top`) defaults to 100 and may not exceed 1000; `0` or `1001` is a `400`.
+`limit` (alias `$top`) defaults to 50 and may not exceed 100; `0` or `101` is a `400`.
 A caller selecting documents should page smaller. `$filter`, `$orderby`, `$skip`, v1
 filters such as `is_schema` or `vendor`, and any other undeclared parameter are refused.

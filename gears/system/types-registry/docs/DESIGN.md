@@ -496,7 +496,7 @@ The sweep reaches no admitted content, identity, or tombstone and therefore does
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-input-bounds`
 
-All six bounds are deployment configuration (§3.8); this section fixes their defaults and purpose.
+Five bounds are deployment configuration (§3.8); the expansion maximum is fixed by the SDK helper. This section fixes their defaults and purpose.
 
 | Input | Default | Purpose |
 |---|---:|---|
@@ -504,7 +504,7 @@ All six bounds are deployment configuration (§3.8); this section fixes their de
 | Resolved document | **1 MB** | Separately bounds derivation expansion, which the authored limit cannot constrain. |
 | Resolution closure | **64 documents** | Bounds reference resolution and composition work. This also bounds derivation depth because each level contributes a document. |
 | Batch | **100 candidates** | Rejected synchronously before storage. It covers the largest current gear (26 definitions); larger inventories may be split and reconciled. |
-| Type-filter expansion | **1000 references** | Bounds the server-side result; about 36 KB of JSON and practical to chunk into a consumer's `IN` predicate. |
+| Type-filter expansion | **1000 references** | SDK-owned, not per-deployment: bounds the `expand_type_filter` result; about 36 KB of JSON and practical to chunk into a consumer's `IN` predicate. |
 | Reverse-impact set | **512 entities** | Bounds the entities walked and refreshed by one revision. The largest measured repository set is 27. |
 
 Total dependents and retained revisions remain unbounded, but `limits.activation_write_set` bounds the impact of one admission. Capping total dependents would prevent reuse of shared base types. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Per-tenant quotas remain outside this design.
@@ -850,11 +850,11 @@ It persists no external definitions, revisions, hashes, mappings, tombstones, or
 
 ##### Responsibility scope
 
-Compiles a validated pattern into a bounded range predicate over the canonical identifier, post-filters candidates through the GTS matcher, expands version-family membership and derivation-hierarchy constraints from the identifier chain — membership rather than compatibility, since a reference set carries no per-edge provenance — traverses sources source-major, and returns one complete deduplicated set of Registry References — or `QUERY_EXPANSION_LIMIT_EXCEEDED`, or a failure when completeness cannot be established. Paginated discovery shares the routing and matching but exposes cursors, which query assistance never does.
+Compiles a validated pattern into a bounded range predicate over the canonical identifier, post-filters candidates through the GTS matcher, expands version-family membership and derivation-hierarchy constraints from the identifier chain — membership rather than compatibility, since a reference set carries no per-edge provenance — traverses sources source-major, and serves paged discovery. SDK `expand_type_filter` composes those pages into one complete deduplicated set of Registry References — or `QUERY_EXPANSION_LIMIT_EXCEEDED`, or a failure when completeness cannot be established; the server keeps no expansion count.
 
 ##### Responsibility boundaries
 
-It returns concrete references, never a normalized predicate or an executable plan, and never a truncated or paginated constraint. It does not apply the result to any gear's storage, and it does not decide what a gear does with references whose entities are unavailable.
+Expansion returns concrete references, never a normalized predicate or an executable plan, and never a truncated or paginated constraint. It does not apply the result to any gear's storage, and it does not decide what a gear does with references whose entities are unavailable.
 
 ##### Related components (by ID)
 
@@ -945,9 +945,9 @@ The tenant surface runs on the business listener with `SecurityContext`. `owner_
 | `DELETE` | `/types-registry/v1/entities/{entity_key}` | Delete exactly one entity, its precondition in the query | `202` with the operation; `200` only when replaying a key whose operation is already terminal | unstable |
 | `GET` | `/types-registry/v1/operations/{operation_id}` | Poll an operation in the same authorization scope | `200` with progress and all per-GTS-ID results known so far | unstable |
 
-`GET /entities` performs content-free discovery. Three intentionally absent routes are worth recording:
+`GET /entities` is ordinary paged discovery. Its default projection is document-free; an explicit `$select` may name documents, and changes only the representation — never a mode or a traversal cap. A traversal may exceed 1000 entities and ends only when `next_cursor` is absent; a short or empty page may still carry one. Three intentionally absent routes are worth recording:
 
-- **Type filter expansion** is paged discovery with `$select=gts_uuid&availability=available`; SDK `expand_type_filter` accumulates and deduplicates pages. Pagination bounds memory but yields completeness over the traversal, not one instant, as ADR-0001 and `cpt-cf-types-registry-fr-type-query-assistance` specify. The server tracks the running cursor count and fails the page exceeding `limits.expansion_references` (default 1000) with `QUERY_EXPANSION_LIMIT_EXCEEDED`; no up-front federated count capability is required. Results have no validator and must not be cached because ADR-0010 availability may change without entity mutation. Direct REST callers accumulate pages themselves.
+- **Type filter expansion** is a tenant-plane SDK helper, not a route: `expand_type_filter` pages discovery with `$select=gts_uuid&availability=available` and deduplicates. It enforces a documented maximum of 1000 distinct references: the 1001st fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`, and exactly 1000 with a `next_cursor` keeps paging until exhaustion or overflow. Any page, source, context or routing failure discards the accumulated prefix; no partial `ConcreteReferenceSet` is exposed. Completeness is over the traversal, not one instant, as ADR-0001 and `cpt-cf-types-registry-fr-type-query-assistance` specify. Results have no validator and must not be cached because ADR-0010 availability may change without entity mutation. A direct REST caller expanding a filter applies the same rules itself.
 - **Dependent enumeration** is replaced by mutation Dry Run, which executes the same revalidation and reports blockers. Platform-plane deletion Dry Run covers hidden dependants under ADR-0009; no requirement needs the non-blocking remainder.
 - **Kind-specific collections** are unnecessary because trailing `~` encodes kind and would let path and identifier disagree. SDK conveniences remain kind-narrowed.
 
@@ -965,7 +965,7 @@ For one read, the validator is both HTTP `ETag` and SDK `Validator`; matching `I
 | `POST /entities:batchGet` | `etag` on each `found` result | `if_none_match` on each request item → `unchanged` |
 | `GET /entities` | **nothing** | — |
 
-The third row is a decision, not a gap. A discovery page is a changing, paginated set rather than an answer about an exact key, so no token could describe "this page, still"; and the page is content-free besides, so a client that wants either the content or a validator asks `:batchGet` for the identifiers the page gave it. That second round trip is the hydration path the SDK read helpers take, and the client cache absorbs it on repeat.
+The third row is a decision, not a gap. A discovery page is a changing, paginated set rather than an answer about an exact key, so no token could describe "this page, still". A page may carry selected documents directly; a client that wants validators, or documents for only some keys, asks `:batchGet` for identifiers the page gave it. That second round trip is optional and suits selection and caching.
 
 ##### What a validator is made of
 
@@ -1138,9 +1138,9 @@ The `If-None-Match` **header** is unavailable here, and refused rather than igno
 | `scope` | query | *Tenant plane only.* `mine` or `all`. Never a tenant identifier — accepting one would let a caller find its ancestors by observing whether a filtered result is empty |
 | `tenant_id` | query | The Context Tenant, as above |
 | `$select` | query | As above, applied to every item on the page |
-| `limit`, `cursor` | query | Page size and position. `limit` defaults to 100 and may not exceed 1000 — the same value as the expansion maximum, so a full type filter expansion can complete in a single page. The bound is on items, not on bytes: a caller selecting documents on a thousand-item page should page smaller |
+| `limit`, `cursor` | query | Page size and position. `limit` defaults to 50 and may not exceed 100. The bound is on items, not on bytes: a caller selecting documents should page smaller |
 
-The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, per-source position, and running item count. It is rejected after routing or context changes rather than splicing distinct traversals, and the count enforces expansion limits across pages. Results exclude deleted entities and sort by canonical identifier. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
+The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Results exclude deleted entities and sort by canonical identifier. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
 
 The `fr-type-query-assistance` filter forms map as follows:
 
@@ -1239,9 +1239,10 @@ pub trait TypesRegistryClient: Send + Sync {
 
     /// Provided, not required: pages `list_entities` under `$select=gts_uuid`
     /// and `availability=available`, which `ExpansionFilter` fixes rather than
-    /// accepting from the caller, accumulating until the traversal ends or
-    /// the registry refuses with `QUERY_EXPANSION_LIMIT_EXCEEDED`. The result
-    /// is complete with respect to the traversal, not to an instant.
+    /// accepting from the caller, until the continuation is absent. More than 1000
+    /// distinct references fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`; that or
+    /// any page failure exposes no partial set. The result is complete with
+    /// respect to the traversal, not to an instant.
     async fn expand_type_filter(
         &self,
         ctx: &SecurityContext,
@@ -1697,6 +1698,8 @@ Each gear submits only inventory records whose `owning_gear` matches its generat
 
 `owning_gear` is unverifiable caller-declared attribution, never authorization, visibility, or a second ownership axis. It is required globally, optional for tenant-owned entities, absent externally, and answers whom to contact about a contract.
 
+The REST input and enforcement of `owning_gear` are P1 work alongside platform-plane authorization; P0 accepts no `owning_gear` field.
+
 ##### Platform identifiers and the lint
 
 Repository-declared `gts.cf.*` Type Schemas and Instances must be major-only, enforced by a new `cargo-gears` `DE09xx` architecture lint over macro literals. ADR-0004 deliberately keeps this house style out of registry admission. API-submitted `gts.cf.*` identifiers therefore follow ordinary policy, whose vendor and tenant-ownership parameters say nothing about versions.
@@ -1723,7 +1726,7 @@ The object-safe scoped-ClientHub trait reuses consumer SDK models where semantic
 
 Federation is available on both planes, so invocation carries a plane-neutral wrapper over the already-authenticated caller context. It does not convert a platform workload into a tenant subject; `SourceCall.tenant_id` independently names the optional Context Tenant for availability.
 
-ADR-0011 permits no plugin writes, operation polling, or dependency-impact lookup, and no advisory answers. Type-filter expansion remains registry composition over `list_entities`: it pages sources, applies platform availability, and enforces the 1000-reference running limit (§3.6).
+ADR-0011 permits no plugin writes, operation polling, or dependency-impact lookup, and no advisory answers. Type-filter expansion is SDK composition over registry discovery, which pages sources and applies platform availability; the 1000-reference limit belongs to the SDK helper (§3.6).
 
 ```rust
 #[async_trait]
@@ -2054,7 +2057,7 @@ sequenceDiagram
     participant Z as Platform PDP
 
     DG->>S: expand_type_filter(pattern, depth, kind, origin)
-    loop until the traversal ends or the registry refuses
+    loop until next_cursor is absent
         S->>A: GET /entities, $select=gts_uuid, availability=available, cursor
         opt tenant plane
             A->>Z: list, registry metatype resource
@@ -2070,20 +2073,21 @@ sequenceDiagram
             P-->>R: Bounded page, next source cursor, explicit exhaustion
             R->>R: Validate and re-filter under platform semantics
         end
-        alt this page would take the running total past the maximum
-            A-->>S: QUERY_EXPANSION_LIMIT_EXCEEDED
-        else a selected source cannot establish its contribution
+        break a selected source cannot establish its contribution
             A-->>S: Source failure and no page at all
-        else
-            A-->>S: Page + cursor binding query, routing generation,<br/>current source, source cursor, running count
+            S-->>DG: Failure; accumulated prefix discarded
+        end
+        A-->>S: Page + cursor binding query, routing generation,<br/>current source, source cursor
+        S->>S: Accumulate and deduplicate
+        break more than 1000 distinct references
+            S-->>DG: QUERY_EXPANSION_LIMIT_EXCEEDED; prefix discarded
         end
     end
-    S->>S: Accumulate and deduplicate
     S-->>DG: ConcreteReferenceSet
     DG->>DG: Apply as a chunked gts_uuid set against its own storage
 ```
 
-**Description**: The SDK accumulates a paged, traversal-consistent rather than instant-atomic set (`cpt-cf-types-registry-fr-type-query-assistance`, ADR-0001). Cursor count enforces the server limit without truncation; any selected source failure aborts the traversal rather than returning an incomplete query constraint.
+**Description**: The SDK accumulates a paged, traversal-consistent rather than instant-atomic set (`cpt-cf-types-registry-fr-type-query-assistance`, ADR-0001). The SDK counts distinct references; the server keeps no expansion count. Overflow or any page failure aborts the call rather than returning an incomplete query constraint.
 
 ### 3.7 Database schemas & tables
 
@@ -2144,7 +2148,7 @@ The leased ToolKit outbox gives multi-pod exclusion without leader election. Dat
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-deployment-config`
 
-Two capability switches, one retention window, one registration policy, and six input bounds are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
+Two capability switches, one retention window, one registration policy, and five input bounds are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
 
 ```yaml
 gears:
@@ -2158,7 +2162,6 @@ gears:
         resolved_document: 1MB
         resolution_closure: 64
         batch_candidates: 100
-        expansion_references: 1000
         activation_write_set: 512
       registration_policy:               # §3.2, Registration policy
         "gts.acme.*":                     # onboard one vendor
@@ -2180,7 +2183,7 @@ gears:
 | `allow_compatibility_force` | bool | `false` | Enables candidate `force`. When disabled, real and Dry Run requests receive a deployment-configuration refusal rather than silent ignore |
 | `allow_purge` | bool | `false` | Whether the operator purge-job entry point exists in this deployment. Where false the job refuses execution before scanning |
 | `operation_retention` | duration | `30d` | How long a terminal, unpinned operation is kept before the sweep may remove it |
-| `limits.*` | size or count | §3.2 | The six admission and query bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
+| `limits.*` | size or count | §3.2 | The five server-owned bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
 | `registration_policy` | map of GTS pattern to `allowed_vendors` and `tenant_ownable` | empty | Opens otherwise closed regions (§3.2). Invalid patterns or parameters fail startup. `allowed_vendors: ["*"]` admits every vendor; omitted parameters inherit by the per-parameter resolution rule. Operators document effective values; refusals name region and parameter |
 
 Limits change request admissibility, so Dry Run is relative to both installation state and configuration (`cpt-cf-types-registry-constraint-single-installation`). A refusal names the bound and configured value.
