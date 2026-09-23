@@ -2193,7 +2193,7 @@ separately, each with its focused tests and a working gear.
 
 ---
 
-### - [ ] T22c: Discovery filters by GTS chain depth and entity kind
+### - [x] T22c: Discovery filters by GTS chain depth and entity kind
 
 **Description:** Add DESIGN §3.3's `depth` and `kind` filters to `GET /entities` on the
 interim v2 route before T23 publishes `EntityQuery` (plan P20, SPEC D14/§10.2). These
@@ -2202,24 +2202,26 @@ T22b's `$select`; they do not change exact read or `batchGet`. Keep T22a's page-
 scan-budget bounds. T22a's completed pattern-only filter record remains historical.
 
 **Acceptance criteria:**
-- [ ] REST accepts optional `depth=1..255` and `kind=type_schema|instance` with typed
+- [x] REST accepts optional `depth=1..255` and `kind=type_schema|instance` with typed
   OpenAPI parameters. `depth` is an inclusive maximum `GtsId::segments().len()`;
   one-segment roots have depth 1, and derived schemas and Instance tails add one
   segment each. The SDK uses `EntityFilter::max_chain_depth: Option<u8>` and
   `kind: Option<EntityKind>`. No `pattern` is required for either filter
-- [ ] Filter active rows by stored `entity.kind` in SecureORM/SQL; keep the indexed
+- [x] Filter active rows by stored `entity.kind` in SecureORM/SQL; keep the indexed
   identifier-prefix range as a safe prefilter and let `gts-rust` decide `pattern`
   matches and parsed chain depth. Intersect all filters before counting a page item
   or hydrating selected documents. Do not hand-count `~`, walk dependency edges,
   materialize the full result set or add per-entity queries
-- [ ] Extend discovery's versioned cursor identity with canonical optional `depth`
+- [x] Extend discovery's versioned cursor identity with canonical optional `depth`
   and `kind`, alongside `pattern` and T22b's normalized selection. A continuation
   changing any filter returns `400`; absence is distinct from an explicit value.
-  Old tokens lacking the new filter dimensions are refused by version, not silently
-  treated as an unfiltered traversal. Keep ordering by canonical `gts_id`, the scan
+  No release preceded T22c, so by decision the wire version stays `CursorV1`'s `1`: a
+  token without the new dimensions resumes only under the same absent `depth`/`kind`
+  and the same `pattern`/`$select`, and is refused as soon as either filter is named;
+  it is never read as an unfiltered traversal of a filtered query. Keep ordering by canonical `gts_id`, the scan
   budget, progress through sparse matches and the possibility of an empty page with
   a continuation; no matching active row is skipped or duplicated
-- [ ] Reject zero, negative, fractional, non-numeric and overflow `depth`, unknown
+- [x] Reject zero, negative, fractional, non-numeric and overflow `depth`, unknown
   `kind`, duplicate/unknown parameters and legacy v1 `is_schema` with RFC-9457 field
   violations. `kind` is an enum rather than a free string; neither generic `$filter`
   nor v1 `vendor`/`package`/`namespace`/`segment_scope` is accepted. Leave v1's
@@ -2232,19 +2234,48 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
    tests green.
 
 **Verification:**
-- [ ] `make fmt`, gear tests on SQLite and both container backends (see
-  [Commands](#commands)), `make clippy` or a documented unrelated baseline failure,
-  `make lychee` and `git diff --check`
-- [ ] Router tests: `depth=1` versus `depth=2` on roots, derived schemas and
+- [x] `make fmt`, gear tests on SQLite (1049) and both container backends (45, including
+  `discovery_filter_backends_test`), `git diff --check`. `make clippy` keeps T22a's
+  unrelated baseline (`clippy::unused_async_trait_impl` in `libs/toolkit-security`); this
+  gear is clean with only that lint allowed. `make lychee` stops on uninitialized
+  submodules in this worktree, as recorded under T22a; `QUICKSTART.md` adds no links
+- [x] Router tests: `depth=1` versus `depth=2` on roots, derived schemas and
   Instances; each `kind`; all combinations with `pattern`, `$select`, absent
   filters and tombstones; typed OpenAPI and RFC-9457 invalid-input responses
-- [ ] Repository/backend tests: SQL kind predicate, exact GTS pattern/depth
+- [x] Repository/backend tests: SQL kind predicate, exact GTS pattern/depth
   post-filter, sparse scan-budget boundary, empty page with continuation and
   mixed-depth/mixed-kind traversal without omission or duplication on all three backends
-- [ ] Cursor tests: changing each of `pattern`, `depth`, `kind` or `$select` returns
+- [x] Cursor tests: changing each of `pattern`, `depth`, `kind` or `$select` returns
   `400`, unchanged filters resume, and an old cursor version is refused
-- [ ] Manual `/cf/docs` and `curl` traversal with `pattern`, `depth`, `kind`,
+- [x] Manual `/cf/docs` and `curl` traversal with `pattern`, `depth`, `kind`,
   `$select` and a second page; `QUICKSTART.md` shows the inclusive depth rule
+
+**Implementation notes:**
+- **`EntityRepo::list_page` takes one `ListFilter`** (`pattern`, `kind`,
+  `max_chain_depth`). `kind` is an SQL predicate on `entity.kind`; `pattern` and `depth`
+  are decided in Rust by one `GtsId` parse (`matches_pattern`, `segments().len()`), with
+  the prefix range still only a prefilter. All filters apply before a row counts toward the
+  limit, under T22a's scan budget and batch size, inside the page's snapshot.
+- **Depth range is the domain's.** REST accepts plain decimal digits only (`u8::from_str`
+  would take `+5`) and refuses overflow; `0` parses and `discover` refuses it as
+  `DepthOutOfRange`, so a future gRPC adapter gets the same rule. Every refusal names
+  `depth`.
+- **The cursor stays `toolkit-odata`'s `CursorV1`**, and `GET /entities` keeps ToolKit's
+  full `extract_odata_query`. `depth`/`kind` are extra terms `And`-ed onto T22b's exact
+  pattern/`$select` expression in the filter hash, added only when present: absent and
+  every explicit value differ, and a T22b token resumes under the same absent filters
+  (unit test built from T22b's formula). The base expression's operand order is part of
+  that compatibility.
+- **OpenAPI.** `depth` is `integer` with `minimum: 1`; `ParamSpec` has no `maximum` or
+  `enum`, so 255 and the `kind` vocabulary are in the descriptions. Closing that needs a
+  ToolKit `ParamSpec` change outside this gear.
+- **Runtime evidence.** Example server as in T22a: root, derived schema and Instance under
+  one pattern answered `depth=1` / `depth=2` / `kind` combinations as expected; a
+  `depth=2&limit=1&$select` walk resumed under a respelled `$select` and was refused after
+  changing `depth` or adding `kind`; the issued token decodes as `CursorV1` `"v": 1` and
+  resumes through `$skiptoken` under a respelled `$select` (ToolKit's extractor), while a
+  2100-character `$select` is refused by ToolKit; malformed `depth`,
+  unknown `kind` and `is_schema` were `400`.
 
 **Dependencies:** T22b (projection and cursor contract); T22a (bounded discovery).
 Must complete before T23 fixes the SDK `EntityQuery` shape. No dependency on deferred

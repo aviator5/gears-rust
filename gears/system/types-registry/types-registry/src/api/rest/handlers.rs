@@ -431,6 +431,8 @@ pub async fn discover_entities(
     let service = require_registry(service)?;
     let binding = Binding {
         pattern: params.pattern.as_deref(),
+        kind: params.kind,
+        max_chain_depth: params.max_chain_depth,
         selection: params.selection,
     };
     let after = params
@@ -444,6 +446,8 @@ pub async fn discover_entities(
             pattern: params.pattern.clone(),
             after,
             limit: params.limit,
+            kind: params.kind,
+            max_chain_depth: params.max_chain_depth,
             selection: params.selection,
         })
         .await

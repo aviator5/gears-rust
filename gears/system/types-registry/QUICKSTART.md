@@ -12,7 +12,7 @@ Features:
 - Required `Idempotency-Key`; replay returns the same operation, changed content conflicts
 - Reads by GTS identifier or Registry Reference UUID, including tombstones
 - Batch reads with one explicit result per key, absence included
-- Bounded discovery with an opaque cursor
+- Bounded discovery with an opaque cursor, filtered by `pattern`, `depth` and `kind`
 - `$select` on every read: a document-free default, documents only when asked for
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
@@ -272,10 +272,30 @@ short. One page is bounded in work as well as in results, so a selective `patter
 large table can legitimately return nothing and still hand back a cursor asking to be
 called again.
 
-`cursor` (alias `$skiptoken`) is opaque, versioned and bound to the `pattern` and the
-normalized `$select` it was issued for. Resuming under a different pattern or selection,
-or with a token from an older version, is a `400` rather than a page spliced out of two
-traversals. An absent `$select` and the explicit default set are the same selection.
+### Filter by chain depth and kind
+
+`depth` is an **inclusive maximum number of GTS identifier segments**. A one-segment root
+such as `gts.cf.core.example.event.v1~` has depth 1; a Type Schema derived from it, or an
+Instance of it (`gts.cf.core.example.event.v1~cf.core.example.first.v1`), has depth 2, and
+each further tail adds one. So `depth=2` returns depth 1 and depth 2 alike. `kind` is
+`type_schema` or `instance`. Both work with or without `pattern`, and all filters apply
+before the page limit:
+
+```bash
+# Instances directly of one root, not of the types derived from it.
+curl -s "$BASE/types-registry/v2/entities?pattern=gts.cf.core.example.event.v1~*&depth=2&kind=instance" \
+  | python3 -m json.tool
+```
+
+`depth` must be an integer from 1 to 255; `0`, negative, fractional or larger values, an
+unknown `kind`, and the v1 spelling `is_schema` are `400`. A filtered page may come back
+empty and still carry a `next_cursor`: follow it until the cursor is absent.
+
+`cursor` (alias `$skiptoken`) is opaque, versioned and bound to the `pattern`, `depth`,
+`kind` and normalized `$select` it was issued for. Resuming under any of them changed —
+including adding or dropping a filter — or with a token of an unknown version, is a `400`
+rather than a page spliced out of two traversals. An absent `$select` and the explicit
+default set are the same selection.
 
 `limit` (alias `$top`) defaults to 100 and may not exceed 1000; `0` or `1001` is a `400`.
 A caller selecting documents should page smaller. `$filter`, `$orderby`, `$skip`, v1

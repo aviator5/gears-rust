@@ -161,6 +161,7 @@ impl From<ServiceError> for CanonicalError {
             // `gts-rust`'s own message: it names the position and the token it
             // refused, which is what a caller fixing a wildcard needs, and it
             // describes the caller's input rather than anything of ours.
+            ServiceError::DepthOutOfRange => depth_not_recognized("0"),
             ServiceError::InvalidPattern { message } => invalid_field(
                 violation_field::PATTERN,
                 format!("the pattern is not a GTS identifier pattern: {message}"),
@@ -287,6 +288,8 @@ mod violation_field {
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
     pub const PATTERN: &str = "pattern";
+    pub const KIND: &str = "kind";
+    pub const DEPTH: &str = "depth";
     pub const LIMIT: &str = "limit";
     pub const CURSOR: &str = "cursor";
     pub const SELECT: &str = "$select";
@@ -341,6 +344,27 @@ pub fn if_none_match_not_supported() -> CanonicalError {
         "If-None-Match is not supported on a batch read; carry each key's validator \
          in that item's if_none_match, because one header cannot represent a batch"
             .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// One refusal for every malformed `depth`, whichever layer spotted it.
+#[must_use]
+pub fn depth_not_recognized(raw: &str) -> CanonicalError {
+    let shown: String = raw.chars().take(64).collect();
+    invalid_field(
+        violation_field::DEPTH,
+        format!("depth must be an integer from 1 to 255, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn kind_not_recognized(raw: &str) -> CanonicalError {
+    let shown: String = raw.chars().take(64).collect();
+    invalid_field(
+        violation_field::KIND,
+        format!("kind must be `type_schema` or `instance`, not `{shown}`"),
         field::VALIDATION_FAILED,
     )
 }

@@ -3000,7 +3000,7 @@ fn the_discovery_query_parameters_are_declared() {
             "missing parameter {expected:?}: {declared:?}",
         );
     }
-    assert_eq!(declared.len(), 4, "nothing else is declared: {declared:?}");
+    assert_eq!(declared.len(), 6, "nothing else is declared: {declared:?}");
 }
 
 /// Every one of the seven v2 operations answers with RFC-9457 problems, so a
@@ -3728,4 +3728,380 @@ async fn discovery_refuses_undeclared_and_unsupported_parameters() {
             response.body,
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Discovery by `kind` (T22c)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn discovery_narrows_by_kind_and_intersects_with_pattern_and_select() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange-other", CF_OTHER_TYPE).await;
+    register_type_and_instance(&router).await;
+
+    let schemas = call(&router, discover("?kind=type_schema")).await;
+    assert_eq!(page_ids(&schemas.body), [CF_OTHER_TYPE, CF_TYPE]);
+    let instances = call(&router, discover("?kind=instance")).await;
+    assert_eq!(page_ids(&instances.body), [CF_INSTANCE]);
+    let all = call(&router, discover("")).await;
+    assert_eq!(page_ids(&all.body), [CF_OTHER_TYPE, CF_TYPE, CF_INSTANCE]);
+
+    let pattern = format!("{}cf.core.example.type.v1~*", gts::GTS_ID_PREFIX);
+    let narrowed = call(
+        &router,
+        discover(&format!("?kind=type_schema&pattern={pattern}")),
+    )
+    .await;
+    assert_eq!(page_ids(&narrowed.body), [CF_TYPE]);
+
+    let projected = call(&router, discover("?kind=instance&$select=gts_id,content")).await;
+    assert_eq!(
+        projected.body["items"],
+        json!([{ "gts_id": CF_INSTANCE, "lifecycle_status": "active", "content": { "name": "first" } }]),
+    );
+}
+
+#[tokio::test]
+async fn kind_filtering_excludes_tombstones() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+    let deleted = call(
+        &router,
+        delete_one(Some("delete"), CF_TYPE, "?expected_resource_version=1"),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED, "{:?}", deleted.body);
+    let page = call(&router, discover("?kind=type_schema")).await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    assert!(page_ids(&page.body).is_empty(), "{:?}", page.body);
+}
+
+/// A kind page over interleaved kinds still progresses to every match.
+#[tokio::test]
+async fn a_kind_traversal_visits_every_match_once() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange-other", CF_OTHER_TYPE).await;
+    register_type_and_instance(&router).await;
+    let items = traverse(&router, "?limit=1&kind=type_schema").await;
+    let ids: Vec<&str> = items
+        .iter()
+        .map(|item| item["gts_id"].as_str().expect("default gts_id"))
+        .collect();
+    assert_eq!(ids, [CF_OTHER_TYPE, CF_TYPE]);
+}
+
+#[tokio::test]
+async fn a_cursor_is_refused_under_a_different_kind() {
+    let (router, db) = router_and_db().await;
+    _ = seed_entities(&db, 3).await;
+
+    for (issued, resumed) in [
+        ("?limit=1", "?limit=1&kind=type_schema"),
+        ("?limit=1&kind=type_schema", "?limit=1"),
+        ("?limit=1&kind=type_schema", "?limit=1&kind=instance"),
+    ] {
+        let cursor = first_cursor(&router, issued).await;
+        let response = call(&router, discover(&format!("{resumed}&cursor={cursor}"))).await;
+        assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
+    }
+    let cursor = first_cursor(&router, "?limit=1&kind=type_schema").await;
+    let resumed = call(
+        &router,
+        discover(&format!("?limit=1&kind=type_schema&cursor={cursor}")),
+    )
+    .await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+}
+
+#[tokio::test]
+async fn an_unknown_kind_is_refused_and_is_schema_is_not_an_alias() {
+    let router = router_with_db().await;
+    for value in ["type", "Type_Schema", "schema", "instances", "", "1"] {
+        let response = call(&router, discover(&format!("?kind={value}"))).await;
+        assert_field_refusal(&response, "kind", "VALIDATION_FAILED");
+    }
+    let repeated = call(&router, discover("?kind=instance&kind=type_schema")).await;
+    assert_field_refusal(&repeated, "kind", "VALIDATION_FAILED");
+    for query in [
+        "?is_schema=true",
+        "?is_schema=false",
+        "?$filter=kind%20eq%20'instance'",
+    ] {
+        let response = call(&router, discover(query)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {:?}",
+            response.body
+        );
+        assert_eq!(
+            response.body["context"]["field_violations"][0]["reason"],
+            json!("UNSUPPORTED_QUERY_PARAM"),
+            "{query}",
+        );
+    }
+}
+
+#[test]
+fn discovery_declares_kind_as_a_string_parameter() {
+    let openapi = TestOpenApi::default();
+    let _router = router_for_openapi(&openapi);
+    let params = openapi.params.lock().expect("params lock");
+    let (_, declared) = params
+        .iter()
+        .find(|(id, _)| id == "types_registry.list_entities")
+        .expect("discovery registered");
+    let kind = declared
+        .iter()
+        .find(|p| p.0 == "kind")
+        .expect("kind is declared");
+    assert_eq!(
+        (kind.1.clone(), kind.2, kind.3.as_str()),
+        (ParamLocation::Query, false, "string")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Discovery by `depth` (T22c)
+// ---------------------------------------------------------------------------
+
+/// A Type Schema derived from [`CF_TYPE`], two segments deep.
+const CF_DERIVED: &str = gts_id!("cf.core.example.type.v1~cf.core.example.derived.v1~");
+
+async fn register_derived(router: &Router) {
+    let mut derived = schema(CF_DERIVED);
+    derived["allOf"] = json!([{ "$ref": format!("gts://{CF_TYPE}") }]);
+    let accepted = call(
+        router,
+        submit(
+            Some("arrange-derived"),
+            &json!({ "items": [{ "gts_id": CF_DERIVED, "content": derived }] }),
+        ),
+    )
+    .await;
+    let operation = poll(router, &accepted).await;
+    assert_eq!(
+        operation["items"][0]["status"],
+        json!("succeeded"),
+        "{operation}"
+    );
+}
+
+#[tokio::test]
+async fn depth_is_an_inclusive_segment_maximum_on_roots_derived_schemas_and_instances() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange-other", CF_OTHER_TYPE).await;
+    register_type_and_instance(&router).await;
+    register_derived(&router).await;
+
+    let everything = [CF_OTHER_TYPE, CF_TYPE, CF_INSTANCE, CF_DERIVED];
+    for (query, want) in [
+        ("?depth=1", &[CF_OTHER_TYPE, CF_TYPE][..]),
+        ("?depth=2", &everything[..]),
+        ("?depth=255", &everything[..]),
+        ("", &everything[..]),
+        ("?depth=1&kind=instance", &[][..]),
+        ("?depth=2&kind=instance", &[CF_INSTANCE][..]),
+        (
+            "?depth=2&kind=type_schema",
+            &[CF_OTHER_TYPE, CF_TYPE, CF_DERIVED][..],
+        ),
+    ] {
+        let page = call(&router, discover(query)).await;
+        assert_eq!(page.status, StatusCode::OK, "{query}: {:?}", page.body);
+        let mut want: Vec<&str> = want.to_vec();
+        want.sort_unstable();
+        assert_eq!(page_ids(&page.body), want, "{query}");
+    }
+
+    let pattern = format!("{}cf.core.example.type.v1~*", gts::GTS_ID_PREFIX);
+    for (depth, want) in [
+        ("1", &[CF_TYPE][..]),
+        ("2", &[CF_TYPE, CF_INSTANCE, CF_DERIVED][..]),
+    ] {
+        let query = format!("?pattern={pattern}&depth={depth}&$select=gts_id,kind");
+        let page = call(&router, discover(&query)).await;
+        let mut want: Vec<&str> = want.to_vec();
+        want.sort_unstable();
+        assert_eq!(page_ids(&page.body), want, "{query}");
+        for item in page.body["items"].as_array().expect("items") {
+            assert_eq!(field_names(item), ["gts_id", "kind", "lifecycle_status"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn depth_filtering_excludes_tombstones() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+    let deleted = call(
+        &router,
+        delete_one(Some("delete"), CF_TYPE, "?expected_resource_version=1"),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED, "{:?}", deleted.body);
+    let page = call(&router, discover("?depth=1")).await;
+    assert!(page_ids(&page.body).is_empty(), "{:?}", page.body);
+}
+
+#[tokio::test]
+async fn a_malformed_depth_is_refused() {
+    let router = router_with_db().await;
+    for value in [
+        "0",
+        "-1",
+        "+1",
+        "1.5",
+        "1e2",
+        "two",
+        "",
+        "256",
+        "99999999999999999999",
+        "%201",
+    ] {
+        let response = call(&router, discover(&format!("?depth={value}"))).await;
+        assert_field_refusal(&response, "depth", "VALIDATION_FAILED");
+    }
+    let repeated = call(&router, discover("?depth=1&depth=2")).await;
+    assert_field_refusal(&repeated, "depth", "VALIDATION_FAILED");
+}
+
+#[tokio::test]
+async fn a_cursor_is_refused_under_a_different_depth() {
+    let (router, db) = router_and_db().await;
+    _ = seed_entities(&db, 3).await;
+
+    for (issued, resumed) in [
+        ("?limit=1", "?limit=1&depth=1"),
+        ("?limit=1&depth=1", "?limit=1"),
+        ("?limit=1&depth=1", "?limit=1&depth=2"),
+        ("?limit=1&depth=1&kind=type_schema", "?limit=1&depth=1"),
+    ] {
+        let cursor = first_cursor(&router, issued).await;
+        let response = call(&router, discover(&format!("{resumed}&cursor={cursor}"))).await;
+        assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
+    }
+    let cursor = first_cursor(&router, "?limit=1&depth=1&kind=type_schema").await;
+    let resumed = call(
+        &router,
+        discover(&format!(
+            "?limit=1&kind=type_schema&depth=1&cursor={cursor}"
+        )),
+    )
+    .await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+}
+
+/// A seeded depth-1 row, then more depth-2 rows than one call may scan, then
+/// another depth-1 row: a page comes back empty with a continuation and the walk
+/// still reaches the far match.
+#[tokio::test]
+async fn a_sparse_depth_traversal_progresses_through_empty_pages() {
+    let (router, db) = router_and_db().await;
+    let near = format!("{}cf.core.example.aaa.v1~", gts::GTS_ID_PREFIX);
+    let far = format!("{}cf.core.example.zzz.v1~", gts::GTS_ID_PREFIX);
+    let gap: Vec<String> = (0..2_100)
+        .map(|i| {
+            format!(
+                "{}cf.core.example.bbb.v1~cf.core.example.n{i:05}.v1~",
+                gts::GTS_ID_PREFIX
+            )
+        })
+        .collect();
+    let mut ids: Vec<&str> = gap.iter().map(String::as_str).collect();
+    ids.push(&near);
+    ids.push(&far);
+    seed_ids(&db, &ids).await;
+
+    let mut seen = Vec::new();
+    let mut empty_with_more = 0;
+    let mut next: Option<String> = None;
+    for _ in 0..20 {
+        let uri = match &next {
+            Some(cursor) => format!("?limit=1&depth=1&cursor={cursor}"),
+            None => "?limit=1&depth=1".to_owned(),
+        };
+        let page = call(&router, discover(&uri)).await;
+        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+        let ids = page_ids(&page.body);
+        next = page.body["page_info"]["next_cursor"]
+            .as_str()
+            .map(str::to_owned);
+        if ids.is_empty() && next.is_some() {
+            empty_with_more += 1;
+        }
+        seen.extend(ids);
+        if next.is_none() {
+            break;
+        }
+    }
+    assert!(next.is_none(), "the traversal must end");
+    assert_eq!(seen, [near, far]);
+    assert!(empty_with_more >= 1, "the gap spans a whole scan budget");
+}
+
+/// `ToolKit`'s extractor parses `$select` and the `CursorV1` token in one request:
+/// its limits apply, and a continuation under a respelled `$select` resumes.
+#[tokio::test]
+async fn toolkit_select_extraction_and_the_v1_cursor_work_together() {
+    let (router, db) = router_and_db().await;
+    _ = seed_entities(&db, 3).await;
+
+    let too_long = format!("gts_id,{}", "x".repeat(2_048));
+    let too_many = vec!["kind"; 101].join(",");
+    for select in [too_long.as_str(), too_many.as_str()] {
+        let response = call(&router, discover(&format!("?$select={select}"))).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{:?}",
+            response.body
+        );
+        assert_eq!(
+            response.body["context"]["field_violations"][0],
+            json!({
+                "field": "$select",
+                "reason": "INVALID_SELECT",
+                "description": response.body["context"]["field_violations"][0]["description"],
+            }),
+        );
+    }
+
+    let cursor = first_cursor(&router, "?limit=1&$select=GTS_ID,%20content").await;
+    assert!(
+        toolkit_odata::CursorV1::decode(&cursor).is_ok(),
+        "discovery issues ToolKit's own cursor: {cursor}"
+    );
+    let resumed = call(
+        &router,
+        discover(&format!(
+            "?limit=1&$select=content,gts_id&$skiptoken={cursor}"
+        )),
+    )
+    .await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+    assert_eq!(
+        field_names(&resumed.body["items"][0]),
+        ["content", "gts_id", "lifecycle_status"]
+    );
+}
+
+#[test]
+fn discovery_declares_depth_as_a_positive_integer() {
+    let openapi = TestOpenApi::default();
+    let _router = router_for_openapi(&openapi);
+    let params = openapi.params.lock().expect("params lock");
+    let (_, declared) = params
+        .iter()
+        .find(|(id, _)| id == "types_registry.list_entities")
+        .expect("discovery registered");
+    let depth = declared
+        .iter()
+        .find(|p| p.0 == "depth")
+        .expect("depth is declared");
+    assert_eq!(depth.1, ParamLocation::Query);
+    assert!(!depth.2);
+    assert_eq!(depth.3, "integer");
+    assert_eq!(depth.5, Some(1.0));
 }

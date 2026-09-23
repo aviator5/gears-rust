@@ -1360,7 +1360,10 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   entities are excluded, which is what makes the cursor a plain keyset — `gts_id` is unique
   and immutable, so a page boundary cannot drift or duplicate. Cursors come from
   `toolkit-odata`, which already encodes them as versioned base64url and refuses an unknown
-  version.
+  version. `depth` and `kind` join the cursor's filter hash as terms added only when
+  present, on top of T22b's pattern/`$select` expression: no release preceded T22c, so the
+  wire version stays `CursorV1`'s `1`, a token issued before the filters existed resumes
+  while neither is named, and naming or changing either is a `400`.
 - **P0 discovery filters.** `pattern` is a GTS wildcard matched by `gts-rust` after a
   safe indexed prefix prefilter. `depth` is an optional **inclusive maximum number of
   GTS identifier segments**: a one-segment root has depth 1, and a derived type or

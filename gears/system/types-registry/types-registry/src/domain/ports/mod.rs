@@ -641,6 +641,17 @@ impl PageRequest {
     }
 }
 
+/// What a discovery page is restricted to; every field absent means no restriction.
+#[domain_model]
+#[derive(Clone, Debug, Default)]
+pub struct ListFilter {
+    pub pattern: Option<gts::GtsIdPattern>,
+    /// Decided by the stored `entity.kind`, in SQL.
+    pub kind: Option<EntityKind>,
+    /// Inclusive maximum of parsed `GtsId::segments()`, decided in Rust.
+    pub max_chain_depth: Option<u8>,
+}
+
 /// One page of a keyset traversal.
 #[domain_model]
 #[derive(Clone, Debug)]
@@ -706,9 +717,9 @@ pub trait EntityStore: Send + Sync {
         gts_uuids: &[Uuid],
     ) -> Result<Vec<EntityRow>, ScopeError>;
 
-    /// One bounded keyset page of **active** entities, optionally narrowed by a
-    /// GTS pattern. Tombstones are excluded: a deleted entity stays exact-readable
-    /// and leaves discovery (ADR-0008).
+    /// One bounded keyset page of **active** entities matching `filter`. Tombstones
+    /// are excluded: a deleted entity stays exact-readable and leaves discovery
+    /// (ADR-0008). Every filter applies before a row counts toward the limit.
     ///
     /// The pattern is `gts-rust`'s, never SQL's: the implementation may narrow with
     /// a range over the identifier, but only [`gts::GtsId::matches_pattern`] decides
@@ -719,7 +730,7 @@ pub trait EntityStore: Send + Sync {
         &self,
         tx: &DbTx<'_>,
         scope: &AccessScope,
-        pattern: Option<&gts::GtsIdPattern>,
+        filter: &ListFilter,
         request: PageRequest,
     ) -> Result<EntityPage, ScopeError>;
 

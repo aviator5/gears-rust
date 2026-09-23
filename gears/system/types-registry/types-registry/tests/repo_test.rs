@@ -10,6 +10,7 @@
 mod common;
 
 use std::sync::Arc;
+use types_registry::domain::ports::ListFilter;
 
 use gts::GtsIdPattern;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -309,9 +310,14 @@ async fn list_returns_exactly_what_the_pattern_accepts_not_what_sql_admits() {
     let conn = db.conn().expect("conn");
 
     let pattern = GtsIdPattern::try_new(CUSTOMER_V1).expect("pattern");
-    let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
 
     let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
@@ -343,9 +349,14 @@ async fn list_with_a_trailing_wildcard_returns_the_base_and_its_derived_identifi
     let conn = db.conn().expect("conn");
 
     let pattern = GtsIdPattern::try_new(gts_id!("acme.crm.customer.type.v1~*")).expect("pattern");
-    let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
     let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
@@ -368,9 +379,14 @@ async fn list_excludes_deleted_rows() {
         Some(2)
     );
 
-    let page = EntityRepo::list_page(&conn, &scope, None, PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &scope,
+        &ListFilter::default(),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
     assert!(
         page.items.is_empty(),
         "a tombstone stays reverse-resolvable by key but leaves discovery"
@@ -443,7 +459,7 @@ async fn keyset_paging_yields_every_row_exactly_once() {
     let mut seen: Vec<String> = Vec::new();
     let mut request = PageRequest::first(3);
     loop {
-        let page = EntityRepo::list_page(&conn, &allow_all(), None, request)
+        let page = EntityRepo::list_page(&conn, &allow_all(), &ListFilter::default(), request)
             .await
             .expect("page");
         assert!(page.items.len() <= 3, "a page never exceeds its limit");
@@ -478,7 +494,7 @@ async fn a_row_inserted_mid_traversal_neither_duplicates_nor_hides() {
     let conn = db.conn().expect("conn");
     let scope = allow_all();
 
-    let first = EntityRepo::list_page(&conn, &scope, None, PageRequest::first(2))
+    let first = EntityRepo::list_page(&conn, &scope, &ListFilter::default(), PageRequest::first(2))
         .await
         .expect("first page");
     assert_eq!(
@@ -503,9 +519,14 @@ async fn a_row_inserted_mid_traversal_neither_duplicates_nor_hides() {
             .expect("insert mid-traversal");
     }
 
-    let second = EntityRepo::list_page(&conn, &scope, None, PageRequest::after(cursor, 10))
-        .await
-        .expect("second page");
+    let second = EntityRepo::list_page(
+        &conn,
+        &scope,
+        &ListFilter::default(),
+        PageRequest::after(cursor, 10),
+    )
+    .await
+    .expect("second page");
     let ids: Vec<&str> = second.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
@@ -560,7 +581,7 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
     let mut completed = false;
     let mut request = PageRequest::first(10);
     for _ in 0..64 {
-        let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), request)
+        let page = EntityRepo::list_page(&conn, &allow_all(), &by_pattern(&pattern), request)
             .await
             .expect("page");
         if page.items.is_empty() {
@@ -1030,4 +1051,11 @@ async fn a_system_failure_fails_every_undecided_item_of_one_operation_and_no_oth
     .await
     .expect("second failure write");
     assert_eq!(again, 0, "the guard makes a repeated failure write a no-op");
+}
+
+fn by_pattern(pattern: &GtsIdPattern) -> ListFilter {
+    ListFilter {
+        pattern: Some(pattern.clone()),
+        ..ListFilter::default()
+    }
 }

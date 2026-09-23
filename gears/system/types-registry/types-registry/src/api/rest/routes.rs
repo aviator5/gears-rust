@@ -356,11 +356,14 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
              with the cursor for the next page. Deleted entities are excluded: a tombstone \
              stays readable by key and leaves discovery. Each item is projected by `$select` \
              exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the \
-             document-free default. A page never carries a validator. `limit` (alias `$top`) \
+             document-free default. A page never carries a validator. `depth` bounds the \
+             number of identifier segments and `kind` narrows to Type Schemas or Instances; \
+             both intersect with `pattern` before the page limit. `limit` (alias `$top`) \
              defaults to 100 and may not exceed 1000; a caller selecting documents should \
              page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to \
-             the pattern and the normalized `$select` it was issued for: resuming under \
-             either changed is a 400, while an absent and an explicit default `$select` are \
+             the pattern, `depth`, `kind` and the normalized `$select` it was issued for: \
+             resuming under any of them changed, or with a token of another version, is a \
+             400, while an absent and an explicit default `$select` are \
              interchangeable. Any other query parameter is refused.",
         )
         .tag(API_TAG)
@@ -372,6 +375,22 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
             "A GTS wildcard pattern (e.g. gts.acme.core.*). Decided by gts-rust; a string it \
              refuses is a 400, not an empty page",
         )
+        // `ParamSpec` has no `maximum`, so the upper bound is stated in the description.
+        .param(
+            ParamSpec::query("depth")
+                .param_type("integer")
+                .minimum(1.0)
+                .description(
+                    "Inclusive maximum number of GTS identifier segments, 1 to 255: a \
+                     one-segment root has depth 1 and each derived type or Instance tail \
+                     adds one. Applies with or without `pattern`",
+                ),
+        )
+        // `ParamSpec` has no `enum`, so the vocabulary is stated in the description.
+        .param(ParamSpec::query("kind").param_type("string").description(
+            "Only entities of this kind: `type_schema` or `instance`. Absent means both; \
+             any other value is a 400",
+        ))
         // `query_param_typed` takes description before type; swapping them silently emits `string`.
         .query_param_typed(
             "limit",

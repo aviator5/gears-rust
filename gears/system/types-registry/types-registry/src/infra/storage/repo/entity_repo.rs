@@ -17,9 +17,9 @@ use uuid::Uuid;
 
 use super::{IN_CHUNK, conflict_do_nothing};
 use crate::domain::enums::EntityKind;
-use crate::domain::ports::{EntityPage, EntityRow, NewEntity, PageRequest};
+use crate::domain::ports::{EntityPage, EntityRow, ListFilter, NewEntity, PageRequest};
 use crate::infra::storage::entity::entity;
-use crate::infra::storage::entity::enums::LifecycleStatus;
+use crate::infra::storage::entity::enums::{EntityKind as StoredKind, LifecycleStatus};
 
 /// Rows the SQL prefilter may read in one [`EntityRepo::list_page`] call.
 ///
@@ -30,7 +30,7 @@ use crate::infra::storage::entity::enums::LifecycleStatus;
 /// shape, which is an index change rather than a protocol change.
 const SCAN_BUDGET: u64 = 2048;
 
-/// Rows the SQL prefilter reads per round trip when a pattern may reject some of
+/// Rows the SQL prefilter reads per round trip when a pattern or depth may reject some of
 /// them. Without a pattern the batch is the page's own remainder instead — see
 /// [`EntityRepo::list_page`] — because then nothing can be rejected and reading
 /// ahead would be pure waste.
@@ -362,9 +362,10 @@ impl EntityRepo {
     pub async fn list_page(
         runner: &impl DBRunner,
         scope: &AccessScope,
-        pattern: Option<&GtsIdPattern>,
+        filter: &ListFilter,
         request: PageRequest,
     ) -> Result<EntityPage, ScopeError> {
+        let pattern = filter.pattern.as_ref();
         // `ExprTrait` is in scope for `Expr::col(..).add(..)`, and its blanket impl
         // shadows the inherent `max` on integers, so this names `Ord::max` outright.
         let limit = std::cmp::max(request.limit, 1) as usize;
@@ -385,7 +386,7 @@ impl EntityRepo {
             // remainder, or a page over a sparse match set costs one round trip per
             // matching row. `SCAN_BATCH` caps it either way: the remainder is
             // caller-supplied, and one round trip's memory must not be.
-            let batch_size = if pattern.is_some() {
+            let batch_size = if pattern.is_some() || filter.max_chain_depth.is_some() {
                 SCAN_BATCH
             } else {
                 std::cmp::min((limit - items.len()) as u64, SCAN_BATCH)
@@ -394,6 +395,9 @@ impl EntityRepo {
                 Condition::all().add(entity::Column::LifecycleStatus.eq(LifecycleStatus::Active));
             if let Some(after) = &cursor {
                 condition = condition.add(entity::Column::GtsId.gt(after.as_str()));
+            }
+            if let Some(kind) = filter.kind {
+                condition = condition.add(entity::Column::EntityKind.eq(StoredKind::from(kind)));
             }
             if let Some((prefix, upper)) = &range {
                 condition = condition.add(entity::Column::GtsId.gte(prefix.as_str()));
@@ -415,7 +419,7 @@ impl EntityRepo {
             for model in batch {
                 scanned += 1;
                 consumed = Some(model.gts_id.clone());
-                if matches_pattern(&model.gts_id, pattern) {
+                if matches(&model.gts_id, pattern, filter.max_chain_depth) {
                     items.push(row(model));
                     if items.len() == limit {
                         break 'scan;
@@ -443,11 +447,15 @@ impl EntityRepo {
 /// Admission parses every candidate before it reaches the table, so that arm is
 /// unreachable through the write path. It stays because the alternative is failing a
 /// whole discovery page on one bad row.
-fn matches_pattern(gts_id: &str, pattern: Option<&GtsIdPattern>) -> bool {
-    let Some(pattern) = pattern else {
+/// `gts-rust` decides both the pattern and the depth; neither is approximated in SQL.
+fn matches(gts_id: &str, pattern: Option<&GtsIdPattern>, max_depth: Option<u8>) -> bool {
+    if pattern.is_none() && max_depth.is_none() {
         return true;
-    };
-    GtsId::try_new(gts_id).is_ok_and(|id| id.matches_pattern(pattern))
+    }
+    GtsId::try_new(gts_id).is_ok_and(|id| {
+        pattern.is_none_or(|pattern| id.matches_pattern(pattern))
+            && max_depth.is_none_or(|max| id.segments().len() <= usize::from(max))
+    })
 }
 
 /// The literal prefix a pattern's matches must all share, or `None` when the

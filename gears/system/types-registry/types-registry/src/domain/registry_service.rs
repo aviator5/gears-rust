@@ -24,7 +24,9 @@ use crate::domain::enums::{
 };
 use crate::domain::policy::RegistrationPolicy;
 use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage};
-use crate::domain::ports::{CurrentReadRow, EntityRow, PageRequest, Stores, snapshot_read};
+use crate::domain::ports::{
+    CurrentReadRow, EntityRow, ListFilter, PageRequest, Stores, snapshot_read,
+};
 use crate::domain::selection::{EntityField, FieldSelection};
 
 /// GTS identifier or deterministic Registry Reference for the same row.
@@ -160,9 +162,8 @@ pub enum EntityLookup {
 
 /// A discovery query over **active** entities (D12).
 ///
-/// No kind, origin, availability or scope filter: each is either out of P0 scope
-/// (SPEC §2) or a tenant-plane input, and the pattern already narrows by
-/// identifier, which is what a GTS caller filters on.
+/// No origin, availability or scope filter: each is out of P0 scope (SPEC §2) or a
+/// tenant-plane input.
 #[domain_model]
 #[derive(Clone, Debug, Default)]
 pub struct DiscoveryQuery {
@@ -172,6 +173,9 @@ pub struct DiscoveryQuery {
     pub after: Option<String>,
     /// `None` takes `limits.page_size_default`; above `limits.page_size_max` is refused.
     pub limit: Option<u32>,
+    pub kind: Option<EntityKind>,
+    /// Inclusive maximum number of GTS identifier segments; `0` is refused.
+    pub max_chain_depth: Option<u8>,
     pub selection: FieldSelection,
 }
 
@@ -241,6 +245,9 @@ pub enum ServiceError {
     /// `limit` outside `1..=limits.page_size_max` (D12).
     #[error("a page size must be between 1 and {max}; this request asked for {limit}")]
     PageSizeOutOfRange { limit: u32, max: u32 },
+    /// `max_chain_depth` must name at least one segment.
+    #[error("a chain depth must be between 1 and {}", u8::MAX)]
+    DepthOutOfRange,
     /// The discovery pattern is not a GTS identifier pattern.
     #[error("the discovery pattern is not a GTS pattern: {message}")]
     InvalidPattern { message: String },
@@ -260,6 +267,7 @@ impl ServiceError {
             Self::BatchReadOutOfRange { .. } => "batch_read_out_of_range",
             Self::PageSizeOutOfRange { .. } => "page_size_out_of_range",
             Self::InvalidPattern { .. } => "invalid_pattern",
+            Self::DepthOutOfRange => "depth_out_of_range",
         }
     }
 }
@@ -715,6 +723,14 @@ impl RegistryService {
                 })
             })
             .transpose()?;
+        if query.max_chain_depth == Some(0) {
+            return Err(ServiceError::DepthOutOfRange);
+        }
+        let filter = ListFilter {
+            pattern,
+            kind: query.kind,
+            max_chain_depth: query.max_chain_depth,
+        };
         let request = PageRequest {
             after: query.after.clone(),
             limit,
@@ -727,9 +743,7 @@ impl RegistryService {
         let (page, current) = provider
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
-                    let page = stores
-                        .list_page(tx, &scope, pattern.as_ref(), request)
-                        .await?;
+                    let page = stores.list_page(tx, &scope, &filter, request).await?;
                     let current =
                         read_current(&*stores, tx, &scope, &page.items, selection).await?;
                     Ok((page, current))

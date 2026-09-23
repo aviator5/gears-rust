@@ -10,7 +10,7 @@ use super::{AdmissionView, unsupported};
 use crate::domain::enums::{EntityKind, OwnershipScope};
 use crate::domain::family::FamilyKey;
 use crate::domain::ports::{
-    EntityPage, EntityRow, EntityStore, EntityWriteOrderStore, NewEntity, PageRequest,
+    EntityPage, EntityRow, EntityStore, EntityWriteOrderStore, ListFilter, NewEntity, PageRequest,
     VersionFamilyRow, VersionFamilyStore,
 };
 
@@ -141,7 +141,7 @@ impl EntityStore for AdmissionView {
         &self,
         _tx: &DbTx<'_>,
         _scope: &AccessScope,
-        _pattern: Option<&gts::GtsIdPattern>,
+        _filter: &ListFilter,
         _request: PageRequest,
     ) -> Result<EntityPage, ScopeError> {
         Err(unsupported(

@@ -9,10 +9,11 @@ use toolkit::api::odata::{ODataQuery, extract_odata_query};
 use toolkit_canonical_errors::CanonicalError;
 
 use super::error::{
-    duplicate_query_param, page_size_zero, pattern_too_long, query_params_unreadable,
-    unsupported_query_params,
+    depth_not_recognized, duplicate_query_param, kind_not_recognized, page_size_zero,
+    pattern_too_long, query_params_unreadable, unsupported_query_params,
 };
 use super::select;
+use crate::domain::enums::EntityKind;
 use crate::domain::selection::FieldSelection;
 
 /// Parameters `GET /entities/{entity_key}` accepts.
@@ -94,6 +95,8 @@ impl<S: Send + Sync> FromRequestParts<S> for NoQuery {
 /// are `ToolKit`'s two spellings of one slot each.
 pub const DISCOVERY: &[&str] = &[
     "pattern",
+    "depth",
+    "kind",
     "limit",
     "$top",
     "cursor",
@@ -105,9 +108,29 @@ pub const DISCOVERY: &[&str] = &[
 /// needs the normalized selection, which only exists after extraction.
 pub struct DiscoveryParams {
     pub pattern: Option<String>,
+    pub kind: Option<EntityKind>,
+    pub max_chain_depth: Option<u8>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
     pub selection: FieldSelection,
+}
+
+/// Plain decimal digits only: `u8::from_str` would also take `+5`. Zero parses and
+/// is refused by the domain, which owns the range.
+fn parse_depth(raw: &str) -> Result<u8, CanonicalError> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(depth_not_recognized(raw));
+    }
+    raw.parse().map_err(|_| depth_not_recognized(raw))
+}
+
+/// The wire spellings of [`EntityKind`], shared with `EntityKindDto`.
+fn parse_kind(raw: &str) -> Result<EntityKind, CanonicalError> {
+    match raw {
+        "type_schema" => Ok(EntityKind::TypeSchema),
+        "instance" => Ok(EntityKind::Instance),
+        _ => Err(kind_not_recognized(raw)),
+    }
 }
 
 fn value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -154,6 +177,8 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
         }
         Ok(Self {
             pattern,
+            kind: value(&pairs, "kind").map(parse_kind).transpose()?,
+            max_chain_depth: value(&pairs, "depth").map(parse_depth).transpose()?,
             limit: query.limit.map(|l| u32::try_from(l).unwrap_or(u32::MAX)),
             cursor: cursor.map(|(_, token)| token.to_owned()),
             selection,

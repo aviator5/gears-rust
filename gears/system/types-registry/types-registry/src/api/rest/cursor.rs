@@ -16,10 +16,10 @@
 //!
 //! # What the cursor binds
 //!
-//! The query it was issued for: the pattern and the canonical [`FieldSelection`].
-//! Replaying a position under either changed is refused rather than spliced; an
-//! absent `$select` and an explicit default one share one canonical spelling and
-//! so one binding.
+//! The query it was issued for: the pattern, `depth`, `kind` and the canonical
+//! [`FieldSelection`]. Replaying a position under any of them changed is refused
+//! rather than spliced; an absent `$select` and an explicit default one share one
+//! canonical spelling and so one binding.
 //!
 //! [`DiscoveryQuery::after`]: crate::domain::registry_service::DiscoveryQuery::after
 
@@ -28,6 +28,7 @@ use toolkit_odata::pagination::short_filter_hash;
 use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir, ast, validate_cursor_against};
 
 use super::error::{cursor_not_usable, cursor_too_long};
+use crate::domain::enums::EntityKind;
 use crate::domain::selection::FieldSelection;
 
 /// The one keyset column. `gts_id` is unique and immutable, which is what makes the
@@ -36,6 +37,15 @@ const KEY_FIELD: &str = "gts_id";
 
 /// The binding's name for the selection; not an entity column.
 const SELECT_FIELD: &str = "$select";
+const KIND_FIELD: &str = "kind";
+const DEPTH_FIELD: &str = "depth";
+
+const fn kind_name(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::TypeSchema => "type_schema",
+        EntityKind::Instance => "instance",
+    }
+}
 
 /// Forward-only. Backward paging is not part of the discovery contract, and a
 /// `"bwd"` token would describe a traversal this route does not perform.
@@ -61,16 +71,30 @@ fn binding_hash(binding: &Binding<'_>) -> Option<String> {
         )
     };
     let select = equals(SELECT_FIELD, &binding.selection.canonical());
-    let expr = match binding.pattern {
+    let base = match binding.pattern {
         Some(pattern) => ast::Expr::And(Box::new(equals(KEY_FIELD, pattern)), Box::new(select)),
         None => select,
     };
+    // T22b's expression is the base, so a token issued before `depth`/`kind`
+    // existed resumes the same traversal when neither is named. An absent filter
+    // adds no term; a present one always changes the hash.
+    let terms = [
+        binding.kind.map(|kind| equals(KIND_FIELD, kind_name(kind))),
+        binding
+            .max_chain_depth
+            .map(|depth| equals(DEPTH_FIELD, &depth.to_string())),
+    ];
+    let expr = terms.into_iter().flatten().fold(base, |expr, term| {
+        ast::Expr::And(Box::new(expr), Box::new(term))
+    });
     short_filter_hash(Some(&expr))
 }
 
 /// What a discovery cursor is bound to.
 pub struct Binding<'a> {
     pub pattern: Option<&'a str>,
+    pub kind: Option<EntityKind>,
+    pub max_chain_depth: Option<u8>,
     pub selection: FieldSelection,
 }
 
@@ -124,7 +148,8 @@ pub fn decode(token: &str, binding: &Binding<'_>) -> Result<String, CanonicalErr
     // which only a pre-T22b cursor lacks.
     if cursor.f != expected {
         return Err(cursor_not_usable(
-            "it was issued for a different pattern or $select than this request names",
+            "it was issued for a different pattern, depth, kind or $select than this \
+             request names",
         ));
     }
     if cursor.d != FORWARD {
@@ -147,8 +172,19 @@ mod tests {
     const PATTERN: &str = "gts.cf.core.example.*";
 
     fn bound<'a>(pattern: Option<&'a str>, select: &[&str]) -> Binding<'a> {
+        filtered(pattern, None, None, select)
+    }
+
+    fn filtered<'a>(
+        pattern: Option<&'a str>,
+        kind: Option<EntityKind>,
+        max_chain_depth: Option<u8>,
+        select: &[&str],
+    ) -> Binding<'a> {
         Binding {
             pattern,
+            kind,
+            max_chain_depth,
             selection: if select.is_empty() {
                 FieldSelection::default()
             } else {
@@ -198,6 +234,70 @@ mod tests {
             let content = encode(AFTER, &bound(pattern, &["content"]))?;
             assert!(decode(&content, &bound(pattern, &[])).is_err());
             assert!(decode(&content, &bound(pattern, &["content", "kind"])).is_err());
+        }
+        Ok(())
+    }
+
+    /// Absent is its own binding, distinct from every explicit value.
+    #[test]
+    fn a_cursor_from_another_kind_or_depth_is_refused() -> Result<(), CanonicalError> {
+        let kinds = [
+            None,
+            Some(EntityKind::TypeSchema),
+            Some(EntityKind::Instance),
+        ];
+        let depths = [None, Some(1), Some(2), Some(255)];
+        for pattern in [None, Some(PATTERN)] {
+            for issued in kinds.iter().flat_map(|k| depths.map(|d| (*k, d))) {
+                let token = encode(AFTER, &filtered(pattern, issued.0, issued.1, &[]))?;
+                for resumed in kinds.iter().flat_map(|k| depths.map(|d| (*k, d))) {
+                    let result = decode(&token, &filtered(pattern, resumed.0, resumed.1, &[]));
+                    assert_eq!(
+                        result.is_ok(),
+                        issued == resumed,
+                        "{issued:?} -> {resumed:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A T22b token, whose hash covered only pattern and `$select`, resumes while
+    /// neither `depth` nor `kind` is named, and is refused once either is.
+    #[test]
+    fn a_t22b_cursor_resumes_under_the_same_absent_filters() -> Result<(), serde_json::Error> {
+        let equals = |field: &str, value: &str| {
+            ast::Expr::Compare(
+                Box::new(ast::Expr::Identifier(field.to_owned())),
+                ast::CompareOperator::Eq,
+                Box::new(ast::Expr::Value(ast::Value::String(value.to_owned()))),
+            )
+        };
+        let select = equals("$select", &FieldSelection::default().canonical());
+        for (pattern, t22b_filter) in [
+            (None, select.clone()),
+            (
+                Some(PATTERN),
+                ast::Expr::And(Box::new(equals("gts_id", PATTERN)), Box::new(select)),
+            ),
+        ] {
+            let token = CursorV1 {
+                k: vec![AFTER.to_owned()],
+                o: SortDir::Asc,
+                s: page_order().to_signed_tokens(),
+                f: short_filter_hash(Some(&t22b_filter)),
+                d: FORWARD.to_owned(),
+            }
+            .encode()?;
+            assert_eq!(
+                decode(&token, &bound(pattern, &[])).ok().as_deref(),
+                Some(AFTER),
+                "{pattern:?}",
+            );
+            let with_kind = filtered(pattern, Some(EntityKind::Instance), None, &[]);
+            assert!(decode(&token, &with_kind).is_err(), "{pattern:?}");
+            assert!(decode(&token, &filtered(pattern, None, Some(2), &[])).is_err());
         }
         Ok(())
     }

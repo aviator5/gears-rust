@@ -20,10 +20,10 @@ use crate::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentReadRow, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, DependencyClosure, DependencyEdgeRow,
     DependencyStore, EdgeSide, EntityEdge, EntityPage, EntityRow, EntityStore,
-    EntityWriteOrderStore, InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema,
-    NewEntity, NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
-    OperationRow, OperationStore, PageRequest, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
-    VersionFamilyStore,
+    EntityWriteOrderStore, InstanceStore, ItemSuccess, ListFilter, NewCurrentInstance,
+    NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewOperation, NewOperationItem,
+    NewRevision, OperationItemRow, OperationRow, OperationStore, PageRequest, ReverseImpact,
+    TypeSchemaStore, VersionFamilyRow, VersionFamilyStore,
 };
 use crate::domain::selection::FieldSelection;
 
@@ -132,10 +132,10 @@ impl EntityStore for Repos {
         &self,
         tx: &DbTx<'_>,
         scope: &AccessScope,
-        pattern: Option<&gts::GtsIdPattern>,
+        filter: &ListFilter,
         request: PageRequest,
     ) -> Result<EntityPage, ScopeError> {
-        EntityRepo::list_page(tx, scope, pattern, request).await
+        EntityRepo::list_page(tx, scope, filter, request).await
     }
 
     async fn kind_in_family(

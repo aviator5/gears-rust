@@ -35,6 +35,7 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
+use types_registry::domain::ports::ListFilter;
 
 use gts::GtsIdPattern;
 use sea_orm::sea_query::Expr;
@@ -172,7 +173,7 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
     let mut seen: Vec<String> = Vec::new();
     let mut request = PageRequest::first(2);
     loop {
-        let page = EntityRepo::list_page(&conn, &allow_all(), None, request)
+        let page = EntityRepo::list_page(&conn, &allow_all(), &ListFilter::default(), request)
             .await
             .expect("page");
         seen.extend(page.items.iter().map(|m| m.gts_id.clone()));
@@ -196,9 +197,14 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
 async fn pattern_list_agrees_with_gts(db: &Provider, backend: &str) {
     let conn = db.conn().expect("conn");
     let pattern = GtsIdPattern::try_new(gts_id!("acme.crm.a_b.type.v1~")).expect("pattern");
-    let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
     let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
@@ -964,4 +970,11 @@ async fn repository_primitives_behave_on_mysql() {
 
     let db = provider_for(&format!("mysql://root@{host}:{port}/test"), 8).await;
     assert_repo_primitives_behave(&db, "mysql").await;
+}
+
+fn by_pattern(pattern: &GtsIdPattern) -> ListFilter {
+    ListFilter {
+        pattern: Some(pattern.clone()),
+        ..ListFilter::default()
+    }
 }

@@ -14,10 +14,10 @@ use types_registry::domain::ports::{
     CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentReadRow, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, DependencyClosure, DependencyEdgeRow,
     DependencyStore, EdgeSide, EntityEdge, EntityPage, EntityRow, EntityStore,
-    EntityWriteOrderStore, InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema,
-    NewEntity, NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
-    OperationRow, OperationStore, PageRequest, ReverseImpact, Stores, TypeSchemaStore,
-    VersionFamilyRow, VersionFamilyStore,
+    EntityWriteOrderStore, InstanceStore, ItemSuccess, ListFilter, NewCurrentInstance,
+    NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewOperation, NewOperationItem,
+    NewRevision, OperationItemRow, OperationRow, OperationStore, PageRequest, ReverseImpact,
+    Stores, TypeSchemaStore, VersionFamilyRow, VersionFamilyStore,
 };
 use types_registry::domain::selection::FieldSelection;
 use uuid::Uuid;
@@ -642,10 +642,10 @@ impl EntityStore for TestStores {
         &self,
         tx: &DbTx<'_>,
         scope: &AccessScope,
-        pattern: Option<&gts::GtsIdPattern>,
+        filter: &ListFilter,
         request: PageRequest,
     ) -> Result<EntityPage, ScopeError> {
-        self.inner.list_page(tx, scope, pattern, request).await
+        self.inner.list_page(tx, scope, filter, request).await
     }
 
     async fn kind_in_family(
