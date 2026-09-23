@@ -28,6 +28,7 @@ use crate::domain::enums::{
     OperationStatus, OwnershipScope, Plane,
 };
 use crate::domain::family::FamilyKey;
+use crate::domain::selection::FieldSelection;
 
 // The output port the admission path's instruments cross (T16).
 pub mod metrics;
@@ -258,6 +259,30 @@ pub struct CurrentDocument {
     pub content_hash: Vec<u8>,
     /// The projection state to use when writing artifacts derived from this document.
     pub projection: CurrentSchemaCas,
+}
+
+/// `content_hash` is always read, so the pointer is checked whatever the
+/// selection. Documents and `provenance` are `Some` only when selected.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub struct CurrentReadRow {
+    pub entity_id: i64,
+    pub content_hash: Vec<u8>,
+    /// The authored document or value, canonical UTF-8 text, unparsed.
+    pub content: Option<String>,
+    pub resolved_schema: Option<String>,
+    pub effective_traits: Option<String>,
+    pub effective_traits_schema: Option<String>,
+    pub provenance: Option<RevisionProvenance>,
+}
+
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevisionProvenance {
+    pub gts_spec_version: String,
+    pub gts_impl_version: String,
+    /// `None` for an Instance, which has no compatibility check to waive.
+    pub compat_forced: Option<bool>,
 }
 
 /// The result of a reverse-impact read.
@@ -785,6 +810,16 @@ pub trait TypeSchemaStore: Send + Sync {
         entity_ids: &[i64],
     ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError>;
 
+    /// Fetches only the documents `selection` names, in bounded chunks;
+    /// `entity_id`-sorted, entities without a current row absent.
+    async fn read_current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError>;
+
     /// Current revision numbers and fingerprints, `entity_id`-sorted, without artifacts.
     /// Entities with no current row are simply absent.
     async fn current_schema_projections(
@@ -847,6 +882,15 @@ pub trait InstanceStore: Send + Sync {
         scope: &AccessScope,
         entity_id: i64,
     ) -> Result<Option<CurrentInstanceRow>, ScopeError>;
+
+    /// As [`TypeSchemaStore::read_current_schemas`]; Instances have no artifacts.
+    async fn read_current_values(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError>;
 
     async fn insert_instance_revision(
         &self,

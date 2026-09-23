@@ -12,7 +12,8 @@ Features:
 - Required `Idempotency-Key`; replay returns the same operation, changed content conflicts
 - Reads by GTS identifier or Registry Reference UUID, including tombstones
 - Batch reads with one explicit result per key, absence included
-- Bounded, content-free discovery with an opaque cursor
+- Bounded discovery with an opaque cursor
+- `$select` on every read: a document-free default, documents only when asked for
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
@@ -71,12 +72,47 @@ curl -s "$BASE/types-registry/v2/operations/$OPERATION_ID" | python3 -m json.too
 
 The completed response contains a `succeeded` item at `resource_version: 1`.
 
-`completed` means every item is terminal. Read the entity and its `gts_uuid`:
+`completed` means every item is terminal. Read the entity:
 
 ```bash
 curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~" \
   | python3 -m json.tool
 ```
+
+```json
+{
+    "gts_id": "gts.cf.core.example.event.v1~",
+    "gts_uuid": "d226dd5b-14c8-56da-a718-9cf29becaba1",
+    "kind": "type_schema",
+    "origin": {
+        "type": "managed",
+        "resource_version": 1,
+        "created_at": "2026-09-15T09:15:30Z",
+        "updated_at": "2026-09-15T09:15:30Z"
+    },
+    "lifecycle_status": "active",
+    "content_hash": "3a1f0c9d4b2e8a71"
+}
+```
+
+### Select fields
+
+Every read returns this document-free default unless `$select` names fields. Documents
+are selected individually and returned flat: `content` (either kind), `resolved_schema`,
+`effective_traits`, `effective_traits_schema` (Type Schemas only; absent on an Instance),
+plus the `provenance` group (`gts_spec_version`, `gts_impl_version`, `owning_gear`,
+`compat_forced`):
+
+```bash
+curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?\$select=content,effective_traits" \
+  | python3 -m json.tool
+```
+
+Names are case-insensitive and order does not matter. `lifecycle_status` is always
+returned. An unselected field is omitted; a selected document that is JSON `null` stays
+`null`. `content_hash` is a non-cryptographic prefilter, not proof two documents are
+equal. An empty, duplicate, unknown or nested name (`content.title`) is a `400` naming
+`$select`, and any other query parameter is refused.
 
 ### Rehearse a deletion, then perform it
 
@@ -142,7 +178,7 @@ curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
 ```json
 {
     "items": [
-        { "key": "gts.cf.core.example.event.v1~", "status": "found", "entity": { "...": "..." } },
+        { "key": "gts.cf.core.example.event.v1~", "status": "found", "entity": { "...": "the default fields" } },
         { "key": "d226dd5b-14c8-56da-a718-9cf29becaba1", "status": "found", "entity": { "...": "..." } },
         { "key": "gts.cf.core.example.missing.v1~", "status": "not_found" }
     ]
@@ -151,15 +187,23 @@ curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
 
 Results come back in request order, each echoing the key it was asked by, so a caller that
 mixed identifiers and Registry References matches answers to questions without re-deriving
-either. A `found` result carries the same full representation the exact read returns —
-authored content plus the materialized artifacts. An absent key is `not_found` inside a
-`200`, not a `404`: one missing key must not lose the answers for the others.
+either. An absent key is `not_found` inside a `200`, not a `404`: one missing key must not
+lose the answers for the others.
+
+A top-level `"$select"` applies to every key and follows the exact read's rules, so a
+`found` entity is exactly what `GET /entities/{key}` returns for the same selection:
+
+```bash
+curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
+  -H "Content-Type: application/json" \
+  -d '{ "$select": "gts_id,content", "items": [{ "key": "gts.cf.core.example.event.v1~" }] }'
+```
+
+`$select` in the query string is refused on this route, as are unknown body fields.
 
 A key named twice collapses onto its first mention. The two spellings of one entity are two
-keys and get two results. At most 100 keys per request, the same ceiling registration and
-deletion batches carry; an empty `items` is a `400`. A `found` result carries the authored
-document and all three materialized artifacts, so the key count is what bounds the
-response size.
+keys and get two results. At most 100 keys per request; an empty `items` is a `400`. The
+key count does not bound response bytes once documents are selected.
 
 `If-None-Match` is refused rather than ignored, because validators are per key: each item
 carries its own `if_none_match` slot.
@@ -182,28 +226,28 @@ curl -s "$BASE/types-registry/v2/entities?limit=2&pattern=gts.cf.core.*" \
             "gts_id": "gts.cf.core.example.event.v1~",
             "gts_uuid": "d226dd5b-14c8-56da-a718-9cf29becaba1",
             "kind": "type_schema",
+            "origin": { "type": "managed", "resource_version": 1, "created_at": "...", "updated_at": "..." },
             "lifecycle_status": "active",
-            "resource_version": 1,
-            "owning_gear": "types-registry",
-            "created_at": "2026-09-15T09:15:30Z",
-            "updated_at": "2026-09-15T09:15:30Z"
+            "content_hash": "3a1f0c9d4b2e8a71"
         }
     ],
     "page_info": { "next_cursor": "eyJ2IjoxLCJrIjpb...", "limit": 2 }
 }
 ```
 
-A page is **content-free**: identity and metadata only, with no `content`, no
-`resolved_schema`, no `effective_traits` and no validator. Discovery answers *what exists*;
-an exact read or `:batchGet` answers *what is in it*. So the read pattern is page, then
-hydrate the identifiers the page gave you:
+Page items take `$select` exactly as the exact read does; the default is document-free and
+a page never carries a validator. Page with the fields you need, then hydrate documents
+through `:batchGet` in batches of at most 100 keys, keeping the same `$select` on every
+continuation:
 
 ```bash
 # Page, collecting identifiers until next_cursor is absent.
 CURSOR=""
 IDS=""
 while :; do
-  PAGE=$(curl -s "$BASE/types-registry/v2/entities?limit=100&cursor=$CURSOR")
+  URL="$BASE/types-registry/v2/entities?limit=100&\$select=gts_id"
+  [ -z "$CURSOR" ] || URL="$URL&cursor=$CURSOR"
+  PAGE=$(curl -s "$URL")
   IDS="$IDS $(echo "$PAGE" | python3 -c 'import json,sys
 for item in json.load(sys.stdin)["items"]: print(item["gts_id"])')"
   CURSOR=$(echo "$PAGE" | python3 -c 'import json,sys
@@ -211,11 +255,16 @@ print(json.load(sys.stdin)["page_info"].get("next_cursor") or "")')
   [ -n "$CURSOR" ] || break
 done
 
-# Hydrate: full documents for what the traversal found.
+# Hydrate content, at most 100 keys per batchGet.
 echo "$IDS" | python3 -c 'import json,sys
-print(json.dumps({"items": [{"key": k} for k in sys.stdin.read().split()]}))' \
-  | curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
-      -H "Content-Type: application/json" -d @-
+keys = sys.stdin.read().split()
+for i in range(0, len(keys), 100):
+    print(json.dumps({"$select": "gts_id,content",
+                      "items": [{"key": k} for k in keys[i:i + 100]]}))' \
+  | while read -r BODY; do
+      curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
+        -H "Content-Type: application/json" -d "$BODY"
+    done
 ```
 
 The traversal ends when `page_info.next_cursor` is **absent** — not when a page comes back
@@ -223,11 +272,11 @@ short. One page is bounded in work as well as in results, so a selective `patter
 large table can legitimately return nothing and still hand back a cursor asking to be
 called again.
 
-`cursor` is opaque, versioned and bound to the query it was issued for. Replaying one under
-a different `pattern`, or one from an older protocol version, is a `400` rather than a page
-spliced out of two traversals.
+`cursor` (alias `$skiptoken`) is opaque, versioned and bound to the `pattern` and the
+normalized `$select` it was issued for. Resuming under a different pattern or selection,
+or with a token from an older version, is a `400` rather than a page spliced out of two
+traversals. An absent `$select` and the explicit default set are the same selection.
 
-`limit` defaults to 100 and may not exceed 1000; `0` or `1001` is a `400` naming `limit`.
-`$select` is refused with a `400` naming `$select`: each read surface has one fixed field
-set, and answering a caller that asked for one field with the whole set would hand back
-bytes it did not ask for.
+`limit` (alias `$top`) defaults to 100 and may not exceed 1000; `0` or `1001` is a `400`.
+A caller selecting documents should page smaller. `$filter`, `$orderby`, `$skip`, v1
+filters such as `is_schema` or `vendor`, and any other undeclared parameter are refused.

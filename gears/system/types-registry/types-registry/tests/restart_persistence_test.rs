@@ -12,6 +12,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use types_registry::domain::selection::FieldSelection;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde_json::{Value, json};
@@ -255,17 +256,20 @@ async fn a_schema_and_instance_survive_database_reopen() {
     // current-state branch and two separate tables.
     let svc = service(&db);
     let schema_by_id = svc
-        .entity(&EntityKey::parse(CF_TYPE))
+        .entity(&EntityKey::parse(CF_TYPE), FieldSelection::full())
         .await
         .expect("read by identifier")
         .expect("the schema survived");
     let schema_by_uuid = svc
-        .entity(&EntityKey::parse(&schema_uuid.to_string()))
+        .entity(
+            &EntityKey::parse(&schema_uuid.to_string()),
+            FieldSelection::full(),
+        )
         .await
         .expect("read by Registry Reference")
         .expect("the schema survived");
     let instance_by_id = svc
-        .entity(&EntityKey::parse(CF_INSTANCE))
+        .entity(&EntityKey::parse(CF_INSTANCE), FieldSelection::full())
         .await
         .expect("read Instance by identifier")
         .expect("the Instance survived");
@@ -405,7 +409,7 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
     assert_eq!(op.items[0].resource_version, Some(1));
 
     let entity = svc
-        .entity(&EntityKey::parse(CF_TYPE))
+        .entity(&EntityKey::parse(CF_TYPE), FieldSelection::full())
         .await
         .expect("read")
         .expect("admission registered the entity");
@@ -472,15 +476,19 @@ async fn an_entity_without_its_current_state_is_reported_as_corrupt() {
             .expect("remove current instance state");
     }
 
-    for (gts_id, expected) in [
-        (CF_TYPE, "no current Type Schema state"),
-        (CF_INSTANCE, "no current Instance state"),
-    ] {
-        match svc.entity(&EntityKey::parse(gts_id)).await {
-            Err(ServiceError::CorruptDocument(detail)) => {
-                assert!(detail.contains(expected), "unexpected detail: {detail}");
+    // Selection must not change the answer: a document-free read still reads the
+    // current-state pointer and reports its absence.
+    for selection in [FieldSelection::default(), FieldSelection::full()] {
+        for (gts_id, expected) in [
+            (CF_TYPE, "no current Type Schema state"),
+            (CF_INSTANCE, "no current Instance state"),
+        ] {
+            match svc.entity(&EntityKey::parse(gts_id), selection).await {
+                Err(ServiceError::CorruptDocument(detail)) => {
+                    assert!(detail.contains(expected), "unexpected detail: {detail}");
+                }
+                other => panic!("expected corrupt current state, got {other:?}"),
             }
-            other => panic!("expected corrupt current state, got {other:?}"),
         }
     }
 }

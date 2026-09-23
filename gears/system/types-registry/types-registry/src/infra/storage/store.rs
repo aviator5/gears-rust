@@ -17,7 +17,7 @@ use crate::domain::admission::fingerprint::ScopeHash;
 use crate::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use crate::domain::family::FamilyKey;
 use crate::domain::ports::{
-    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
+    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentReadRow, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, DependencyClosure, DependencyEdgeRow,
     DependencyStore, EdgeSide, EntityEdge, EntityPage, EntityRow, EntityStore,
     EntityWriteOrderStore, InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema,
@@ -25,6 +25,7 @@ use crate::domain::ports::{
     OperationRow, OperationStore, PageRequest, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
     VersionFamilyStore,
 };
+use crate::domain::selection::FieldSelection;
 
 use super::repo::{
     CoordinationStateRepo, DependencyRepo, EntityRepo, InstanceRepo, OperationRepo, TypeSchemaRepo,
@@ -208,6 +209,16 @@ impl TypeSchemaStore for Repos {
         TypeSchemaRepo::current_rows(tx, scope, entity_ids).await
     }
 
+    async fn read_current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        TypeSchemaRepo::read_current(tx, scope, entity_ids, selection).await
+    }
+
     async fn current_schema_projections(
         &self,
         tx: &DbTx<'_>,
@@ -264,6 +275,16 @@ impl InstanceStore for Repos {
         entity_id: i64,
     ) -> Result<Option<CurrentInstanceRow>, ScopeError> {
         InstanceRepo::find_current(tx, scope, entity_id).await
+    }
+
+    async fn read_current_values(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        InstanceRepo::read_current(tx, scope, entity_ids, selection).await
     }
 
     async fn insert_instance_revision(

@@ -173,8 +173,8 @@ async fn router_with(v1_ready: bool) -> TestApi {
 }
 
 /// The router plus the provider behind it, for the discovery tests that seed
-/// `entity` rows directly. A content-free page reads nothing but `entity`, and the
-/// scan-budget case needs more rows than the admission path can admit in a test.
+/// rows directly: the scan-budget case needs more rows than the admission path can
+/// admit in a test.
 async fn router_and_db() -> (TestApi, Arc<DBProvider<DbError>>) {
     router_and_db_with(false).await
 }
@@ -548,12 +548,19 @@ async fn a_registration_is_accepted_polled_and_read_back() {
         "the operation outcome must expose resource_version, not an internal revision number",
     );
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(
+        &router,
+        get(&format!(
+            "{V2}/entities/{CF_TYPE}?$select=gts_id,kind,origin,content,resolved_schema,\
+             effective_traits"
+        )),
+    )
+    .await;
     assert_eq!(entity.status, StatusCode::OK);
     assert_eq!(entity.body["gts_id"], json!(CF_TYPE));
     assert_eq!(entity.body["kind"], json!("type_schema"));
     assert_eq!(entity.body["lifecycle_status"], json!("active"));
-    assert_eq!(entity.body["resource_version"], json!(1));
+    assert_eq!(entity.body["origin"]["resource_version"], json!(1));
     // D3: the artifacts are materialized, so a read recomputes nothing.
     assert!(entity.body["resolved_schema"].is_object());
     assert!(entity.body["effective_traits"].is_object());
@@ -583,12 +590,19 @@ async fn an_instance_reads_back_with_its_authored_value() {
     assert_eq!(operation.body["items"][0]["status"], json!("succeeded"));
     assert!(operation.body["items"][0].get("revision_no").is_none());
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_INSTANCE}"))).await;
+    let entity = call(
+        &router,
+        get(&format!(
+            "{V2}/entities/{CF_INSTANCE}?$select=gts_id,kind,origin,content,resolved_schema,\
+             effective_traits,effective_traits_schema"
+        )),
+    )
+    .await;
     assert_eq!(entity.status, StatusCode::OK);
     assert_eq!(entity.body["gts_id"], json!(CF_INSTANCE));
     assert_eq!(entity.body["kind"], json!("instance"));
     assert_eq!(entity.body["lifecycle_status"], json!("active"));
-    assert_eq!(entity.body["resource_version"], json!(1));
+    assert_eq!(entity.body["origin"]["resource_version"], json!(1));
     assert_eq!(
         entity.body["content"], value,
         "the authored value, byte for byte what was submitted",
@@ -597,13 +611,18 @@ async fn an_instance_reads_back_with_its_authored_value() {
         entity.body.get("revision_no").is_none(),
         "the immutable content revision remains internal; writes use resource_version",
     );
-    assert!(
-        entity.body["resolved_schema"].is_null()
-            && entity.body["effective_traits"].is_null()
-            && entity.body["effective_traits_schema"].is_null(),
-        "an Instance has no derived artifacts; absent is the answer, not a gap: {:?}",
-        entity.body,
-    );
+    for field in [
+        "resolved_schema",
+        "effective_traits",
+        "effective_traits_schema",
+    ] {
+        assert!(
+            entity.body.get(field).is_none(),
+            "an Instance has no derived artifacts, so even selected they are absent, \
+             not null: {:?}",
+            entity.body,
+        );
+    }
 }
 
 #[tokio::test]
@@ -622,7 +641,11 @@ async fn an_instance_is_readable_by_registry_reference() {
     let uuid = gts::GtsId::try_new(CF_INSTANCE)
         .expect("identifier")
         .to_uuid();
-    let by_uuid = call(&router, get(&format!("{V2}/entities/{uuid}"))).await;
+    let by_uuid = call(
+        &router,
+        get(&format!("{V2}/entities/{uuid}?$select=gts_id,content")),
+    )
+    .await;
     assert_eq!(by_uuid.status, StatusCode::OK);
     assert_eq!(by_uuid.body["gts_id"], json!(CF_INSTANCE));
     assert_eq!(by_uuid.body["content"], json!({ "name": "first" }));
@@ -912,9 +935,15 @@ async fn a_revision_is_readable_through_the_entity_route() {
     assert_eq!(operation.body["items"][0]["status"], json!("succeeded"));
     assert_eq!(operation.body["items"][0]["resource_version"], json!(2));
 
-    let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    let entity = call(
+        &router,
+        get(&format!(
+            "{V2}/entities/{CF_TYPE}?$select=origin,content,resolved_schema"
+        )),
+    )
+    .await;
     assert_eq!(entity.status, StatusCode::OK);
-    assert_eq!(entity.body["resource_version"], json!(2));
+    assert_eq!(entity.body["origin"]["resource_version"], json!(2));
     assert_eq!(entity.body["content"]["title"], json!("revised"));
     assert_eq!(
         entity.body["resolved_schema"]["title"],
@@ -947,7 +976,7 @@ async fn unchanged_content_reports_unchanged_on_the_operation() {
     assert_eq!(item["resource_version"], json!(1));
 
     let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
-    assert_eq!(entity.body["resource_version"], json!(1));
+    assert_eq!(entity.body["origin"]["resource_version"], json!(1));
 }
 
 /// An absent operation and an absent entity are both `404` problem documents
@@ -1935,7 +1964,7 @@ async fn the_two_deletion_spellings_agree_on_a_version_mismatch() {
 
     let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.body["lifecycle_status"], json!("active"));
-    assert_eq!(entity.body["resource_version"], json!(1));
+    assert_eq!(entity.body["origin"]["resource_version"], json!(1));
 }
 
 #[tokio::test]
@@ -1985,7 +2014,7 @@ async fn a_dry_run_deletion_predicts_and_the_commit_performs() {
             "{idempotency_key} must leave the entity alone",
         );
         assert_eq!(
-            entity.body["resource_version"],
+            entity.body["origin"]["resource_version"],
             json!(1),
             "{idempotency_key} must not advance resource_version",
         );
@@ -2046,7 +2075,7 @@ async fn a_dry_run_registration_reaches_a_terminal_outcome_and_writes_nothing() 
     );
     let entity = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
     assert_eq!(entity.status, StatusCode::OK);
-    assert_eq!(entity.body["resource_version"], json!(1));
+    assert_eq!(entity.body["origin"]["resource_version"], json!(1));
 }
 
 #[tokio::test]
@@ -2272,7 +2301,11 @@ async fn every_mutation_reaches_a_terminal_outcome_through_the_outbox() {
             (Mutation::Register, false) => {
                 assert_eq!(entity.status, StatusCode::OK, "{case}: {:?}", entity.body);
                 assert_eq!(entity.body["lifecycle_status"], json!("active"), "{case}");
-                assert_eq!(entity.body["resource_version"], json!(1), "{case}");
+                assert_eq!(
+                    entity.body["origin"]["resource_version"],
+                    json!(1),
+                    "{case}"
+                );
             }
             (Mutation::Register, true) => {
                 assert_eq!(
@@ -2293,7 +2326,7 @@ async fn every_mutation_reaches_a_terminal_outcome_through_the_outbox() {
                     "{case}: a predicted deletion leaves the entity alone",
                 );
                 assert_eq!(
-                    entity.body["resource_version"],
+                    entity.body["origin"]["resource_version"],
                     json!(1),
                     "{case}: and does not advance resource_version",
                 );
@@ -2375,7 +2408,7 @@ async fn the_operation_polling_response_refuses_to_be_cached() {
     );
 }
 // ---------------------------------------------------------------------------
-// The two read routes: `:batchGet` and content-free discovery (T22a)
+// The two read routes: `:batchGet` and discovery (T22a)
 // ---------------------------------------------------------------------------
 //
 // Both are driven through `register_routes` like every other case here, so the
@@ -2461,11 +2494,11 @@ async fn a_batch_read_answers_every_key_including_the_absent_one() {
     let router = router_with_db().await;
     register_type_and_instance(&router).await;
 
-    let response = call(
-        &router,
-        batch_get(&keys(&[CF_ABSENT_TYPE, CF_TYPE, CF_INSTANCE])),
-    )
-    .await;
+    let mut body = keys(&[CF_ABSENT_TYPE, CF_TYPE, CF_INSTANCE]);
+    body["$select"] = json!(
+        "gts_id,kind,origin,content,resolved_schema,effective_traits,effective_traits_schema"
+    );
+    let response = call(&router, batch_get(&body)).await;
 
     assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
     let items = response.body["items"].as_array().expect("items").to_owned();
@@ -2484,13 +2517,13 @@ async fn a_batch_read_answers_every_key_including_the_absent_one() {
     let schema = &items[1]["entity"];
     assert_eq!(schema["gts_id"], json!(CF_TYPE));
     assert_eq!(schema["kind"], json!("type_schema"));
-    assert_eq!(schema["resource_version"], json!(1));
+    assert_eq!(schema["origin"]["resource_version"], json!(1));
     assert!(
         schema["content"].is_object()
             && schema["resolved_schema"].is_object()
             && schema["effective_traits"].is_object()
             && schema["effective_traits_schema"].is_object(),
-        "a batch read returns the full representation, D3 artifacts included: {schema:?}",
+        "a batch read returns every selected document, D3 artifacts included: {schema:?}",
     );
 
     assert_eq!(items[2]["key"], json!(CF_INSTANCE));
@@ -2645,7 +2678,7 @@ async fn a_batch_read_is_bounded_at_its_ceiling() {
     assert_field_refusal(&past_ceiling, "items", "VALIDATION_FAILED");
 }
 
-// --- content-free discovery -------------------------------------------------
+// --- discovery ---------------------------------------------------------------
 
 /// A page carries identity and metadata only: no authored content and none of D3's
 /// artifacts (§8.5, D12). Ordering is by canonical identifier.
@@ -2665,22 +2698,12 @@ async fn a_discovery_page_is_content_free_and_ordered_by_identifier() {
     );
     assert_eq!(response.body["page_info"]["limit"], json!(100));
     for item in response.body["items"].as_array().expect("items") {
-        assert!(item["gts_uuid"].is_string(), "{item:?}");
-        assert!(item["kind"].is_string(), "{item:?}");
-        assert!(item["resource_version"].is_number(), "{item:?}");
-        assert!(item["created_at"].is_string(), "{item:?}");
-        for absent in [
-            "content",
-            "resolved_schema",
-            "effective_traits",
-            "effective_traits_schema",
-            "etag",
-        ] {
-            assert!(
-                item.get(absent).is_none(),
-                "a discovery page must not carry `{absent}`: {item:?}",
-            );
-        }
+        assert_eq!(
+            field_names(item),
+            DEFAULT_FIELDS,
+            "the default page is the document-free default set, no validator: {item:?}",
+        );
+        assert_eq!(item["origin"]["type"], json!("managed"), "{item:?}");
     }
 }
 
@@ -2809,17 +2832,6 @@ async fn a_cursor_is_refused_under_a_different_pattern() {
     .await;
 
     assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
-}
-
-/// `$select` is refused, not ignored: a caller that asked for one field must not be
-/// answered with the whole default set (§10.2, `principle-fail-closed`).
-#[tokio::test]
-async fn select_is_refused_naming_the_parameter() {
-    let router = router_with_db().await;
-
-    let response = call(&router, discover("?$select=gts_id")).await;
-
-    assert_field_refusal(&response, "$select", "VALIDATION_FAILED");
 }
 
 /// The pattern is compiled by `gts-rust`, and a string it refuses is a `400` naming
@@ -2974,12 +2986,21 @@ fn the_discovery_query_parameters_are_declared() {
             None,
             None,
         ),
+        (
+            "$select".to_owned(),
+            ParamLocation::Query,
+            false,
+            "string".to_owned(),
+            None,
+            None,
+        ),
     ] {
         assert!(
             declared.contains(&expected),
             "missing parameter {expected:?}: {declared:?}",
         );
     }
+    assert_eq!(declared.len(), 4, "nothing else is declared: {declared:?}");
 }
 
 /// Every one of the seven v2 operations answers with RFC-9457 problems, so a
@@ -3028,7 +3049,7 @@ fn all_seven_v2_operations_declare_problem_responses() {
 /// Returns their identifiers in byte order.
 ///
 /// The admission path is the subject of every other test here; these cases are
-/// about paging over rows, and a content-free page reads nothing but `entity`.
+/// about paging over rows.
 async fn seed_entities(db: &Arc<DBProvider<DbError>>, count: u32) -> Vec<String> {
     let ids: Vec<String> = (0..count)
         .map(|i| format!("{}cf.core.example.seed.v{}~", gts::GTS_ID_PREFIX, i + 1))
@@ -3043,8 +3064,8 @@ async fn seed_entities(db: &Arc<DBProvider<DbError>>, count: u32) -> Vec<String>
 /// Insert the given identifiers as active global Type Schemas of one family.
 async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
     use types_registry::domain::enums::{EntityKind, OwnershipScope};
-    use types_registry::domain::ports::NewEntity;
-    use types_registry::infra::storage::repo::{EntityRepo, VersionFamilyRepo};
+    use types_registry::domain::ports::{NewEntity, NewRevision};
+    use types_registry::infra::storage::repo::{EntityRepo, TypeSchemaRepo, VersionFamilyRepo};
 
     let now = time::OffsetDateTime::now_utc();
     let owned: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
@@ -3062,7 +3083,7 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
             .await
             .expect("family");
             for id in &owned {
-                EntityRepo::insert(
+                let row = EntityRepo::insert(
                     tx,
                     &scope,
                     NewEntity {
@@ -3077,11 +3098,634 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
                     },
                 )
                 .await
-                .unwrap_or_else(|e| panic!("seed {id}: {e}"));
+                .unwrap_or_else(|e| panic!("seed {id}: {e}"))
+                .expect("a fresh identifier inserts");
+                // A discovery page reads `content_hash` off the current revision, so a
+                // seeded row needs the same current state admission would write.
+                let item = common::seed_operation_item(tx, id, 1, now).await;
+                let document = serde_json::to_string(&schema(id)).expect("schema json");
+                TypeSchemaRepo::insert_revision(
+                    tx,
+                    &scope,
+                    NewRevision {
+                        entity_id: row.id,
+                        revision_no: 1,
+                        content_hash: types_registry::domain::artifacts::content_hash(&document),
+                        raw_schema: document.clone(),
+                        gts_spec_version: gts::GTS_SPECIFICATION_VERSION.to_owned(),
+                        gts_impl_version: gts::GTS_IMPLEMENTATION_VERSION.to_owned(),
+                        compat_forced: false,
+                        operation_item_id: item,
+                        now,
+                    },
+                )
+                .await
+                .expect("seed revision");
+                common::seed_current_type_schema(tx, row.id, 1, &document, now).await;
             }
             Ok::<(), DbError>(())
         })
     })
     .await
     .expect("seed entity rows");
+}
+
+// ---------------------------------------------------------------------------
+// `$select` on the exact read and `:batchGet` (T22b)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_FIELDS: [&str; 6] = [
+    "content_hash",
+    "gts_id",
+    "gts_uuid",
+    "kind",
+    "lifecycle_status",
+    "origin",
+];
+
+fn exact(key: &str, query: &str) -> Request<Body> {
+    get(&format!("{V2}/entities/{key}{query}"))
+}
+
+/// A batch read of `keys` under one body `$select`.
+fn selective_batch(keys_: &[&str], select: &str) -> Request<Body> {
+    let mut body = keys(keys_);
+    body["$select"] = json!(select);
+    batch_get(&body)
+}
+
+fn field_names(entity: &Value) -> Vec<String> {
+    let mut names: Vec<String> = entity
+        .as_object()
+        .expect("an entity is an object")
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn an_absent_select_returns_the_document_free_default_on_both_routes() {
+    let (router, db) = router_and_db().await;
+    register_type_and_instance(&router).await;
+
+    for key in [CF_TYPE, CF_INSTANCE] {
+        let single = call(&router, exact(key, "")).await;
+        assert_eq!(single.status, StatusCode::OK, "{:?}", single.body);
+        assert_eq!(field_names(&single.body), DEFAULT_FIELDS, "{key}");
+
+        let batch = call(&router, batch_get(&keys(&[key]))).await;
+        assert_eq!(
+            batch.body["items"][0]["entity"], single.body,
+            "one key answers identically on both routes: {key}",
+        );
+
+        let explicit = call(
+            &router,
+            exact(
+                key,
+                "?$select=gts_id,gts_uuid,kind,origin,lifecycle_status,content_hash",
+            ),
+        )
+        .await;
+        assert_eq!(explicit.body, single.body, "absent equals explicit default");
+    }
+
+    let schema = call(&router, exact(CF_TYPE, "")).await.body;
+    let origin = &schema["origin"];
+    assert_eq!(origin["type"], json!("managed"));
+    assert_eq!(origin["resource_version"], json!(1));
+    for stamp in ["created_at", "updated_at"] {
+        let text = origin[stamp].as_str().expect("an RFC 3339 timestamp");
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|e| panic!("{stamp} {text}: {e}"));
+    }
+    assert_eq!(
+        field_names(origin),
+        ["created_at", "resource_version", "type", "updated_at"],
+    );
+
+    let hash = schema["content_hash"].as_str().expect("hex content_hash");
+    assert_eq!(hash.len(), 16, "{hash}");
+    assert!(
+        hash.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    );
+    assert_eq!(hash, stored_content_hash_hex(&db, CF_TYPE).await);
+}
+
+/// The stored eight bytes, hex-encoded independently of the read path.
+async fn stored_content_hash_hex(db: &Arc<DBProvider<DbError>>, gts_id: &str) -> String {
+    use types_registry::infra::storage::repo::{EntityRepo, TypeSchemaRepo};
+    let conn = db.conn().expect("conn");
+    let scope = common::allow_all();
+    let row = EntityRepo::find_by_gts_id(&conn, &scope, gts_id)
+        .await
+        .expect("read")
+        .expect("entity");
+    let docs = TypeSchemaRepo::current_documents(&conn, &scope, &[row.id])
+        .await
+        .expect("documents");
+    docs[0]
+        .content_hash
+        .iter()
+        .fold(String::new(), |mut hex, b| {
+            use std::fmt::Write as _;
+            write!(hex, "{b:02x}").expect("write to a String");
+            hex
+        })
+}
+
+#[tokio::test]
+async fn each_document_is_selected_alone() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+
+    for field in [
+        "content",
+        "resolved_schema",
+        "effective_traits",
+        "effective_traits_schema",
+    ] {
+        let response = call(&router, exact(CF_TYPE, &format!("?$select={field}"))).await;
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+        let mut expected = vec![field, "lifecycle_status"];
+        expected.sort_unstable();
+        assert_eq!(field_names(&response.body), expected, "{field}");
+        assert!(
+            response.body[field].is_object(),
+            "{field}: {:?}",
+            response.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_mixed_batch_omits_type_schema_documents_on_the_instance() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+
+    let response = call(
+        &router,
+        selective_batch(&[CF_TYPE, CF_INSTANCE], "kind,content,resolved_schema"),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    let schema = &response.body["items"][0]["entity"];
+    let instance = &response.body["items"][1]["entity"];
+    assert_eq!(
+        field_names(schema),
+        ["content", "kind", "lifecycle_status", "resolved_schema"]
+    );
+    assert_eq!(
+        field_names(instance),
+        ["content", "kind", "lifecycle_status"],
+        "an inapplicable document is absent, not null",
+    );
+    assert_eq!(instance["content"], json!({ "name": "first" }));
+}
+
+#[tokio::test]
+async fn provenance_is_one_group_and_null_where_inapplicable() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+
+    let response = call(
+        &router,
+        selective_batch(&[CF_TYPE, CF_INSTANCE], "provenance"),
+    )
+    .await;
+    let schema = &response.body["items"][0]["entity"]["provenance"];
+    let instance = &response.body["items"][1]["entity"]["provenance"];
+    for provenance in [schema, instance] {
+        assert_eq!(
+            field_names(provenance),
+            [
+                "compat_forced",
+                "gts_impl_version",
+                "gts_spec_version",
+                "owning_gear"
+            ],
+        );
+        assert!(provenance["gts_spec_version"].is_string(), "{provenance:?}");
+        assert!(provenance["gts_impl_version"].is_string(), "{provenance:?}");
+    }
+    assert_eq!(schema["compat_forced"], json!(false));
+    assert!(
+        instance["compat_forced"].is_null(),
+        "an Instance has nothing to waive: {instance:?}",
+    );
+}
+
+/// `lifecycle_status` is mandatory, so a projected tombstone is not an absence.
+#[tokio::test]
+async fn a_tombstone_selected_for_content_still_reports_its_lifecycle() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+    let deleted = call(
+        &router,
+        delete_one(Some("delete"), CF_TYPE, "?expected_resource_version=1"),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED, "{:?}", deleted.body);
+
+    let single = call(&router, exact(CF_TYPE, "?$select=content")).await;
+    assert_eq!(single.status, StatusCode::OK, "{:?}", single.body);
+    assert_eq!(field_names(&single.body), ["content", "lifecycle_status"]);
+    assert_eq!(single.body["lifecycle_status"], json!("deleted"));
+    let batch = call(&router, selective_batch(&[CF_TYPE], "content")).await;
+    assert_eq!(batch.body["items"][0]["status"], json!("found"));
+    assert_eq!(batch.body["items"][0]["entity"], single.body);
+}
+
+#[tokio::test]
+async fn an_absent_key_is_404_exact_and_not_found_in_a_batch_under_any_selection() {
+    let router = router_with_db().await;
+    let single = call(&router, exact(CF_ABSENT_TYPE, "?$select=content")).await;
+    assert_eq!(single.status, StatusCode::NOT_FOUND, "{:?}", single.body);
+    let batch = call(&router, selective_batch(&[CF_ABSENT_TYPE], "content")).await;
+    assert_eq!(batch.body["items"][0]["status"], json!("not_found"));
+    assert!(batch.body["items"][0].get("entity").is_none());
+}
+
+/// One normalization, one projection: every selection answers one key identically.
+#[tokio::test]
+async fn exact_and_batch_reads_agree_for_every_selection() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+    let uuid = gts::GtsId::try_new(CF_TYPE).expect("identifier").to_uuid();
+
+    for select in [
+        "gts_id",
+        "content,provenance",
+        "RESOLVED_SCHEMA, effective_traits",
+        "content,content_hash,effective_traits,effective_traits_schema,gts_id,gts_uuid,kind,\
+         lifecycle_status,origin,provenance,resolved_schema",
+    ] {
+        for key in [CF_TYPE.to_owned(), CF_INSTANCE.to_owned(), uuid.to_string()] {
+            let query = format!("?$select={}", select.replace(' ', "%20"));
+            let single = call(&router, exact(&key, &query)).await;
+            assert_eq!(
+                single.status,
+                StatusCode::OK,
+                "{select} {key}: {:?}",
+                single.body
+            );
+            let batch = call(&router, selective_batch(&[&key], select)).await;
+            assert_eq!(
+                batch.body["items"][0]["entity"], single.body,
+                "{select} {key}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_selections_are_refused_on_both_routes() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+
+    for select in [
+        "",
+        "content,,kind",
+        "content,",
+        "content,Content",
+        "contents",
+        "availability",
+        "owned_by_context_tenant",
+        "content.title",
+        "effective/resolved_schema",
+        "key",
+    ] {
+        let query = format!("?$select={select}");
+        let single = call(&router, exact(CF_TYPE, &query)).await;
+        assert_eq!(
+            single.status,
+            StatusCode::BAD_REQUEST,
+            "{select:?}: {:?}",
+            single.body
+        );
+        assert_eq!(
+            single.body["context"]["field_violations"][0]["field"],
+            json!("$select"),
+            "{select:?}: {:?}",
+            single.body,
+        );
+        let batch = call(&router, selective_batch(&[CF_TYPE], select)).await;
+        assert_field_refusal(&batch, "$select", "INVALID_SELECT");
+    }
+}
+
+/// Parameters a route does not declare are refused, not silently ignored.
+#[tokio::test]
+async fn undeclared_query_parameters_are_refused_on_both_routes() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange", CF_TYPE).await;
+
+    for (query, field) in [
+        ("?pattern=gts.cf.*", "pattern"),
+        ("?kind=type", "kind"),
+        ("?is_schema=true", "is_schema"),
+        ("?limit=1", "limit"),
+        ("?$top=1", "$top"),
+        ("?$filter=gts_id%20eq%20'x'", "$filter"),
+        ("?$orderby=gts_id", "$orderby"),
+        ("?$skip=1", "$skip"),
+        ("?$expand=content", "$expand"),
+    ] {
+        let single = call(&router, exact(CF_TYPE, query)).await;
+        assert_field_refusal(&single, field, "UNSUPPORTED_QUERY_PARAM");
+    }
+
+    let repeated = call(&router, exact(CF_TYPE, "?$select=content&$select=kind")).await;
+    assert_field_refusal(&repeated, "$select", "VALIDATION_FAILED");
+
+    let in_query = post(
+        &format!("{V2}/entities:batchGet?$select=content"),
+        &keys(&[CF_TYPE]),
+    );
+    let refused = call(&router, in_query).await;
+    assert_field_refusal(&refused, "$select", "UNSUPPORTED_QUERY_PARAM");
+}
+
+/// A misspelled body field would otherwise be answered with the default set.
+#[tokio::test]
+async fn unknown_batch_body_fields_are_refused() {
+    let router = router_with_db().await;
+    for (body, field) in [
+        (
+            json!({ "items": [{ "key": CF_TYPE }], "select": "content" }),
+            "select",
+        ),
+        (
+            json!({ "items": [{ "key": CF_TYPE, "$select": "content" }] }),
+            "$select",
+        ),
+    ] {
+        let response = call(&router, batch_get(&body)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}: {:?}",
+            response.body,
+        );
+        assert!(
+            format!("{:?}", response.body).contains(field),
+            "the refusal names the field: {:?}",
+            response.body,
+        );
+    }
+}
+
+#[test]
+fn the_exact_read_declares_select() {
+    let openapi = TestOpenApi::default();
+    let _router = router_for_openapi(&openapi);
+    let params = openapi.params.lock().expect("params lock");
+    let (_, declared) = params
+        .iter()
+        .find(|(id, _)| id == "types_registry.get_entity")
+        .expect("exact read registered");
+    let names: Vec<&str> = declared
+        .iter()
+        .filter(|p| p.1 == ParamLocation::Query)
+        .map(|p| p.0.as_str())
+        .collect();
+    assert_eq!(names, ["$select"]);
+}
+
+fn router_for_openapi(openapi: &TestOpenApi) -> Router {
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    types_registry::api::rest::routes::register_routes(Router::new(), openapi, legacy, None)
+}
+
+// ---------------------------------------------------------------------------
+// `$select` on discovery and its cursor binding (T22b)
+// ---------------------------------------------------------------------------
+
+/// Walk every page under `query`, returning the pages' items in order.
+async fn traverse(router: &Router, query: &str) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut next: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &next {
+            Some(cursor) => format!("{query}&cursor={cursor}"),
+            None => query.to_owned(),
+        };
+        let page = call(router, discover(&uri)).await;
+        assert_eq!(page.status, StatusCode::OK, "{uri}: {:?}", page.body);
+        items.extend(
+            page.body["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .cloned(),
+        );
+        match page.body["page_info"]["next_cursor"].as_str() {
+            Some(cursor) => next = Some(cursor.to_owned()),
+            None => return items,
+        }
+    }
+    panic!("the traversal did not end: {query}");
+}
+
+#[tokio::test]
+async fn discovery_projects_selected_documents_across_pages() {
+    let router = router_with_db().await;
+    register_entity(&router, "arrange-other", CF_OTHER_TYPE).await;
+    register_type_and_instance(&router).await;
+
+    let items = traverse(&router, "?limit=1&$select=gts_id,content,resolved_schema").await;
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["gts_id"].as_str().expect("selected gts_id"))
+            .collect::<Vec<_>>(),
+        [CF_OTHER_TYPE, CF_TYPE, CF_INSTANCE],
+        "every active entity exactly once, in canonical order",
+    );
+    for item in &items[..2] {
+        assert_eq!(
+            field_names(item),
+            ["content", "gts_id", "lifecycle_status", "resolved_schema"]
+        );
+        assert!(item["content"].is_object() && item["resolved_schema"].is_object());
+    }
+    assert_eq!(
+        field_names(&items[2]),
+        ["content", "gts_id", "lifecycle_status"],
+        "the Instance has no resolved_schema",
+    );
+
+    let exact = call(
+        &router,
+        exact(CF_INSTANCE, "?$select=gts_id,content,resolved_schema"),
+    )
+    .await;
+    assert_eq!(
+        items[2], exact.body,
+        "a page item is the exact read's projection"
+    );
+}
+
+#[tokio::test]
+async fn a_page_under_a_metadata_only_selection_carries_only_it() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+    let page = call(&router, discover("?$select=gts_uuid")).await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    for item in page.body["items"].as_array().expect("items") {
+        assert_eq!(field_names(item), ["gts_uuid", "lifecycle_status"]);
+    }
+}
+
+async fn first_cursor(router: &Router, query: &str) -> String {
+    let page = call(router, discover(query)).await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    page.body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a one-item page of three carries a cursor")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_cursor_is_refused_under_a_different_selection() {
+    let (router, db) = router_and_db().await;
+    _ = seed_entities(&db, 3).await;
+
+    for (issued, resumed) in [
+        ("?limit=1", "?limit=1&$select=content"),
+        ("?limit=1&$select=content", "?limit=1"),
+        ("?limit=1&$select=content", "?limit=1&$select=content,kind"),
+        ("?limit=1&$select=gts_id", "?limit=1&$select=gts_uuid"),
+    ] {
+        let cursor = first_cursor(&router, issued).await;
+        let response = call(&router, discover(&format!("{resumed}&cursor={cursor}"))).await;
+        assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
+    }
+}
+
+/// The cursor binds the normalized set, never its spelling: resuming under an
+/// equivalent spelling answers exactly what resuming under the original does.
+#[tokio::test]
+async fn equivalent_selections_resume_one_traversal() {
+    let (router, db) = router_and_db().await;
+    _ = seed_entities(&db, 3).await;
+
+    for (issued, equivalent) in [
+        (
+            "?limit=1",
+            "?limit=1&$select=gts_id,gts_uuid,kind,origin,lifecycle_status,content_hash",
+        ),
+        (
+            "?limit=1&$select=content_hash,origin,lifecycle_status,kind,gts_uuid,gts_id",
+            "?limit=1",
+        ),
+        (
+            "?limit=1&$select=gts_uuid,content",
+            "?limit=1&$select=Content,%20GTS_UUID,lifecycle_status",
+        ),
+    ] {
+        let cursor = first_cursor(&router, issued).await;
+        let original = call(&router, discover(&format!("{issued}&cursor={cursor}"))).await;
+        let respelled = call(&router, discover(&format!("{equivalent}&cursor={cursor}"))).await;
+        assert_eq!(
+            original.status,
+            StatusCode::OK,
+            "{issued}: {:?}",
+            original.body
+        );
+        assert_eq!(
+            respelled.status,
+            StatusCode::OK,
+            "{equivalent}: {:?}",
+            respelled.body
+        );
+        assert_eq!(
+            original.body["items"].as_array().map(Vec::len),
+            Some(1),
+            "{issued}: {:?}",
+            original.body,
+        );
+        assert_eq!(
+            respelled.body, original.body,
+            "{issued} -> {equivalent}: same items and same next_cursor",
+        );
+    }
+}
+
+#[tokio::test]
+async fn toolkit_spellings_of_limit_and_cursor_are_one_slot_each() {
+    let (router, db) = router_and_db().await;
+    let seeded = seed_entities(&db, 3).await;
+
+    let page = call(&router, discover("?$top=1")).await;
+    assert_eq!(page_ids(&page.body), seeded[..1]);
+    let cursor = page.body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("cursor")
+        .to_owned();
+    let next = call(&router, discover(&format!("?$top=1&$skiptoken={cursor}"))).await;
+    assert_eq!(page_ids(&next.body), seeded[1..2]);
+
+    for (query, field) in [
+        ("?limit=1&$top=1".to_owned(), "$top"),
+        (
+            format!("?cursor={cursor}&$skiptoken={cursor}"),
+            "$skiptoken",
+        ),
+        ("?limit=1&limit=2".to_owned(), "limit"),
+        ("?pattern=a&pattern=b".to_owned(), "pattern"),
+    ] {
+        let response = call(&router, discover(&query)).await;
+        assert_field_refusal(&response, field, "VALIDATION_FAILED");
+    }
+    let zero = call(&router, discover("?$top=0")).await;
+    assert_field_refusal(&zero, "$top", "VALIDATION_FAILED");
+}
+
+#[tokio::test]
+async fn discovery_refuses_undeclared_and_unsupported_parameters() {
+    let router = router_with_db().await;
+
+    for (query, field) in [
+        ("?$filter=gts_id%20eq%20'x'", "$filter"),
+        ("?$orderby=gts_id", "$orderby"),
+        ("?$skip=1", "$skip"),
+        ("?$count=true", "$count"),
+        ("?$expand=content", "$expand"),
+        ("?$filtre=x", "$filtre"),
+        ("?is_schema=true", "is_schema"),
+        ("?vendor=cf", "vendor"),
+        ("?package=core", "package"),
+        ("?namespace=example", "namespace"),
+        ("?segmentScope=any", "segmentScope"),
+        ("?segment_scope=any", "segment_scope"),
+    ] {
+        let response = call(&router, discover(query)).await;
+        assert_field_refusal(&response, field, "UNSUPPORTED_QUERY_PARAM");
+    }
+
+    for select in [
+        "",
+        "content,,kind",
+        "availability",
+        "content.title",
+        "kind,KIND",
+        "nope",
+    ] {
+        let response = call(&router, discover(&format!("?$select={select}"))).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{select:?}");
+        assert_eq!(
+            response.body["context"]["field_violations"][0]["field"],
+            json!("$select"),
+            "{select:?}: {:?}",
+            response.body,
+        );
+    }
 }

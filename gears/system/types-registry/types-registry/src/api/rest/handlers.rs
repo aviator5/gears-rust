@@ -9,12 +9,14 @@ use toolkit::api::canonical_prelude::*;
 use toolkit::api::rest::extract;
 use uuid::Uuid;
 
+use super::cursor::Binding;
 use super::dto::{
-    BatchGetRequest, DeleteEntitiesRequest, DeleteEntityQuery, DiscoverEntitiesQuery, EntityDto,
-    EntityLookupDto, EntityLookupsDto, EntityPageDto, GtsEntityDto, ListEntitiesQuery,
-    ListEntitiesResponse, OperationAcceptedDto, OperationDto, PageInfoDto, RegisterEntitiesRequest,
+    BatchGetRequest, DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, EntityLookupDto,
+    EntityLookupsDto, EntityPageDto, GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse,
+    OperationAcceptedDto, OperationDto, PageInfoDto, RegisterEntitiesRequest,
     RegisterEntitiesResponse, RegisterResultDto, RegisterSummaryDto, SubmitEntitiesRequest,
 };
+use super::params::{DiscoveryParams, ExactReadSelection, NoQuery};
 use super::paths::V2;
 use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
 use crate::domain::enums::OperationKind;
@@ -338,11 +340,12 @@ fn no_store() -> HeaderMap {
 pub async fn get_entity_by_key(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
     extract::Path(key): extract::Path<String>,
+    ExactReadSelection(selection): ExactReadSelection,
 ) -> ApiResult<Json<EntityDto>> {
     let service = require_registry(service)?;
     let parsed = EntityKey::parse(&key);
     let record = service
-        .entity(&parsed)
+        .entity(&parsed, selection)
         .await
         .map_err(CanonicalError::from)?
         .ok_or_else(|| CanonicalError::from(DomainError::not_found_by_id(key)))?;
@@ -360,9 +363,11 @@ pub async fn get_entity_by_key(
 pub async fn batch_get_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
     headers: HeaderMap,
+    _: NoQuery,
     extract::Json(req): extract::Json<BatchGetRequest>,
 ) -> ApiResult<Json<EntityLookupsDto>> {
     let service = require_registry(service)?;
+    let selection = super::select::parse(req.select.as_deref())?;
     // Refused before the read, not ignored: a caller that sent one believes its
     // request is conditional, and answering `200` with full snapshots would be
     // answering a different question.
@@ -396,7 +401,7 @@ pub async fn batch_get_entities(
     }
 
     let results = service
-        .batch_get(&keys)
+        .batch_get(&keys, selection)
         .await
         .map_err(CanonicalError::from)?;
 
@@ -417,62 +422,43 @@ pub async fn batch_get_entities(
 
 /// `GET /types-registry/v2/entities`
 ///
-/// One bounded, content-free page ordered by canonical identifier, plus the cursor
-/// for the next one (D12).
+/// One bounded page ordered by canonical identifier, projected by `$select`, plus
+/// the cursor for the next one (D12).
 pub async fn discover_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
-    extract::Query(query): extract::Query<DiscoverEntitiesQuery>,
+    params: DiscoveryParams,
 ) -> ApiResult<Json<EntityPageDto>> {
     let service = require_registry(service)?;
-    if query.select.is_some() {
-        return Err(super::error::select_not_supported());
-    }
-
-    // Both bounds are enforced before any decoding or compilation, so an
-    // arbitrarily large string cannot enter the GTS pattern compiler or the
-    // base64url decoder. Pattern shares the 1024-byte GTS identifier ceiling;
-    // the cursor is base64url-encoded JSON, so 4096 bytes is a generous bound
-    // that a real cursor token cannot approach.
-    if let Some(p) = &query.pattern
-        && p.len() > 1024
-    {
-        return Err(super::error::pattern_too_long(p.len()));
-    }
-    if let Some(c) = &query.cursor
-        && c.len() > 4096
-    {
-        return Err(super::error::cursor_too_long(c.len()));
-    }
-
-    let after = query
+    let binding = Binding {
+        pattern: params.pattern.as_deref(),
+        selection: params.selection,
+    };
+    let after = params
         .cursor
         .as_deref()
-        .map(|token| super::cursor::decode(token, query.pattern.as_deref()))
+        .map(|token| super::cursor::decode(token, &binding))
         .transpose()?;
 
     let page = service
         .discover(&DiscoveryQuery {
-            pattern: query.pattern.clone(),
+            pattern: params.pattern.clone(),
             after,
-            limit: query.limit,
+            limit: params.limit,
+            selection: params.selection,
         })
         .await
         .map_err(CanonicalError::from)?;
 
-    // A cursor only where the traversal has more to give, so its absence is the
-    // one end-of-traversal signal. `has_more` may over-report, which costs the
-    // caller one empty page rather than a lost row.
+    // `has_more` may over-report, which costs the caller one empty page rather
+    // than a lost row.
     let next_cursor = match (page.has_more, page.next_after.as_deref()) {
-        (true, Some(after)) => Some(super::cursor::encode(after, query.pattern.as_deref())?),
+        (true, Some(after)) => Some(super::cursor::encode(after, &binding)?),
         _ => None,
     };
     Ok(Json(EntityPageDto {
         items: page.items.into_iter().map(Into::into).collect(),
         page_info: PageInfoDto {
             next_cursor,
-            // The page reports the size it was read at, which is the configured
-            // default when the caller named none. A handler must not read
-            // `limits.page_size_default` to fill this in (SPEC §8.4).
             limit: page.limit,
         },
     }))

@@ -10,8 +10,9 @@ use crate::domain::enums::{
 };
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
 use crate::domain::registry_service::{
-    EntityLookup, EntityRecord, EntitySummary, OperationItemRecord, OperationRecord,
+    EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
 };
+use crate::domain::selection::EntityField;
 
 /// DTO for a GTS ID segment.
 #[derive(Debug, Clone)]
@@ -221,6 +222,76 @@ mod tests {
     use super::*;
     use gts::GtsIdSegment;
     use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+
+    fn schema_json<T: utoipa::PartialSchema>() -> serde_json::Value {
+        serde_json::to_value(T::schema()).expect("a schema serializes")
+    }
+
+    /// `OpenAPI` must say what `$select` does: only `lifecycle_status` is always
+    /// present, metadata is never `null`, and a selected document may be `null`.
+    #[test]
+    fn the_entity_schema_declares_projection_accurately() {
+        let schema = schema_json::<EntityDto>();
+        assert_eq!(schema["required"], serde_json::json!(["lifecycle_status"]));
+        let properties = &schema["properties"];
+        for field in ["gts_id", "gts_uuid", "content_hash"] {
+            assert_eq!(properties[field]["type"], "string", "{field}: {properties}");
+        }
+        assert_eq!(properties["content_hash"]["pattern"], "^[0-9a-f]{16}$");
+        for field in [
+            "content",
+            "resolved_schema",
+            "effective_traits",
+            "effective_traits_schema",
+        ] {
+            // Any JSON value, `null` included: no `type` narrows it.
+            assert!(
+                properties[field].get("type").is_none(),
+                "{field}: {}",
+                properties[field]
+            );
+        }
+    }
+
+    #[test]
+    fn unselected_fields_are_omitted_and_a_selected_null_is_kept() {
+        let dto = EntityDto {
+            gts_id: None,
+            gts_uuid: None,
+            kind: None,
+            origin: None,
+            lifecycle_status: LifecycleStatusDto::Deleted,
+            content_hash: None,
+            content: Some(serde_json::Value::Null),
+            resolved_schema: None,
+            effective_traits: None,
+            effective_traits_schema: None,
+            provenance: None,
+        };
+        assert_eq!(
+            serde_json::to_value(dto).expect("serialize"),
+            serde_json::json!({ "lifecycle_status": "deleted", "content": null }),
+        );
+    }
+
+    #[test]
+    fn origin_is_internally_tagged_with_rfc3339_timestamps() {
+        let at = time::macros::datetime!(2026-09-23 10:00:00 UTC);
+        let origin = OriginDto::Managed {
+            resource_version: 3,
+            created_at: at,
+            updated_at: at,
+        };
+        assert_eq!(
+            serde_json::to_value(origin).expect("serialize"),
+            serde_json::json!({
+                "type": "managed",
+                "resource_version": 3,
+                "created_at": "2026-09-23T10:00:00Z",
+                "updated_at": "2026-09-23T10:00:00Z",
+            }),
+        );
+    }
 
     #[test]
     fn operation_item_error_preserves_reason_and_message() -> Result<(), serde_json::Error> {
@@ -598,28 +669,77 @@ pub struct OperationDto {
     pub items: Vec<OperationItemDto>,
 }
 
-/// One entity with its authored content and the artifacts materialized at
-/// admission (D3). No consumer recomputes an effective form.
+/// One entity, projected by `$select` (SPEC §10.2).
+///
+/// An unselected field is omitted; a selected document that is JSON `null` stays
+/// present as `null`. `lifecycle_status` is mandatory, so a projected tombstone
+/// is never mistaken for an absence. The three artifacts are absent on an
+/// Instance.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EntityDto {
-    pub gts_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub gts_id: Option<String>,
     /// The Registry Reference: a deterministic `UUIDv5` of the identifier.
-    pub gts_uuid: Uuid,
-    pub kind: EntityKindDto,
-    /// A tombstone stays exact-readable and only leaves discovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub gts_uuid: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub kind: Option<EntityKindDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub origin: Option<OriginDto>,
+    /// Always present. A tombstone stays exact-readable and only leaves discovery.
     pub lifecycle_status: LifecycleStatusDto,
-    pub resource_version: i64,
+    /// Sixteen lowercase hex digits of the non-cryptographic content digest; a
+    /// prefilter, not proof that two documents are equal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, pattern = "^[0-9a-f]{16}$")]
+    pub content_hash: Option<String>,
+    /// The whole authored document, either kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
+    /// Type Schemas only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_schema: Option<serde_json::Value>,
+    /// Type Schemas only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_traits: Option<serde_json::Value>,
+    /// Type Schemas only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_traits_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub provenance: Option<ProvenanceDto>,
+}
+
+/// Where an entity comes from. P0 has only the managed variant; federation adds
+/// `external` without changing this one.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+#[serde(tag = "type")]
+pub enum OriginDto {
+    Managed {
+        resource_version: i64,
+        #[serde(with = "time::serde::rfc3339")]
+        created_at: time::OffsetDateTime,
+        #[serde(with = "time::serde::rfc3339")]
+        updated_at: time::OffsetDateTime,
+    },
+}
+
+/// Who admitted the current revision and how. Selected as one group.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProvenanceDto {
+    pub gts_spec_version: String,
+    pub gts_impl_version: String,
     /// Caller-declared attribution. It MUST NOT be used to authorize.
     pub owning_gear: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: time::OffsetDateTime,
-    pub content: Option<serde_json::Value>,
-    pub resolved_schema: Option<serde_json::Value>,
-    pub effective_traits: Option<serde_json::Value>,
-    pub effective_traits_schema: Option<serde_json::Value>,
+    /// Whether ADR-0004 `force` waived a cross-minor check; `null` for Instances.
+    pub compat_forced: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -770,35 +890,43 @@ impl From<OperationRecord> for OperationDto {
 
 impl From<EntityRecord> for EntityDto {
     fn from(record: EntityRecord) -> Self {
+        let selected = |field: EntityField| record.selection.contains(field);
         Self {
-            gts_id: record.gts_id,
-            gts_uuid: record.gts_uuid,
-            kind: record.kind.into(),
+            gts_id: selected(EntityField::GtsId).then_some(record.gts_id),
+            gts_uuid: selected(EntityField::GtsUuid).then_some(record.gts_uuid),
+            kind: selected(EntityField::Kind).then(|| record.kind.into()),
+            origin: selected(EntityField::Origin).then_some(OriginDto::Managed {
+                resource_version: record.resource_version,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            }),
             lifecycle_status: record.lifecycle_status.into(),
-            resource_version: record.resource_version,
-            owning_gear: record.owning_gear,
-            created_at: record.created_at,
-            updated_at: record.updated_at,
+            content_hash: selected(EntityField::ContentHash).then(|| record.content_hash.to_hex()),
             content: record.content,
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,
             effective_traits_schema: record.effective_traits_schema,
+            provenance: record.provenance.map(|p| ProvenanceDto {
+                gts_spec_version: p.gts_spec_version,
+                gts_impl_version: p.gts_impl_version,
+                owning_gear: p.owning_gear,
+                compat_forced: p.compat_forced,
+            }),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// The two read surfaces: `:batchGet` and content-free discovery (T22a)
+// The two read surfaces: `:batchGet` and discovery (T22a, T22b)
 // ---------------------------------------------------------------------------
 //
-// One default field set per surface, not one per caller: discovery answers *what
-// exists* with identity and metadata, while an exact read and `batchGet` answer
-// *what is in it* with the authored content and D3's artifacts. `$select` is
-// refused rather than honoured, so these two sets are the only two (SPEC §10.2).
+// Exact read and `batchGet` share [`EntityDto`] and one `$select` normalization, so
+// one key answers identically on both (SPEC §10.2).
 
 /// One key in a batch read.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
 pub struct BatchGetItemDto {
     /// A canonical GTS identifier or a Registry Reference UUID, classified exactly
     /// as `GET /entities/{entity_key}` classifies its path segment.
@@ -818,9 +946,11 @@ pub struct BatchGetItemDto {
     pub if_none_match: Option<String>,
 }
 
-/// A batch read.
+/// A batch read. Unknown fields are refused, so a misspelled `$select` is not
+/// answered with the default set.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
 pub struct BatchGetRequest {
     /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, enforced by
     /// `RegistryService::batch_get` before it reads anything. Stated in one place,
@@ -829,6 +959,11 @@ pub struct BatchGetRequest {
     /// [`MAX_BATCH_GET_KEYS`]: crate::domain::registry_service::MAX_BATCH_GET_KEYS
     #[schema(min_items = 1)]
     pub items: Vec<BatchGetItemDto>,
+    /// Fields to return for every key, spelled as the GET routes' `$select`.
+    /// Absent is the document-free default.
+    #[serde(default, rename = "$select")]
+    #[schema(max_length = 2048)]
+    pub select: Option<String>,
 }
 
 /// `found` or `not_found`.
@@ -863,8 +998,8 @@ impl From<&EntityLookup> for EntityLookupStatusDto {
 pub struct EntityLookupDto {
     pub key: String,
     pub status: EntityLookupStatusDto,
-    /// The full representation, exactly as the exact read returns it. Absent on
-    /// `not_found`.
+    /// The selected fields, exactly as the exact read returns them for the same
+    /// `$select`. Absent on `not_found`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity: Option<EntityDto>,
 }
@@ -874,56 +1009,6 @@ pub struct EntityLookupDto {
 #[toolkit_macros::api_dto(response)]
 pub struct EntityLookupsDto {
     pub items: Vec<EntityLookupDto>,
-}
-
-/// Query parameters of the content-free discovery page (D12).
-#[derive(Debug, Clone, Default)]
-#[toolkit_macros::api_dto(request)]
-pub struct DiscoverEntitiesQuery {
-    /// A GTS wildcard pattern. Compiled and decided by `gts-rust`; a string it
-    /// refuses is a `400`, not an empty page.
-    #[serde(default)]
-    #[schema(max_length = 1024)]
-    pub pattern: Option<String>,
-    /// Page size. Defaults to `limits.page_size_default` and may not exceed
-    /// `limits.page_size_max`.
-    #[serde(default)]
-    pub limit: Option<u32>,
-    /// The previous page's `page_info.next_cursor`. Opaque, versioned and bound to
-    /// the query it was issued for.
-    #[serde(default)]
-    #[schema(max_length = 4096)]
-    pub cursor: Option<String>,
-    /// Bound only so it can be **refused**: axum drops query keys nothing claims,
-    /// and answering a caller that asked for one field with the whole default set is
-    /// worse than refusing (SPEC §10.2).
-    #[serde(default, rename = "$select")]
-    pub select: Option<String>,
-}
-
-/// One entity as a page names it: identity and metadata only.
-///
-/// No `content`, no `resolved_schema`, no `effective_traits`,
-/// no `effective_traits_schema` and no validator — a page is a changing set rather
-/// than an answer about an exact key (§8.5). A caller that wants any of those asks
-/// `:batchGet` for the identifiers the page gave it.
-#[derive(Debug, Clone)]
-#[toolkit_macros::api_dto(response)]
-pub struct EntitySummaryDto {
-    pub gts_id: String,
-    /// The Registry Reference: a deterministic `UUIDv5` of the identifier.
-    pub gts_uuid: Uuid,
-    pub kind: EntityKindDto,
-    /// Always `active` on a page; tombstones leave discovery. Carried so a page item
-    /// and a full representation name the same fields the same way.
-    pub lifecycle_status: LifecycleStatusDto,
-    pub resource_version: i64,
-    /// Caller-declared attribution. It MUST NOT be used to authorize.
-    pub owning_gear: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub created_at: time::OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub updated_at: time::OffsetDateTime,
 }
 
 /// Where the next page starts.
@@ -947,21 +1032,7 @@ pub struct PageInfoDto {
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EntityPageDto {
-    pub items: Vec<EntitySummaryDto>,
+    /// Each item projected exactly as the exact read projects it.
+    pub items: Vec<EntityDto>,
     pub page_info: PageInfoDto,
-}
-
-impl From<EntitySummary> for EntitySummaryDto {
-    fn from(summary: EntitySummary) -> Self {
-        Self {
-            gts_id: summary.gts_id,
-            gts_uuid: summary.gts_uuid,
-            kind: summary.kind.into(),
-            lifecycle_status: summary.lifecycle_status.into(),
-            resource_version: summary.resource_version,
-            owning_gear: summary.owning_gear,
-            created_at: summary.created_at,
-            updated_at: summary.updated_at,
-        }
-    }
 }

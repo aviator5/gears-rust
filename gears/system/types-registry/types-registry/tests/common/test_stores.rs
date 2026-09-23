@@ -11,7 +11,7 @@ use types_registry::domain::admission::fingerprint::ScopeHash;
 use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use types_registry::domain::family::FamilyKey;
 use types_registry::domain::ports::{
-    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
+    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentReadRow, CurrentSchemaCas,
     CurrentSchemaProjection, CurrentTypeSchemaRow, DependencyClosure, DependencyEdgeRow,
     DependencyStore, EdgeSide, EntityEdge, EntityPage, EntityRow, EntityStore,
     EntityWriteOrderStore, InstanceStore, ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema,
@@ -19,6 +19,7 @@ use types_registry::domain::ports::{
     OperationRow, OperationStore, PageRequest, ReverseImpact, Stores, TypeSchemaStore,
     VersionFamilyRow, VersionFamilyStore,
 };
+use types_registry::domain::selection::FieldSelection;
 use uuid::Uuid;
 
 use super::stores;
@@ -730,6 +731,18 @@ impl TypeSchemaStore for TestStores {
         self.inner.current_schemas(tx, scope, entity_ids).await
     }
 
+    async fn read_current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        self.inner
+            .read_current_schemas(tx, scope, entity_ids, selection)
+            .await
+    }
+
     async fn current_schema_projections(
         &self,
         tx: &DbTx<'_>,
@@ -797,6 +810,18 @@ impl InstanceStore for TestStores {
         entity_id: i64,
     ) -> Result<Option<CurrentInstanceRow>, ScopeError> {
         self.inner.find_current_instance(tx, scope, entity_id).await
+    }
+
+    async fn read_current_values(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+        selection: FieldSelection,
+    ) -> Result<Vec<CurrentReadRow>, ScopeError> {
+        self.inner
+            .read_current_values(tx, scope, entity_ids, selection)
+            .await
     }
 
     async fn insert_instance_revision(

@@ -16,11 +16,10 @@
 //!
 //! # What the cursor binds
 //!
-//! The query it was issued for. A page is complete with respect to *its* traversal,
-//! so replaying one page's position under a different pattern would return a page
-//! that is complete for neither — which is why a mismatch is refused rather than
-//! reinterpreted. Ordering is fixed (`gts_id` ascending, the keyset the page is
-//! built on), so it is bound too and cannot be renegotiated by a caller.
+//! The query it was issued for: the pattern and the canonical [`FieldSelection`].
+//! Replaying a position under either changed is refused rather than spliced; an
+//! absent `$select` and an explicit default one share one canonical spelling and
+//! so one binding.
 //!
 //! [`DiscoveryQuery::after`]: crate::domain::registry_service::DiscoveryQuery::after
 
@@ -28,11 +27,15 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::pagination::short_filter_hash;
 use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir, ast, validate_cursor_against};
 
-use super::error::cursor_not_usable;
+use super::error::{cursor_not_usable, cursor_too_long};
+use crate::domain::selection::FieldSelection;
 
 /// The one keyset column. `gts_id` is unique and immutable, which is what makes the
 /// cursor a plain keyset: a page boundary cannot drift or duplicate (§10.2).
 const KEY_FIELD: &str = "gts_id";
+
+/// The binding's name for the selection; not an entity column.
+const SELECT_FIELD: &str = "$select";
 
 /// Forward-only. Backward paging is not part of the discovery contract, and a
 /// `"bwd"` token would describe a traversal this route does not perform.
@@ -46,23 +49,29 @@ fn page_order() -> ODataOrderBy {
     }])
 }
 
-/// The fingerprint of the filter a page was taken under, or `None` for an
-/// unfiltered traversal.
-///
-/// Hashed through `toolkit-odata`'s own normalizer rather than by carrying the
-/// pattern verbatim: the cursor is opaque by contract, and a token that spells the
-/// query out invites a caller to edit it. The GTS pattern is not an `OData` filter,
-/// so it is expressed as the one comparison it is — `gts_id` against the pattern
-/// text — purely to reach that normalizer.
-fn pattern_hash(pattern: Option<&str>) -> Option<String> {
-    let expr = pattern.map(|pattern| {
+/// The query a page was taken under, hashed through `toolkit-odata`'s normalizer so
+/// the opaque token does not spell it out. Never `None`: the selection is always
+/// bound, so `validate_cursor_against` compares every pair of bindings.
+fn binding_hash(binding: &Binding<'_>) -> Option<String> {
+    let equals = |field: &str, value: &str| {
         ast::Expr::Compare(
-            Box::new(ast::Expr::Identifier(KEY_FIELD.to_owned())),
+            Box::new(ast::Expr::Identifier(field.to_owned())),
             ast::CompareOperator::Eq,
-            Box::new(ast::Expr::Value(ast::Value::String(pattern.to_owned()))),
+            Box::new(ast::Expr::Value(ast::Value::String(value.to_owned()))),
         )
-    });
-    short_filter_hash(expr.as_ref())
+    };
+    let select = equals(SELECT_FIELD, &binding.selection.canonical());
+    let expr = match binding.pattern {
+        Some(pattern) => ast::Expr::And(Box::new(equals(KEY_FIELD, pattern)), Box::new(select)),
+        None => select,
+    };
+    short_filter_hash(Some(&expr))
+}
+
+/// What a discovery cursor is bound to.
+pub struct Binding<'a> {
+    pub pattern: Option<&'a str>,
+    pub selection: FieldSelection,
 }
 
 /// Encode the position a page stopped at, bound to the query that produced it.
@@ -70,12 +79,12 @@ fn pattern_hash(pattern: Option<&str>) -> Option<String> {
 /// # Errors
 /// A canonical internal error if the token will not serialize, which is a bug here
 /// rather than anything the caller did.
-pub fn encode(after: &str, pattern: Option<&str>) -> Result<String, CanonicalError> {
+pub fn encode(after: &str, binding: &Binding<'_>) -> Result<String, CanonicalError> {
     CursorV1 {
         k: vec![after.to_owned()],
         o: SortDir::Asc,
         s: page_order().to_signed_tokens(),
-        f: pattern_hash(pattern),
+        f: binding_hash(binding),
         d: FORWARD.to_owned(),
     }
     .encode()
@@ -85,22 +94,37 @@ pub fn encode(after: &str, pattern: Option<&str>) -> Result<String, CanonicalErr
     })
 }
 
+/// Refuse an oversized or undecodable token before anything else reads it.
+///
+/// # Errors
+/// A `400` naming `cursor`.
+pub fn check_readable(token: &str) -> Result<(), CanonicalError> {
+    if token.len() > MAX_TOKEN_LEN {
+        return Err(cursor_too_long(token.len()));
+    }
+    CursorV1::decode(token)
+        .map(drop)
+        .map_err(|e| cursor_not_usable(&e.to_string()))
+}
+
+/// Base64url JSON of one identifier; a real token cannot approach this.
+const MAX_TOKEN_LEN: usize = 4096;
+
 /// Decode a cursor into the stored `gts_id` the next page resumes after.
 ///
 /// # Errors
 /// A `400` problem naming `cursor` when the token is unreadable, of an unsupported
 /// version, or bound to a different query than this request asks.
-pub fn decode(token: &str, pattern: Option<&str>) -> Result<String, CanonicalError> {
+pub fn decode(token: &str, binding: &Binding<'_>) -> Result<String, CanonicalError> {
     let cursor = CursorV1::decode(token).map_err(|e| cursor_not_usable(&e.to_string()))?;
-    validate_cursor_against(&cursor, &page_order(), pattern_hash(pattern).as_deref())
+    let expected = binding_hash(binding);
+    validate_cursor_against(&cursor, &page_order(), expected.as_deref())
         .map_err(|e| cursor_not_usable(&e.to_string()))?;
-    // `validate_cursor_against` compares filters only when both sides carry one, so
-    // the unfiltered/filtered pair is checked here: without this, a cursor from a
-    // patternless traversal would be accepted under a pattern and resume at a
-    // position that traversal never visited.
-    if cursor.f != pattern_hash(pattern) {
+    // `validate_cursor_against` skips the comparison when the token has no filter,
+    // which only a pre-T22b cursor lacks.
+    if cursor.f != expected {
         return Err(cursor_not_usable(
-            "it was issued for a different pattern than this request names",
+            "it was issued for a different pattern or $select than this request names",
         ));
     }
     if cursor.d != FORWARD {
@@ -122,45 +146,104 @@ mod tests {
     const AFTER: &str = "gts.cf.core.example.type.v1~";
     const PATTERN: &str = "gts.cf.core.example.*";
 
+    fn bound<'a>(pattern: Option<&'a str>, select: &[&str]) -> Binding<'a> {
+        Binding {
+            pattern,
+            selection: if select.is_empty() {
+                FieldSelection::default()
+            } else {
+                FieldSelection::parse(select).expect("valid")
+            },
+        }
+    }
+
     #[test]
     fn a_cursor_round_trips_its_position() -> Result<(), CanonicalError> {
-        let token = encode(AFTER, None)?;
-        assert_eq!(decode(&token, None)?, AFTER);
-        let filtered = encode(AFTER, Some(PATTERN))?;
-        assert_eq!(decode(&filtered, Some(PATTERN))?, AFTER);
+        let token = encode(AFTER, &bound(None, &[]))?;
+        assert_eq!(decode(&token, &bound(None, &[]))?, AFTER);
+        let filtered = encode(AFTER, &bound(Some(PATTERN), &["content"]))?;
+        assert_eq!(
+            decode(&filtered, &bound(Some(PATTERN), &["content"]))?,
+            AFTER
+        );
         Ok(())
     }
 
-    /// The token is opaque: the position and the pattern must not be readable off
-    /// it, or a caller will start editing one.
+    /// The token is opaque: neither the position's pattern nor the selection may be
+    /// readable off it, or a caller will start editing one.
     #[test]
     fn the_token_does_not_spell_the_query_out() -> Result<(), CanonicalError> {
-        let token = encode(AFTER, Some(PATTERN))?;
-        assert!(!token.contains(PATTERN), "{token}");
-        assert!(!token.contains("example"), "{token}");
+        let token = encode(AFTER, &bound(Some(PATTERN), &["content"]))?;
+        for needle in [PATTERN, "example", "content"] {
+            assert!(!token.contains(needle), "{token}");
+        }
         Ok(())
     }
 
     #[test]
     fn a_cursor_from_another_pattern_is_refused() -> Result<(), CanonicalError> {
-        let token = encode(AFTER, Some(PATTERN))?;
-        assert!(decode(&token, Some("gts.cf.other.*")).is_err());
-        assert!(
-            decode(&token, None).is_err(),
-            "a filtered traversal's position is not a patternless traversal's",
+        let token = encode(AFTER, &bound(Some(PATTERN), &[]))?;
+        assert!(decode(&token, &bound(Some("gts.cf.other.*"), &[])).is_err());
+        assert!(decode(&token, &bound(None, &[])).is_err());
+        let unfiltered = encode(AFTER, &bound(None, &[]))?;
+        assert!(decode(&unfiltered, &bound(Some(PATTERN), &[])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_cursor_from_another_selection_is_refused() -> Result<(), CanonicalError> {
+        for pattern in [None, Some(PATTERN)] {
+            let token = encode(AFTER, &bound(pattern, &[]))?;
+            assert!(decode(&token, &bound(pattern, &["content"])).is_err());
+            let content = encode(AFTER, &bound(pattern, &["content"]))?;
+            assert!(decode(&content, &bound(pattern, &[])).is_err());
+            assert!(decode(&content, &bound(pattern, &["content", "kind"])).is_err());
+        }
+        Ok(())
+    }
+
+    /// The binding is the canonical set, never the spelling that produced it.
+    #[test]
+    fn absent_and_explicit_default_selections_are_interchangeable() -> Result<(), CanonicalError> {
+        let explicit = [
+            "origin",
+            "GTS_ID",
+            "content_hash",
+            "kind",
+            "gts_uuid",
+            "lifecycle_status",
+        ];
+        let token = encode(AFTER, &bound(Some(PATTERN), &[]))?;
+        assert_eq!(decode(&token, &bound(Some(PATTERN), &explicit))?, AFTER);
+        let token = encode(AFTER, &bound(Some(PATTERN), &explicit))?;
+        assert_eq!(decode(&token, &bound(Some(PATTERN), &[]))?, AFTER);
+        let reordered = encode(AFTER, &bound(None, &["kind", "content"]))?;
+        assert_eq!(
+            decode(&reordered, &bound(None, &["Content", " kind"]))?,
+            AFTER
         );
-        let unfiltered = encode(AFTER, None)?;
-        assert!(
-            decode(&unfiltered, Some(PATTERN)).is_err(),
-            "and the reverse: `validate_cursor_against` alone would accept this",
-        );
+        Ok(())
+    }
+
+    /// A T22a token carries no selection binding, so it cannot resume a T22b page.
+    #[test]
+    fn a_cursor_without_a_selection_binding_is_refused() -> Result<(), serde_json::Error> {
+        let token = CursorV1 {
+            k: vec![AFTER.to_owned()],
+            o: SortDir::Asc,
+            s: page_order().to_signed_tokens(),
+            f: None,
+            d: FORWARD.to_owned(),
+        }
+        .encode()?;
+        assert!(decode(&token, &bound(None, &[])).is_err());
         Ok(())
     }
 
     #[test]
     fn an_unreadable_token_is_refused() {
-        assert!(decode("not-base64url-json", None).is_err());
-        assert!(decode("", None).is_err());
+        assert!(decode("not-base64url-json", &bound(None, &[])).is_err());
+        assert!(decode("", &bound(None, &[])).is_err());
     }
 
     /// The version field is the upgrade path, so a token this build does not know
@@ -171,35 +254,27 @@ mod tests {
         // which `CursorV1` cannot construct — hence the literal.
         const VERSION_2: &str = "eyJ2IjoyLCJrIjpbImd0cy5jZi5jb3JlLmV4YW1wbGUudHlwZS52MX4iXSwibyI6\
                                  ImFzYyIsInMiOiIrZ3RzX2lkIiwiZCI6ImZ3ZCJ9";
-        assert!(decode(VERSION_2, None).is_err());
-    }
-
-    /// A cursor taken under a different sort order describes a different traversal.
-    #[test]
-    fn a_cursor_with_another_order_is_refused() -> Result<(), serde_json::Error> {
-        let token = CursorV1 {
-            k: vec![AFTER.to_owned()],
-            o: SortDir::Desc,
-            s: "-gts_id".to_owned(),
-            f: None,
-            d: FORWARD.to_owned(),
-        }
-        .encode()?;
-        assert!(decode(&token, None).is_err());
-        Ok(())
+        assert!(decode(VERSION_2, &bound(None, &[])).is_err());
     }
 
     #[test]
-    fn a_backward_cursor_is_refused() -> Result<(), serde_json::Error> {
-        let token = CursorV1 {
-            k: vec![AFTER.to_owned()],
-            o: SortDir::Asc,
-            s: page_order().to_signed_tokens(),
-            f: None,
-            d: "bwd".to_owned(),
+    fn a_cursor_with_another_order_or_direction_is_refused() -> Result<(), CanonicalError> {
+        let binding = bound(None, &[]);
+        for (o, s, d) in [
+            (SortDir::Desc, "-gts_id".to_owned(), FORWARD),
+            (SortDir::Asc, page_order().to_signed_tokens(), "bwd"),
+        ] {
+            let token = CursorV1 {
+                k: vec![AFTER.to_owned()],
+                o,
+                s,
+                f: binding_hash(&binding),
+                d: d.to_owned(),
+            }
+            .encode()
+            .map_err(|e| CanonicalError::internal(e.to_string()).create())?;
+            assert!(decode(&token, &binding).is_err(), "{d}");
         }
-        .encode()?;
-        assert!(decode(&token, None).is_err());
         Ok(())
     }
 }

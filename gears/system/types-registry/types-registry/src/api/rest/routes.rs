@@ -6,8 +6,8 @@ use axum::{Extension, Router};
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::canonical_prelude::StatusCode;
 use toolkit::api::operation_builder::{
-    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, ParamSpec,
-    ResponseHeaderSpec, ResponseHeaderType,
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, OperationBuilderODataExt,
+    ParamSpec, ResponseHeaderSpec, ResponseHeaderType,
 };
 
 use super::dto::{
@@ -276,10 +276,15 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("types_registry.get_entity")
         .summary("Get a GTS entity by identifier or Registry Reference")
         .description(
-            "Return one entity with its authored document and the effective artifacts \
-             materialized at admission. The key is either a canonical GTS identifier or the \
-             Registry Reference UUID derived from it. A deleted entity is still readable and \
-             reports its lifecycle status.",
+            "Return one entity, projected by `$select`. The key is either a canonical GTS \
+             identifier or the Registry Reference UUID derived from it. Absent `$select` is \
+             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status,\
+             content_hash`; documents are selected individually from `content`, \
+             `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last \
+             three Type Schemas only), plus the `provenance` group. Names are \
+             case-insensitive; an empty, duplicate, unknown or nested name is a 400. \
+             `lifecycle_status` is always returned, so a deleted entity is still readable \
+             and reports it. No other query parameter is accepted.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -289,6 +294,7 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry \
              Reference UUID",
         )
+        .with_odata_select()
         .handler(handlers::get_entity_by_key)
         .json_response_with_schema::<EntityDto>(openapi, StatusCode::OK, "The requested entity")
         .problem_response(openapi, StatusCode::NOT_FOUND, "Entity not found")
@@ -311,8 +317,11 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
             "Read up to 100 entities in one round trip. Each item names one entity in `key` \
              (a canonical GTS identifier or the Registry Reference UUID derived from it), \
              resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. \
-             Returns 200 with one result per requested key, in request order and echoing the \
-             key it was asked by: `found` with the full representation, or `not_found`. A key \
+             A top-level `$select` string applies to every key and follows that route's \
+             `$select` rules; absent, the document-free default. Returns 200 with one result \
+             per requested key, in request order and echoing the key it was asked by: `found` \
+             with the selected fields, exactly as the exact read returns them, or \
+             `not_found`. Query parameters are refused, `$select` included. A key \
              named twice collapses onto its first mention; the two spellings of one entity are \
              two keys and get two results. An absent key is not a 404: one missing key must \
              not lose the answers for the others. The If-None-Match header is refused rather \
@@ -337,7 +346,7 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
     router
 }
 
-/// `GET {V2}/entities` — the bounded, content-free discovery page (D12, T22a).
+/// `GET {V2}/entities` — the bounded, projected discovery page (D12, T22a, T22b).
 fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router = OperationBuilder::get(format!("{V2}/entities"))
         .operation_id("types_registry.list_entities")
@@ -345,14 +354,14 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .description(
             "Return one bounded page of active entities, ordered by canonical identifier, \
              with the cursor for the next page. Deleted entities are excluded: a tombstone \
-             stays readable by key and leaves discovery. A page is content-free: identity \
-             and metadata only, with no authored content, no materialized artifacts and no \
-             validator, so a caller that wants any of those asks \
-             POST /types-registry/v2/entities:batchGet for the identifiers this page gave it. \
-             `limit` defaults to 100 and may not exceed 1000. `cursor` is opaque, versioned \
-             and bound to the query it was issued for; replaying one under a different \
-             pattern is refused rather than spliced. `$select` is refused at this version: \
-             each read surface has one fixed field set.",
+             stays readable by key and leaves discovery. Each item is projected by `$select` \
+             exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the \
+             document-free default. A page never carries a validator. `limit` (alias `$top`) \
+             defaults to 100 and may not exceed 1000; a caller selecting documents should \
+             page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to \
+             the pattern and the normalized `$select` it was issued for: resuming under \
+             either changed is a 400, while an absent and an explicit default `$select` are \
+             interchangeable. Any other query parameter is refused.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -367,14 +376,16 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .query_param_typed(
             "limit",
             false,
-            "Page size, 1 to 1000. Defaults to 100",
+            "Page size, 1 to 1000. Defaults to 100. Alias: $top",
             "integer",
         )
         .query_param(
             "cursor",
             false,
-            "The previous page's page_info.next_cursor. Absent starts at the beginning",
+            "The previous page's page_info.next_cursor, under the same pattern and $select. \
+             Absent starts at the beginning. Alias: $skiptoken",
         )
+        .with_odata_select()
         .handler(handlers::discover_entities)
         .json_response_with_schema::<EntityPageDto>(
             openapi,

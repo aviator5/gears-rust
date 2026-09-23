@@ -24,10 +24,8 @@ use crate::domain::enums::{
 };
 use crate::domain::policy::RegistrationPolicy;
 use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage};
-use crate::domain::ports::{
-    CurrentDocument, CurrentInstanceValue, CurrentTypeSchemaRow, EntityRow, PageRequest, Stores,
-    snapshot_read,
-};
+use crate::domain::ports::{CurrentReadRow, EntityRow, PageRequest, Stores, snapshot_read};
+use crate::domain::selection::{EntityField, FieldSelection};
 
 /// GTS identifier or deterministic Registry Reference for the same row.
 #[domain_model]
@@ -92,25 +90,51 @@ pub struct OperationItemRecord {
     pub error: Option<String>,
 }
 
-/// One entity with its content and D3's materialized artifacts.
+/// Entity-row metadata is always present and emitted only where [`Self::selection`]
+/// names it. A document or `provenance` is `Some` only when selected and
+/// applicable; `Some(Value::Null)` is a selected JSON `null`.
 #[domain_model]
 #[derive(Clone, Debug)]
 pub struct EntityRecord {
+    pub selection: FieldSelection,
     pub gts_id: String,
     pub gts_uuid: Uuid,
     pub kind: EntityKind,
     pub lifecycle_status: LifecycleStatus,
     pub resource_version: i64,
-    pub owning_gear: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
-    /// The authored document under the public resource name. Absent only if the
-    /// current-state row is missing, which is a corrupt row rather than a state a
-    /// reader should expect.
+    pub content_hash: ContentHash,
     pub content: Option<Value>,
     pub resolved_schema: Option<Value>,
     pub effective_traits: Option<Value>,
     pub effective_traits_schema: Option<Value>,
+    pub provenance: Option<Provenance>,
+}
+
+/// The eight stored FNV-1a bytes of the canonical authored content: a prefilter,
+/// never proof of equality (ADR-0012).
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ContentHash(pub [u8; 8]);
+
+impl ContentHash {
+    /// Sixteen lowercase hexadecimal digits, most significant byte first.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        format!("{:016x}", u64::from_be_bytes(self.0))
+    }
+}
+
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provenance {
+    pub gts_spec_version: String,
+    pub gts_impl_version: String,
+    /// Caller-declared attribution. It MUST NOT be used to authorize.
+    pub owning_gear: Option<String>,
+    /// `None` for an Instance.
+    pub compat_forced: Option<bool>,
 }
 
 /// One key's answer in a batch read.
@@ -134,7 +158,7 @@ pub enum EntityLookup {
     NotFound,
 }
 
-/// A content-free discovery query over **active** entities (D12).
+/// A discovery query over **active** entities (D12).
 ///
 /// No kind, origin, availability or scope filter: each is either out of P0 scope
 /// (SPEC §2) or a tenant-plane input, and the pattern already narrows by
@@ -148,32 +172,14 @@ pub struct DiscoveryQuery {
     pub after: Option<String>,
     /// `None` takes `limits.page_size_default`; above `limits.page_size_max` is refused.
     pub limit: Option<u32>,
-}
-
-/// One entity as a discovery page names it: identity and metadata, no authored
-/// content, none of D3's artifacts and no validator (§8.5, §10.2).
-///
-/// A separate type rather than an `EntityRecord` with the documents left `None`:
-/// `None` already means "the current-state row is missing" there, so reusing it
-/// would make a corrupt row and a content-free projection the same value.
-#[domain_model]
-#[derive(Clone, Debug)]
-pub struct EntitySummary {
-    pub gts_id: String,
-    pub gts_uuid: Uuid,
-    pub kind: EntityKind,
-    pub lifecycle_status: LifecycleStatus,
-    pub resource_version: i64,
-    pub owning_gear: Option<String>,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
+    pub selection: FieldSelection,
 }
 
 /// One bounded discovery page and the position a caller resumes from.
 #[domain_model]
 #[derive(Clone, Debug)]
 pub struct DiscoveryPage {
-    pub items: Vec<EntitySummary>,
+    pub items: Vec<EntityRecord>,
     /// The page size actually applied: the caller's `limit`, or
     /// `limits.page_size_default` where it named none. Returned rather than left
     /// for a transport adapter to restate, so REST and a future gRPC adapter
@@ -552,8 +558,8 @@ impl RegistryService {
         }))
     }
 
-    /// Read one entity by identifier or Registry Reference, with its authored
-    /// content and D3's materialized artifacts.
+    /// Read one entity by identifier or Registry Reference, projected by
+    /// `selection`.
     ///
     /// One key's [`Self::batch_get`], as `delete_entity` is one target's `delete`.
     /// Sharing the implementation is what makes the two surfaces agree: the key is
@@ -564,8 +570,12 @@ impl RegistryService {
     /// # Errors
     /// [`ServiceError::Storage`] for a read failure, or
     /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
-    pub async fn entity(&self, key: &EntityKey) -> Result<Option<EntityRecord>, ServiceError> {
-        let results = self.batch_get(std::slice::from_ref(key)).await?;
+    pub async fn entity(
+        &self,
+        key: &EntityKey,
+        selection: FieldSelection,
+    ) -> Result<Option<EntityRecord>, ServiceError> {
+        let results = self.batch_get(std::slice::from_ref(key), selection).await?;
         Ok(results.into_iter().find_map(|(_, lookup)| match lookup {
             EntityLookup::Found(record) => Some(record),
             EntityLookup::NotFound => None,
@@ -582,7 +592,8 @@ impl RegistryService {
     /// about and each is echoed.
     ///
     /// Constant in round trips rather than linear in keys: two identity reads and
-    /// three current-state reads, all under one snapshot, whatever the batch size.
+    /// two current-state reads per kind, all under one snapshot, whatever the batch
+    /// size. Only the documents `selection` names are fetched and parsed.
     ///
     /// # Errors
     /// [`ServiceError::BatchReadOutOfRange`] for an empty or over-long batch,
@@ -591,6 +602,7 @@ impl RegistryService {
     pub async fn batch_get(
         &self,
         keys: &[EntityKey],
+        selection: FieldSelection,
     ) -> Result<Vec<(EntityKey, EntityLookup)>, ServiceError> {
         // Bounded before any read, as deletion bounds its batch: the ceiling exists
         // to keep one request's work finite, so it cannot be checked after the work.
@@ -641,22 +653,13 @@ impl RegistryService {
 
                     // Branch on row kind, not on key: Type Schemas have a document
                     // and D3's three artifacts, Instances only an authored value.
-                    let type_ids = ids_of(&rows, EntityKind::TypeSchema);
-                    let instance_ids = ids_of(&rows, EntityKind::Instance);
-                    let schemas = stores.current_schemas(tx, &scope, &type_ids).await?;
-                    let documents = stores.current_documents(tx, &scope, &type_ids).await?;
-                    let values = stores.current_values(tx, &scope, &instance_ids).await?;
-                    Ok(BatchState {
-                        rows,
-                        schemas,
-                        documents,
-                        values,
-                    })
+                    let current = read_current(&*stores, tx, &scope, &rows, selection).await?;
+                    Ok((rows, current))
                 })
             })
             .await?;
 
-        let records = state.into_records()?;
+        let records = into_records(state.0, state.1, selection)?;
         let by_gts_id: BTreeMap<&str, &EntityRecord> = records
             .values()
             .map(|record| (record.gts_id.as_str(), record))
@@ -682,8 +685,8 @@ impl RegistryService {
             .collect())
     }
 
-    /// One bounded, content-free page of active entities, ordered by canonical
-    /// identifier (D12).
+    /// One bounded page of active entities, ordered by canonical identifier and
+    /// projected by `query.selection` (D12).
     ///
     /// The page size and its ceiling are deployment configuration, which is why the
     /// default and the refusal live here rather than in a transport adapter: a gRPC
@@ -720,31 +723,24 @@ impl RegistryService {
         let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
         let scope = Self::scope();
         let stores = Arc::clone(&self.stores);
-        let page = provider
+        let selection = query.selection;
+        let (page, current) = provider
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
-                    Ok(stores
+                    let page = stores
                         .list_page(tx, &scope, pattern.as_ref(), request)
-                        .await?)
+                        .await?;
+                    let current =
+                        read_current(&*stores, tx, &scope, &page.items, selection).await?;
+                    Ok((page, current))
                 })
             })
             .await?;
 
+        let order: Vec<i64> = page.items.iter().map(|row| row.id).collect();
+        let mut records = into_records(page.items, current, selection)?;
         Ok(DiscoveryPage {
-            items: page
-                .items
-                .into_iter()
-                .map(|row| EntitySummary {
-                    gts_id: row.gts_id,
-                    gts_uuid: row.gts_uuid,
-                    kind: row.entity_kind,
-                    lifecycle_status: row.lifecycle_status,
-                    resource_version: row.resource_version,
-                    owning_gear: row.owning_gear,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                })
-                .collect(),
+            items: order.iter().filter_map(|id| records.remove(id)).collect(),
             limit,
             next_after: page.next_after,
             has_more: page.has_more,
@@ -760,93 +756,109 @@ fn ids_of(rows: &[EntityRow], kind: EntityKind) -> Vec<i64> {
         .collect()
 }
 
-/// One snapshot's worth of rows and current state, before it becomes records.
-///
-/// A struct rather than a tuple because the three current-state reads are keyed by
-/// `entity_id` and pairing the wrong one with `rows` is exactly the mistake that
-/// returns an Instance's value as a resolved schema.
-struct BatchState {
-    rows: Vec<EntityRow>,
-    schemas: Vec<CurrentTypeSchemaRow>,
-    documents: Vec<CurrentDocument>,
-    values: Vec<CurrentInstanceValue>,
+/// Branches on row kind, not on key: only a Type Schema has artifacts.
+async fn read_current(
+    stores: &dyn Stores,
+    tx: &toolkit_db::DbTx<'_>,
+    scope: &AccessScope,
+    rows: &[EntityRow],
+    selection: FieldSelection,
+) -> Result<BTreeMap<i64, CurrentReadRow>, ServiceError> {
+    let type_ids = ids_of(rows, EntityKind::TypeSchema);
+    let instance_ids = ids_of(rows, EntityKind::Instance);
+    let mut current = stores
+        .read_current_schemas(tx, scope, &type_ids, selection)
+        .await?;
+    current.extend(
+        stores
+            .read_current_values(tx, scope, &instance_ids, selection)
+            .await?,
+    );
+    Ok(current
+        .into_iter()
+        .map(|row| (row.entity_id, row))
+        .collect())
 }
 
-impl BatchState {
-    /// Assemble one [`EntityRecord`] per row, keyed by entity id.
-    ///
-    /// A row with no current state is a corrupt row rather than a state a reader
-    /// should expect, so it is an error and not an absence — the same answer the
-    /// single read has always given, which is what keeps one key's batch identical
-    /// to the exact read.
-    fn into_records(self) -> Result<BTreeMap<i64, EntityRecord>, ServiceError> {
-        let schemas: BTreeMap<i64, CurrentTypeSchemaRow> = self
-            .schemas
-            .into_iter()
-            .map(|row| (row.entity_id, row))
-            .collect();
-        let documents: BTreeMap<i64, CurrentDocument> = self
-            .documents
-            .into_iter()
-            .map(|row| (row.entity_id, row))
-            .collect();
-        let values: BTreeMap<i64, CurrentInstanceValue> = self
-            .values
-            .into_iter()
-            .map(|row| (row.entity_id, row))
-            .collect();
-
-        let mut out = BTreeMap::new();
-        for row in self.rows {
-            let (content, resolved_schema, effective_traits, effective_traits_schema) =
-                match row.entity_kind {
-                    EntityKind::TypeSchema => {
-                        let current = schemas.get(&row.id).ok_or_else(|| {
-                            missing_state(&row.gts_id, "current Type Schema state")
-                        })?;
-                        let document = documents.get(&row.id).ok_or_else(|| {
-                            missing_state(&row.gts_id, "current Type Schema document")
-                        })?;
-                        (
-                            Some(parse_stored(&document.raw_schema, &row.gts_id)?),
-                            Some(parse_stored(&current.resolved_schema, &row.gts_id)?),
-                            Some(parse_stored(&current.effective_traits, &row.gts_id)?),
-                            Some(parse_stored(&current.effective_traits_schema, &row.gts_id)?),
-                        )
-                    }
-                    // Instances have no derived artifacts; all three are intentionally `None`.
-                    EntityKind::Instance => {
-                        let value = values
-                            .get(&row.id)
-                            .ok_or_else(|| missing_state(&row.gts_id, "current Instance state"))?;
-                        (
-                            Some(parse_stored(&value.canonical_value, &row.gts_id)?),
-                            None,
-                            None,
-                            None,
-                        )
-                    }
-                };
-            out.insert(
-                row.id,
-                EntityRecord {
-                    gts_id: row.gts_id,
-                    gts_uuid: row.gts_uuid,
-                    kind: row.entity_kind,
-                    lifecycle_status: row.lifecycle_status,
-                    resource_version: row.resource_version,
-                    owning_gear: row.owning_gear,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    content,
-                    resolved_schema,
-                    effective_traits,
-                    effective_traits_schema,
-                },
-            );
-        }
-        Ok(out)
+/// A missing current state, or a selected column that did not come back, is
+/// corruption rather than absence, whatever the selection.
+fn into_records(
+    rows: Vec<EntityRow>,
+    mut current: BTreeMap<i64, CurrentReadRow>,
+    selection: FieldSelection,
+) -> Result<BTreeMap<i64, EntityRecord>, ServiceError> {
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let state = current.remove(&row.id).ok_or_else(|| {
+            let what = match row.entity_kind {
+                EntityKind::TypeSchema => "current Type Schema state",
+                EntityKind::Instance => "current Instance state",
+            };
+            missing_state(&row.gts_id, what)
+        })?;
+        let content_hash = <[u8; 8]>::try_from(state.content_hash.as_slice())
+            .map(ContentHash)
+            .map_err(|_| missing_state(&row.gts_id, "eight-byte content hash"))?;
+        let is_schema = row.entity_kind == EntityKind::TypeSchema;
+        let document = |field: EntityField, text: Option<String>| {
+            select_document(selection, field, is_schema, text, &row.gts_id)
+        };
+        let content = document(EntityField::Content, state.content)?;
+        let resolved_schema = document(EntityField::ResolvedSchema, state.resolved_schema)?;
+        let effective_traits = document(EntityField::EffectiveTraits, state.effective_traits)?;
+        let effective_traits_schema = document(
+            EntityField::EffectiveTraitsSchema,
+            state.effective_traits_schema,
+        )?;
+        let provenance = if selection.contains(EntityField::Provenance) {
+            let revision = state
+                .provenance
+                .ok_or_else(|| missing_state(&row.gts_id, "selected provenance"))?;
+            Some(Provenance {
+                gts_spec_version: revision.gts_spec_version,
+                gts_impl_version: revision.gts_impl_version,
+                owning_gear: row.owning_gear,
+                compat_forced: revision.compat_forced,
+            })
+        } else {
+            None
+        };
+        out.insert(
+            row.id,
+            EntityRecord {
+                selection,
+                gts_id: row.gts_id,
+                gts_uuid: row.gts_uuid,
+                kind: row.entity_kind,
+                lifecycle_status: row.lifecycle_status,
+                resource_version: row.resource_version,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                content_hash,
+                content,
+                resolved_schema,
+                effective_traits,
+                effective_traits_schema,
+                provenance,
+            },
+        );
     }
+    Ok(out)
+}
+
+fn select_document(
+    selection: FieldSelection,
+    field: EntityField,
+    is_schema: bool,
+    text: Option<String>,
+    gts_id: &str,
+) -> Result<Option<Value>, ServiceError> {
+    let applicable = field == EntityField::Content || is_schema;
+    if !selection.contains(field) || !applicable {
+        return Ok(None);
+    }
+    let text = text.ok_or_else(|| missing_state(gts_id, field.name()))?;
+    parse_stored(&text, gts_id).map(Some)
 }
 
 fn missing_state(gts_id: &str, what: &str) -> ServiceError {
@@ -856,4 +868,91 @@ fn missing_state(gts_id: &str, what: &str) -> ServiceError {
 fn parse_stored(text: &str, gts_id: &str) -> Result<Value, ServiceError> {
     serde_json::from_str(text)
         .map_err(|e| ServiceError::CorruptDocument(format!("'{gts_id}': {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::enums::OwnershipScope;
+
+    const AT: OffsetDateTime = time::macros::datetime!(2026-09-23 10:00:00 UTC);
+
+    fn row(kind: EntityKind) -> EntityRow {
+        EntityRow {
+            id: 7,
+            gts_uuid: Uuid::nil(),
+            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            entity_kind: kind,
+            family_id: 1,
+            ownership_scope: OwnershipScope::Global,
+            owner_tenant_id: None,
+            owning_gear: Some("types-registry".to_owned()),
+            lifecycle_status: LifecycleStatus::Active,
+            resource_version: 1,
+            deleted_at: None,
+            created_at: AT,
+            updated_at: AT,
+        }
+    }
+
+    fn state(content: Option<&str>) -> BTreeMap<i64, CurrentReadRow> {
+        BTreeMap::from([(
+            7,
+            CurrentReadRow {
+                entity_id: 7,
+                content_hash: vec![0, 1, 2, 3, 4, 5, 6, 0xff],
+                content: content.map(str::to_owned),
+                resolved_schema: None,
+                effective_traits: None,
+                effective_traits_schema: None,
+                provenance: None,
+            },
+        )])
+    }
+
+    fn content() -> FieldSelection {
+        FieldSelection::parse(&["content"]).expect("valid")
+    }
+
+    #[test]
+    fn a_selected_document_that_did_not_come_back_is_corruption_not_absence() {
+        let result = into_records(vec![row(EntityKind::TypeSchema)], state(None), content());
+        assert!(
+            matches!(result, Err(ServiceError::CorruptDocument(ref d)) if d.contains("content")),
+            "{result:?}",
+        );
+    }
+
+    #[test]
+    fn an_unselected_document_is_neither_read_nor_parsed() {
+        let records = into_records(
+            vec![row(EntityKind::TypeSchema)],
+            state(Some("not json")),
+            FieldSelection::default(),
+        )
+        .expect("an unselected column is never parsed");
+        assert!(records[&7].content.is_none());
+        assert_eq!(records[&7].content_hash.to_hex(), "00010203040506ff");
+    }
+
+    #[test]
+    fn a_selected_json_null_is_kept_as_a_value() {
+        let records = into_records(
+            vec![row(EntityKind::Instance)],
+            state(Some("null")),
+            content(),
+        )
+        .expect("valid");
+        assert_eq!(records[&7].content, Some(Value::Null));
+    }
+
+    #[test]
+    fn selected_provenance_that_did_not_come_back_is_corruption() {
+        let selection = FieldSelection::parse(&["provenance"]).expect("valid");
+        let result = into_records(vec![row(EntityKind::Instance)], state(None), selection);
+        assert!(
+            matches!(result, Err(ServiceError::CorruptDocument(_))),
+            "{result:?}"
+        );
+    }
 }

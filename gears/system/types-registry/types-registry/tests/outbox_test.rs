@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use types_registry::domain::selection::FieldSelection;
 
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -205,7 +206,7 @@ async fn a_duplicate_delivery_changes_nothing() {
     let first = handler.admit_payload(payload.as_bytes(), 0).await;
     assert!(matches!(first, MessageResult::Ok), "got: {first:?}");
     let after_first = registry
-        .entity(&EntityKey::GtsId(TARGET.to_owned()))
+        .entity(&EntityKey::GtsId(TARGET.to_owned()), FieldSelection::full())
         .await
         .expect("read")
         .expect("the entity exists");
@@ -217,7 +218,7 @@ async fn a_duplicate_delivery_changes_nothing() {
     );
 
     let after_second = registry
-        .entity(&EntityKey::GtsId(TARGET.to_owned()))
+        .entity(&EntityKey::GtsId(TARGET.to_owned()), FieldSelection::full())
         .await
         .expect("read")
         .expect("the entity exists");
@@ -381,7 +382,7 @@ async fn an_admission_past_the_delivery_budget_is_terminalized_without_being_adm
 
     assert!(
         registry
-            .entity(&EntityKey::GtsId(TARGET.to_owned()))
+            .entity(&EntityKey::GtsId(TARGET.to_owned()), FieldSelection::full())
             .await
             .expect("read")
             .is_none(),
@@ -896,7 +897,7 @@ async fn enqueue_routes_independent_operations_to_different_partitions() {
     assert_eq!(operation.items[0].status, OperationItemStatus::Succeeded);
     assert_eq!(
         registry
-            .entity(&EntityKey::GtsId(SECOND.to_owned()))
+            .entity(&EntityKey::GtsId(SECOND.to_owned()), FieldSelection::full())
             .await
             .unwrap()
             .unwrap()
@@ -944,7 +945,7 @@ async fn an_accepted_operation_is_admitted_by_the_outbox() {
 
     assert_eq!(operation.items[0].status, OperationItemStatus::Succeeded);
     let entity = registry
-        .entity(&EntityKey::GtsId(TARGET.to_owned()))
+        .entity(&EntityKey::GtsId(TARGET.to_owned()), FieldSelection::full())
         .await
         .expect("read")
         .expect("the entity the outbox admitted is readable");
@@ -971,7 +972,7 @@ async fn stopping_the_pipeline_leaves_no_silent_enqueue() {
     );
     assert!(
         registry
-            .entity(&EntityKey::GtsId(TARGET.to_owned()))
+            .entity(&EntityKey::GtsId(TARGET.to_owned()), FieldSelection::full())
             .await
             .expect("read")
             .is_none(),

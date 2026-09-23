@@ -33,17 +33,19 @@ and dependent refresh. Both must be positive. Closure accounting is per document
 candidate overlay; the resolved-size budget applies to the canonical bytes of each effective
 artifact. Exceeding either refuses the candidate without committing partial state.
 
-32 P0 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a
-added out of the Checkpoint 1 review (P12/P13), T27 split into T20a and T22a (P17), and T22
-deferred to P1 (P18). Existing task IDs are retained; T22 is a transfer note, not an open P0
-task. Twenty-nine are
-S or M; three are **L** and say why in their own entry — T25 and T26 (consumer migration across twenty-plus gears) and T28
-(e2e migration across seven files), each split by gear or by file rather than landing as one
-commit. Two tasks exceed the ~5 file guideline, flagged with the reason where they occur.
+34 P0 tasks in 8 phases with 8 review checkpoints — 30 planned up front, plus T9a and T24a
+added out of the Checkpoint 1 review (P12/P13), T27 split into T20a and T22a (P17), T22
+deferred to P1 (P18), T22b added for projection (P19), and T22c added for discovery
+filtering (P20), both before the SDK contract. Existing task IDs are retained; T22 is a
+transfer note, not an open P0 task. Twenty-nine are S or M; five are **L** and say why in
+their own entry — T22b spans three read surfaces, T22c changes discovery through REST,
+domain and storage, T25 and T26 migrate consumers across twenty-plus gears, and T28
+migrates the e2e suites. Each L task is split
+into focused implementation slices rather than landing as one commit.
 
 ## Decisions taken during planning
 
-Seventeen decisions were made here rather than in the spec, because all of them are consequences
+Nineteen decisions were made here rather than in the spec, because all of them are consequences
 of task ordering or of facts about the runtime that only surface once the work is sliced.
 P1–P5 were taken before implementation started; P6–P10 came out of reviewing Phase 1 on its way
 in, and the spec has been updated to match all five. P12 is a correction: it reverses a change T9
@@ -57,6 +59,11 @@ observability is a per-task obligation from T17 onward. P17, revised after T20, 
 completion into T20a (mutations, Phase 5) and T22a (reads, Phase 6), and moves T21 outbox
 dispatch into Phase 5. P18 supersedes P4’s P0 scope: inventory push moves to P1, while
 explicit-document reconciliation remains in P0. (P11 was a housekeeping close-out and is retired; the number is not reused.)
+P19 adds `$select` across the three read routes before T23 fixes the SDK shape and T29
+adds validators; it supersedes P10's arbitrary-projection deferral, not P10's bounded
+content-free discovery default.
+P20 adds `depth` and `kind` to P0 discovery before T23 fixes `EntityQuery`; it supersedes
+T22a's historical filter limit while keeping tenancy, availability and federation deferred.
 
 ### P1. The spec's §15 build order is replaced by vertical slices
 
@@ -376,7 +383,7 @@ Consequences:
 T30 was renumbered from T29 to keep task numbers in dependency order. P17 retires T27's
 out-of-order identifier by splitting it into T20a and T22a; T28–T30 keep their existing IDs.
 
-### P10. Discovery is paged and content-free in P0; `$select` and expansion stay out
+### P10. Discovery is paged and content-free in P0; `$select` was deferred here, expansion stays out
 
 SPEC gains decision **D12** and a rewritten §10.2; §2's row is split. T4, T22a, T23 and T28
 gain criteria; no task is added.
@@ -402,10 +409,11 @@ that is *entity count* × up to 1 MB, and after the pull→push cutover the coun
 declarations. A `limit` alone would not have fixed it — without a cursor the bound makes the
 endpoint incomplete rather than large, which is why D12 lands both together.
 
-**The default projection is in; arbitrary `$select` is out.** The default field set is what
+**At this decision, the default projection was in and arbitrary `$select` was out.** The default field set is what
 makes a page content-free, so it is not optional. Caller-chosen sets need optional fields
 across the models plus a normalized field-set digest inside the validator, and buy nothing
-while there is a single representation to select from — that half stays in ceiling C7.
+while there is a single representation to select from. P19 later moves that half into P0;
+the document-free discovery default remains.
 
 **`expand_type_filter` is genuinely blocked**, and this is the one item whose original
 placement was right for the wrong reason. Its DESIGN definition *is*
@@ -727,7 +735,8 @@ T20a documents mutations; T22a completes OpenAPI and quickstart reads. Both use
 P12 keeps e2e files unchanged and `make e2e-local` green until T24.
 
 Cutover remains **T24 → T24a → T28**, alongside T25 → T26. T24a promotes all seven
-routes and owns both v1-breaking changelog entries; T28 migrates the Python suites.
+routes and owns both v1-breaking changelog entries: one for the write protocol, one for
+pagination and document-free defaults on read routes. T28 migrates the Python suites.
 
 ### P18. Defer per-gear inventory push to P1; retain explicit-document reconciliation
 
@@ -740,8 +749,8 @@ this work is to verify the complete cross-process startup path together; metadat
 has no authN dependency.
 
 **Task boundaries and numbering.** Keep all existing IDs so issue links and recorded evidence
-remain valid. There are 32 active P0 tasks; T22 remains a transfer note. Phase 6 is now
-T22a → T23. T23 keeps the new trait/models and a helper accepting explicit desired documents:
+remain valid. P19 adds one active P0 task after this decision; T22 remains a transfer note.
+Phase 6 is now T22a → T22b → T22c → T23 (P19/P20). T23 keeps the new trait/models and a helper accepting explicit desired documents:
 batch-read → compare → submit changes → poll, with bounded dependency retry. It neither
 collects inventory nor deletes records omitted from the desired set. T25/T26 migrate existing
 registration and read callers; they add no inventory registration call merely because a gear
@@ -770,6 +779,66 @@ unchanged; a content-only `UpToDate` shortcut must not retain the placeholder. P
 operator/bootstrap attribution for `cfg.entities` and never infer owners from GTS namespaces.
 Only then close C3. Metadata acceptance and verification are tracked in #4827; integration
 and migration remain epic obligations in #4628 for the P1 task breakdown.
+
+### P19. Add field projection before the SDK and validator contracts
+
+**Scope revision (2026-09-23).** T22b follows the completed T22a and precedes T23. It
+implements `$select` on exact read, `:batchGet` and discovery. An absent selection on all
+three returns a document-free P0 metadata set, following DESIGN §3.3's default; selected
+documents are flat and individually addressable. P0 exposes only the managed `origin`
+variant, and has no tenant availability or external origin to invent; the allowlist
+contains only fields the P0 read path can actually answer.
+The current 100-key batch ceiling and discovery page limits remain until a separately
+specified response-byte budget justifies changing them.
+
+This supersedes P10's deferral of arbitrary `$select`, SPEC §2's corresponding out-of-scope
+row, and the fixed-projection part of ceiling C7. It also supersedes T22a's *end-state*
+statements that exact/batch reads always return full documents and `$select` is refused;
+T22a's completed implementation record remains intact. SPEC now fixes the P0 field
+allowlist, default, DTO/SDK contract, cursor binding and validator input before coding.
+
+**Order and boundaries.** Normalize one field set for all three reads. Exact/batch share
+one projected lookup; discovery keeps one bounded keyset page and binds the normalized
+selection into its cursor. Document-free reads avoid fetching and parsing documents in
+storage; applying `toolkit::api::select::apply_select` after loading full documents would
+change only response bytes. The result envelope and tombstone lifecycle remain mandatory
+outside selection. T23's reconciliation and hydration helpers explicitly request the
+documents they consume; T29 digests the normalized selection rather than a fixed marker;
+T30 keys cached representations by that same selection. T22b does not add tenant fields,
+federation, or `expand_type_filter`.
+
+**Implementation slices.** First land the SPEC/field-set contract and pure tests; next
+project exact and batch reads with bounded, snapshot-consistent storage tests; last project
+discovery, bind its cursor and verify OpenAPI/quickstart/router behavior. Each slice leaves
+the gear building and passing its focused tests. Checkpoint 6 reviews the combined contract
+before T24 begins the consumer cutover.
+
+### P20. Add chain-depth and kind filters to P0 discovery
+
+**Scope revision (2026-09-23).** T22c follows T22b and precedes T23. It adds only the
+DESIGN §3.3 `GET /entities` filters `depth` and `kind` to the P0 read surface. `depth`
+is an inclusive maximum length of parsed GTS identifier segments (`GtsId::segments()`;
+one segment has depth 1), so `pattern` plus `depth` can bound a derivation or version
+family without treating a greedy GTS wildcard as an exact chain level. `kind` is the
+existing `type_schema`/`instance` enum. Both work without `pattern` and intersect with
+it when supplied; deleted entities remain excluded. P0 still omits `origin`,
+`availability`, `scope`, `tenant_id`, legacy segment filters and generic `$filter`.
+
+**Boundary and order.** Keep GTS matching and depth semantics in `gts-id`; use the stored
+kind as an SQL predicate and treat any SQL identifier-prefix range as a candidate
+prefilter only. Apply both filters before page limits and `$select`. Extend the versioned
+cursor with canonical optional `depth` and `kind`, rejecting continuation under a
+changed filter; an absent field is distinct from an explicit value. This requires T22b's
+cursor contract first and fixes `EntityQuery` before T23 publishes the SDK. T29's
+per-entity validator does not gain filter inputs: a validator describes one selected
+entity, while a discovery page has none.
+
+**Implementation slices.** First add `kind` through the query, repository, REST and
+router tests. Then add parsed-segment `depth`, cursor binding and mixed-filter traversal
+tests on all three backends. The second slice must preserve progress through sparse
+results under T22a's scan budget: a page may be empty while a continuation exists, but
+it may neither skip a later match nor claim completion early. Checkpoint 6 reviews the
+combined filter and projection contract; T24a promotes it with the other v2 routes.
 
 ## Dependency graph
 
@@ -817,8 +886,16 @@ T6 config ───────────────────────�
         (needs T4, T9a, T20a)
                    │
                    ▼
+        T22b field projection on all three reads
+        (needs T22a; default is document-free)
+                   │
+                   ▼
+        T22c discovery depth + kind filters
+        (needs T22b; binds filters in cursor)
+                   │
+                   ▼
         T23 new SDK trait + explicit-document reconciliation
-        (needs T4, T21; scheduled after T22a)
+        (needs T4, T21, T22b, T22c)
         T22 deferred to P1 (#4628); no P0 dependency
                    │
         ─── Checkpoint 6: SDK + all seven v2 routes ───
@@ -832,7 +909,7 @@ T6 config ───────────────────────�
         ▼                                 ▼
         T28 e2e migration                 T26 migrate domain gears; delete old trait
 
-        T29 validators + conditional reads (needs T22a, T23)
+        T29 validators + conditional reads (needs T22b, T23)
                    │
         T30 SDK client cache (needs T24, T26, T29; parallel with T28)
 ```
@@ -892,6 +969,8 @@ exists. From T7 onward the graph is vertical.
 ### Phase 6 — Read API and the new contract
 - **Deferred to P1:** T22 — inventory `owning_gear` metadata/filtering (#4628, P18)
 - T22a: REST batchGet and discovery — complete OpenAPI and quickstart (P17)
+- T22b: Field projection on all three read routes — document-free default (P19)
+- T22c: Discovery `depth` and `kind` filters — cursor-bound and composed with `pattern` (P20)
 - T23: New SDK trait and explicit-document reconciliation helper
 
 **Checkpoint 6**
@@ -953,9 +1032,11 @@ worker call (T21): operation/outcome records persist, while a dry run changes no
 revision or resource version. `make e2e-local` stays green with no e2e file edited.
 
 **Checkpoint 6** — the new trait and explicit-document reconciliation helper work against
-a mock consumer without inventory metadata or filtering. **All seven v2 routes are complete** (T20a, T22a, P17):
-`batchGet` returns explicit per-key results; discovery is bounded and content-free, its cursor
-traverses a stable set exactly once, and `$select` is refused. OpenAPI covers every route and
+a mock consumer without inventory metadata or per-gear inventory filtering. **All seven v2 routes are complete** (T20a, T22a, T22b, T22c, P17/P19/P20):
+`batchGet` returns explicit per-key results; discovery is bounded and content-free by default, its cursor
+traverses a stable matching set exactly once under one `pattern`/`depth`/`kind` filter and
+normalized `$select`, and all three reads
+project the requested fields. OpenAPI covers every route and
 `QUICKSTART.md` covers reads and mutations. Gear tests, `make lychee` and unchanged
 `make e2e-local` pass; nothing has been cut over yet.
 
@@ -981,9 +1062,11 @@ behave as Checkpoints 5 and 6 proved them, now on the promoted v1 paths. All 16 
 | Read latency regresses at T24, when reads move from memory to the database | Medium | Correctness first, then the cache: D3 already materializes what a read returns, so a read is one keyed `SELECT`, and T30 restores caching with DESIGN's contract (P7). The exposure is the T24–T28 window, which is why Checkpoint 7 gates on T30 |
 | A cached entry can be stale inside its freshness window | Low | DESIGN §3.3's sanctioned trade, and now bounded further: T29's validators let T30 revalidate rather than guess, `fresh` gives an authoritative read, `0s` disables the window, and invalidation is immediate on an observed terminal outcome |
 | The validator field reaches the SDK models after consumers have migrated | **High** — a second migration across 20+ gears | T23 carries the field from the start, before T25/T26 move any consumer; T29 only fills it in (P9) |
+| A narrow projection reuses a validator or cache entry for a wider representation | **High** — an incomplete answer can be accepted as current | T22b defines one normalized field set; T29 digests it into the validator and T30 keys representations by it (P19) |
+| A sparse `depth`/`kind` discovery page skips a later match or resumes under changed filters | **High** — incomplete traversal looks successful | T22c filters before page limits, keeps T22a's scan-position progress, binds both filters into the cursor, and tests mixed-depth/mixed-kind traversal across the scan budget (P20) |
 | A materialized `effective_*` value differs from the deleted client-side computation | Medium — reads as a regression, invites a "fix" back to the old wrong answer | 12 call sites in `account-management`, `resource-group`, `credstore` consume those methods today. The old ones resolved only the parent `$ref` and approximated trait defaults (`TODO(#1723)`), so `gts-rust` is authoritative; T25/T26 carry an explicit criterion to accept the new value, and SPEC §13 pins the outside-the-chain `$ref` case as a test |
 | Content-free discovery turns one-step list reads into list + `batchGet` at ~87 call sites | Medium | The SDK helpers hydrate internally, so call shapes survive (P10); the client cache absorbs the second trip; T23 fixes the helper shape before T25/T26 touch a consumer |
-| `GET /entities` shape change reaches e2e alongside the `POST` break | Medium | Both are the same migration in T28, behind the one shared helper it already owns; the route's declared stability is `unstable`. Under P12 both arrive at the same moment by construction: T24 deletes old v1, T24a promotes the whole async surface at once |
+| Read-shape change reaches e2e alongside the `POST` break | Medium | T28 handles paged discovery and explicit document selection on exact/batch reads through its shared helpers; route stability is `unstable`. Under P12 both breaks arrive at once: T24 deletes old v1 and T24a promotes the async surface |
 | Concurrency protocol wrong under the least-tested backend (MySQL) | Medium | Plain gear tests on SQLite plus `make test-types-registry-db` on PostgreSQL/MySQL at every checkpoint |
 | The `POST /entities` 202 break reaches other gears' e2e suites | Medium | Confirmed surface: 6 types-registry e2e files (~95 references to `/entities`) plus `account_management/conftest.py` and — **missed until P12** — `oagw/helpers.py`, which registers a batch of schemas *and* instances and reads them back through the list route. T28 owns the migration behind one shared polling helper, not open-coded loops. The break itself no longer arrives at T9: T9a keeps v1 intact, so the suite goes red at T24 and green at T28 rather than being red for ~19 tasks |
 | T20a/T22a's v2 DTOs are authored before T23 fixes the SDK trait shape | Low | The contract is SPEC §10.1/§10.2, not either task: `items`, `key`, `EntityPage`. Both are written against that section, and a disagreement surfaces at T23 while the routes are still behind `/v2/` with no consumer (P17) |
@@ -997,9 +1080,9 @@ behave as Checkpoints 5 and 6 proved them, now on the promoted v1 paths. All 16 
   shared trait and so lands after T25 — the split is within each, not between them. T30 with T28 — it needs the new models (T26) and the database read path (T24), and
   nothing in the e2e task touches the client cache.
 - **Sequential:** T2→T5 (foundation), T7→T8, T13→T14→T15, T19→T20→T20a→T21 in Phase 5
-  (P17/P18). Phase 6 executes T22a→T23; T23 uses T4 reads and T21 dispatch, with no
+  (P17/P18). Phase 6 executes T22a→T22b→T22c→T23; T23 uses T4 reads and T21 dispatch, with no
   inventory metadata dependency. In Phase 7 T24→T24a→T28: the
   promotion now sits directly after the cutover, because every route it promotes already exists.
 - **Contract first:** T23's trait shape is fixed by SPEC §10.1 rather than by the REST DTOs.
-  Keep SDK integration after T22a in the chosen execution order; T29 then uses both the
+  Keep SDK integration after T22c in the chosen execution order; T29 then uses both the
   batch read route and the SDK validator models.

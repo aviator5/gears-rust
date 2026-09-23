@@ -7,6 +7,7 @@ use crate::domain::admission::acceptance::{AcceptanceError, MAX_IDEMPOTENCY_KEY}
 use crate::domain::admission::worker::WorkerError;
 use crate::domain::error::DomainError;
 use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, ServiceError};
+use crate::domain::selection::{EntityField, SelectionError};
 
 #[resource_error(gts_id!("cf.types_registry.registry.type.v1~"))]
 pub struct TypeRegistryError;
@@ -344,23 +345,90 @@ pub fn if_none_match_not_supported() -> CanonicalError {
     )
 }
 
-/// Reject `$select` rather than answering with the default set.
-///
-/// Silently returning a full representation to a caller that asked for one field is
-/// worse than a refusal on three counts: the caller gets bytes it did not ask for,
-/// it may build on behaviour P1 will change under it, and a validator would be
-/// computed over a projection it does not believe it has (SPEC §10.2,
-/// `principle-fail-closed`).
+/// `0` is refused under the spelling the caller used, before `ToolKit` reports
+/// it as `$top`.
 #[must_use]
-pub fn select_not_supported() -> CanonicalError {
+pub fn page_size_zero(name: &str) -> CanonicalError {
     invalid_field(
-        violation_field::SELECT,
-        "$select is not supported at this version; each read surface has one fixed \
-         field set: a discovery page is identity and metadata, an exact or batch \
-         read is the full representation"
-            .to_owned(),
+        name,
+        format!("{name} must be a positive page size"),
         field::VALIDATION_FAILED,
     )
+}
+
+/// Reason code of every `$select` refusal, matching `ToolKit`'s own `$select` parser.
+const INVALID_SELECT: &str = "INVALID_SELECT";
+
+#[must_use]
+pub fn select_refused(error: &SelectionError) -> CanonicalError {
+    let detail = match error {
+        SelectionError::Empty => "$select must name at least one field".to_owned(),
+        SelectionError::EmptySegment => {
+            "$select must not contain an empty field name between commas".to_owned()
+        }
+        SelectionError::Duplicate(name) => format!("duplicate field in $select: {name}"),
+        SelectionError::Unknown(name) => format!(
+            "'{name}' is not a selectable field; select from {}",
+            selectable_fields()
+        ),
+        SelectionError::Unavailable(name) => format!(
+            "'{name}' is not available at this version; select from {}",
+            selectable_fields()
+        ),
+        SelectionError::Nested(name) => {
+            format!("'{name}' names a path inside a field; $select takes whole top-level fields")
+        }
+    };
+    invalid_field(violation_field::SELECT, detail, INVALID_SELECT)
+}
+
+/// One violation per key, with `ToolKit`'s reason code for the `$` namespace.
+#[must_use]
+pub fn unsupported_query_params(keys: &[&str], allowed: &[&str]) -> CanonicalError {
+    let accepted = if allowed.is_empty() {
+        "this route accepts no query parameters".to_owned()
+    } else {
+        format!("this route accepts only {}", allowed.join(", "))
+    };
+    let violation = |key: &str| {
+        (
+            format!("unsupported query parameter `{key}`; {accepted}"),
+            "UNSUPPORTED_QUERY_PARAM",
+        )
+    };
+    let Some((first, rest)) = keys.split_first() else {
+        return query_params_unreadable("no parameter to refuse");
+    };
+    let (detail, reason) = violation(first);
+    let mut error =
+        TypeRegistryError::invalid_argument().with_field_violation(*first, detail, reason);
+    for key in rest {
+        let (detail, reason) = violation(key);
+        error = error.with_field_violation(*key, detail, reason);
+    }
+    error.create()
+}
+
+#[must_use]
+pub fn duplicate_query_param(key: &str) -> CanonicalError {
+    invalid_field(
+        key,
+        format!("query parameter `{key}` is given more than once"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn query_params_unreadable(detail: &str) -> CanonicalError {
+    invalid_field(
+        "query",
+        format!("the query string could not be read: {detail}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+fn selectable_fields() -> String {
+    EntityField::ALL.map(EntityField::name).join(", ")
 }
 
 /// Reject a batch-get `key` item whose raw byte length exceeds the GTS identifier

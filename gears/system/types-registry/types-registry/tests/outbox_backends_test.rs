@@ -4,6 +4,7 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
+use types_registry::domain::selection::FieldSelection;
 
 use serde_json::{Value, json};
 use testcontainers::ImageExt;
@@ -94,7 +95,7 @@ async fn assert_delivery(db: &Arc<DBProvider<DbError>>, backend: &str) {
         operation.items,
     );
     let entity = registry
-        .entity(&EntityKey::GtsId(TARGET.to_owned()))
+        .entity(&EntityKey::GtsId(TARGET.to_owned()), FieldSelection::full())
         .await
         .unwrap_or_else(|e| panic!("{backend}: read the entity: {e}"))
         .unwrap_or_else(|| panic!("{backend}: the admitted entity is readable"));
@@ -264,7 +265,7 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
         operation.items,
     );
     let entity = submitter
-        .entity(&EntityKey::GtsId(gts_id.to_owned()))
+        .entity(&EntityKey::GtsId(gts_id.to_owned()), FieldSelection::full())
         .await
         .unwrap_or_else(|e| panic!("{backend}: read the entity: {e}"))
         .unwrap_or_else(|| panic!("{backend}: the admitted entity is readable"));
