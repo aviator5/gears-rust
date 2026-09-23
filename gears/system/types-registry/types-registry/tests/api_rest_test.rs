@@ -2707,10 +2707,11 @@ async fn a_discovery_page_is_content_free_and_ordered_by_identifier() {
     }
 }
 
-/// A tombstone stays exact-readable and leaves discovery (ADR-0008).
+/// A tombstone stays exact-readable and is listed only on request (ADR-0008).
 #[tokio::test]
-async fn discovery_excludes_tombstones() {
+async fn discovery_lists_tombstones_only_on_request() {
     let router = router_with_db().await;
+    register_entity(&router, "arrange-other", CF_OTHER_TYPE).await;
     register_entity(&router, "arrange", CF_TYPE).await;
     let deleted = call(
         &router,
@@ -2723,13 +2724,39 @@ async fn discovery_excludes_tombstones() {
         json!("succeeded")
     );
 
-    let page = call(&router, discover("")).await;
-    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
-    assert!(
-        page_ids(&page.body).is_empty(),
-        "the tombstone must not appear on a page: {:?}",
-        page.body,
-    );
+    for (query, want) in [
+        ("?limit=1", vec![CF_OTHER_TYPE]),
+        ("?limit=1&lifecycle_status=active", vec![CF_OTHER_TYPE]),
+        ("?limit=1&lifecycle_status=deleted", vec![CF_TYPE]),
+        (
+            "?limit=1&lifecycle_status=all",
+            vec![CF_OTHER_TYPE, CF_TYPE],
+        ),
+        ("?limit=1&lifecycle_status=deleted&kind=instance", vec![]),
+        (
+            "?limit=1&lifecycle_status=all&depth=1&kind=type_schema",
+            vec![CF_OTHER_TYPE, CF_TYPE],
+        ),
+        (
+            &format!("?limit=1&lifecycle_status=deleted&pattern={CF_OTHER_TYPE}"),
+            vec![],
+        ),
+    ] {
+        let items = traverse(&router, query).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|i| i["gts_id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, want, "{query}");
+        for item in &items {
+            let status = if item["gts_id"] == CF_TYPE {
+                "deleted"
+            } else {
+                "active"
+            };
+            assert_eq!(item["lifecycle_status"], status, "{query}: {item:?}");
+        }
+    }
 
     let exact = call(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
     assert_eq!(exact.status, StatusCode::OK, "{:?}", exact.body);
@@ -3000,7 +3027,7 @@ fn the_discovery_query_parameters_are_declared() {
             "missing parameter {expected:?}: {declared:?}",
         );
     }
-    assert_eq!(declared.len(), 6, "nothing else is declared: {declared:?}");
+    assert_eq!(declared.len(), 7, "nothing else is declared: {declared:?}");
 }
 
 /// Every one of the seven v2 operations answers with RFC-9457 problems, so a
@@ -3250,7 +3277,7 @@ async fn each_document_is_selected_alone() {
     ] {
         let response = call(&router, exact(CF_TYPE, &format!("?$select={field}"))).await;
         assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
-        let mut expected = vec![field, "lifecycle_status"];
+        let mut expected = vec![field, "gts_id", "gts_uuid", "lifecycle_status"];
         expected.sort_unstable();
         assert_eq!(field_names(&response.body), expected, "{field}");
         assert!(
@@ -3258,6 +3285,29 @@ async fn each_document_is_selected_alone() {
             "{field}: {:?}",
             response.body
         );
+    }
+
+    // Selecting only a document the Instance lacks still returns its identity
+    // and lifecycle on every read, and omits the document.
+    let select = "resolved_schema";
+    let single = call(&router, exact(CF_INSTANCE, &format!("?$select={select}"))).await;
+    let batch = call(&router, selective_batch(&[CF_INSTANCE], select)).await;
+    let page = call(
+        &router,
+        discover(&format!("?kind=instance&$select={select}")),
+    )
+    .await;
+    for entity in [
+        &single.body,
+        &batch.body["items"][0]["entity"],
+        &page.body["items"][0],
+    ] {
+        assert_eq!(
+            field_names(entity),
+            ["gts_id", "gts_uuid", "lifecycle_status"]
+        );
+        assert_eq!(entity["gts_id"], CF_INSTANCE);
+        assert_eq!(entity["lifecycle_status"], "active");
     }
 }
 
@@ -3276,11 +3326,18 @@ async fn a_mixed_batch_omits_type_schema_documents_on_the_instance() {
     let instance = &response.body["items"][1]["entity"];
     assert_eq!(
         field_names(schema),
-        ["content", "kind", "lifecycle_status", "resolved_schema"]
+        [
+            "content",
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "resolved_schema"
+        ]
     );
     assert_eq!(
         field_names(instance),
-        ["content", "kind", "lifecycle_status"],
+        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"],
         "an inapplicable document is absent, not null",
     );
     assert_eq!(instance["content"], json!({ "name": "first" }));
@@ -3318,7 +3375,7 @@ async fn provenance_is_one_group_and_null_where_inapplicable() {
     );
 }
 
-/// `lifecycle_status` is mandatory, so a projected tombstone is not an absence.
+/// Identity and lifecycle are mandatory, so a projected tombstone is not an absence.
 #[tokio::test]
 async fn a_tombstone_selected_for_content_still_reports_its_lifecycle() {
     let router = router_with_db().await;
@@ -3332,7 +3389,10 @@ async fn a_tombstone_selected_for_content_still_reports_its_lifecycle() {
 
     let single = call(&router, exact(CF_TYPE, "?$select=content")).await;
     assert_eq!(single.status, StatusCode::OK, "{:?}", single.body);
-    assert_eq!(field_names(&single.body), ["content", "lifecycle_status"]);
+    assert_eq!(
+        field_names(&single.body),
+        ["content", "gts_id", "gts_uuid", "lifecycle_status"]
+    );
     assert_eq!(single.body["lifecycle_status"], json!("deleted"));
     let batch = call(&router, selective_batch(&[CF_TYPE], "content")).await;
     assert_eq!(batch.body["items"][0]["status"], json!("found"));
@@ -3552,13 +3612,19 @@ async fn discovery_projects_selected_documents_across_pages() {
     for item in &items[..2] {
         assert_eq!(
             field_names(item),
-            ["content", "gts_id", "lifecycle_status", "resolved_schema"]
+            [
+                "content",
+                "gts_id",
+                "gts_uuid",
+                "lifecycle_status",
+                "resolved_schema"
+            ]
         );
         assert!(item["content"].is_object() && item["resolved_schema"].is_object());
     }
     assert_eq!(
         field_names(&items[2]),
-        ["content", "gts_id", "lifecycle_status"],
+        ["content", "gts_id", "gts_uuid", "lifecycle_status"],
         "the Instance has no resolved_schema",
     );
 
@@ -3580,7 +3646,10 @@ async fn a_page_under_a_metadata_only_selection_carries_only_it() {
     let page = call(&router, discover("?$select=gts_uuid")).await;
     assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
     for item in page.body["items"].as_array().expect("items") {
-        assert_eq!(field_names(item), ["gts_uuid", "lifecycle_status"]);
+        assert_eq!(
+            field_names(item),
+            ["gts_id", "gts_uuid", "lifecycle_status"]
+        );
     }
 }
 
@@ -3602,7 +3671,7 @@ async fn a_cursor_is_refused_under_a_different_selection() {
         ("?limit=1", "?limit=1&$select=content"),
         ("?limit=1&$select=content", "?limit=1"),
         ("?limit=1&$select=content", "?limit=1&$select=content,kind"),
-        ("?limit=1&$select=gts_id", "?limit=1&$select=gts_uuid"),
+        ("?limit=1&$select=gts_id", "?limit=1&$select=kind"),
     ] {
         let cursor = first_cursor(&router, issued).await;
         let response = call(&router, discover(&format!("{resumed}&cursor={cursor}"))).await;
@@ -3630,6 +3699,7 @@ async fn equivalent_selections_resume_one_traversal() {
             "?limit=1&$select=gts_uuid,content",
             "?limit=1&$select=Content,%20GTS_UUID,lifecycle_status",
         ),
+        ("?limit=1&$select=gts_id", "?limit=1&$select=gts_uuid"),
     ] {
         let cursor = first_cursor(&router, issued).await;
         let original = call(&router, discover(&format!("{issued}&cursor={cursor}"))).await;
@@ -3758,7 +3828,12 @@ async fn discovery_narrows_by_kind_and_intersects_with_pattern_and_select() {
     let projected = call(&router, discover("?kind=instance&$select=gts_id,content")).await;
     assert_eq!(
         projected.body["items"],
-        json!([{ "gts_id": CF_INSTANCE, "lifecycle_status": "active", "content": { "name": "first" } }]),
+        json!([{
+            "gts_id": CF_INSTANCE,
+            "gts_uuid": gts::GtsId::try_new(CF_INSTANCE).expect("id").to_uuid(),
+            "lifecycle_status": "active",
+            "content": { "name": "first" },
+        }]),
     );
 }
 
@@ -3843,22 +3918,155 @@ async fn an_unknown_kind_is_refused_and_is_schema_is_not_an_alias() {
     }
 }
 
+/// The generated document, not the builder input: `ParamSpec` has no `enum` or
+/// `default`, so `kind` and `lifecycle_status` are optional plain strings whose
+/// vocabulary is in the description.
+fn generated_openapi() -> Value {
+    let registry = toolkit::api::OpenApiRegistryImpl::new();
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let _router =
+        types_registry::api::rest::routes::register_routes(Router::new(), &registry, legacy, None);
+    let document = registry
+        .build_openapi(&toolkit::api::OpenApiInfo::default())
+        .expect("the document builds");
+    serde_json::to_value(document).expect("the document serializes")
+}
+
+#[tokio::test]
+async fn a_malformed_lifecycle_status_is_refused() {
+    let router = router_with_db().await;
+    for value in [
+        "",
+        "ACTIVE",
+        "Active",
+        "any",
+        "active,deleted",
+        "%20active",
+        "tombstone",
+    ] {
+        let response = call(&router, discover(&format!("?lifecycle_status={value}"))).await;
+        assert_field_refusal(&response, "lifecycle_status", "VALIDATION_FAILED");
+    }
+    let repeated = call(
+        &router,
+        discover("?lifecycle_status=all&lifecycle_status=all"),
+    )
+    .await;
+    assert_field_refusal(&repeated, "lifecycle_status", "VALIDATION_FAILED");
+}
+
+/// Omitted and explicit `active` are one binding; `deleted` and `all` are not.
+#[tokio::test]
+async fn a_cursor_binds_the_normalized_lifecycle_status() {
+    let (router, db) = router_and_db().await;
+    _ = seed_entities(&db, 3).await;
+
+    for (issued, resumed) in [
+        ("?limit=1", "?limit=1&lifecycle_status=deleted"),
+        ("?limit=1", "?limit=1&lifecycle_status=all"),
+        (
+            "?limit=1&lifecycle_status=active",
+            "?limit=1&lifecycle_status=all",
+        ),
+        ("?limit=1&lifecycle_status=all", "?limit=1"),
+        (
+            "?limit=1&lifecycle_status=all",
+            "?limit=1&lifecycle_status=deleted",
+        ),
+    ] {
+        let cursor = first_cursor(&router, issued).await;
+        let response = call(&router, discover(&format!("{resumed}&cursor={cursor}"))).await;
+        assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
+    }
+    for (issued, resumed) in [
+        ("?limit=1", "?limit=1&lifecycle_status=active"),
+        ("?limit=1&lifecycle_status=active", "?limit=1"),
+        (
+            "?limit=1&lifecycle_status=all",
+            "?limit=1&lifecycle_status=all",
+        ),
+    ] {
+        let cursor = first_cursor(&router, issued).await;
+        let response = call(&router, discover(&format!("{resumed}&cursor={cursor}"))).await;
+        assert_eq!(response.status, StatusCode::OK, "{issued} -> {resumed}");
+        assert_eq!(page_ids(&response.body).len(), 1, "{issued} -> {resumed}");
+    }
+}
+
 #[test]
-fn discovery_declares_kind_as_a_string_parameter() {
-    let openapi = TestOpenApi::default();
-    let _router = router_for_openapi(&openapi);
-    let params = openapi.params.lock().expect("params lock");
-    let (_, declared) = params
+fn discovery_declares_kind_and_lifecycle_status_as_optional_strings() {
+    let doc = generated_openapi();
+    let params = doc["paths"][format!("{V2}/entities")]["get"]["parameters"]
+        .as_array()
+        .expect("discovery parameters")
+        .clone();
+    for name in ["kind", "lifecycle_status"] {
+        let param = params
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is declared: {params:?}"));
+        assert_eq!(param["in"], "query", "{name}");
+        assert_eq!(param["required"], false, "{name}");
+        assert_eq!(param["schema"], json!({ "type": "string" }), "{name}");
+    }
+    let lifecycle = params
         .iter()
-        .find(|(id, _)| id == "types_registry.list_entities")
-        .expect("discovery registered");
-    let kind = declared
-        .iter()
-        .find(|p| p.0 == "kind")
-        .expect("kind is declared");
+        .find(|p| p["name"] == "lifecycle_status")
+        .expect("declared");
+    let text = lifecycle["description"].as_str().expect("described");
+    for word in ["`active` (default)", "`deleted`", "`all`"] {
+        assert!(text.contains(word), "{word}: {text}");
+    }
+}
+
+/// All three database-backed reads answer with the one `EntityDto`, whose
+/// identity and lifecycle are required and never `null`.
+#[test]
+fn every_entity_read_requires_identity_and_lifecycle_in_the_generated_document() {
+    let doc = generated_openapi();
+    let schemas = &doc["components"]["schemas"];
+    let entity = &schemas["EntityDto"];
     assert_eq!(
-        (kind.1.clone(), kind.2, kind.3.as_str()),
-        (ParamLocation::Query, false, "string")
+        entity["required"],
+        json!(["gts_id", "gts_uuid", "lifecycle_status"])
+    );
+    assert_eq!(entity["properties"]["gts_id"]["type"], "string");
+    assert_eq!(
+        (
+            &entity["properties"]["gts_uuid"]["type"],
+            &entity["properties"]["gts_uuid"]["format"],
+        ),
+        (&json!("string"), &json!("uuid"))
+    );
+    let body = |path: String, method: &str| {
+        doc["paths"][path][method]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["$ref"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let entity_ref = "#/components/schemas/EntityDto";
+    assert_eq!(
+        body(format!("{V2}/entities/{{entity_key}}"), "get"),
+        entity_ref
+    );
+    assert_eq!(
+        body(format!("{V2}/entities:batchGet"), "post"),
+        "#/components/schemas/EntityLookupsDto"
+    );
+    assert_eq!(
+        body(format!("{V2}/entities"), "get"),
+        "#/components/schemas/EntityPageDto"
+    );
+    let lookup = schemas["EntityLookupDto"]["properties"]["entity"].to_string();
+    assert!(lookup.contains(entity_ref), "{lookup}");
+    assert_eq!(
+        schemas["EntityPageDto"]["properties"]["items"]["items"]["$ref"],
+        entity_ref
     );
 }
 
@@ -3926,7 +4134,10 @@ async fn depth_is_an_inclusive_segment_maximum_on_roots_derived_schemas_and_inst
         want.sort_unstable();
         assert_eq!(page_ids(&page.body), want, "{query}");
         for item in page.body["items"].as_array().expect("items") {
-            assert_eq!(field_names(item), ["gts_id", "kind", "lifecycle_status"]);
+            assert_eq!(
+                field_names(item),
+                ["gts_id", "gts_uuid", "kind", "lifecycle_status"]
+            );
         }
     }
 }
@@ -4014,31 +4225,36 @@ async fn a_sparse_depth_traversal_progresses_through_empty_pages() {
     ids.push(&far);
     seed_ids(&db, &ids).await;
 
-    let mut seen = Vec::new();
-    let mut empty_with_more = 0;
-    let mut next: Option<String> = None;
-    for _ in 0..20 {
-        let uri = match &next {
-            Some(cursor) => format!("?limit=1&depth=1&cursor={cursor}"),
-            None => "?limit=1&depth=1".to_owned(),
-        };
-        let page = call(&router, discover(&uri)).await;
-        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
-        let ids = page_ids(&page.body);
-        next = page.body["page_info"]["next_cursor"]
-            .as_str()
-            .map(str::to_owned);
-        if ids.is_empty() && next.is_some() {
-            empty_with_more += 1;
+    for base in ["?limit=1&depth=1", "?limit=1&depth=1&lifecycle_status=all"] {
+        let mut seen = Vec::new();
+        let mut empty_with_more = 0;
+        let mut next: Option<String> = None;
+        for _ in 0..20 {
+            let uri = match &next {
+                Some(cursor) => format!("{base}&cursor={cursor}"),
+                None => base.to_owned(),
+            };
+            let page = call(&router, discover(&uri)).await;
+            assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+            let ids = page_ids(&page.body);
+            next = page.body["page_info"]["next_cursor"]
+                .as_str()
+                .map(str::to_owned);
+            if ids.is_empty() && next.is_some() {
+                empty_with_more += 1;
+            }
+            seen.extend(ids);
+            if next.is_none() {
+                break;
+            }
         }
-        seen.extend(ids);
-        if next.is_none() {
-            break;
-        }
+        assert!(next.is_none(), "{base}: the traversal must end");
+        assert_eq!(seen, [near.as_str(), far.as_str()], "{base}");
+        assert!(
+            empty_with_more >= 1,
+            "{base}: the gap spans a whole scan budget"
+        );
     }
-    assert!(next.is_none(), "the traversal must end");
-    assert_eq!(seen, [near, far]);
-    assert!(empty_with_more >= 1, "the gap spans a whole scan budget");
 }
 
 /// `ToolKit`'s extractor parses `$select` and the `CursorV1` token in one request:
@@ -4083,7 +4299,7 @@ async fn toolkit_select_extraction_and_the_v1_cursor_work_together() {
     assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
     assert_eq!(
         field_names(&resumed.body["items"][0]),
-        ["content", "gts_id", "lifecycle_status"]
+        ["content", "gts_id", "gts_uuid", "lifecycle_status"]
     );
 }
 

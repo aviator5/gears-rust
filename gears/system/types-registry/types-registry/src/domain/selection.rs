@@ -77,8 +77,8 @@ impl EntityField {
 /// advertises nor synthesizes them.
 const UNAVAILABLE: [&str; 2] = ["availability", "owned_by_context_tenant"];
 
-/// A bitset, so equality is identity. [`EntityField::LifecycleStatus`] is always a
-/// member: it is mandatory, and naming it must not change a cursor or validator.
+/// A bitset, so equality is identity. [`FieldSelection::MANDATORY_FIELDS`] are
+/// always members: naming one must not change a cursor or validator.
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FieldSelection(u16);
@@ -91,6 +91,13 @@ impl Default for FieldSelection {
 }
 
 impl FieldSelection {
+    /// Identity and lifecycle: on every entity whatever `$select` names.
+    pub const MANDATORY_FIELDS: [EntityField; 3] = [
+        EntityField::GtsId,
+        EntityField::GtsUuid,
+        EntityField::LifecycleStatus,
+    ];
+
     pub const DEFAULT_FIELDS: [EntityField; 6] = [
         EntityField::GtsId,
         EntityField::GtsUuid,
@@ -106,12 +113,12 @@ impl FieldSelection {
     }
 
     fn of(fields: &[EntityField]) -> Self {
-        let bits = fields
-            .iter()
-            .fold(EntityField::LifecycleStatus.bit(), |bits, field| {
-                bits | field.bit()
-            });
-        Self(bits)
+        Self(
+            Self::MANDATORY_FIELDS
+                .iter()
+                .chain(fields)
+                .fold(0, |bits, field| bits | field.bit()),
+        )
     }
 
     /// Trimmed and case-insensitive, as `ToolKit` `OData` parses names.
@@ -123,7 +130,7 @@ impl FieldSelection {
         if names.is_empty() {
             return Err(SelectionError::Empty);
         }
-        let mut bits = EntityField::LifecycleStatus.bit();
+        let mut bits = Self::of(&[]).0;
         let mut seen: u16 = 0;
         for raw in names {
             let name = raw.as_ref().trim().to_lowercase();

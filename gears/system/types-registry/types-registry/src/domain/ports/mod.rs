@@ -24,8 +24,8 @@ use uuid::Uuid;
 use crate::domain::admission::Precondition;
 use crate::domain::admission::fingerprint::{RequestFingerprint, ScopeHash};
 use crate::domain::enums::{
-    DependencyKind, EntityKind, LifecycleStatus, OperationItemStatus, OperationKind,
-    OperationStatus, OwnershipScope, Plane,
+    DependencyKind, EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus,
+    OperationKind, OperationStatus, OwnershipScope, Plane,
 };
 use crate::domain::family::FamilyKey;
 use crate::domain::selection::FieldSelection;
@@ -641,13 +641,16 @@ impl PageRequest {
     }
 }
 
-/// What a discovery page is restricted to; every field absent means no restriction.
+/// What a discovery page is restricted to; every absent field and the default
+/// `lifecycle` mean no restriction beyond active entities.
 #[domain_model]
 #[derive(Clone, Debug, Default)]
 pub struct ListFilter {
     pub pattern: Option<gts::GtsIdPattern>,
     /// Decided by the stored `entity.kind`, in SQL.
     pub kind: Option<EntityKind>,
+    /// Decided by the stored `entity.lifecycle_status`, in SQL.
+    pub lifecycle: LifecycleFilter,
     /// Inclusive maximum of parsed `GtsId::segments()`, decided in Rust.
     pub max_chain_depth: Option<u8>,
 }
@@ -717,9 +720,9 @@ pub trait EntityStore: Send + Sync {
         gts_uuids: &[Uuid],
     ) -> Result<Vec<EntityRow>, ScopeError>;
 
-    /// One bounded keyset page of **active** entities matching `filter`. Tombstones
-    /// are excluded: a deleted entity stays exact-readable and leaves discovery
-    /// (ADR-0008). Every filter applies before a row counts toward the limit.
+    /// One bounded keyset page of entities matching `filter`, active only unless
+    /// `filter.lifecycle` asks for tombstones (ADR-0008). Every filter applies
+    /// before a row counts toward the limit.
     ///
     /// The pattern is `gts-rust`'s, never SQL's: the implementation may narrow with
     /// a range over the identifier, but only [`gts::GtsId::matches_pattern`] decides

@@ -558,7 +558,7 @@ The availability-blocking relationships are:
 
 A new relationship kind **MUST** be classified by the same semantic-contract rule before it affects availability. Blocking edges exist only between Managed Entities; an Externally Managed Entity's availability is obtained live from its source and has no registry-composed Availability Closure.
 
-P1 has no managed enablement override. A visible `ACTIVE` Managed Entity is eligible for `AVAILABLE` but **MUST** be reasoned `UNAVAILABLE` when a blocking target is unavailable. A `DELETED` entity **MUST** be unavailable yet still be returned by exact read as deleted; discovery, search, and query assistance exclude it. Admission Candidates **MUST NOT** participate.
+P1 has no managed enablement override. A visible `ACTIVE` Managed Entity is eligible for `AVAILABLE` but **MUST** be reasoned `UNAVAILABLE` when a blocking target is unavailable. A `DELETED` entity **MUST** be unavailable yet still be returned by exact read as deleted; discovery excludes it by default but includes it on explicit `lifecycle_status=deleted|all`, while search and query assistance exclude it. Admission Candidates **MUST NOT** participate.
 
 The Context Tenant defaults to the subject tenant on the tenant plane. A caller may name a descendant only when the platform PDP authorizes the subject-to-context ancestor relation. The platform plane has no default; without an explicit Context Tenant the verdict **MUST** be absent, with no synthetic not-evaluated state.
 

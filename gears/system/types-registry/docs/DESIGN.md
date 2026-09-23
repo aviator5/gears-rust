@@ -504,7 +504,7 @@ Five bounds are deployment configuration (§3.8); the expansion maximum is fixed
 | Resolved document | **1 MB** | Separately bounds derivation expansion, which the authored limit cannot constrain. |
 | Resolution closure | **64 documents** | Bounds reference resolution and composition work. This also bounds derivation depth because each level contributes a document. |
 | Batch | **100 candidates** | Rejected synchronously before storage. It covers the largest current gear (26 definitions); larger inventories may be split and reconciled. |
-| Type-filter expansion | **1000 references** | SDK-owned, not per-deployment: bounds the `expand_type_filter` result; about 36 KB of JSON and practical to chunk into a consumer's `IN` predicate. |
+| Type-filter expansion | **1000 references** | SDK-owned, not per-deployment: bounds the `expand_type_filter` result, practical to chunk into a consumer's `IN` predicate. |
 | Reverse-impact set | **512 entities** | Bounds the entities walked and refreshed by one revision. The largest measured repository set is 27. |
 
 Total dependents and retained revisions remain unbounded, but `limits.activation_write_set` bounds the impact of one admission. Capping total dependents would prevent reuse of shared base types. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Per-tenant quotas remain outside this design.
@@ -947,7 +947,7 @@ The tenant surface runs on the business listener with `SecurityContext`. `owner_
 
 `GET /entities` is ordinary paged discovery. Its default projection is document-free; an explicit `$select` may name documents, and changes only the representation — never a mode or a traversal cap. A traversal may exceed 1000 entities and ends only when `next_cursor` is absent; a short or empty page may still carry one. Three intentionally absent routes are worth recording:
 
-- **Type filter expansion** is a tenant-plane SDK helper, not a route: `expand_type_filter` pages discovery with `$select=gts_uuid&availability=available` and deduplicates. It enforces a documented maximum of 1000 distinct references: the 1001st fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`, and exactly 1000 with a `next_cursor` keeps paging until exhaustion or overflow. Any page, source, context or routing failure discards the accumulated prefix; no partial `ConcreteReferenceSet` is exposed. Completeness is over the traversal, not one instant, as ADR-0001 and `cpt-cf-types-registry-fr-type-query-assistance` specify. Results have no validator and must not be cached because ADR-0010 availability may change without entity mutation. A direct REST caller expanding a filter applies the same rules itself.
+- **Type filter expansion** is a tenant-plane SDK helper, not a route: `expand_type_filter` pages discovery with `$select=gts_uuid&lifecycle_status=active&availability=available` and deduplicates. It enforces a documented maximum of 1000 distinct references: the 1001st fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`, and exactly 1000 with a `next_cursor` keeps paging until exhaustion or overflow. Any page, source, context or routing failure discards the accumulated prefix; no partial `ConcreteReferenceSet` is exposed. Completeness is over the traversal, not one instant, as ADR-0001 and `cpt-cf-types-registry-fr-type-query-assistance` specify. Results have no validator and must not be cached because ADR-0010 availability may change without entity mutation. A direct REST caller expanding a filter applies the same rules itself.
 - **Dependent enumeration** is replaced by mutation Dry Run, which executes the same revalidation and reports blockers. Platform-plane deletion Dry Run covers hidden dependants under ADR-0009; no requirement needs the non-blocking remainder.
 - **Kind-specific collections** are unnecessary because trailing `~` encodes kind and would let path and identifier disagree. SDK conveniences remain kind-narrowed.
 
@@ -1133,6 +1133,7 @@ The `If-None-Match` **header** is unavailable here, and refused rather than igno
 | `pattern` | query | A GTS wildcard pattern. Compiles to a range predicate over the canonical identifier, which the GTS matcher then confirms |
 | `depth` | query | Maximum chain length. A GTS wildcard is greedy across `~`, so a pattern alone cannot exclude types derived from what it matches; pattern plus depth is also how a version family is enumerated exactly, which is what ADR-0008 asks of discovery. A version-less pattern collects every major and, where the family carries them, every minor |
 | `kind` | query | `type_schema` or `instance` |
+| `lifecycle_status` | query | `active` (default), `deleted` (tombstones only) or `all`. Bound by the cursor; absent equals `active` |
 | `origin` | query | `managed` or `external`. Restricting to `managed` selects no Registry Source, so that view survives a plugin outage which `cpt-cf-types-registry-fr-registry-source-routing` would otherwise fail closed on |
 | `availability` | query | `available` or `unavailable`, evaluated for the Context Tenant. An enum rather than an available-only flag, so the vocabulary can grow with the verdict. Type filter expansion fixes it to `available` |
 | `scope` | query | *Tenant plane only.* `mine` or `all`. Never a tenant identifier — accepting one would let a caller find its ancestors by observing whether a filtered result is empty |
@@ -1140,7 +1141,7 @@ The `If-None-Match` **header** is unavailable here, and refused rather than igno
 | `$select` | query | As above, applied to every item on the page |
 | `limit`, `cursor` | query | Page size and position. `limit` defaults to 50 and may not exceed 100. The bound is on items, not on bytes: a caller selecting documents should page smaller |
 
-The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Results exclude deleted entities and sort by canonical identifier. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
+The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Results are active-only unless `lifecycle_status` says otherwise, and sort by canonical identifier. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
 
 The `fr-type-query-assistance` filter forms map as follows:
 
@@ -1237,8 +1238,8 @@ pub trait TypesRegistryClient: Send + Sync {
         query: EntityQuery,
     ) -> Result<EntityPage, CanonicalError>;
 
-    /// Provided, not required: pages `list_entities` under `$select=gts_uuid`
-    /// and `availability=available`, which `ExpansionFilter` fixes rather than
+    /// Provided, not required: pages `list_entities` under `$select=gts_uuid`,
+    /// `lifecycle_status=active` and `availability=available`, which `ExpansionFilter` fixes rather than
     /// accepting from the caller, until the continuation is absent. More than 1000
     /// distinct references fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`; that or
     /// any page failure exposes no partial set. The result is complete with
@@ -1381,14 +1382,15 @@ pub enum EntityLookup {
     Failed(CanonicalError),
 }
 
-/// Fields are optional because `$select` returns only selected fields.
+/// Identity and lifecycle are always present; other fields only when selected.
 pub struct EntitySnapshot {
-    // The default set.
-    pub gts_id: Option<GtsId>,
-    pub gts_uuid: Option<Uuid>,
+    pub gts_id: GtsId,
+    pub gts_uuid: Uuid,
+    pub lifecycle_status: LifecycleStatus,
+
+    // The rest of the default set.
     pub kind: Option<EntityKind>,
     pub origin: Option<Origin>,
-    pub lifecycle_status: Option<LifecycleStatus>,
     pub availability: Option<Availability>,
     /// Whether the Context Tenant owns it; absent without a Context Tenant.
     pub owned_by_context_tenant: Option<bool>,
@@ -1464,14 +1466,19 @@ pub struct EntityFilter {
     pub pattern: Option<GtsIdPattern>,
     pub max_chain_depth: Option<u8>,
     pub kind: Option<EntityKind>,
+    pub lifecycle: LifecycleFilter,
     pub origin: Option<OriginFilter>,        // Managed | External
     pub availability: Option<AvailabilityState>,
     /// Tenant-only; the platform endpoint accepts only None.
     pub scope: Option<OwnershipScopeFilter>, // Mine | All
 }
 
-/// Expansion requires a pattern, fixes availability to Available, and is
-/// tenant-only; therefore it exposes neither availability nor scope.
+/// Which lifecycle states a page lists; tombstones only on request.
+#[derive(Default)]
+pub enum LifecycleFilter { #[default] Active, Deleted, All }
+
+/// Expansion requires a pattern, fixes lifecycle to Active and availability to
+/// Available, and is tenant-only; therefore it exposes no lifecycle, availability or scope.
 pub struct ExpansionFilter {
     pub pattern: GtsIdPattern,
     pub max_chain_depth: Option<u8>,
@@ -1558,9 +1565,9 @@ That gives three read operations with three different completeness contracts:
 
 They remain separate because filters cannot carry per-key validators, page absence is not a key answer, and their failure/completeness rules differ.
 
-Exact reads return deleted entities as deleted/unavailable rather than conflating them with never-issued IDs; discovery and expansion exclude them. Their `content` and derived documents remain readable because live gear-owned data may still conform under `cpt-cf-types-registry-fr-lifecycle` and `cpt-cf-types-registry-principle-contract-not-object`.
+Exact reads return deleted entities as deleted/unavailable rather than conflating them with never-issued IDs; discovery excludes them unless `lifecycle_status=deleted|all` asks, and expansion always excludes them. Their `content` and derived documents remain readable because live gear-owned data may still conform under `cpt-cf-types-registry-fr-lifecycle` and `cpt-cf-types-registry-principle-contract-not-object`.
 
-`lifecycle_status: DELETED` is mandatory exact-read metadata, outside `$select` — like the freshness validator below. A projection that names only `content` still carries the deleted status on a deleted entity, because a caller selecting documents must be able to distinguish a retired contract from an identifier that never existed; stripping it would make the two responses identical.
+`gts_id`, `gts_uuid` and `lifecycle_status` are mandatory on every returned entity, outside `$select` — like the freshness validator below. A projection that names only `content` still identifies the entity and carries its status, so a caller selecting documents can tell a retired contract from an active one; absence is already `404`/`not_found`.
 
 Authorization runs first, then visibility, so a denial is uniform and out-of-scope remains indistinguishable from absent.
 
@@ -1568,7 +1575,7 @@ Authorization runs first, then visibility, so a denial is uniform and out-of-sco
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-field-projection`
 
-`$select` returns exactly named fields. Its document-free default is `gts_id`, `gts_uuid`, `kind`, `origin`, `lifecycle_status`, `availability` and reason, ownership view, `content_hash`, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` alone.
+`$select` returns the named fields plus the mandatory `gts_id`, `gts_uuid` and `lifecycle_status`. Its document-free default is `gts_id`, `gts_uuid`, `kind`, `origin`, `lifecycle_status`, `availability` and reason, ownership view, `content_hash`, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` plus the mandatory fields.
 
 **Selectable documents are flat, with one group left**, cut by transfer cost rather than by consumer:
 
@@ -1598,7 +1605,7 @@ Projection changes naturally cause validator mismatch and a full result. Inappli
 
 ##### Resolution and availability
 
-Forward and reverse resolution are batch reads: `EntityKey` accepts either form and results carry both. `$select=gts_id` or `$select=gts_id,availability` supplies the narrow form without another operation.
+Forward and reverse resolution are batch reads: `EntityKey` accepts either form and results carry both. `$select=gts_uuid` or `$select=availability` supplies the narrow form (identity is always returned) without another operation.
 
 Deleted reverse resolution succeeds with deleted state; invisible and never-issued references both return `not_found` (ADR-0009). Since references encode no source, unresolved ones walk plugins in order, batched once per plugin, without ADR-0007 memo or circuit breaker.
 
@@ -2058,7 +2065,7 @@ sequenceDiagram
 
     DG->>S: expand_type_filter(pattern, depth, kind, origin)
     loop until next_cursor is absent
-        S->>A: GET /entities, $select=gts_uuid, availability=available, cursor
+        S->>A: GET /entities, $select=gts_uuid, lifecycle_status=active, availability=available, cursor
         opt tenant plane
             A->>Z: list, registry metatype resource
             Z-->>A: Allow or deny, gear-wide in P1

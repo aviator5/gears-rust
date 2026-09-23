@@ -417,7 +417,7 @@ the document-free discovery default remains.
 
 **`expand_type_filter` is genuinely blocked**, and this is the one item whose original
 placement was right for the wrong reason. Its DESIGN definition *is*
-`$select=gts_uuid&availability=available`, with the availability filter fixed by the method
+`$select=gts_uuid&lifecycle_status=active&availability=available`, with the filters fixed by the method
 rather than supplied by the caller. Availability (ADR-0010) needs tenancy and is out of P0, so
 a P0 method under that name would report retired contracts as usable. A same-named different
 meaning is worse than absence; a caller wanting the traversal pages `list_entities` itself.
@@ -820,7 +820,7 @@ is an inclusive maximum length of parsed GTS identifier segments (`GtsId::segmen
 one segment has depth 1), so `pattern` plus `depth` can bound a derivation or version
 family without treating a greedy GTS wildcard as an exact chain level. `kind` is the
 existing `type_schema`/`instance` enum. Both work without `pattern` and intersect with
-it when supplied; deleted entities remain excluded. P0 still omits `origin`,
+it when supplied; discovery stays active-only by default. P0 still omits `origin`,
 `availability`, `scope`, `tenant_id`, legacy segment filters and generic `$filter`.
 
 **Boundary and order.** Keep GTS matching and depth semantics in `gts-id`; use the stored
@@ -838,6 +838,12 @@ tests on all three backends. The second slice must preserve progress through spa
 results under T22a's scan budget: a page may be empty while a continuation exists, but
 it may neither skip a later match nor claim completion early. Checkpoint 6 reviews the
 combined filter and projection contract; T24a promotes it with the other v2 routes.
+
+**Amendment (2026-09-23).** Discovery adds `lifecycle_status=active|deleted|all`
+(default `active`), an SQL predicate applied before the page limit and bound by the
+cursor (absent equals `active`). All three reads always return `gts_id`, `gts_uuid` and
+`lifecycle_status`, required in OpenAPI and part of every normalized selection. Exact
+reads and `batchGet` are unchanged; SDK expansion requests `active` explicitly.
 
 ## Dependency graph
 
@@ -969,7 +975,7 @@ exists. From T7 onward the graph is vertical.
 - **Deferred to P1:** T22 — inventory `owning_gear` metadata/filtering (#4628, P18)
 - T22a: REST batchGet and discovery — complete OpenAPI and quickstart (P17)
 - T22b: Field projection on all three read routes — document-free default (P19)
-- T22c: Discovery `depth` and `kind` filters — cursor-bound and composed with `pattern` (P20)
+- T22c: Discovery `depth`, `kind` and `lifecycle_status` filters — cursor-bound and composed with `pattern` (P20)
 - T23: New SDK trait and explicit-document reconciliation helper
 
 **Checkpoint 6**

@@ -432,6 +432,7 @@ pub async fn discover_entities(
     let binding = Binding {
         pattern: params.pattern.as_deref(),
         kind: params.kind,
+        lifecycle: params.lifecycle,
         max_chain_depth: params.max_chain_depth,
         selection: params.selection,
     };
@@ -447,6 +448,7 @@ pub async fn discover_entities(
             after,
             limit: params.limit,
             kind: params.kind,
+            lifecycle: params.lifecycle,
             max_chain_depth: params.max_chain_depth,
             selection: params.selection,
         })

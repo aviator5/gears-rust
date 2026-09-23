@@ -16,10 +16,10 @@
 //!
 //! # What the cursor binds
 //!
-//! The query it was issued for: the pattern, `depth`, `kind` and the canonical
-//! [`FieldSelection`]. Replaying a position under any of them changed is refused
-//! rather than spliced; an absent `$select` and an explicit default one share one
-//! canonical spelling and so one binding.
+//! The query it was issued for: the pattern, `depth`, `kind`, `lifecycle_status`
+//! and the canonical [`FieldSelection`]. Replaying a position under any of them
+//! changed is refused rather than spliced; an absent `$select` or
+//! `lifecycle_status` and its explicit default share one binding.
 //!
 //! [`DiscoveryQuery::after`]: crate::domain::registry_service::DiscoveryQuery::after
 
@@ -28,7 +28,7 @@ use toolkit_odata::pagination::short_filter_hash;
 use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir, ast, validate_cursor_against};
 
 use super::error::{cursor_not_usable, cursor_too_long};
-use crate::domain::enums::EntityKind;
+use crate::domain::enums::{EntityKind, LifecycleFilter};
 use crate::domain::selection::FieldSelection;
 
 /// The one keyset column. `gts_id` is unique and immutable, which is what makes the
@@ -39,11 +39,21 @@ const KEY_FIELD: &str = "gts_id";
 const SELECT_FIELD: &str = "$select";
 const KIND_FIELD: &str = "kind";
 const DEPTH_FIELD: &str = "depth";
+const LIFECYCLE_FIELD: &str = "lifecycle_status";
 
 const fn kind_name(kind: EntityKind) -> &'static str {
     match kind {
         EntityKind::TypeSchema => "type_schema",
         EntityKind::Instance => "instance",
+    }
+}
+
+/// `None` for the default, which adds no term.
+const fn lifecycle_name(lifecycle: LifecycleFilter) -> Option<&'static str> {
+    match lifecycle {
+        LifecycleFilter::Active => None,
+        LifecycleFilter::Deleted => Some("deleted"),
+        LifecycleFilter::All => Some("all"),
     }
 }
 
@@ -75,14 +85,14 @@ fn binding_hash(binding: &Binding<'_>) -> Option<String> {
         Some(pattern) => ast::Expr::And(Box::new(equals(KEY_FIELD, pattern)), Box::new(select)),
         None => select,
     };
-    // T22b's expression is the base, so a token issued before `depth`/`kind`
-    // existed resumes the same traversal when neither is named. An absent filter
-    // adds no term; a present one always changes the hash.
+    // An absent or default filter adds no term; any other always changes the hash.
+    // Earlier tokens resume only while their canonical `$select` is unchanged.
     let terms = [
         binding.kind.map(|kind| equals(KIND_FIELD, kind_name(kind))),
         binding
             .max_chain_depth
             .map(|depth| equals(DEPTH_FIELD, &depth.to_string())),
+        lifecycle_name(binding.lifecycle).map(|name| equals(LIFECYCLE_FIELD, name)),
     ];
     let expr = terms.into_iter().flatten().fold(base, |expr, term| {
         ast::Expr::And(Box::new(expr), Box::new(term))
@@ -94,6 +104,7 @@ fn binding_hash(binding: &Binding<'_>) -> Option<String> {
 pub struct Binding<'a> {
     pub pattern: Option<&'a str>,
     pub kind: Option<EntityKind>,
+    pub lifecycle: LifecycleFilter,
     pub max_chain_depth: Option<u8>,
     pub selection: FieldSelection,
 }
@@ -148,8 +159,8 @@ pub fn decode(token: &str, binding: &Binding<'_>) -> Result<String, CanonicalErr
     // which only a pre-T22b cursor lacks.
     if cursor.f != expected {
         return Err(cursor_not_usable(
-            "it was issued for a different pattern, depth, kind or $select than this \
-             request names",
+            "it was issued for a different pattern, depth, kind, lifecycle_status or \
+             $select than this request names",
         ));
     }
     if cursor.d != FORWARD {
@@ -184,6 +195,7 @@ mod tests {
         Binding {
             pattern,
             kind,
+            lifecycle: LifecycleFilter::Active,
             max_chain_depth,
             selection: if select.is_empty() {
                 FieldSelection::default()
@@ -263,8 +275,33 @@ mod tests {
         Ok(())
     }
 
-    /// A T22b token, whose hash covered only pattern and `$select`, resumes while
-    /// neither `depth` nor `kind` is named, and is refused once either is.
+    /// `deleted` and `all` are bindings of their own; the default adds no term.
+    #[test]
+    fn a_cursor_from_another_lifecycle_filter_is_refused() -> Result<(), CanonicalError> {
+        let filters = [
+            LifecycleFilter::Active,
+            LifecycleFilter::Deleted,
+            LifecycleFilter::All,
+        ];
+        let with = |lifecycle| Binding {
+            lifecycle,
+            ..bound(Some(PATTERN), &["content"])
+        };
+        for issued in filters {
+            let token = encode(AFTER, &with(issued))?;
+            for resumed in filters {
+                assert_eq!(
+                    decode(&token, &with(resumed)).is_ok(),
+                    issued == resumed,
+                    "{issued:?} -> {resumed:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A T22b default-selection token (its canonical spelling is unchanged)
+    /// resumes while no `depth`, `kind` or non-default `lifecycle_status` is named.
     #[test]
     fn a_t22b_cursor_resumes_under_the_same_absent_filters() -> Result<(), serde_json::Error> {
         let equals = |field: &str, value: &str| {
@@ -298,6 +335,11 @@ mod tests {
             let with_kind = filtered(pattern, Some(EntityKind::Instance), None, &[]);
             assert!(decode(&token, &with_kind).is_err(), "{pattern:?}");
             assert!(decode(&token, &filtered(pattern, None, Some(2), &[])).is_err());
+            let deleted = Binding {
+                lifecycle: LifecycleFilter::Deleted,
+                ..bound(pattern, &[])
+            };
+            assert!(decode(&token, &deleted).is_err(), "{pattern:?}");
         }
         Ok(())
     }

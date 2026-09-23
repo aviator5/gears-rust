@@ -289,6 +289,7 @@ mod violation_field {
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
     pub const PATTERN: &str = "pattern";
     pub const KIND: &str = "kind";
+    pub const LIFECYCLE_STATUS: &str = "lifecycle_status";
     pub const DEPTH: &str = "depth";
     pub const LIMIT: &str = "limit";
     pub const CURSOR: &str = "cursor";
@@ -365,6 +366,16 @@ pub fn kind_not_recognized(raw: &str) -> CanonicalError {
     invalid_field(
         violation_field::KIND,
         format!("kind must be `type_schema` or `instance`, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn lifecycle_status_not_recognized(raw: &str) -> CanonicalError {
+    let shown: String = raw.chars().take(64).collect();
+    invalid_field(
+        violation_field::LIFECYCLE_STATUS,
+        format!("lifecycle_status must be `active`, `deleted` or `all`, not `{shown}`"),
         field::VALIDATION_FAILED,
     )
 }

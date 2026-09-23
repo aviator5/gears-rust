@@ -2160,8 +2160,8 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   `projected_read_backends_test` records the SQL on all three backends: metadata-only
   exact, batch and discovery reads never name a document column, selected ones name only
   theirs, all in one snapshot transaction, at most six statements for a batch.
-- **Wire shape.** `EntityDto` omits unselected fields; only `lifecycle_status` is required
-  in OpenAPI, metadata is non-nullable, documents are any-JSON (so a selected `null`
+- **Wire shape.** `EntityDto` omits unselected fields; only `lifecycle_status` was required
+  in OpenAPI (T22c's amendment adds `gts_id`/`gts_uuid`), metadata is non-nullable, documents are any-JSON (so a selected `null`
   stays). `origin` is `{"type":"managed",resource_version,created_at,updated_at}`;
   `owning_gear` moved under `provenance`. Instance artifacts are absent even when selected.
 - **Strict query parameters.** A guard extractor refuses undeclared keys
@@ -2277,6 +2277,23 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
   2100-character `$select` is refused by ToolKit; malformed `depth`,
   unknown `kind` and `is_schema` were `400`.
 
+**Amendment (2026-09-23): lifecycle filter and mandatory identity.**
+- [x] Discovery accepts `lifecycle_status=active|deleted|all` (default `active`); unknown,
+  empty or repeated values are `400` naming it. It is an SQL predicate in
+  `ListFilter::lifecycle`, applied with `kind` before the scan budget and page limit;
+  `pattern`/`depth` still post-filter in Rust. Exact read and `batchGet` are unchanged
+- [x] The cursor adds a `lifecycle_status` term only for `deleted`/`all`, so absent and
+  explicit `active` share one binding and changing the value on resume is `400`
+- [x] `gts_id`, `gts_uuid` and `lifecycle_status` are members of every `FieldSelection`
+  and required, non-nullable `EntityDto` fields. Canonical selections other than the
+  default gained `gts_id,gts_uuid`, so a pre-amendment cursor under such a `$select` is
+  refused rather than resumed
+- [x] Tests: generated OpenAPI (`OpenApiRegistryImpl`) for the `EntityDto` required set,
+  its use by all three reads, and `lifecycle_status` as an optional string parameter
+  (`ParamSpec` has no `enum`/`default`; vocabulary is in the description); REST lifecycle
+  traversal, malformed values and cursor binding; repository tombstones across a sparse
+  scan budget on all three backends
+
 **Dependencies:** T22b (projection and cursor contract); T22a (bounded discovery).
 Must complete before T23 fixes the SDK `EntityQuery` shape. No dependency on deferred
 inventory T22 or on tenancy/federation.
@@ -2311,8 +2328,8 @@ T26 once every consumer has moved.
 - [ ] Documents are selectable **individually**, not as an `effective` group: a caller wanting `effective_traits` must not be made to transfer the 1 MB-bounded `resolved_schema` with it (DESIGN §3.3, *Field selection*). T22b supplies the server contract; the SDK models use the same normalized selection and represent omitted fields explicitly
 - [ ] **No `effective_*` recomputation exists in the SDK** — the old `GtsTypeSchema::effective_schema` / `effective_properties` / `effective_required` / `effective_traits` / `effective_traits_schema` are not reproduced. They resolved only the parent `$ref` and left non-parent references unresolved, and `effective_traits` was an admitted approximation (`TODO(#1723)`), so reproducing them would reintroduce both a wrong answer and a `constraint-gts-implementation` violation (SPEC §10.1)
 - [ ] `EntityQuery` carries `limit` and `cursor`, and `EntityPage` carries the next cursor — the trait already declared `EntityPage` in SPEC §10.1, and without these it is a page in name only (D12)
-- [ ] `EntityQuery::filter` carries `pattern`, `max_chain_depth` and `kind` from T22c
-  as typed fields. `list_type_schemas` and `list_instances` request their respective
+- [ ] `EntityQuery::filter` carries `pattern`, `max_chain_depth`, `kind` and `lifecycle`
+  from T22c as typed fields. `list_type_schemas` and `list_instances` request their respective
   `kind` server-side while preserving caller-supplied pattern/depth and cursor;
   they do not fetch the opposite kind and discard it client-side
 - [ ] `list_instances` / `list_type_schemas` **explicitly select the documents their callers read**, on the discovery page or through a following `batchGet`. The ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant; `batchGet` is optional, for per-key validators and caching

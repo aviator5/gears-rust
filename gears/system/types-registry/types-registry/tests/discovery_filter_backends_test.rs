@@ -1,6 +1,6 @@
 //! Discovery filters (T22c) in `EntityRepo::list_page`, on every backend.
 //!
-//! `kind` is an SQL predicate on the stored `entity.kind`; `depth` and `pattern` are
+//! `kind` and `lifecycle` are SQL predicates on stored columns; `depth` and `pattern` are
 //! decided in Rust over SQL-prefiltered rows, which is where a sparse match set meets
 //! the scan budget. `SQLite` runs unconditionally; `PostgreSQL` and `MySQL` need
 //! Docker:
@@ -23,7 +23,7 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use common::allow_all;
-use types_registry::domain::enums::{EntityKind, OwnershipScope};
+use types_registry::domain::enums::{EntityKind, LifecycleFilter, OwnershipScope};
 use types_registry::domain::ports::{ListFilter, NewEntity, PageRequest};
 use types_registry::infra::storage::repo::{EntityRepo, VersionFamilyRepo};
 
@@ -137,6 +137,7 @@ async fn kind_is_an_sql_predicate_intersected_with_the_pattern(db: &Provider, ba
                 GtsIdPattern::try_new(gts_id!("cf.core.dfb.base.v1~*")).expect("pattern"),
             ),
             kind: Some(kind),
+            lifecycle: LifecycleFilter::Active,
             max_chain_depth: None,
         };
         assert_eq!(
@@ -173,6 +174,7 @@ async fn depth_bounds_parsed_segments_and_composes(db: &Provider, backend: &str)
                 let filter = ListFilter {
                     pattern: pattern.clone(),
                     kind,
+                    lifecycle: LifecycleFilter::Active,
                     max_chain_depth: Some(depth),
                 };
                 let want = expected(|id| {
@@ -220,6 +222,7 @@ async fn a_sparse_depth_traversal_crosses_the_scan_budget(db: &Provider, backend
     let filter = ListFilter {
         pattern: Some(GtsIdPattern::try_new(gts_id!("cf.core.dfs.*")).expect("pattern")),
         kind: None,
+        lifecycle: LifecycleFilter::Active,
         max_chain_depth: Some(1),
     };
     let conn = db.conn().expect("conn");
@@ -250,11 +253,96 @@ async fn a_sparse_depth_traversal_crosses_the_scan_budget(db: &Provider, backend
     );
 }
 
+async fn tombstone(db: &Provider, gts_id: &str) {
+    let conn = db.conn().expect("conn");
+    let row = EntityRepo::find_by_gts_id(&conn, &allow_all(), gts_id)
+        .await
+        .expect("read")
+        .expect("seeded");
+    EntityRepo::mark_deleted(&conn, &allow_all(), row.id, row.resource_version, NOW)
+        .await
+        .expect("delete")
+        .expect("active row deletes");
+}
+
+/// Two tombstones around more active rows than one call may scan. `deleted` skips
+/// the actives in SQL; `all` with `depth` crosses the budget through empty pages
+/// and still reaches both; `active` never shows a tombstone.
+async fn lifecycle_is_an_sql_predicate_across_sparse_pages(db: &Provider, backend: &str) {
+    const GAP: usize = 2_100;
+    let near = gts_id!("cf.core.dfl.aaa.v1~");
+    let far = gts_id!("cf.core.dfl.zzz.v1~");
+    let gap: Vec<String> = (0..GAP)
+        .map(|i| {
+            format!(
+                "{}cf.core.dfl.base.v1~cf.core.dfl.n{i:05}.v1~",
+                gts::GTS_ID_PREFIX
+            )
+        })
+        .collect();
+    seed(db, &[near, far]).await;
+    let gap_refs: Vec<&str> = gap.iter().map(String::as_str).collect();
+    seed_in(db, &gap_refs, Some("family:lifecycle")).await;
+    tombstone(db, near).await;
+    tombstone(db, far).await;
+
+    let pattern = GtsIdPattern::try_new(gts_id!("cf.core.dfl.*")).expect("pattern");
+    let filter = |lifecycle, max_chain_depth| ListFilter {
+        pattern: Some(pattern.clone()),
+        kind: None,
+        lifecycle,
+        max_chain_depth,
+    };
+    assert_eq!(
+        traverse(db, &filter(LifecycleFilter::Deleted, None), 1).await,
+        [near, far],
+        "deleted lists only tombstones on {backend}",
+    );
+    assert!(
+        traverse(db, &filter(LifecycleFilter::Active, Some(1)), 1)
+            .await
+            .is_empty(),
+        "active never lists a tombstone on {backend}",
+    );
+    let active = traverse(db, &filter(LifecycleFilter::Active, None), 500).await;
+    assert_eq!(active, gap, "active is unchanged on {backend}");
+    let mut all = traverse(db, &filter(LifecycleFilter::All, None), 500).await;
+    all.sort();
+    let mut want = gap.clone();
+    want.extend([near.to_owned(), far.to_owned()]);
+    want.sort();
+    assert_eq!(all, want, "all is both, each once, on {backend}");
+
+    let conn = db.conn().expect("conn");
+    let sparse = filter(LifecycleFilter::All, Some(1));
+    let (mut seen, mut empty_with_more) = (Vec::new(), 0);
+    let mut request = PageRequest::first(1);
+    loop {
+        let page = EntityRepo::list_page(&conn, &allow_all(), &sparse, request)
+            .await
+            .expect("page");
+        if page.items.is_empty() && page.has_more {
+            empty_with_more += 1;
+        }
+        seen.extend(page.items.into_iter().map(|row| row.gts_id));
+        if !page.has_more {
+            break;
+        }
+        request = PageRequest::after(page.next_after.expect("a cursor while more remains"), 1);
+    }
+    assert_eq!(seen, [near, far], "no tombstone skipped on {backend}");
+    assert!(
+        empty_with_more >= 1,
+        "the gap spans a scan budget on {backend}"
+    );
+}
+
 async fn assert_filters(db: &Provider, backend: &str) {
     seed(db, ROWS).await;
     kind_is_an_sql_predicate_intersected_with_the_pattern(db, backend).await;
     depth_bounds_parsed_segments_and_composes(db, backend).await;
     a_sparse_depth_traversal_crosses_the_scan_budget(db, backend).await;
+    lifecycle_is_an_sql_predicate_across_sparse_pages(db, backend).await;
 }
 
 #[tokio::test]

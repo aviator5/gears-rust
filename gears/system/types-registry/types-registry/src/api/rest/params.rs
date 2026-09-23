@@ -9,11 +9,12 @@ use toolkit::api::odata::{ODataQuery, extract_odata_query};
 use toolkit_canonical_errors::CanonicalError;
 
 use super::error::{
-    depth_not_recognized, duplicate_query_param, kind_not_recognized, page_size_zero,
-    pattern_too_long, query_params_unreadable, unsupported_query_params,
+    depth_not_recognized, duplicate_query_param, kind_not_recognized,
+    lifecycle_status_not_recognized, page_size_zero, pattern_too_long, query_params_unreadable,
+    unsupported_query_params,
 };
 use super::select;
-use crate::domain::enums::EntityKind;
+use crate::domain::enums::{EntityKind, LifecycleFilter};
 use crate::domain::selection::FieldSelection;
 
 /// Parameters `GET /entities/{entity_key}` accepts.
@@ -97,6 +98,7 @@ pub const DISCOVERY: &[&str] = &[
     "pattern",
     "depth",
     "kind",
+    "lifecycle_status",
     "limit",
     "$top",
     "cursor",
@@ -109,6 +111,7 @@ pub const DISCOVERY: &[&str] = &[
 pub struct DiscoveryParams {
     pub pattern: Option<String>,
     pub kind: Option<EntityKind>,
+    pub lifecycle: LifecycleFilter,
     pub max_chain_depth: Option<u8>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
@@ -130,6 +133,15 @@ fn parse_kind(raw: &str) -> Result<EntityKind, CanonicalError> {
         "type_schema" => Ok(EntityKind::TypeSchema),
         "instance" => Ok(EntityKind::Instance),
         _ => Err(kind_not_recognized(raw)),
+    }
+}
+
+fn parse_lifecycle(raw: &str) -> Result<LifecycleFilter, CanonicalError> {
+    match raw {
+        "active" => Ok(LifecycleFilter::Active),
+        "deleted" => Ok(LifecycleFilter::Deleted),
+        "all" => Ok(LifecycleFilter::All),
+        _ => Err(lifecycle_status_not_recognized(raw)),
     }
 }
 
@@ -178,6 +190,10 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
         Ok(Self {
             pattern,
             kind: value(&pairs, "kind").map(parse_kind).transpose()?,
+            lifecycle: value(&pairs, "lifecycle_status")
+                .map(parse_lifecycle)
+                .transpose()?
+                .unwrap_or_default(),
             max_chain_depth: value(&pairs, "depth").map(parse_depth).transpose()?,
             limit: query.limit.map(|l| u32::try_from(l).unwrap_or(u32::MAX)),
             cursor: cursor.map(|(_, token)| token.to_owned()),

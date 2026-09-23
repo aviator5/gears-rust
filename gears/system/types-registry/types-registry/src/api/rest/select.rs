@@ -66,7 +66,10 @@ mod tests {
     fn a_valid_selection_is_normalized() {
         let parsed = parse(Some(" Content , gts_id ")).expect("valid");
         assert!(parsed.contains(EntityField::Content));
-        assert_eq!(parsed.canonical(), "content,gts_id,lifecycle_status");
+        assert_eq!(
+            parsed.canonical(),
+            "content,gts_id,gts_uuid,lifecycle_status"
+        );
     }
 
     #[test]

@@ -31,12 +31,17 @@ fn order_and_case_and_surrounding_whitespace_do_not_change_identity() {
 }
 
 #[test]
-fn lifecycle_status_is_always_in_the_normalized_set() {
+fn mandatory_fields_are_always_in_the_normalized_set() {
     let without = parse(&["content"]).expect("valid");
-    let with = parse(&["content", "lifecycle_status"]).expect("valid");
-    assert!(without.contains(EntityField::LifecycleStatus));
-    assert_eq!(without, with, "naming the mandatory field changes nothing");
-    assert_eq!(without.canonical(), "content,lifecycle_status");
+    let with = parse(&["gts_uuid", "content", "lifecycle_status", "gts_id"]).expect("valid");
+    for field in FieldSelection::MANDATORY_FIELDS {
+        assert!(without.contains(field), "{}", field.name());
+    }
+    assert_eq!(without, with, "naming a mandatory field changes nothing");
+    assert_eq!(
+        without.canonical(),
+        "content,gts_id,gts_uuid,lifecycle_status"
+    );
 }
 
 #[test]

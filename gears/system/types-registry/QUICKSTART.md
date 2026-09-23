@@ -108,9 +108,9 @@ curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?\$select
   | python3 -m json.tool
 ```
 
-Names are case-insensitive and order does not matter. `lifecycle_status` is always
-returned. An unselected field is omitted; a selected document that is JSON `null` stays
-`null`. `content_hash` is a non-cryptographic prefilter, not proof two documents are
+Names are case-insensitive and order does not matter. `gts_id`, `gts_uuid` and
+`lifecycle_status` are always returned. Any other unselected field is omitted; a
+selected document that is JSON `null` stays `null`. `content_hash` is a non-cryptographic prefilter, not proof two documents are
 equal. An empty, duplicate, unknown or nested name (`content.title`) is a `400` naming
 `$select`, and any other query parameter is refused.
 
@@ -196,7 +196,7 @@ A top-level `"$select"` applies to every key and follows the exact read's rules,
 ```bash
 curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
   -H "Content-Type: application/json" \
-  -d '{ "$select": "gts_id,content", "items": [{ "key": "gts.cf.core.example.event.v1~" }] }'
+  -d '{ "$select": "content", "items": [{ "key": "gts.cf.core.example.event.v1~" }] }'
 ```
 
 `$select` in the query string is refused on this route, as are unknown body fields.
@@ -210,9 +210,9 @@ carries its own `if_none_match` slot.
 
 ### Discover what exists
 
-`GET /entities` returns **one bounded page** of active entities, ordered by canonical
-identifier. Deleted entities are excluded — a tombstone stays readable by key and leaves
-discovery:
+`GET /entities` returns **one bounded page** of entities, ordered by canonical
+identifier. `lifecycle_status` is `active` by default; `deleted` lists only tombstones and
+`all` lists both. Tombstones are always readable by key:
 
 ```bash
 curl -s "$BASE/types-registry/v2/entities?limit=2&pattern=gts.cf.core.*" \
@@ -239,7 +239,7 @@ Page items take `$select` exactly as the exact read does; the default is documen
 a page never carries a validator. Select documents on the page directly:
 
 ```bash
-curl -s "$BASE/types-registry/v2/entities?limit=20&pattern=gts.cf.core.*&\$select=gts_id,content" \
+curl -s "$BASE/types-registry/v2/entities?limit=20&pattern=gts.cf.core.*&\$select=content" \
   | python3 -m json.tool
 ```
 
@@ -266,7 +266,7 @@ done
 echo "$IDS" | python3 -c 'import json,sys
 keys = sys.stdin.read().split()
 for i in range(0, len(keys), 100):
-    print(json.dumps({"$select": "gts_id,content",
+    print(json.dumps({"$select": "content",
                       "items": [{"key": k} for k in keys[i:i + 100]]}))' \
   | while read -r BODY; do
       curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \

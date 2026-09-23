@@ -228,16 +228,20 @@ mod tests {
         serde_json::to_value(T::schema()).expect("a schema serializes")
     }
 
-    /// `OpenAPI` must say what `$select` does: only `lifecycle_status` is always
+    /// `OpenAPI` must say what `$select` does: identity and lifecycle are always
     /// present, metadata is never `null`, and a selected document may be `null`.
     #[test]
     fn the_entity_schema_declares_projection_accurately() {
         let schema = schema_json::<EntityDto>();
-        assert_eq!(schema["required"], serde_json::json!(["lifecycle_status"]));
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["gts_id", "gts_uuid", "lifecycle_status"])
+        );
         let properties = &schema["properties"];
         for field in ["gts_id", "gts_uuid", "content_hash"] {
             assert_eq!(properties[field]["type"], "string", "{field}: {properties}");
         }
+        assert_eq!(properties["gts_uuid"]["format"], "uuid");
         assert_eq!(properties["content_hash"]["pattern"], "^[0-9a-f]{16}$");
         for field in [
             "content",
@@ -257,8 +261,8 @@ mod tests {
     #[test]
     fn unselected_fields_are_omitted_and_a_selected_null_is_kept() {
         let dto = EntityDto {
-            gts_id: None,
-            gts_uuid: None,
+            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            gts_uuid: Uuid::nil(),
             kind: None,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Deleted,
@@ -271,7 +275,12 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(dto).expect("serialize"),
-            serde_json::json!({ "lifecycle_status": "deleted", "content": null }),
+            serde_json::json!({
+                "gts_id": "gts.cf.core.example.type.v1~",
+                "gts_uuid": Uuid::nil(),
+                "lifecycle_status": "deleted",
+                "content": null,
+            }),
         );
     }
 
@@ -791,27 +800,25 @@ pub struct OperationDto {
 
 /// One entity, projected by `$select` (SPEC §10.2).
 ///
-/// An unselected field is omitted; a selected document that is JSON `null` stays
-/// present as `null`. `lifecycle_status` is mandatory, so a projected tombstone
-/// is never mistaken for an absence. The three artifacts are absent on an
-/// Instance.
+/// `gts_id`, `gts_uuid` and `lifecycle_status` are always present, so a projected
+/// item is identifiable and a tombstone is never mistaken for an absence. An
+/// unselected field is omitted; a selected document that is JSON `null` stays
+/// present as `null`. The three artifacts are absent on an Instance.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EntityDto {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub gts_id: Option<String>,
-    /// The Registry Reference: a deterministic `UUIDv5` of the identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub gts_uuid: Option<Uuid>,
+    /// Always present.
+    pub gts_id: String,
+    /// Always present. The Registry Reference: a deterministic `UUIDv5` of the
+    /// identifier.
+    pub gts_uuid: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub kind: Option<EntityKindDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub origin: Option<OriginDto>,
-    /// Always present. A tombstone stays exact-readable and only leaves discovery.
+    /// Always present. A tombstone stays exact-readable and is listed only on request.
     pub lifecycle_status: LifecycleStatusDto,
     /// Sixteen lowercase hex digits of the non-cryptographic content digest; a
     /// prefilter, not proof that two documents are equal.
@@ -1027,8 +1034,8 @@ impl From<EntityRecord> for EntityDto {
     fn from(record: EntityRecord) -> Self {
         let selected = |field: EntityField| record.selection.contains(field);
         Self {
-            gts_id: selected(EntityField::GtsId).then_some(record.gts_id),
-            gts_uuid: selected(EntityField::GtsUuid).then_some(record.gts_uuid),
+            gts_id: record.gts_id,
+            gts_uuid: record.gts_uuid,
             kind: selected(EntityField::Kind).then(|| record.kind.into()),
             origin: selected(EntityField::Origin).then_some(OriginDto::Managed {
                 resource_version: record.resource_version,

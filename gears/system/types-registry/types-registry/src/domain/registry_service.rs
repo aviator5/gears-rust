@@ -20,7 +20,8 @@ use crate::domain::admission::{
     Accepted, AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
 };
 use crate::domain::enums::{
-    EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
+    EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
+    OperationStatus,
 };
 use crate::domain::policy::RegistrationPolicy;
 use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage};
@@ -160,7 +161,7 @@ pub enum EntityLookup {
     NotFound,
 }
 
-/// A discovery query over **active** entities (D12).
+/// A discovery query, over active entities unless `lifecycle` says otherwise (D12).
 ///
 /// No origin, availability or scope filter: each is out of P0 scope (SPEC §2) or a
 /// tenant-plane input.
@@ -174,6 +175,7 @@ pub struct DiscoveryQuery {
     /// `None` takes `limits.page_size_default`; above `limits.page_size_max` is refused.
     pub limit: Option<u32>,
     pub kind: Option<EntityKind>,
+    pub lifecycle: LifecycleFilter,
     /// Inclusive maximum number of GTS identifier segments; `0` is refused.
     pub max_chain_depth: Option<u8>,
     pub selection: FieldSelection,
@@ -693,7 +695,7 @@ impl RegistryService {
             .collect())
     }
 
-    /// One bounded page of active entities, ordered by canonical identifier and
+    /// One bounded page of entities in `query.lifecycle`, ordered by canonical identifier and
     /// projected by `query.selection` (D12).
     ///
     /// The page size and its ceiling are deployment configuration, which is why the
@@ -729,6 +731,7 @@ impl RegistryService {
         let filter = ListFilter {
             pattern,
             kind: query.kind,
+            lifecycle: query.lifecycle,
             max_chain_depth: query.max_chain_depth,
         };
         let request = PageRequest {

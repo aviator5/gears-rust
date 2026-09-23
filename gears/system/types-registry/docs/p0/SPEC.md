@@ -74,7 +74,7 @@ without re-registration.
 | Availability Evaluator, `tenant-resolver` dependency | Needs tenancy |
 | Validator inputs that only a tenant or external read has: subject visibility-chain version, Context Tenant availability-chain version, routing generation, `external_revision` | Each is `tenant plane only`, availability-conditional or external, so **none participates in a platform-plane read** — the validator itself is in P0, see §8.5 |
 | Availability, reason and Context Tenant ownership-view fields in `$select` | Those values need the tenant availability and visibility work deferred to P1. P0 still supports caller-chosen selection over its managed field allowlist (§10.2, plan P19) |
-| `expand_type_filter` | Its DESIGN definition *is* `$select=gts_uuid&availability=available`, with the availability filter fixed by the method rather than supplied by the caller. Availability is out of P0 (needs tenancy), so a P0 method of that name would report retired contracts as usable — a same-named different meaning, which is worse than absence. Paging `list_entities` directly is available to any caller that wants the traversal |
+| `expand_type_filter` | Its DESIGN definition *is* `$select=gts_uuid&availability=available` (plus explicit `lifecycle_status=active`), with the availability filter fixed by the method rather than supplied by the caller. Availability is out of P0 (needs tenancy), so a P0 method of that name would report retired contracts as usable — a same-named different meaning, which is worse than absence. Paging `list_entities` directly is available to any caller that wants the traversal |
 | Operator purge job, operation-retention sweep | ADR-0013, §3.2 — no P0 consumer |
 | Aliases, Validation Hooks, casting, tenant enablement | P2 in DESIGN |
 
@@ -103,7 +103,7 @@ correctness core, not scope.
 | D11 | **P0 retains registry-side inventory pull; per-gear push moves to P1** | Supersedes the original P0 push decision (plan P4/P18). types-registry seeds all linked inventory plus `cfg.entities` through the outbox, requiring every seed item to be `succeeded` or `unchanged` before publishing its client. T23 reconciles explicitly supplied documents for existing registration callers; no per-gear inventory filter or new inventory startup calls in P0. C3 remains open until P1 integrates inventory attribution and push with the platform-plane client |
 | D12 | **`GET /entities` becomes a bounded page with a cursor, document-free by default** | The old shape returns every match with full `content` in one response. A `limit` without a cursor would make the endpoint incomplete, so both land together. P19 adds `$select` on this page and the two exact-key routes; selected documents are explicit and the discovery cursor binds the normalized selection (§10.2) |
 | D13 | **P0 field projection on all three reads** (plan P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity, T29 validators and T30 cache keys (§10.2) |
-| D14 | **Discovery gains `depth` and `kind` in P0** (plan P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`. They compose with `pattern` and the active-only rule before page limits and projection. The cursor binds both filters so continuation cannot splice different result sets (§10.2) |
+| D14 | **Discovery gains `depth` and `kind` in P0** (plan P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`. They compose with `pattern` and `lifecycle_status` (default `active`) before page limits and projection. The cursor binds these filters so continuation cannot splice different result sets (§10.2) |
 
 ---
 
@@ -1219,9 +1219,10 @@ type parameter, preserving object safety. `Default` and an explicit selection of
 default fields have one normalized identity. An empty or unsupported selection fails before
 transport; the REST adapter applies the same rules to wire input.
 
-`EntityQuery::filter` carries P0 `pattern`, `max_chain_depth` and `kind` alongside its
+`EntityQuery::filter` carries P0 `pattern`, `max_chain_depth`, `kind` and `lifecycle` alongside its
 projection and page request. `max_chain_depth` maps to REST `depth`; `kind` uses the
-existing `EntityKind` vocabulary. Omitted fields mean no restriction, and the server
+existing `EntityKind` vocabulary. Omitted fields mean no restriction, except `lifecycle`,
+which defaults to `Active`; the server
 applies the same filter before either projected items or cursors are produced (§10.2).
 
 **Reconciliation takes explicitly supplied desired documents in P0 (T23).** It batch-reads
@@ -1356,14 +1357,22 @@ match in one array, each item carrying full `content`; old exact reads likewise 
 documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field selection:
 
 - **A page, not a list.** `limit` defaults to 50 and may not exceed 100; the response
-  carries a cursor when more remains. Ordering is by canonical identifier and deleted
-  entities are excluded, which is what makes the cursor a plain keyset — `gts_id` is unique
+  carries a cursor when more remains. Ordering is by canonical identifier, which is what
+  makes the cursor a plain keyset — `gts_id` is unique
   and immutable, so a page boundary cannot drift or duplicate. Cursors come from
   `toolkit-odata`, which already encodes them as versioned base64url and refuses an unknown
-  version. `depth` and `kind` join the cursor's filter hash as terms added only when
-  present, on top of T22b's pattern/`$select` expression: no release preceded T22c, so the
-  wire version stays `CursorV1`'s `1`, a token issued before the filters existed resumes
-  while neither is named, and naming or changing either is a `400`.
+  version. `depth`, `kind` and a non-default `lifecycle_status` join the cursor's filter
+  hash as terms added only when present, on top of T22b's pattern/`$select` expression:
+  no release preceded T22c, so the wire version stays `CursorV1`'s `1`, and naming or
+  changing any of them is a `400`. An earlier token resumes only while its canonical
+  `$select` is unchanged; making `gts_id`/`gts_uuid` mandatory changed it for every
+  non-default selection, so such tokens are refused.
+- **Lifecycle filter (discovery only).** `lifecycle_status=active|deleted|all`, default
+  `active`: `active` lists live entities, `deleted` only tombstones, `all` both. It is an
+  SQL predicate on the stored status, intersected with the other filters before the page
+  limit and scan budget, so a sparse set of tombstones is neither skipped nor charged to
+  the budget. Unknown, empty or repeated values are a `400` naming `lifecycle_status`.
+  Exact reads and `batchGet` are unchanged: they always return tombstones by key.
 - **P0 discovery filters.** `pattern` is a GTS wildcard matched by `gts-rust` after a
   safe indexed prefix prefilter. `depth` is an optional **inclusive maximum number of
   GTS identifier segments**: a one-segment root has depth 1, and a derived type or
@@ -1375,8 +1384,8 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   accepts only `type_schema` or `instance`, using the stored `entity.kind` and the
   same enum as read results; unknown values are `400` naming `kind`. The old v1
   `is_schema` spelling is not an alias. A caller may
-  combine `pattern`, `depth` and `kind`; all three are intersected with active-only
-  discovery **before** the page limit and projection. `limit` and `cursor` control
+  combine `pattern`, `depth`, `kind` and `lifecycle_status`; all are intersected
+  **before** the page limit and projection. `limit` and `cursor` control
   traversal, while `$select` controls returned fields; none changes the match predicate.
 - **One document-free default on all three reads.** Absent `$select` is identical to an
   explicit selection of `gts_id,gts_uuid,kind,origin,lifecycle_status,content_hash`.
@@ -1409,30 +1418,33 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   reason ToolKit's own parser reports. *Unavailable* means a DESIGN §3.3 field P0 cannot
   answer — `availability` and `owned_by_context_tenant` — and *nested* any name
   containing `.` or `/`. The canonical identity is the selected names sorted and
-  comma-joined, e.g. `content,gts_id,lifecycle_status`. In particular, reject empty comma
+  comma-joined, e.g. `content,gts_id,gts_uuid,lifecycle_status`. In particular, reject empty comma
   segments such as `$select=content,,kind`: ToolKit's parser currently drops those,
   so the gear checks the raw spelling as well. Honor ToolKit's 2048-character and
-  100-field parser limits. `lifecycle_status` is mandatory metadata outside selection,
-  including for a deleted exact-read result; add it to the normalized effective set so
-  explicitly naming it does not change validator or cache identity. Unselected fields
+  100-field parser limits. `gts_id`, `gts_uuid` and `lifecycle_status` are mandatory on
+  every entity of all three reads, whatever `$select` names, including a deleted result;
+  they are always in the normalized effective set, so naming them does not change cursor,
+  validator or cache identity. Unselected fields
   are omitted, while a selected JSON `null` remains present. `key`, per-key status and
   `etag` are batch result
   envelope metadata outside selection. An exact `ETag` is likewise outside the body.
-  REST DTOs and OpenAPI mark selectable fields as optional and omit an unselected field;
-  selected nullable values remain present as JSON `null`.
+  REST DTOs and OpenAPI mark the three mandatory fields required and non-nullable and
+  every other field optional, omitting an unselected one; selected nullable values
+  remain present as JSON `null`.
 - **Transport placement.** Exact `GET /entities/{entity_key}` and discovery `GET /entities`
   take `$select` in the query. `POST /entities:batchGet` takes one top-level body
   `"$select"` string applying to every `items[]` key, never a per-item selection or query
   parameter. Its per-item `if_none_match` remains independent. The GET routes register
   ToolKit's OData `$select` parameter and use its extractor; this gear accepts only its
-  declared options (`pattern`, `depth`, `kind`, `limit`/`$top`,
+  declared options (`pattern`, `depth`, `kind`, `lifecycle_status`, `limit`/`$top`,
   `cursor`/`$skiptoken` on discovery;
   `$select` on exact read) and rejects unsupported OData options, v1-only filters and
   unknown unprefixed parameters rather than silently ignoring them.
 - **Cursor and storage contract.** Discovery's cursor binds the normalized selection in
-  addition to `pattern`, `depth`, `kind` and the keyset position; changing any bound
-  filter or the selection on continuation is `400`. Absent `depth`/`kind` are distinct
-  from explicit values and must be bound as such.
+  addition to `pattern`, `depth`, `kind`, `lifecycle_status` and the keyset position;
+  changing any bound filter or the selection on continuation is `400`. Absent
+  `depth`/`kind` are distinct from explicit values and must be bound as such; absent
+  `lifecycle_status` and explicit `active` are one binding.
   Absent selection and an explicit default set are interchangeable. The hidden canonical
   `gts_id` used for ordering remains available even if the caller does not select it.
   A metadata-only read does not fetch or parse authored/effective JSON. Selected documents
@@ -1855,7 +1867,7 @@ identifier profile refusals, topological order, baseline selection.
 | `effective_traits` of a chain with a trait default at two levels | matches `gts-rust`, not the deleted client-side merge order |
 | `$select` on exact read, `batchGet` and discovery | each applies the same field allowlist and document-free default; exact and batch return the same projected entity for one key; each document can be selected alone |
 | Invalid `$select` | empty, empty comma segment, duplicate, unknown, unavailable, nested and over-limit fields return RFC-9457 `400` naming `$select`; unsupported OData options and unknown unprefixed query keys are refused |
-| Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; a deleted exact read with `$select=content` still includes `lifecycle_status: deleted` |
+| Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; `$select=resolved_schema` on an Instance still returns `gts_id`, `gts_uuid`, `lifecycle_status`; a deleted exact read with `$select=content` still includes `lifecycle_status: deleted` |
 | Metadata-only exact/batch/discovery reads | instrumented storage proves no authored/effective JSON column is fetched or parsed; selected documents are fetched in bounded, snapshot-consistent batches on SQLite, PostgreSQL and MySQL |
 | Content hash and reconciliation | wire hash is 16 lowercase hex digits of the stored FNV-1a bytes; a matching hash alone never suppresses an authored-byte difference |
 | Registration policy, four DESIGN §3.2 entries | each admits and refuses exactly what §10.3's table says, including the exact-key-versus-`~*` split |
@@ -1864,16 +1876,17 @@ identifier profile refusals, topological order, baseline selection.
 | Region with no entry | first creation refused, naming region **and** parameter |
 | Revision or deletion in a closed region | admitted — closing a region must not freeze existing entities |
 | Config carrying `tenant_ownable` | parsed and validated, never enforced, and never silently treated as enabling tenant ownership |
-| Discovery page | bounded by `limit`, ordered by canonical identifier, deleted entities absent; `content` absent by default and present only when selected |
+| Discovery page | bounded by `limit`, ordered by canonical identifier, deleted entities absent by default; `content` absent by default and present only when selected |
+| Discovery `lifecycle_status` | `active` (default), `deleted` and `all` list live, tombstoned and both; composes with `pattern`/`depth`/`kind` across sparse pages; malformed or repeated values are `400`; the cursor binds the normalized value |
 | Discovery `depth` and `kind` | a one-segment Type Schema matches `depth=1`, a two-segment derived schema or Instance does not; `depth=2` includes both levels, while `kind=type_schema` and `kind=instance` partition the same active fixture set |
 | Combined discovery filters | `pattern`, `depth` and `kind` intersect before page limits; a sparse post-filter cannot skip a later match or terminate traversal early, and filtering is independent of `$select` |
 | Invalid discovery filters | `depth=0`, negative, non-integer and overflow values, plus unknown `kind` and legacy `is_schema`, return RFC-9457 `400` with the offending field named |
 | `limit` above `page_size_max` | refused, not silently clamped |
-| Cursor traversal over a matching set larger than one page | every matching active entity appears exactly once across pages |
+| Cursor traversal over a matching set larger than one page | every matching entity (active by default) appears exactly once across pages |
 | Entity admitted mid-traversal | the traversal stays consistent: no duplicate and no skipped predecessor, because the cursor is a keyset over an immutable unique `gts_id` |
 | Cursor with an unknown version | rejected rather than reinterpreted |
 | Cursor resumed with another selection or filter | changing `$select`, `pattern`, `depth` or `kind` is rejected with `400`; absent `$select` and the explicit default field set resume interchangeably |
-| Filtered cursor traversal | mixed depths and kinds across multiple pages produce each matching active entity exactly once, including when the scan budget ends a sparse page |
+| Filtered cursor traversal | mixed depths and kinds across multiple pages produce each matching entity exactly once, under any `lifecycle_status`, including when the scan budget ends a sparse page |
 | SDK cache under two selections | different normalized sets occupy different entries; reordered/default-equivalent selections reuse one entry |
 | `list_instances` helper over a document-free default | selects documents on the page or through `batchGet` and returns payloads, so the call shape consumers use is preserved |
 | Two pods, concurrent dependency change | commit-time revision-vector mismatch rolls back and retries |
@@ -1998,8 +2011,8 @@ is the executable task list. The number is kept because other documents cite it.
     move (§8.5).
 15. Exact read, `batchGet` and discovery honor one normalized `$select` contract and
     return document-free managed metadata by default. `GET /entities` is bounded in
-    item count and its cursor traverses the matching active set exactly once under one
-    `pattern`/`depth`/`kind` filter and one selection;
+    item count and its cursor traverses the matching set (active by default) exactly once under one
+    `pattern`/`depth`/`kind`/`lifecycle_status` filter and one selection;
     selected documents are fetched only on request. P0 has no aggregate response-byte
     budget (§10.2, D12–D14, C10).
 16. Every admission decision is diagnosable from the emitted signals alone (§8.6): each terminal

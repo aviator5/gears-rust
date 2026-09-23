@@ -283,8 +283,9 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last \
              three Type Schemas only), plus the `provenance` group. Names are \
              case-insensitive; an empty, duplicate, unknown or nested name is a 400. \
-             `lifecycle_status` is always returned, so a deleted entity is still readable \
-             and reports it. No other query parameter is accepted.",
+             `gts_id`, `gts_uuid` and `lifecycle_status` are always returned, whether or \
+             not `$select` names them, so a deleted entity is still readable and reports \
+             it. No other query parameter is accepted.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -318,10 +319,10 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
              (a canonical GTS identifier or the Registry Reference UUID derived from it), \
              resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. \
              A top-level `$select` string applies to every key and follows that route's \
-             `$select` rules; absent, the document-free default. Returns 200 with one result \
+             `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result \
              per requested key, in request order and echoing the key it was asked by: `found` \
-             with the selected fields, exactly as the exact read returns them, or \
-             `not_found`. Query parameters are refused, `$select` included. A key \
+             with the selected fields, exactly as the exact read returns them and always \
+             including `gts_id`, `gts_uuid` and `lifecycle_status`, or `not_found`. Query parameters are refused, `$select` included. A key \
              named twice collapses onto its first mention; the two spellings of one entity are \
              two keys and get two results. An absent key is not a 404: one missing key must \
              not lose the answers for the others. The If-None-Match header is refused rather \
@@ -352,19 +353,22 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .operation_id("types_registry.list_entities")
         .summary("Discover GTS entities")
         .description(
-            "Return one bounded page of active entities, ordered by canonical identifier, \
-             with the cursor for the next page. Deleted entities are excluded: a tombstone \
-             stays readable by key and leaves discovery. Each item is projected by `$select` \
+            "Return one bounded page of entities, ordered by canonical identifier, with the \
+             cursor for the next page. `lifecycle_status` is `active` (default), `deleted` \
+             (tombstones only) or `all`. Each item is projected by `$select` \
              exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the \
-             document-free default. A page never carries a validator. `depth` bounds the \
-             number of identifier segments and `kind` narrows to Type Schemas or Instances; \
-             both intersect with `pattern` before the page limit. `limit` (alias `$top`) \
+             document-free default; `gts_id`, `gts_uuid` and `lifecycle_status` are always \
+             returned. A page never carries a validator. `depth` bounds the number of \
+             identifier segments and `kind` narrows to Type Schemas or Instances; \
+             `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page \
+             limit. `limit` (alias `$top`) \
              defaults to 50 and may not exceed 100; a caller selecting documents should \
              page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to \
-             the pattern, `depth`, `kind` and the normalized `$select` it was issued for: \
-             resuming under any of them changed, or with a token of another version, is a \
-             400, while an absent and an explicit default `$select` are \
-             interchangeable. Any other query parameter is refused.",
+             the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` \
+             it was issued for: resuming under any of them changed, or with a token of \
+             another version, is a 400, while an absent and an explicit default value of \
+             `$select` or `lifecycle_status` are interchangeable. Any other query parameter \
+             is refused.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -391,6 +395,14 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
             "Only entities of this kind: `type_schema` or `instance`. Absent means both; \
              any other value is a 400",
         ))
+        .param(
+            ParamSpec::query("lifecycle_status")
+                .param_type("string")
+                .description(
+                    "`active` (default), `deleted` (tombstones only) or `all` (both). Any other \
+                     value, empty or repeated, is a 400",
+                ),
+        )
         // `query_param_typed` takes description before type; swapping them silently emits `string`.
         .query_param_typed(
             "limit",
@@ -401,7 +413,8 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .query_param(
             "cursor",
             false,
-            "The previous page's page_info.next_cursor, under the same pattern and $select. \
+            "The previous page's page_info.next_cursor, under the same pattern, depth, kind, \
+             lifecycle_status and $select. \
              Absent starts at the beginning. Alias: $skiptoken",
         )
         .with_odata_select()

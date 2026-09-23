@@ -347,7 +347,8 @@ impl EntityRepo {
         Ok((result.rows_affected == 1).then_some(next_resource_version))
     }
 
-    /// One keyset page of active entities, optionally filtered by a GTS pattern.
+    /// One keyset page of entities in `filter.lifecycle`, optionally filtered by a
+    /// GTS pattern.
     ///
     /// The page boundary is a stored `gts_id`, so it cannot drift or duplicate the
     /// way an offset can: a row inserted mid-traversal either sorts ahead of the
@@ -391,8 +392,11 @@ impl EntityRepo {
             } else {
                 std::cmp::min((limit - items.len()) as u64, SCAN_BATCH)
             };
-            let mut condition =
-                Condition::all().add(entity::Column::LifecycleStatus.eq(LifecycleStatus::Active));
+            let mut condition = Condition::all();
+            if let Some(status) = filter.lifecycle.status() {
+                condition = condition
+                    .add(entity::Column::LifecycleStatus.eq(LifecycleStatus::from(status)));
+            }
             if let Some(after) = &cursor {
                 condition = condition.add(entity::Column::GtsId.gt(after.as_str()));
             }
