@@ -222,38 +222,69 @@ impl ItemFailure {
     /// Parse stored failures while preserving invalid payloads as diagnostics.
     #[must_use]
     pub fn from_payload(payload: &str) -> Self {
-        match serde_json::from_str::<serde_json::Value>(payload) {
-            Ok(value) => {
-                let reason = value.get("reason").and_then(serde_json::Value::as_str);
-                let message = value.get("message").and_then(serde_json::Value::as_str);
-                match (reason, message) {
-                    (Some(reason), Some(message)) => Self {
-                        reason: AdmissionFailureReason::from_wire(reason),
-                        message: message.to_owned(),
-                        // Preserve unknown kinds written by newer versions.
-                        dependency: value
-                            .get("dependency_id")
-                            .and_then(serde_json::Value::as_str)
-                            .zip(
-                                value
-                                    .get("dependency_kind")
-                                    .and_then(serde_json::Value::as_str),
-                            )
-                            .map(|(target, kind)| FailureDependency {
-                                kind: kind.to_owned(),
-                                target: target.to_owned(),
-                            }),
-                    },
-                    _ => Self::new(
-                        AdmissionFailureReason::UnrecognizedPayload,
-                        payload.to_owned(),
-                    ),
-                }
+        match StoredFailure::parse(payload) {
+            Ok(stored) => Self {
+                reason: AdmissionFailureReason::from_wire(&stored.reason),
+                message: stored.message,
+                dependency: stored
+                    .dependency_id
+                    .zip(stored.dependency_kind)
+                    .map(|(target, kind)| FailureDependency { kind, target }),
+            },
+            Err(unreadable) => Self::new(unreadable.reason, payload.to_owned()),
+        }
+    }
+}
+
+/// The one reader of a stored `error_payload`, in every field any writer emits.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct StoredFailure {
+    pub reason: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_id: Option<String>,
+    /// Kept as written: newer writers may add kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_kind: Option<String>,
+    /// Stable diagnostic code of a `system_failure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<Uuid>,
+}
+
+/// A stored payload [`StoredFailure::parse`] refused, and why.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnreadableFailure {
+    /// `unparsable_payload` or `unrecognized_payload`.
+    pub reason: AdmissionFailureReason,
+    pub cause: String,
+}
+
+impl StoredFailure {
+    /// # Errors
+    /// [`UnreadableFailure`] for text that is not JSON, or JSON of another shape,
+    /// including a dependency without both halves.
+    pub fn parse(payload: &str) -> Result<Self, UnreadableFailure> {
+        let unreadable = |reason, cause: String| UnreadableFailure { reason, cause };
+        match serde_json::from_str::<Self>(payload) {
+            Ok(stored) if stored.dependency_id.is_some() == stored.dependency_kind.is_some() => {
+                Ok(stored)
             }
-            Err(_) => Self::new(
+            Ok(_) => Err(unreadable(
+                AdmissionFailureReason::UnrecognizedPayload,
+                "dependency_id and dependency_kind must appear together".to_owned(),
+            )),
+            Err(e) if e.is_data() => Err(unreadable(
+                AdmissionFailureReason::UnrecognizedPayload,
+                e.to_string(),
+            )),
+            Err(e) => Err(unreadable(
                 AdmissionFailureReason::UnparsablePayload,
-                payload.to_owned(),
-            ),
+                e.to_string(),
+            )),
         }
     }
 }

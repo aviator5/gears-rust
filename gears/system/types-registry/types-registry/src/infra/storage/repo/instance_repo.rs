@@ -143,8 +143,8 @@ impl InstanceRepo {
                     query.into_model::<RevisionReadColumns>()
                 })
                 .await?;
-            out.extend(rows.into_iter().map(|revision| {
-                let provenance = revision.provenance();
+            out.extend(rows.into_iter().map(|mut revision| {
+                let provenance = revision.take_provenance();
                 CurrentReadRow {
                     entity_id: revision.entity_id,
                     content_hash: revision.content_hash,

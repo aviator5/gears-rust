@@ -35,19 +35,6 @@ impl TypeSchemaStore for AdmissionView {
         Ok(docs)
     }
 
-    /// Refused for the reason [`Self::read_current_schemas`] is.
-    async fn current_schemas(
-        &self,
-        _tx: &DbTx<'_>,
-        _scope: &AccessScope,
-        _entity_ids: &[i64],
-    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
-        Err(unsupported(
-            "an admission view does not serve batched current-state artifacts; \
-             the read path does",
-        ))
-    }
-
     /// The read path's projected current-state read. Admission compares state through
     /// [`Self::current_schema_projections`] and writes through the two current-state
     /// calls; it never needs a batch of materialized artifacts, and an overlay has

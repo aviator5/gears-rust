@@ -13,6 +13,10 @@ pub use crate::policy_config::PolicyEntry;
 /// Lease time reserved after admission.
 pub const LEASE_HEADROOM: Duration = Duration::from_secs(2);
 
+/// A discovery page carries the same documents a batch read does, so it shares
+/// that ceiling (C10).
+pub const PAGE_SIZE_CEILING: u32 = 100;
+
 /// Largest attempt budget that fits the outbox's signed counter.
 const MAX_DELIVERY_ATTEMPTS: u32 = i16::MAX as u32 - 1;
 
@@ -103,7 +107,7 @@ pub struct Limits {
     pub activation_write_set: usize,
     /// Default `GET /entities` page size.
     pub page_size_default: u32,
-    /// Maximum `GET /entities` page size.
+    /// Maximum `GET /entities` page size, at most [`PAGE_SIZE_CEILING`].
     pub page_size_max: u32,
 }
 
@@ -307,6 +311,12 @@ impl TypesRegistryConfig {
     /// [`ConfigError::Limits`] for an invalid limit, or [`ConfigError::Worker`]
     /// for an invalid worker setting.
     pub fn validate(&self) -> Result<RegistrationPolicy, ConfigError> {
+        if self.limits.page_size_max > PAGE_SIZE_CEILING {
+            return Err(ConfigError::Limits(format!(
+                "limits.page_size_max ({}) exceeds {PAGE_SIZE_CEILING}",
+                self.limits.page_size_max
+            )));
+        }
         if self.limits.page_size_default > self.limits.page_size_max {
             return Err(ConfigError::Limits(format!(
                 "limits.page_size_default ({}) exceeds limits.page_size_max ({})",

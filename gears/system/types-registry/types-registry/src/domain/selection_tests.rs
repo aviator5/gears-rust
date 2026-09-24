@@ -139,3 +139,67 @@ fn the_canonical_spelling_parses_back_to_the_same_selection() {
         assert_eq!(parse(&names), Ok(selection), "{canonical}");
     }
 }
+
+#[test]
+fn every_field_is_listed_once_in_canonical_order() {
+    use EntityField as F;
+    // A new variant fails to compile here, pointing at `expected`.
+    let exhaustive = |field: EntityField| match field {
+        F::Content
+        | F::ContentHash
+        | F::EffectiveTraits
+        | F::EffectiveTraitsSchema
+        | F::GtsId
+        | F::GtsUuid
+        | F::Kind
+        | F::LifecycleStatus
+        | F::Origin
+        | F::Provenance
+        | F::ResolvedSchema => (),
+    };
+    let expected = [
+        F::Content,
+        F::ContentHash,
+        F::EffectiveTraits,
+        F::EffectiveTraitsSchema,
+        F::GtsId,
+        F::GtsUuid,
+        F::Kind,
+        F::LifecycleStatus,
+        F::Origin,
+        F::Provenance,
+        F::ResolvedSchema,
+    ];
+    expected.into_iter().for_each(exhaustive);
+    assert_eq!(EntityField::ALL, expected);
+    let names = EntityField::ALL.map(EntityField::name);
+    assert!(
+        names.windows(2).all(|w| w[0] < w[1]),
+        "unique and sorted: {names:?}"
+    );
+}
+
+#[test]
+fn every_selection_round_trips_through_its_canonical_spelling() {
+    for mask in 1_u16..(1 << EntityField::ALL.len()) {
+        let names: Vec<&str> = EntityField::ALL
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, field)| field.name())
+            .collect();
+        let selection = parse(&names).expect("valid");
+        let canonical = selection.canonical();
+        let back: Vec<&str> = canonical.split(',').collect();
+        assert_eq!(parse(&back), Ok(selection), "{canonical}");
+        let respelled: Vec<String> = names
+            .iter()
+            .rev()
+            .map(|name| format!(" {} ", name.to_uppercase()))
+            .collect();
+        assert_eq!(
+            FieldSelection::parse(&respelled).map(FieldSelection::canonical),
+            Ok(canonical)
+        );
+    }
+}

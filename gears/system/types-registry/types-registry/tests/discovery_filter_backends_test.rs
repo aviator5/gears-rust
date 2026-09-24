@@ -13,6 +13,7 @@
 
 mod common;
 
+use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use gts::GtsIdPattern;
@@ -175,7 +176,7 @@ async fn depth_bounds_parsed_segments_and_composes(db: &Provider, backend: &str)
                     pattern: pattern.clone(),
                     kind,
                     lifecycle: LifecycleFilter::Active,
-                    max_chain_depth: Some(depth),
+                    max_chain_depth: NonZeroU8::new(depth),
                 };
                 let want = expected(|id| {
                     depth_of(id) <= usize::from(depth)
@@ -223,7 +224,7 @@ async fn a_sparse_depth_traversal_crosses_the_scan_budget(db: &Provider, backend
         pattern: Some(GtsIdPattern::try_new(gts_id!("cf.core.dfs.*")).expect("pattern")),
         kind: None,
         lifecycle: LifecycleFilter::Active,
-        max_chain_depth: Some(1),
+        max_chain_depth: NonZeroU8::new(1),
     };
     let conn = db.conn().expect("conn");
     let mut seen = Vec::new();
@@ -299,7 +300,7 @@ async fn lifecycle_is_an_sql_predicate_across_sparse_pages(db: &Provider, backen
         "deleted lists only tombstones on {backend}",
     );
     assert!(
-        traverse(db, &filter(LifecycleFilter::Active, Some(1)), 1)
+        traverse(db, &filter(LifecycleFilter::Active, NonZeroU8::new(1)), 1)
             .await
             .is_empty(),
         "active never lists a tombstone on {backend}",
@@ -314,7 +315,7 @@ async fn lifecycle_is_an_sql_predicate_across_sparse_pages(db: &Provider, backen
     assert_eq!(all, want, "all is both, each once, on {backend}");
 
     let conn = db.conn().expect("conn");
-    let sparse = filter(LifecycleFilter::All, Some(1));
+    let sparse = filter(LifecycleFilter::All, NonZeroU8::new(1));
     let (mut seen, mut empty_with_more) = (Vec::new(), 0);
     let mut request = PageRequest::first(1);
     loop {

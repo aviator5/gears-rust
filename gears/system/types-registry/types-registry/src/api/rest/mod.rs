@@ -7,4 +7,4 @@ pub mod handlers;
 mod params;
 mod paths;
 pub mod routes;
-pub mod select;
+mod select;

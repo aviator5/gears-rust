@@ -1,10 +1,13 @@
 //! REST handlers for the Types Registry gear.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Extension, OriginalUri};
 use axum::http::{HeaderMap, HeaderValue, header};
+use axum::response::{IntoResponse, Response};
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::rest::extract;
 use uuid::Uuid;
@@ -22,8 +25,10 @@ use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
 use crate::domain::enums::OperationKind;
 use crate::domain::error::DomainError;
 use crate::domain::registry_service::{
-    DeleteRequest, DeleteTarget, DiscoveryQuery, EntityKey, EntityLookup, RegistryService,
+    DeleteRequest, DeleteTarget, DiscoveryQuery, EntityKey, EntityLookup, MAX_BATCH_GET_KEYS,
+    RegistryService, ServiceError,
 };
+use crate::domain::selection::FieldSelection;
 use crate::domain::service::TypesRegistryService;
 
 /// POST /api/v1/types-registry/entities
@@ -341,7 +346,7 @@ pub async fn get_entity_by_key(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
     extract::Path(key): extract::Path<String>,
     ExactReadSelection(selection): ExactReadSelection,
-) -> ApiResult<Json<EntityDto>> {
+) -> ApiResult<Response> {
     let service = require_registry(service)?;
     let parsed = EntityKey::parse(&key);
     let record = service
@@ -349,8 +354,27 @@ pub async fn get_entity_by_key(
         .await
         .map_err(CanonicalError::from)?
         .ok_or_else(|| CanonicalError::from(DomainError::not_found_by_id(key)))?;
-    Ok(Json(record.into()))
+    json_body(EntityDto::from(record), selection).await
 }
+
+/// Serialized off the executor when the body carries documents.
+async fn json_body<T: serde::Serialize + Send + 'static>(
+    value: T,
+    selection: FieldSelection,
+) -> Result<Response, CanonicalError> {
+    if !selection.selects_any_document() {
+        return Ok(Json(value).into_response());
+    }
+    let bytes = tokio::task::spawn_blocking(move || serde_json::to_vec(&value))
+        .await
+        .map_err(|e| ServiceError::Blocking(e.to_string()))?
+        .map_err(|e| ServiceError::Blocking(e.to_string()))?;
+    let content_type = HeaderValue::from_static("application/json");
+    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+}
+
+/// A GTS identifier runs to 1024 bytes; a UUID is 36.
+const MAX_KEY_LEN: usize = 1024;
 
 /// `POST /types-registry/v2/entities:batchGet`
 ///
@@ -365,7 +389,7 @@ pub async fn batch_get_entities(
     headers: HeaderMap,
     _: NoQuery,
     extract::Json(req): extract::Json<BatchGetRequest>,
-) -> ApiResult<Json<EntityLookupsDto>> {
+) -> ApiResult<Response> {
     let service = require_registry(service)?;
     let selection = super::select::parse(req.select.as_deref())?;
     // Refused before the read, not ignored: a caller that sent one believes its
@@ -375,29 +399,34 @@ pub async fn batch_get_entities(
         return Err(super::error::if_none_match_not_supported());
     }
 
-    // `if_none_match` is carried by the request DTO and not read here: no read
-    // emits a validator until T29, so there is nothing a supplied one could be
-    // compared against. The handler must not invent a comparison the read path
-    // does not perform.
-    // Map each unique EntityKey to its first-occurrence raw spelling so the echo
-    // is driven by the key returned with each result, not a positional iterator
-    // over the (potentially duplicate-containing) request. A positional iterator
-    // diverges when a duplicate key precedes a distinct key in the input.
-    let mut spelling_map: std::collections::HashMap<EntityKey, String> =
-        std::collections::HashMap::with_capacity(req.items.len());
+    // Bounded before any per-item work, and on the raw count: duplicates still cost
+    // parsing and must not stretch the ceiling.
+    if req.items.is_empty() || req.items.len() > MAX_BATCH_GET_KEYS {
+        return Err(ServiceError::BatchReadOutOfRange {
+            count: req.items.len(),
+        }
+        .into());
+    }
+    // `if_none_match` is length-checked but not compared: no read emits a
+    // validator until T29.
+    let mut spelling_map: HashMap<EntityKey, String> = HashMap::with_capacity(req.items.len());
     let mut keys: Vec<EntityKey> = Vec::with_capacity(req.items.len());
     for item in req.items {
-        // Bounded before EntityKey::parse so an arbitrarily long string cannot
-        // enter the domain layer. GTS identifiers run to 1024 characters
-        // (DESIGN §3.3); a UUID is 36 bytes; 1024 covers both.
-        if item.key.len() > 1024 {
+        // Bounded before EntityKey::parse: a GTS identifier runs to 1024 bytes.
+        if item.key.len() > MAX_KEY_LEN {
             return Err(super::error::key_too_long(item.key.len()));
         }
-        let key = EntityKey::parse(&item.key);
-        if let std::collections::hash_map::Entry::Vacant(e) = spelling_map.entry(key.clone()) {
-            e.insert(item.key);
-            keys.push(key);
+        if let Some(validator) = &item.if_none_match
+            && validator.len() > MAX_KEY_LEN
+        {
+            return Err(super::error::validator_too_long(validator.len()));
         }
+        let key = EntityKey::parse(&item.key);
+        // The service dedups; the echo keeps the first spelling.
+        if let Entry::Vacant(e) = spelling_map.entry(key.clone()) {
+            e.insert(item.key);
+        }
+        keys.push(key);
     }
 
     let results = service
@@ -405,19 +434,27 @@ pub async fn batch_get_entities(
         .await
         .map_err(CanonicalError::from)?;
 
-    Ok(Json(EntityLookupsDto {
+    let body = EntityLookupsDto {
         items: results
             .into_iter()
-            .map(|(key, lookup)| EntityLookupDto {
-                key: spelling_map.remove(&key).unwrap_or_default(),
-                status: (&lookup).into(),
-                entity: match lookup {
-                    EntityLookup::Found(record) => Some(EntityDto::from(record)),
-                    EntityLookup::NotFound => None,
-                },
+            .map(|(key, lookup)| {
+                let key = spelling_map.remove(&key).ok_or_else(|| {
+                    tracing::error!("types_registry batch read answered a key it was not asked");
+                    CanonicalError::internal("the registry could not match a batch read result")
+                        .create()
+                })?;
+                Ok(EntityLookupDto {
+                    key,
+                    status: (&lookup).into(),
+                    entity: match lookup {
+                        EntityLookup::Found(record) => Some(EntityDto::from(record)),
+                        EntityLookup::NotFound => None,
+                    },
+                })
             })
-            .collect(),
-    }))
+            .collect::<Result<_, CanonicalError>>()?,
+    };
+    json_body(body, selection).await
 }
 
 /// `GET /types-registry/v2/entities`
@@ -427,47 +464,39 @@ pub async fn batch_get_entities(
 pub async fn discover_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
     params: DiscoveryParams,
-) -> ApiResult<Json<EntityPageDto>> {
+) -> ApiResult<Response> {
     let service = require_registry(service)?;
-    let binding = Binding {
-        pattern: params.pattern.as_deref(),
+    let mut query = DiscoveryQuery {
+        pattern: params.pattern,
+        after: None,
+        limit: params.limit,
         kind: params.kind,
         lifecycle: params.lifecycle,
         max_chain_depth: params.max_chain_depth,
         selection: params.selection,
     };
-    let after = params
-        .cursor
-        .as_deref()
-        .map(|token| super::cursor::decode(token, &binding))
-        .transpose()?;
+    if let Some(cursor) = &params.cursor {
+        query.after = Some(super::cursor::resume(cursor, &Binding::from(&query))?);
+    }
 
     let page = service
-        .discover(&DiscoveryQuery {
-            pattern: params.pattern.clone(),
-            after,
-            limit: params.limit,
-            kind: params.kind,
-            lifecycle: params.lifecycle,
-            max_chain_depth: params.max_chain_depth,
-            selection: params.selection,
-        })
+        .discover(&query)
         .await
         .map_err(CanonicalError::from)?;
 
-    // `has_more` may over-report, which costs the caller one empty page rather
-    // than a lost row.
-    let next_cursor = match (page.has_more, page.next_after.as_deref()) {
-        (true, Some(after)) => Some(super::cursor::encode(after, &binding)?),
-        _ => None,
-    };
-    Ok(Json(EntityPageDto {
+    let next_cursor = page
+        .next_after
+        .as_deref()
+        .map(|after| super::cursor::encode(after, &Binding::from(&query)))
+        .transpose()?;
+    let body = EntityPageDto {
         items: page.items.into_iter().map(Into::into).collect(),
         page_info: PageInfoDto {
             next_cursor,
             limit: page.limit,
         },
-    }))
+    };
+    json_body(body, query.selection).await
 }
 
 /// The database-backed path is only wired where a database is bound to this gear

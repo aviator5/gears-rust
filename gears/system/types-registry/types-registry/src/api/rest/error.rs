@@ -129,6 +129,7 @@ impl From<ServiceError> for CanonicalError {
             // Storage and database failures are not the caller's fault and carry
             // nothing the caller can act on, so they stay opaque.
             ServiceError::Storage(inner) => opaque_internal(&inner, "storage read"),
+            ServiceError::Blocking(inner) => opaque_internal(&inner, "blocking task"),
             ServiceError::Db(inner) => opaque_internal(&inner, "database read"),
             // A stored document that will not parse is corruption, not input, so
             // the offending value goes to the operator log and not to the caller.
@@ -161,7 +162,6 @@ impl From<ServiceError> for CanonicalError {
             // `gts-rust`'s own message: it names the position and the token it
             // refused, which is what a caller fixing a wildcard needs, and it
             // describes the caller's input rather than anything of ours.
-            ServiceError::DepthOutOfRange => depth_not_recognized("0"),
             ServiceError::InvalidPattern { message } => invalid_field(
                 violation_field::PATTERN,
                 format!("the pattern is not a GTS identifier pattern: {message}"),
@@ -285,6 +285,7 @@ mod violation_field {
     pub const IF_NONE_MATCH: &str = "If-None-Match";
     pub const ITEMS: &str = "items";
     pub const KEY: &str = "key";
+    pub const IF_NONE_MATCH_ITEM: &str = "if_none_match";
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
     pub const PATTERN: &str = "pattern";
@@ -349,10 +350,15 @@ pub fn if_none_match_not_supported() -> CanonicalError {
     )
 }
 
+/// Caller input echoed into a problem document, cut to a bounded length.
+fn shown(raw: &str) -> String {
+    raw.chars().take(64).collect()
+}
+
 /// One refusal for every malformed `depth`, whichever layer spotted it.
 #[must_use]
 pub fn depth_not_recognized(raw: &str) -> CanonicalError {
-    let shown: String = raw.chars().take(64).collect();
+    let shown = shown(raw);
     invalid_field(
         violation_field::DEPTH,
         format!("depth must be an integer from 1 to 255, not `{shown}`"),
@@ -362,7 +368,7 @@ pub fn depth_not_recognized(raw: &str) -> CanonicalError {
 
 #[must_use]
 pub fn kind_not_recognized(raw: &str) -> CanonicalError {
-    let shown: String = raw.chars().take(64).collect();
+    let shown = shown(raw);
     invalid_field(
         violation_field::KIND,
         format!("kind must be `type_schema` or `instance`, not `{shown}`"),
@@ -372,7 +378,7 @@ pub fn kind_not_recognized(raw: &str) -> CanonicalError {
 
 #[must_use]
 pub fn lifecycle_status_not_recognized(raw: &str) -> CanonicalError {
-    let shown: String = raw.chars().take(64).collect();
+    let shown = shown(raw);
     invalid_field(
         violation_field::LIFECYCLE_STATUS,
         format!("lifecycle_status must be `active`, `deleted` or `all`, not `{shown}`"),
@@ -426,22 +432,29 @@ pub fn unsupported_query_params(keys: &[&str], allowed: &[&str]) -> CanonicalErr
         format!("this route accepts only {}", allowed.join(", "))
     };
     let violation = |key: &str| {
-        (
-            format!("unsupported query parameter `{key}`; {accepted}"),
-            "UNSUPPORTED_QUERY_PARAM",
-        )
+        let key = shown(key);
+        let detail = format!("unsupported query parameter `{key}`; {accepted}");
+        (key, detail, "UNSUPPORTED_QUERY_PARAM")
     };
     let Some((first, rest)) = keys.split_first() else {
         return query_params_unreadable("no parameter to refuse");
     };
-    let (detail, reason) = violation(first);
-    let mut error =
-        TypeRegistryError::invalid_argument().with_field_violation(*first, detail, reason);
+    let (key, detail, reason) = violation(first);
+    let mut error = TypeRegistryError::invalid_argument().with_field_violation(key, detail, reason);
     for key in rest {
-        let (detail, reason) = violation(key);
-        error = error.with_field_violation(*key, detail, reason);
+        let (key, detail, reason) = violation(key);
+        error = error.with_field_violation(key, detail, reason);
     }
     error.create()
+}
+
+#[must_use]
+pub fn too_many_query_params(count: usize, max: usize) -> CanonicalError {
+    invalid_field(
+        "query",
+        format!("at most {max} query parameters are accepted; this request has {count}"),
+        field::VALIDATION_FAILED,
+    )
 }
 
 #[must_use]
@@ -473,6 +486,16 @@ pub fn key_too_long(len: usize) -> CanonicalError {
     invalid_field(
         violation_field::KEY,
         format!("each key must be at most 1024 bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a batch-get `if_none_match` longer than a key may be.
+#[must_use]
+pub fn validator_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        violation_field::IF_NONE_MATCH_ITEM,
+        format!("each if_none_match must be at most 1024 bytes; this one is {len}"),
         field::VALIDATION_FAILED,
     )
 }

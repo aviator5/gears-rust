@@ -722,15 +722,6 @@ impl TypeSchemaStore for TestStores {
         self.inner.find_current_schema(tx, scope, entity_id).await
     }
 
-    async fn current_schemas(
-        &self,
-        tx: &DbTx<'_>,
-        scope: &AccessScope,
-        entity_ids: &[i64],
-    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
-        self.inner.current_schemas(tx, scope, entity_ids).await
-    }
-
     async fn read_current_schemas(
         &self,
         tx: &DbTx<'_>,

@@ -11,9 +11,13 @@ use toolkit_canonical_errors::CanonicalError;
 use super::error::{
     depth_not_recognized, duplicate_query_param, kind_not_recognized,
     lifecycle_status_not_recognized, page_size_zero, pattern_too_long, query_params_unreadable,
-    unsupported_query_params,
+    too_many_query_params, unsupported_query_params,
 };
 use super::select;
+use std::num::NonZeroU8;
+
+use toolkit_odata::CursorV1;
+
 use crate::domain::enums::{EntityKind, LifecycleFilter};
 use crate::domain::selection::FieldSelection;
 
@@ -23,11 +27,17 @@ pub const EXACT_READ: &[&str] = &["$select"];
 /// `POST /entities:batchGet` carries everything in its body, `$select` included.
 pub const BATCH_READ: &[&str] = &[];
 
+/// A refusal names at most this many unknown keys, which also bounds the dedup.
+const MAX_REPORTED_KEYS: usize = 16;
+
 fn guard(pairs: &[(String, String)], allowed: &[&str]) -> Result<(), CanonicalError> {
     let mut unsupported: Vec<&str> = Vec::new();
     for (key, _) in pairs {
         if !allowed.contains(&key.as_str()) && !unsupported.contains(&key.as_str()) {
             unsupported.push(key);
+            if unsupported.len() == MAX_REPORTED_KEYS {
+                break;
+            }
         }
     }
     if !unsupported.is_empty() {
@@ -41,10 +51,18 @@ fn guard(pairs: &[(String, String)], allowed: &[&str]) -> Result<(), CanonicalEr
     Ok(())
 }
 
+/// Above any valid request: each route's vocabulary is smaller and repeats are refused.
+const MAX_QUERY_PAIRS: usize = 32;
+
 async fn raw_pairs<S: Send + Sync>(
     parts: &mut Parts,
     state: &S,
 ) -> Result<Vec<(String, String)>, CanonicalError> {
+    // Counted on the raw string, before any pair is decoded or allocated.
+    let count = parts.uri.query().map_or(0, |q| q.split('&').count());
+    if count > MAX_QUERY_PAIRS {
+        return Err(too_many_query_params(count, MAX_QUERY_PAIRS));
+    }
     let Query(pairs) = Query::<Vec<(String, String)>>::from_request_parts(parts, state)
         .await
         .map_err(|e| query_params_unreadable(&e.to_string()))?;
@@ -112,22 +130,21 @@ pub struct DiscoveryParams {
     pub pattern: Option<String>,
     pub kind: Option<EntityKind>,
     pub lifecycle: LifecycleFilter,
-    pub max_chain_depth: Option<u8>,
-    pub limit: Option<u32>,
-    pub cursor: Option<String>,
+    pub max_chain_depth: Option<NonZeroU8>,
+    pub limit: Option<u64>,
+    pub cursor: Option<CursorV1>,
     pub selection: FieldSelection,
 }
 
-/// Plain decimal digits only: `u8::from_str` would also take `+5`. Zero parses and
-/// is refused by the domain, which owns the range.
-fn parse_depth(raw: &str) -> Result<u8, CanonicalError> {
+/// Plain decimal digits only: `NonZeroU8::from_str` would also take `+5`.
+fn parse_depth(raw: &str) -> Result<NonZeroU8, CanonicalError> {
     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(depth_not_recognized(raw));
     }
     raw.parse().map_err(|_| depth_not_recognized(raw))
 }
 
-/// The wire spellings of [`EntityKind`], shared with `EntityKindDto`.
+/// The wire spellings of [`EntityKind`]; a test pins them to `EntityKindDto`.
 fn parse_kind(raw: &str) -> Result<EntityKind, CanonicalError> {
     match raw {
         "type_schema" => Ok(EntityKind::TypeSchema),
@@ -176,9 +193,9 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
         if let Some((name, "0")) = limit {
             return Err(page_size_zero(name));
         }
-        if let Some((_, token)) = cursor {
-            super::cursor::check_readable(token)?;
-        }
+        let cursor = cursor
+            .map(|(_, token)| super::cursor::read(token))
+            .transpose()?;
 
         let (query, selection, _) = extract(parts, state, DISCOVERY).await?;
         let pattern = value(&pairs, "pattern").map(str::to_owned);
@@ -195,9 +212,13 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
                 .transpose()?
                 .unwrap_or_default(),
             max_chain_depth: value(&pairs, "depth").map(parse_depth).transpose()?,
-            limit: query.limit.map(|l| u32::try_from(l).unwrap_or(u32::MAX)),
-            cursor: cursor.map(|(_, token)| token.to_owned()),
+            limit: query.limit,
+            cursor,
             selection,
         })
     }
 }
+
+#[cfg(test)]
+#[path = "params_tests.rs"]
+mod tests;

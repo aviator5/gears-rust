@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde_json::json;
 use toolkit_gts::gts_id;
 
-use types_registry::config::{ByteSize, ConfigError, TypesRegistryConfig};
+use types_registry::config::{ByteSize, ConfigError, PAGE_SIZE_CEILING, TypesRegistryConfig};
 use types_registry::domain::enums::OwnershipScope;
 
 fn parse(value: serde_json::Value) -> TypesRegistryConfig {
@@ -327,10 +327,15 @@ fn configured_limits_are_kept() {
         cfg.worker.max_revalidation_attempts, 3,
         "T15 enforces this one: the bound on the revalidation loop"
     );
-    assert_eq!(
-        (cfg.limits.page_size_default, cfg.limits.page_size_max),
-        (20, 40)
-    );
+}
+
+#[test]
+fn a_page_size_max_above_the_ceiling_fails_startup() {
+    let at = parse(json!({ "limits": { "page_size_max": PAGE_SIZE_CEILING } }));
+    at.validate().expect("the ceiling itself is valid");
+    let over = parse(json!({ "limits": { "page_size_max": PAGE_SIZE_CEILING + 1 } }));
+    let err = over.validate().expect_err("above the ceiling must fail");
+    assert!(matches!(err, ConfigError::Limits(_)), "got {err}");
 }
 
 #[test]

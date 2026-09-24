@@ -1365,7 +1365,7 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
         .entity(&key, FieldSelection::full())
         .await?
         .expect("B's first read after A's commit must see it");
-    assert_eq!(first_read.resource_version, 1);
+    assert_eq!(first_read.origin.map(|o| o.resource_version), Some(1));
 
     // And a revision on A is visible to B just the same: the read is a `SELECT`, not a snapshot, so
     // there is no second thing to invalidate.
@@ -1374,7 +1374,7 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
         .entity(&key, FieldSelection::full())
         .await?
         .expect("the entity is still there");
-    assert_eq!(second_read.resource_version, 2);
+    assert_eq!(second_read.origin.map(|o| o.resource_version), Some(2));
     assert_eq!(
         second_read.content,
         Some(base_schema("label")),

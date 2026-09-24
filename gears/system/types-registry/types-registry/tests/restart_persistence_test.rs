@@ -276,7 +276,7 @@ async fn a_schema_and_instance_survive_database_reopen() {
 
     assert_eq!(schema_by_id.gts_id, CF_TYPE);
     assert_eq!(schema_by_id.gts_uuid, schema_uuid);
-    assert_eq!(schema_by_id.resource_version, 1);
+    assert_eq!(schema_by_id.origin.map(|o| o.resource_version), Some(1));
     assert_eq!(schema_by_uuid.gts_uuid, schema_by_id.gts_uuid);
     assert_eq!(schema_by_uuid.gts_id, schema_by_id.gts_id);
 
@@ -303,7 +303,7 @@ async fn a_schema_and_instance_survive_database_reopen() {
     );
 
     assert_eq!(instance_by_id.gts_id, CF_INSTANCE);
-    assert_eq!(instance_by_id.resource_version, 1);
+    assert_eq!(instance_by_id.origin.map(|o| o.resource_version), Some(1));
     assert_eq!(instance_by_id.content.as_ref(), Some(&authored_instance));
     assert!(instance_by_id.resolved_schema.is_none());
     assert!(instance_by_id.effective_traits.is_none());
@@ -413,7 +413,7 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
         .await
         .expect("read")
         .expect("admission registered the entity");
-    assert_eq!(entity.resource_version, 1);
+    assert_eq!(entity.origin.map(|o| o.resource_version), Some(1));
 
     drop(svc);
     drop(db);

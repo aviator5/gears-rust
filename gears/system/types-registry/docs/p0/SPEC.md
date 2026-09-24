@@ -1482,7 +1482,7 @@ gears:
         batch_candidates: 100
         activation_write_set: 512      # DESIGN §3.2; the profile is §4
         page_size_default: 50          # `GET /entities`, DESIGN §3.3
-        page_size_max: 100
+        page_size_max: 100             # at most 100, the batch-read ceiling (C10)
       registration_policy: {}          # closed by default; global `cf` implicit
       worker:
         operation_timeout: 5m          # T21 lease-handler budget; must be > 0. Not

@@ -3,6 +3,7 @@
 //! P0 managed entities are unrestricted, but ports already accept an access scope.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use gts::GtsIdPattern;
@@ -17,7 +18,8 @@ use crate::config::TypesRegistryConfig;
 use crate::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use crate::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use crate::domain::admission::{
-    Accepted, AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
+    Accepted, AdmissionFailureReason, Candidate, OperationDispatch, StoredFailure, SubmitRequest,
+    UnreadableFailure,
 };
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
@@ -89,30 +91,34 @@ pub struct OperationItemRecord {
     pub gts_id: String,
     pub status: OperationItemStatus,
     pub resource_version: Option<i64>,
-    /// The stored structured reason, verbatim.
-    pub error: Option<String>,
+    pub error: Option<Result<StoredFailure, UnreadableFailure>>,
 }
 
-/// Entity-row metadata is always present and emitted only where [`Self::selection`]
-/// names it. A document or `provenance` is `Some` only when selected and
+/// Projected by the selection: an optional field is `Some` only when selected and
 /// applicable; `Some(Value::Null)` is a selected JSON `null`.
 #[domain_model]
 #[derive(Clone, Debug)]
 pub struct EntityRecord {
-    pub selection: FieldSelection,
     pub gts_id: String,
     pub gts_uuid: Uuid,
-    pub kind: EntityKind,
+    pub kind: Option<EntityKind>,
+    pub origin: Option<ManagedOrigin>,
     pub lifecycle_status: LifecycleStatus,
-    pub resource_version: i64,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
-    pub content_hash: ContentHash,
+    pub content_hash: Option<ContentHash>,
     pub content: Option<Value>,
     pub resolved_schema: Option<Value>,
     pub effective_traits: Option<Value>,
     pub effective_traits_schema: Option<Value>,
     pub provenance: Option<Provenance>,
+}
+
+/// Where a managed entity's current state came from.
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagedOrigin {
+    pub resource_version: i64,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
 }
 
 /// The eight stored FNV-1a bytes of the canonical authored content: a prefilter,
@@ -152,7 +158,7 @@ pub struct Provenance {
 // `NotFound` pays for the shared discriminant are not what makes a batch large.
 // Boxing would buy that back and charge an allocation and an indirection per found
 // record — the wrong trade for the variant that carries every successful read.
-#[allow(
+#[expect(
     clippy::large_enum_variant,
     reason = "boxing Found penalises every successful read with an allocation and an indirection; NotFound's discriminant overhead is acceptable"
 )]
@@ -173,11 +179,11 @@ pub struct DiscoveryQuery {
     /// Exclusive keyset lower bound: the position the previous page stopped at.
     pub after: Option<String>,
     /// `None` takes `limits.page_size_default`; above `limits.page_size_max` is refused.
-    pub limit: Option<u32>,
+    pub limit: Option<u64>,
     pub kind: Option<EntityKind>,
     pub lifecycle: LifecycleFilter,
-    /// Inclusive maximum number of GTS identifier segments; `0` is refused.
-    pub max_chain_depth: Option<u8>,
+    /// Inclusive maximum number of GTS identifier segments.
+    pub max_chain_depth: Option<NonZeroU8>,
     pub selection: FieldSelection,
 }
 
@@ -191,14 +197,10 @@ pub struct DiscoveryPage {
     /// for a transport adapter to restate, so REST and a future gRPC adapter
     /// cannot report different defaults for the same read.
     pub limit: u32,
-    /// The identifier the scan stopped at. Meaningful only with [`Self::has_more`]:
-    /// rows the pattern rejected were consumed too, so this is not necessarily the
-    /// last item returned.
+    /// Where the next page resumes; `None` once the range is exhausted. Rows the
+    /// pattern rejected were consumed too, so this is not necessarily the last item
+    /// returned. May be `Some` before an empty last page, never `None` early.
     pub next_after: Option<String>,
-    /// `true` when the scan stopped on the page limit or its scan budget rather than
-    /// on exhausting the range. May over-report, which costs the caller one more
-    /// empty page rather than a lost row.
-    pub has_more: bool,
 }
 
 /// How many keys one batch read may name.
@@ -236,6 +238,9 @@ pub enum ServiceError {
     Db(#[from] DbError),
     #[error("a stored document could not be read as JSON: {0}")]
     CorruptDocument(String),
+    /// A blocking task panicked or was cancelled.
+    #[error("a blocking task did not complete: {0}")]
+    Blocking(String),
     /// Registry Reference with no identifier for an asynchronous item outcome.
     #[error("no entity has Registry Reference {gts_uuid}")]
     UnresolvedReference { gts_uuid: Uuid },
@@ -246,10 +251,7 @@ pub enum ServiceError {
     BatchReadOutOfRange { count: usize },
     /// `limit` outside `1..=limits.page_size_max` (D12).
     #[error("a page size must be between 1 and {max}; this request asked for {limit}")]
-    PageSizeOutOfRange { limit: u32, max: u32 },
-    /// `max_chain_depth` must name at least one segment.
-    #[error("a chain depth must be between 1 and {}", u8::MAX)]
-    DepthOutOfRange,
+    PageSizeOutOfRange { limit: u64, max: u32 },
     /// The discovery pattern is not a GTS identifier pattern.
     #[error("the discovery pattern is not a GTS pattern: {message}")]
     InvalidPattern { message: String },
@@ -265,11 +267,11 @@ impl ServiceError {
             Self::Storage(_) => "storage",
             Self::Db(_) => "database",
             Self::CorruptDocument(_) => "corrupt_document",
+            Self::Blocking(_) => "blocking_task",
             Self::UnresolvedReference { .. } => "unresolved_reference",
             Self::BatchReadOutOfRange { .. } => "batch_read_out_of_range",
             Self::PageSizeOutOfRange { .. } => "page_size_out_of_range",
             Self::InvalidPattern { .. } => "invalid_pattern",
-            Self::DepthOutOfRange => "depth_out_of_range",
         }
     }
 }
@@ -305,6 +307,12 @@ impl RegistryService {
             dispatch,
             metrics,
         }
+    }
+
+    /// The configured limits, for a transport adapter's published contract.
+    #[must_use]
+    pub fn limits(&self) -> &crate::config::Limits {
+        &self.config.limits
     }
 
     /// Admission budget, also used by the outbox leased handler.
@@ -558,11 +566,14 @@ impl RegistryService {
             completed_at: operation.completed_at,
             items: items
                 .into_iter()
-                .map(|item| OperationItemRecord {
-                    gts_id: item.gts_id,
-                    status: item.status,
-                    resource_version: item.result_resource_version,
-                    error: item.error_payload,
+                .map(|item| {
+                    let error = item.error_payload.as_deref().map(StoredFailure::parse);
+                    OperationItemRecord {
+                        gts_id: item.gts_id,
+                        status: item.status,
+                        resource_version: item.result_resource_version,
+                        error,
+                    }
                 })
                 .collect(),
         }))
@@ -669,28 +680,45 @@ impl RegistryService {
             })
             .await?;
 
-        let records = into_records(state.0, state.1, selection)?;
-        let by_gts_id: BTreeMap<&str, &EntityRecord> = records
-            .values()
-            .map(|record| (record.gts_id.as_str(), record))
+        let mut records = build_records(state.0, state.1, selection).await?;
+        let by_gts_id: BTreeMap<&str, i64> = records
+            .iter()
+            .map(|(id, record)| (record.gts_id.as_str(), *id))
             .collect();
-        let by_gts_uuid: BTreeMap<Uuid, &EntityRecord> = records
-            .values()
-            .map(|record| (record.gts_uuid, record))
+        let by_gts_uuid: BTreeMap<Uuid, i64> = records
+            .iter()
+            .map(|(id, record)| (record.gts_uuid, *id))
             .collect();
-
+        let ids: Vec<Option<i64>> = requested
+            .iter()
+            .map(|key| match key {
+                EntityKey::GtsId(gts_id) => by_gts_id.get(gts_id.as_str()).copied(),
+                EntityKey::Uuid(gts_uuid) => by_gts_uuid.get(gts_uuid).copied(),
+            })
+            .collect();
+        drop((by_gts_id, by_gts_uuid));
+        // Moved out on a row's last mention; cloned only for a row asked by both spellings.
+        let mut uses: BTreeMap<i64, usize> = BTreeMap::new();
+        for id in ids.iter().flatten() {
+            *uses.entry(*id).or_default() += 1;
+        }
         Ok(requested
             .into_iter()
-            .map(|key| {
-                let found = match &key {
-                    EntityKey::GtsId(gts_id) => by_gts_id.get(gts_id.as_str()).copied(),
-                    EntityKey::Uuid(gts_uuid) => by_gts_uuid.get(gts_uuid).copied(),
-                };
-                let lookup = match found {
-                    Some(record) => EntityLookup::Found(record.clone()),
-                    None => EntityLookup::NotFound,
-                };
-                (key, lookup)
+            .zip(ids)
+            .map(|(key, id)| {
+                let record = id.and_then(|id| {
+                    let left = uses.get_mut(&id)?;
+                    *left -= 1;
+                    if *left == 0 {
+                        records.remove(&id)
+                    } else {
+                        records.get(&id).cloned()
+                    }
+                });
+                (
+                    key,
+                    record.map_or(EntityLookup::NotFound, EntityLookup::Found),
+                )
             })
             .collect())
     }
@@ -708,10 +736,13 @@ impl RegistryService {
     /// or [`ServiceError::Storage`] for a read failure.
     pub async fn discover(&self, query: &DiscoveryQuery) -> Result<DiscoveryPage, ServiceError> {
         let max = self.config.limits.page_size_max;
-        let limit = query.limit.unwrap_or(self.config.limits.page_size_default);
-        if limit == 0 || limit > max {
-            return Err(ServiceError::PageSizeOutOfRange { limit, max });
-        }
+        let limit = match query.limit {
+            None => self.config.limits.page_size_default,
+            Some(asked) => u32::try_from(asked)
+                .ok()
+                .filter(|limit| (1..=max).contains(limit))
+                .ok_or(ServiceError::PageSizeOutOfRange { limit: asked, max })?,
+        };
         // Compiled by `gts-rust`, the sole authority on the pattern grammar
         // (`constraint-gts-implementation`). A string it refuses is a refused
         // request, not an empty page: the two are indistinguishable to a caller
@@ -725,9 +756,6 @@ impl RegistryService {
                 })
             })
             .transpose()?;
-        if query.max_chain_depth == Some(0) {
-            return Err(ServiceError::DepthOutOfRange);
-        }
         let filter = ListFilter {
             pattern,
             kind: query.kind,
@@ -755,12 +783,11 @@ impl RegistryService {
             .await?;
 
         let order: Vec<i64> = page.items.iter().map(|row| row.id).collect();
-        let mut records = into_records(page.items, current, selection)?;
+        let mut records = build_records(page.items, current, selection).await?;
         Ok(DiscoveryPage {
             items: order.iter().filter_map(|id| records.remove(id)).collect(),
             limit,
-            next_after: page.next_after,
-            has_more: page.has_more,
+            next_after: page.next_after.filter(|_| page.has_more),
         })
     }
 }
@@ -797,6 +824,21 @@ async fn read_current(
         .collect())
 }
 
+/// [`into_records`], off the executor when documents are selected: parsing them is
+/// CPU work proportional to up to a page of 1 MB documents.
+async fn build_records(
+    rows: Vec<EntityRow>,
+    current: BTreeMap<i64, CurrentReadRow>,
+    selection: FieldSelection,
+) -> Result<BTreeMap<i64, EntityRecord>, ServiceError> {
+    if !selection.selects_any_document() {
+        return into_records(rows, current, selection);
+    }
+    tokio::task::spawn_blocking(move || into_records(rows, current, selection))
+        .await
+        .map_err(|e| ServiceError::Blocking(e.to_string()))?
+}
+
 /// A missing current state, or a selected column that did not come back, is
 /// corruption rather than absence, whatever the selection.
 fn into_records(
@@ -815,7 +857,13 @@ fn into_records(
         })?;
         let content_hash = <[u8; 8]>::try_from(state.content_hash.as_slice())
             .map(ContentHash)
-            .map_err(|_| missing_state(&row.gts_id, "eight-byte content hash"))?;
+            .map_err(|_| {
+                ServiceError::CorruptDocument(format!(
+                    "entity '{}' has a {}-byte content hash, expected 8",
+                    row.gts_id,
+                    state.content_hash.len()
+                ))
+            })?;
         let is_schema = row.entity_kind == EntityKind::TypeSchema;
         let document = |field: EntityField, text: Option<String>| {
             select_document(selection, field, is_schema, text, &row.gts_id)
@@ -843,15 +891,22 @@ fn into_records(
         out.insert(
             row.id,
             EntityRecord {
-                selection,
                 gts_id: row.gts_id,
                 gts_uuid: row.gts_uuid,
-                kind: row.entity_kind,
+                kind: selection
+                    .contains(EntityField::Kind)
+                    .then_some(row.entity_kind),
+                origin: selection
+                    .contains(EntityField::Origin)
+                    .then_some(ManagedOrigin {
+                        resource_version: row.resource_version,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                    }),
                 lifecycle_status: row.lifecycle_status,
-                resource_version: row.resource_version,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-                content_hash,
+                content_hash: selection
+                    .contains(EntityField::ContentHash)
+                    .then_some(content_hash),
                 content,
                 resolved_schema,
                 effective_traits,
@@ -949,7 +1004,10 @@ mod tests {
         )
         .expect("an unselected column is never parsed");
         assert!(records[&7].content.is_none());
-        assert_eq!(records[&7].content_hash.to_hex(), "00010203040506ff");
+        assert_eq!(
+            records[&7].content_hash.map(ContentHash::to_hex).as_deref(),
+            Some("00010203040506ff")
+        );
     }
 
     #[test]

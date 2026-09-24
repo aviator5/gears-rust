@@ -4,6 +4,8 @@
 //! The SQL prefilter behind [`EntityRepo::list_page`] lives here too — see the
 //! module header of [`super`] for why it only ever narrows, and never decides.
 
+use std::num::NonZeroU8;
+
 use gts::{GtsId, GtsIdPattern};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -452,14 +454,20 @@ impl EntityRepo {
 /// unreachable through the write path. It stays because the alternative is failing a
 /// whole discovery page on one bad row.
 /// `gts-rust` decides both the pattern and the depth; neither is approximated in SQL.
-fn matches(gts_id: &str, pattern: Option<&GtsIdPattern>, max_depth: Option<u8>) -> bool {
+fn matches(gts_id: &str, pattern: Option<&GtsIdPattern>, max_depth: Option<NonZeroU8>) -> bool {
     if pattern.is_none() && max_depth.is_none() {
         return true;
     }
-    GtsId::try_new(gts_id).is_ok_and(|id| {
-        pattern.is_none_or(|pattern| id.matches_pattern(pattern))
-            && max_depth.is_none_or(|max| id.segments().len() <= usize::from(max))
-    })
+    match GtsId::try_new(gts_id) {
+        Ok(id) => {
+            pattern.is_none_or(|pattern| id.matches_pattern(pattern))
+                && max_depth.is_none_or(|max| id.segments().len() <= usize::from(max.get()))
+        }
+        Err(e) => {
+            tracing::error!(gts_id, error = %e, "types_registry skipped a stored identifier it cannot parse");
+            false
+        }
+    }
 }
 
 /// The literal prefix a pattern's matches must all share, or `None` when the

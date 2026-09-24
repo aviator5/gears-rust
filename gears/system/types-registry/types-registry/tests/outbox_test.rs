@@ -21,6 +21,7 @@ use types_registry::domain::ports::Stores;
 use types_registry::domain::ports::metrics::{AdmissionMetrics, DeliveryOutcome};
 use types_registry::domain::registry_service::{EntityKey, RegistryService};
 use types_registry::infra::outbox::{AdmissionHandler, OutboxDispatch};
+use types_registry::infra::storage::repo::OperationRepo;
 
 mod common;
 use common::{await_delivery, metrics, stores, test_db_with_outbox};
@@ -223,7 +224,8 @@ async fn a_duplicate_delivery_changes_nothing() {
         .expect("read")
         .expect("the entity exists");
     assert_eq!(
-        after_second.resource_version, after_first.resource_version,
+        after_second.origin.map(|o| o.resource_version),
+        after_first.origin.map(|o| o.resource_version),
         "a redelivery must not advance resource_version",
     );
     assert_eq!(after_second.lifecycle_status, LifecycleStatus::Active);
@@ -325,13 +327,7 @@ async fn a_transient_failure_on_the_last_attempt_is_terminalized_and_acked() {
         "a failed operation must not stay non-terminal",
     );
     assert_eq!(operation.items[0].status, OperationItemStatus::Failed);
-    let error: Value = serde_json::from_str(
-        operation.items[0]
-            .error
-            .as_deref()
-            .expect("a failed item carries a stored error payload"),
-    )
-    .expect("the stored payload is JSON");
+    let error = stored_error(&operation.items[0]);
     assert_eq!(
         error["reason"],
         json!("system_failure"),
@@ -371,13 +367,7 @@ async fn an_admission_past_the_delivery_budget_is_terminalized_without_being_adm
         "the operation must be terminal, not left running for a delivery that will not come",
     );
     assert_eq!(operation.items[0].status, OperationItemStatus::Failed);
-    let error: Value = serde_json::from_str(
-        operation.items[0]
-            .error
-            .as_deref()
-            .expect("a failed item carries a stored error payload"),
-    )
-    .expect("the stored payload is JSON");
+    let error = stored_error(&operation.items[0]);
     assert_eq!(error["reason"], json!("system_failure"));
 
     assert!(
@@ -458,13 +448,7 @@ async fn a_status_read_that_fails_past_the_budget_terminalizes_rather_than_retri
         "acking the message is only allowed because the operation was terminalized",
     );
     assert_eq!(operation.items[0].status, OperationItemStatus::Failed);
-    let error: Value = serde_json::from_str(
-        operation.items[0]
-            .error
-            .as_deref()
-            .expect("a failed item carries a stored error payload"),
-    )
-    .expect("the stored payload is JSON");
+    let error = stored_error(&operation.items[0]);
     assert_eq!(
         error["reason"],
         json!("system_failure"),
@@ -589,13 +573,7 @@ async fn an_overrunning_admission_is_cut_off_with_lease_left_to_fail_it() {
         "the reserve exists so this write lands: acking a message whose operation \
          stays non-terminal would leave no queued work to resume it",
     );
-    let error: Value = serde_json::from_str(
-        operation.items[0]
-            .error
-            .as_deref()
-            .expect("a failed item carries a stored error payload"),
-    )
-    .expect("the stored payload is JSON");
+    let error = stored_error(&operation.items[0]);
     assert_eq!(
         error["error_code"], "admission_deadline_exceeded",
         "an overrun is its own diagnostic, not a failure code borrowed from admission",
@@ -672,8 +650,13 @@ async fn a_system_failure_records_the_cause_kind_and_never_the_drivers_own_text(
         .await
         .expect("read")
         .expect("the operation exists");
-    let stored = operation.items[0]
-        .error
+    // The raw column: a parsed read would drop an unknown field carrying the cause.
+    let conn = db.conn().expect("conn");
+    let raw = OperationRepo::find_items(&conn, &common::allow_all(), accepted.operation_id)
+        .await
+        .expect("read items");
+    let stored = raw[0]
+        .error_payload
         .as_deref()
         .expect("a failed item carries a stored error payload");
     assert!(
@@ -681,6 +664,11 @@ async fn a_system_failure_records_the_cause_kind_and_never_the_drivers_own_text(
         "the injected cause must not reach the client-visible payload: {stored}",
     );
     let error: Value = serde_json::from_str(stored).expect("the stored payload is JSON");
+    assert_eq!(
+        stored_error(&operation.items[0]),
+        error,
+        "the poll reads it whole"
+    );
     assert_eq!(error["reason"], json!("system_failure"));
     assert_eq!(error["error_code"], json!("storage_failure"));
     assert_eq!(
@@ -713,13 +701,7 @@ async fn invalid_scope_is_terminalized_on_the_first_delivery_with_a_system_diagn
         .expect("exists");
     assert_eq!(operation.status, OperationStatus::Completed);
     assert_eq!(operation.items[0].status, OperationItemStatus::Failed);
-    let error: Value = serde_json::from_str(
-        operation.items[0]
-            .error
-            .as_deref()
-            .expect("a failed item carries a stored error payload"),
-    )
-    .expect("the stored payload is JSON");
+    let error = stored_error(&operation.items[0]);
     assert_eq!(error["error_code"], json!("storage_failure"));
     assert_eq!(
         error["operation_id"],
@@ -901,8 +883,9 @@ async fn enqueue_routes_independent_operations_to_different_partitions() {
             .await
             .unwrap()
             .unwrap()
-            .resource_version,
-        1
+            .origin
+            .map(|o| o.resource_version),
+        Some(1)
     );
     assert_eq!(
         registry.operation(first_id).await.unwrap().unwrap().status,
@@ -949,7 +932,7 @@ async fn an_accepted_operation_is_admitted_by_the_outbox() {
         .await
         .expect("read")
         .expect("the entity the outbox admitted is readable");
-    assert_eq!(entity.resource_version, 1);
+    assert_eq!(entity.origin.map(|o| o.resource_version), Some(1));
 
     handle.stop().await;
 }
@@ -1272,4 +1255,14 @@ async fn a_retried_terminalization_failure_says_so_in_the_log() {
         log.contains("write=\"write_failed\""),
         "with the reason the terminalization did not land: {log}",
     );
+}
+
+/// A failed item's stored payload, read back through the domain parser.
+fn stored_error(item: &types_registry::domain::registry_service::OperationItemRecord) -> Value {
+    let stored = item
+        .error
+        .clone()
+        .expect("a failed item carries a stored error payload")
+        .expect("the stored payload is readable");
+    serde_json::to_value(stored).expect("serialize")
 }

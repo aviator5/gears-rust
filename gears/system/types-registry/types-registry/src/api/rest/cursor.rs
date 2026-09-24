@@ -23,12 +23,15 @@
 //!
 //! [`DiscoveryQuery::after`]: crate::domain::registry_service::DiscoveryQuery::after
 
+use std::num::NonZeroU8;
+
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::pagination::short_filter_hash;
 use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir, ast, validate_cursor_against};
 
 use super::error::{cursor_not_usable, cursor_too_long};
 use crate::domain::enums::{EntityKind, LifecycleFilter};
+use crate::domain::registry_service::DiscoveryQuery;
 use crate::domain::selection::FieldSelection;
 
 /// The one keyset column. `gts_id` is unique and immutable, which is what makes the
@@ -105,8 +108,30 @@ pub struct Binding<'a> {
     pub pattern: Option<&'a str>,
     pub kind: Option<EntityKind>,
     pub lifecycle: LifecycleFilter,
-    pub max_chain_depth: Option<u8>,
+    pub max_chain_depth: Option<NonZeroU8>,
     pub selection: FieldSelection,
+}
+
+impl<'a> From<&'a DiscoveryQuery> for Binding<'a> {
+    /// Exhaustive, so a new query filter cannot be left out of the binding.
+    fn from(query: &'a DiscoveryQuery) -> Self {
+        let DiscoveryQuery {
+            pattern,
+            after: _,
+            limit: _,
+            kind,
+            lifecycle,
+            max_chain_depth,
+            selection,
+        } = query;
+        Self {
+            pattern: pattern.as_deref(),
+            kind: *kind,
+            lifecycle: *lifecycle,
+            max_chain_depth: *max_chain_depth,
+            selection: *selection,
+        }
+    }
 }
 
 /// Encode the position a page stopped at, bound to the query that produced it.
@@ -129,31 +154,33 @@ pub fn encode(after: &str, binding: &Binding<'_>) -> Result<String, CanonicalErr
     })
 }
 
-/// Refuse an oversized or undecodable token before anything else reads it.
-///
-/// # Errors
-/// A `400` naming `cursor`.
-pub fn check_readable(token: &str) -> Result<(), CanonicalError> {
-    if token.len() > MAX_TOKEN_LEN {
-        return Err(cursor_too_long(token.len()));
-    }
-    CursorV1::decode(token)
-        .map(drop)
-        .map_err(|e| cursor_not_usable(&e.to_string()))
-}
-
 /// Base64url JSON of one identifier; a real token cannot approach this.
 const MAX_TOKEN_LEN: usize = 4096;
 
-/// Decode a cursor into the stored `gts_id` the next page resumes after.
+/// Read a token, refusing an oversized or undecodable one.
 ///
 /// # Errors
-/// A `400` problem naming `cursor` when the token is unreadable, of an unsupported
-/// version, or bound to a different query than this request asks.
-pub fn decode(token: &str, binding: &Binding<'_>) -> Result<String, CanonicalError> {
-    let cursor = CursorV1::decode(token).map_err(|e| cursor_not_usable(&e.to_string()))?;
+/// A `400` naming `cursor`.
+pub fn read(token: &str) -> Result<CursorV1, CanonicalError> {
+    if token.len() > MAX_TOKEN_LEN {
+        return Err(cursor_too_long(token.len()));
+    }
+    CursorV1::decode(token).map_err(|e| cursor_not_usable(&e.to_string()))
+}
+
+#[cfg(test)]
+fn decode(token: &str, binding: &Binding<'_>) -> Result<String, CanonicalError> {
+    resume(&read(token)?, binding)
+}
+
+/// The stored `gts_id` a [`read`] cursor resumes after.
+///
+/// # Errors
+/// A `400` problem naming `cursor` when the token is of an unsupported shape or
+/// bound to a different query than this request asks.
+pub fn resume(cursor: &CursorV1, binding: &Binding<'_>) -> Result<String, CanonicalError> {
     let expected = binding_hash(binding);
-    validate_cursor_against(&cursor, &page_order(), expected.as_deref())
+    validate_cursor_against(cursor, &page_order(), expected.as_deref())
         .map_err(|e| cursor_not_usable(&e.to_string()))?;
     // `validate_cursor_against` skips the comparison when the token has no filter,
     // which only a pre-T22b cursor lacks.
@@ -177,6 +204,9 @@ pub fn decode(token: &str, binding: &Binding<'_>) -> Result<String, CanonicalErr
 
 #[cfg(test)]
 mod tests {
+    use toolkit_canonical_errors::{FieldViolation, InvalidArgument};
+    use types_registry_sdk::field;
+
     use super::*;
 
     const AFTER: &str = "gts.cf.core.example.type.v1~";
@@ -196,7 +226,7 @@ mod tests {
             pattern,
             kind,
             lifecycle: LifecycleFilter::Active,
-            max_chain_depth,
+            max_chain_depth: max_chain_depth.and_then(NonZeroU8::new),
             selection: if select.is_empty() {
                 FieldSelection::default()
             } else {
@@ -221,9 +251,74 @@ mod tests {
     /// readable off it, or a caller will start editing one.
     #[test]
     fn the_token_does_not_spell_the_query_out() -> Result<(), CanonicalError> {
-        let token = encode(AFTER, &bound(Some(PATTERN), &["content"]))?;
-        for needle in [PATTERN, "example", "content"] {
-            assert!(!token.contains(needle), "{token}");
+        let binding = bound(Some(PATTERN), &["content"]);
+        let cursor = read(&encode(AFTER, &binding)?)?;
+        let filter = cursor.f.expect("the selection is always bound");
+        assert_eq!(Some(&filter), binding_hash(&binding).as_ref());
+        for needle in [PATTERN, "content"] {
+            assert!(!filter.contains(needle), "{filter}");
+        }
+        Ok(())
+    }
+
+    /// The one violation a refusal carries.
+    fn violation<T: std::fmt::Debug>(result: Result<T, CanonicalError>) -> FieldViolation {
+        match result {
+            Err(CanonicalError::InvalidArgument {
+                ctx: InvalidArgument::FieldViolations { field_violations },
+                ..
+            }) => match <[FieldViolation; 1]>::try_from(field_violations) {
+                Ok([violation]) => violation,
+                Err(all) => panic!("expected one violation, got {all:?}"),
+            },
+            other => panic!("expected a field refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_token_is_refused_before_decoding() {
+        let at_limit = violation(read(&"A".repeat(MAX_TOKEN_LEN)));
+        assert!(
+            at_limit
+                .description
+                .starts_with("the cursor cannot be used"),
+            "a token at the limit reaches decoding: {at_limit:?}"
+        );
+        let over = violation(read(&"A".repeat(MAX_TOKEN_LEN + 1)));
+        assert_eq!(over.field, "cursor");
+        assert_eq!(over.reason, field::VALIDATION_FAILED);
+        assert_eq!(
+            over.description,
+            "cursor must be at most 4096 bytes; this one is 4097"
+        );
+    }
+
+    #[test]
+    fn a_cursor_must_name_exactly_one_key() -> Result<(), CanonicalError> {
+        let binding = bound(None, &[]);
+        // `CursorV1::decode` refuses an empty key list itself.
+        for (k, reason) in [
+            (vec![], "invalid cursor: empty or invalid keys"),
+            (
+                vec![AFTER.to_owned(), AFTER.to_owned()],
+                "a discovery cursor names exactly one key, not 2",
+            ),
+        ] {
+            let token = CursorV1 {
+                k,
+                o: SortDir::Asc,
+                s: page_order().to_signed_tokens(),
+                f: binding_hash(&binding),
+                d: FORWARD.to_owned(),
+            }
+            .encode()
+            .map_err(|e| CanonicalError::internal(e.to_string()).create())?;
+            let refused = violation(decode(&token, &binding));
+            assert_eq!(refused.field, "cursor");
+            assert_eq!(
+                refused.description,
+                format!("the cursor cannot be used for this request: {reason}")
+            );
         }
         Ok(())
     }

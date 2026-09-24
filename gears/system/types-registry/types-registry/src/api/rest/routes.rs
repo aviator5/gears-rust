@@ -17,6 +17,7 @@ use super::dto::{
 };
 use super::handlers;
 pub use super::paths::{V1, V2};
+use crate::config::Limits;
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 
@@ -63,7 +64,10 @@ pub fn register_routes(
     router = register_submit(router, openapi);
     router = register_reads(router, openapi);
     router = register_batch_get(router, openapi);
-    router = register_discovery(router, openapi);
+    let limits = registry
+        .as_deref()
+        .map_or_else(Limits::default, |registry| *registry.limits());
+    router = register_discovery(router, openapi, &limits);
     router = register_batch_delete(router, openapi);
     router = register_delete_entity(router, openapi);
 
@@ -348,28 +352,33 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
 }
 
 /// `GET {V2}/entities` — the bounded, projected discovery page (D12, T22a, T22b).
-fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+fn register_discovery(
+    mut router: Router,
+    openapi: &dyn OpenApiRegistry,
+    limits: &Limits,
+) -> Router {
+    let (default, max) = (limits.page_size_default, limits.page_size_max);
     router = OperationBuilder::get(format!("{V2}/entities"))
         .operation_id("types_registry.list_entities")
         .summary("Discover GTS entities")
-        .description(
+        .description(format!(
             "Return one bounded page of entities, ordered by canonical identifier, with the \
              cursor for the next page. `lifecycle_status` is `active` (default), `deleted` \
              (tombstones only) or `all`. Each item is projected by `$select` \
-             exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the \
+             exactly as GET /types-registry/v2/entities/{{entity_key}} projects it; absent, the \
              document-free default; `gts_id`, `gts_uuid` and `lifecycle_status` are always \
              returned. A page never carries a validator. `depth` bounds the number of \
              identifier segments and `kind` narrows to Type Schemas or Instances; \
              `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page \
              limit. `limit` (alias `$top`) \
-             defaults to 50 and may not exceed 100; a caller selecting documents should \
+             defaults to {default} and may not exceed {max}; a caller selecting documents should \
              page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to \
              the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` \
              it was issued for: resuming under any of them changed, or with a token of \
              another version, is a 400, while an absent and an explicit default value of \
              `$select` or `lifecycle_status` are interchangeable. Any other query parameter \
              is refused.",
-        )
+        ))
         .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
@@ -407,7 +416,7 @@ fn register_discovery(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .query_param_typed(
             "limit",
             false,
-            "Page size, 1 to 100. Defaults to 50. Alias: $top",
+            format!("Page size, 1 to {max}. Defaults to {default}. Alias: $top"),
             "integer",
         )
         .query_param(

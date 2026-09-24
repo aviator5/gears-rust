@@ -99,7 +99,11 @@ async fn assert_delivery(db: &Arc<DBProvider<DbError>>, backend: &str) {
         .await
         .unwrap_or_else(|e| panic!("{backend}: read the entity: {e}"))
         .unwrap_or_else(|| panic!("{backend}: the admitted entity is readable"));
-    assert_eq!(entity.resource_version, 1, "{backend}");
+    assert_eq!(
+        entity.origin.map(|o| o.resource_version),
+        Some(1),
+        "{backend}"
+    );
 
     handle.stop().await;
 }
@@ -270,7 +274,8 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
         .unwrap_or_else(|e| panic!("{backend}: read the entity: {e}"))
         .unwrap_or_else(|| panic!("{backend}: the admitted entity is readable"));
     assert_eq!(
-        entity.resource_version, 1,
+        entity.origin.map(|o| o.resource_version),
+        Some(1),
         "{backend}: a second admission would have bumped the version",
     );
 

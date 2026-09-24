@@ -141,11 +141,10 @@ impl OpenApiRegistry for TestOpenApi {
     }
 }
 
-/// A router and the pipeline that admits its submissions. Dropping the handle
-/// stops the workers, so the test holds both; fields drop in declaration order.
+/// A router with optional admission workers and its database directory.
 struct TestApi {
     router: Router,
-    _handle: toolkit_db::outbox::OutboxHandle,
+    _handle: Option<toolkit_db::outbox::OutboxHandle>,
     _dir: common::TestDir,
 }
 
@@ -173,14 +172,27 @@ async fn router_with(v1_ready: bool) -> TestApi {
 }
 
 /// The router plus the provider behind it, for the discovery tests that seed
-/// rows directly: the scan-budget case needs more rows than the admission path can
-/// admit in a test.
+/// rows directly, without outbox workers competing for SQLite's write lock.
 async fn router_and_db() -> (TestApi, Arc<DBProvider<DbError>>) {
-    router_and_db_with(false).await
+    router_and_db_configured(false, TypesRegistryConfig::default()).await
 }
 
 async fn router_and_db_with(v1_ready: bool) -> (TestApi, Arc<DBProvider<DbError>>) {
-    // WAL: the partition workers must not lock out the request under test.
+    router_and_db_setup(v1_ready, TypesRegistryConfig::default(), true).await
+}
+
+async fn router_and_db_configured(
+    v1_ready: bool,
+    config: TypesRegistryConfig,
+) -> (TestApi, Arc<DBProvider<DbError>>) {
+    router_and_db_setup(v1_ready, config, false).await
+}
+
+async fn router_and_db_setup(
+    v1_ready: bool,
+    config: TypesRegistryConfig,
+    with_outbox: bool,
+) -> (TestApi, Arc<DBProvider<DbError>>) {
     let dir = common::TestDir::new("tr-api");
     let dsn = format!(
         "sqlite://{}?mode=rwc&journal_mode=wal",
@@ -188,7 +200,6 @@ async fn router_and_db_with(v1_ready: bool) -> (TestApi, Arc<DBProvider<DbError>
     );
     let db = common::provider_for_with_outbox(&dsn, 8).await;
     let openapi = TestOpenApi::default();
-    let config = TypesRegistryConfig::default();
     let legacy = Arc::new(TypesRegistryService::new(
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config.clone(),
@@ -205,9 +216,15 @@ async fn router_and_db_with(v1_ready: bool) -> (TestApi, Arc<DBProvider<DbError>
         Arc::clone(&dispatch) as Arc<dyn OperationDispatch>,
         common::metrics(),
     ));
-    let handle = types_registry::infra::outbox::start(db.db(), &registry, &dispatch)
-        .await
-        .expect("start the admission outbox");
+    let handle = if with_outbox {
+        Some(
+            types_registry::infra::outbox::start(db.db(), &registry, &dispatch)
+                .await
+                .expect("start the admission outbox"),
+        )
+    } else {
+        None
+    };
     let router = types_registry::api::rest::routes::register_routes(
         Router::new(),
         &openapi,
@@ -2806,6 +2823,71 @@ async fn a_page_size_outside_the_configured_range_is_refused() {
     }
 }
 
+/// A batch key is bounded at 1024 bytes before it is classified.
+#[tokio::test]
+async fn a_batch_key_over_1024_bytes_is_refused() {
+    let router = router_with_db().await;
+
+    let at = "a".repeat(1024);
+    let served = call(&router, batch_get(&json!({ "items": [{ "key": at }] }))).await;
+    assert_eq!(served.status, StatusCode::OK, "{:?}", served.body);
+    assert_eq!(served.body["items"][0]["status"], json!("not_found"));
+
+    let over = "a".repeat(1025);
+    let refused = call(&router, batch_get(&json!({ "items": [{ "key": over }] }))).await;
+    assert_field_refusal(&refused, "key", "VALIDATION_FAILED");
+}
+
+/// A pattern is bounded at 1024 bytes before `gts-rust` compiles it.
+#[tokio::test]
+async fn a_pattern_over_1024_bytes_is_refused_before_compilation() {
+    let router = router_with_db().await;
+
+    let at = call(&router, discover(&format!("?pattern={}", "a".repeat(1024)))).await;
+    assert_field_refusal(&at, "pattern", "INVALID_QUERY");
+
+    let over = call(&router, discover(&format!("?pattern={}", "a".repeat(1025)))).await;
+    assert_field_refusal(&over, "pattern", "VALIDATION_FAILED");
+}
+
+/// Configured page sizes govern the default, the ceiling and its refusal.
+#[tokio::test]
+async fn configured_page_sizes_govern_discovery() {
+    let mut config = TypesRegistryConfig::default();
+    config.limits.page_size_default = 20;
+    config.limits.page_size_max = 40;
+    let (router, _db) = router_and_db_configured(true, config).await;
+
+    for (query, limit) in [("", 20), ("?limit=40", 40)] {
+        let response = call(&router, discover(query)).await;
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+        assert_eq!(response.body["page_info"]["limit"], json!(limit), "{query}");
+    }
+    let refused = call(&router, discover("?limit=41")).await;
+    assert_field_refusal(&refused, "limit", "VALIDATION_FAILED");
+    assert_eq!(
+        refused.body["context"]["field_violations"][0]["description"],
+        json!("a page size must be between 1 and 40; this request asked for 41"),
+    );
+}
+
+/// A `limit` beyond `u32` is refused with the value the caller sent.
+#[tokio::test]
+async fn a_page_size_beyond_u32_is_refused_verbatim() {
+    let router = router_with_db().await;
+
+    for limit in ["4294967296", "99999999999"] {
+        let response = call(&router, discover(&format!("?limit={limit}"))).await;
+        assert_field_refusal(&response, "limit", "VALIDATION_FAILED");
+        assert_eq!(
+            response.body["context"]["field_violations"][0]["description"],
+            json!(format!(
+                "a page size must be between 1 and 100; this request asked for {limit}"
+            )),
+        );
+    }
+}
+
 /// The boundary value `limit=page_size_max` (100) is served, not refused.
 #[tokio::test]
 async fn a_page_size_at_the_configured_maximum_is_served() {
@@ -3194,7 +3276,7 @@ fn field_names(entity: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn an_absent_select_returns_the_document_free_default_on_both_routes() {
-    let (router, db) = router_and_db().await;
+    let (router, db) = router_and_db_with(false).await;
     register_type_and_instance(&router).await;
 
     for key in [CF_TYPE, CF_INSTANCE] {
@@ -3530,10 +3612,12 @@ async fn unknown_batch_body_fields_are_refused() {
             "{body}: {:?}",
             response.body,
         );
+        let violation = &response.body["context"]["field_violations"][0];
+        assert_eq!(violation["reason"], json!("invalid_json_body"), "{body}");
+        let description = violation["description"].as_str().unwrap_or_default();
         assert!(
-            format!("{:?}", response.body).contains(field),
-            "the refusal names the field: {:?}",
-            response.body,
+            description.contains(&format!("unknown field `{field}`")),
+            "the refusal names `{field}`: {description}",
         );
     }
 }
@@ -4062,8 +4146,10 @@ fn every_entity_read_requires_identity_and_lifecycle_in_the_generated_document()
         body(format!("{V2}/entities"), "get"),
         "#/components/schemas/EntityPageDto"
     );
-    let lookup = schemas["EntityLookupDto"]["properties"]["entity"].to_string();
-    assert!(lookup.contains(entity_ref), "{lookup}");
+    let lookup = &schemas["EntityLookupDto"]["properties"]["entity"]["oneOf"];
+    assert_eq!(lookup.as_array().map(Vec::len), Some(2), "{lookup}");
+    assert_eq!(lookup[0], json!({"type": "null"}));
+    assert_eq!(lookup[1]["$ref"], entity_ref);
     assert_eq!(
         schemas["EntityPageDto"]["properties"]["items"]["items"]["$ref"],
         entity_ref

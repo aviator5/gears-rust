@@ -652,7 +652,7 @@ pub struct ListFilter {
     /// Decided by the stored `entity.lifecycle_status`, in SQL.
     pub lifecycle: LifecycleFilter,
     /// Inclusive maximum of parsed `GtsId::segments()`, decided in Rust.
-    pub max_chain_depth: Option<u8>,
+    pub max_chain_depth: Option<std::num::NonZeroU8>,
 }
 
 /// One page of a keyset traversal.
@@ -811,18 +811,6 @@ pub trait TypeSchemaStore: Send + Sync {
         scope: &AccessScope,
         entity_id: i64,
     ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError>;
-
-    /// The current-state row of each named entity, artifacts included,
-    /// `entity_id`-sorted. Entities with no current row are simply absent.
-    ///
-    /// The batched form of [`Self::find_current_schema`], so a batch read costs a
-    /// bounded number of queries rather than one per key (DESIGN §3.3).
-    async fn current_schemas(
-        &self,
-        tx: &DbTx<'_>,
-        scope: &AccessScope,
-        entity_ids: &[i64],
-    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError>;
 
     /// Fetches only the documents `selection` names, in bounded chunks;
     /// `entity_id`-sorted, entities without a current row absent.

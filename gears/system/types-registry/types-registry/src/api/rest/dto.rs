@@ -5,15 +5,14 @@ use uuid::Uuid;
 use gts::GtsIdSegment;
 use types_registry_sdk::RegisterSummary;
 
-use crate::domain::admission::AdmissionFailureReason;
+use crate::domain::admission::{AdmissionFailureReason, StoredFailure};
 use crate::domain::enums::{
     EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
 };
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
 use crate::domain::registry_service::{
-    EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
+    ContentHash, EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
 };
-use crate::domain::selection::EntityField;
 
 /// DTO for a GTS ID segment.
 #[derive(Debug, Clone)]
@@ -309,23 +308,29 @@ mod tests {
             "reason": "incompatible_with_baseline",
             "message": "PropertyAdded at $.payload",
         });
-        let dto = OperationItemDto::from(OperationItemRecord {
-            gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
-            status: OperationItemStatus::Failed,
-            resource_version: None,
-            error: Some(payload.to_string()),
-        });
+        let dto = OperationItemDto::from_record(
+            OperationItemRecord {
+                gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
+                status: OperationItemStatus::Failed,
+                resource_version: None,
+                error: Some(StoredFailure::parse(&payload.to_string())),
+            },
+            Uuid::nil(),
+        );
         assert_eq!(serde_json::to_value(dto)?["error"], payload);
         Ok(())
     }
 
     fn item_error(stored: Option<&str>) -> serde_json::Value {
-        let dto = OperationItemDto::from(OperationItemRecord {
-            gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
-            status: OperationItemStatus::Failed,
-            resource_version: None,
-            error: stored.map(str::to_owned),
-        });
+        let dto = OperationItemDto::from_record(
+            OperationItemRecord {
+                gts_id: gts_id!("cf.core.compat.thing.v1~").to_owned(),
+                status: OperationItemStatus::Failed,
+                resource_version: None,
+                error: stored.map(StoredFailure::parse),
+            },
+            Uuid::nil(),
+        );
         serde_json::to_value(dto).expect("serialize")["error"].clone()
     }
 
@@ -413,8 +418,13 @@ mod tests {
         assert_eq!(properties["operation_id"]["format"], "uuid");
 
         let item = schema_json::<OperationItemDto>();
-        let error = item["properties"]["error"].to_string();
-        assert!(error.contains("OperationItemErrorDto"), "{error}");
+        let variants = &item["properties"]["error"]["oneOf"];
+        assert_eq!(variants.as_array().map(Vec::len), Some(2), "{variants}");
+        assert_eq!(variants[0], serde_json::json!({"type": "null"}));
+        assert_eq!(
+            variants[1]["$ref"],
+            "#/components/schemas/OperationItemErrorDto"
+        );
     }
 
     fn seg(full_id: &str, idx: usize) -> GtsIdSegment {
@@ -756,7 +766,7 @@ pub struct OperationItemDto {
 
 /// Why a candidate failed. `reason` is a stable code and may be one the client
 /// does not know; `message` is for humans and must not be parsed.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct OperationItemErrorDto {
     pub reason: String,
@@ -980,30 +990,35 @@ impl From<LifecycleStatus> for LifecycleStatusDto {
     }
 }
 
-impl From<OperationItemRecord> for OperationItemDto {
-    fn from(item: OperationItemRecord) -> Self {
+impl OperationItemDto {
+    fn from_record(item: OperationItemRecord, operation_id: Uuid) -> Self {
+        let error = item.error.map(|stored| {
+            stored.map_or_else(
+                |unreadable| {
+                    tracing::error!(
+                        %operation_id,
+                        gts_id = %item.gts_id,
+                        reason = unreadable.reason.as_str(),
+                        cause = %unreadable.cause,
+                        "types_registry cannot read a stored item failure"
+                    );
+                    OperationItemErrorDto::unreadable(&unreadable.reason)
+                },
+                Into::into,
+            )
+        });
         Self {
             gts_id: item.gts_id,
             status: item.status.into(),
             resource_version: item.resource_version,
-            error: item
-                .error
-                .as_deref()
-                .map(OperationItemErrorDto::from_payload),
+            error,
         }
     }
 }
 
 impl OperationItemErrorDto {
-    /// A payload that does not have this shape is reported by reason, never echoed.
-    fn from_payload(payload: &str) -> Self {
-        let reason = match serde_json::from_str::<Self>(payload) {
-            Ok(error) if error.dependency_id.is_some() == error.dependency_kind.is_some() => {
-                return error;
-            }
-            Err(error) if !error.is_data() => AdmissionFailureReason::UnparsablePayload,
-            _ => AdmissionFailureReason::UnrecognizedPayload,
-        };
+    /// Reported by reason; the stored text is never echoed.
+    fn unreadable(reason: &AdmissionFailureReason) -> Self {
         Self {
             reason: reason.as_str().to_owned(),
             message: "the recorded failure could not be read".to_owned(),
@@ -1011,6 +1026,19 @@ impl OperationItemErrorDto {
             dependency_kind: None,
             error_code: None,
             operation_id: None,
+        }
+    }
+}
+
+impl From<StoredFailure> for OperationItemErrorDto {
+    fn from(failure: StoredFailure) -> Self {
+        Self {
+            reason: failure.reason,
+            message: failure.message,
+            dependency_id: failure.dependency_id,
+            dependency_kind: failure.dependency_kind,
+            error_code: failure.error_code,
+            operation_id: failure.operation_id,
         }
     }
 }
@@ -1025,25 +1053,28 @@ impl From<OperationRecord> for OperationDto {
             created_at: record.created_at,
             started_at: record.started_at,
             completed_at: record.completed_at,
-            items: record.items.into_iter().map(Into::into).collect(),
+            items: record
+                .items
+                .into_iter()
+                .map(|item| OperationItemDto::from_record(item, record.operation_id))
+                .collect(),
         }
     }
 }
 
 impl From<EntityRecord> for EntityDto {
     fn from(record: EntityRecord) -> Self {
-        let selected = |field: EntityField| record.selection.contains(field);
         Self {
             gts_id: record.gts_id,
             gts_uuid: record.gts_uuid,
-            kind: selected(EntityField::Kind).then(|| record.kind.into()),
-            origin: selected(EntityField::Origin).then_some(OriginDto::Managed {
-                resource_version: record.resource_version,
-                created_at: record.created_at,
-                updated_at: record.updated_at,
+            kind: record.kind.map(Into::into),
+            origin: record.origin.map(|origin| OriginDto::Managed {
+                resource_version: origin.resource_version,
+                created_at: origin.created_at,
+                updated_at: origin.updated_at,
             }),
             lifecycle_status: record.lifecycle_status.into(),
-            content_hash: selected(EntityField::ContentHash).then(|| record.content_hash.to_hex()),
+            content_hash: record.content_hash.map(ContentHash::to_hex),
             content: record.content,
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,
@@ -1085,6 +1116,7 @@ pub struct BatchGetItemDto {
     /// what a stale validator does after T29 too. The field is declared now so the
     /// wire shape does not change under the callers T23 migrates.
     #[serde(default)]
+    #[schema(max_length = 1024)]
     pub if_none_match: Option<String>,
 }
 
@@ -1094,9 +1126,8 @@ pub struct BatchGetItemDto {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct BatchGetRequest {
-    /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, enforced by
-    /// `RegistryService::batch_get` before it reads anything. Stated in one place,
-    /// as `DeleteEntitiesRequest` states its own.
+    /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, enforced on the raw
+    /// item count before any item is processed.
     ///
     /// [`MAX_BATCH_GET_KEYS`]: crate::domain::registry_service::MAX_BATCH_GET_KEYS
     #[schema(min_items = 1)]
