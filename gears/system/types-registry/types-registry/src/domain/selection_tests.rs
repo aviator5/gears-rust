@@ -26,14 +26,15 @@ fn order_and_case_and_surrounding_whitespace_do_not_change_identity() {
 #[test]
 fn mandatory_fields_are_always_in_the_normalized_set() {
     let without = parse(&["content"]).expect("valid");
-    let with = parse(&["gts_uuid", "content", "lifecycle_status", "gts_id"]).expect("valid");
+    let with =
+        parse(&["gts_uuid", "content", "kind", "lifecycle_status", "gts_id"]).expect("valid");
     for field in FieldSelection::MANDATORY_FIELDS {
         assert!(without.contains(field), "{}", field.name());
     }
     assert_eq!(without, with, "naming a mandatory field changes nothing");
     assert_eq!(
         without.canonical(),
-        "content,gts_id,gts_uuid,lifecycle_status"
+        "content,gts_id,gts_uuid,kind,lifecycle_status"
     );
 }
 

@@ -101,7 +101,7 @@ pub struct OperationItemRecord {
 pub struct EntityRecord {
     pub gts_id: String,
     pub gts_uuid: Uuid,
-    pub kind: Option<EntityKind>,
+    pub kind: EntityKind,
     pub origin: Option<ManagedOrigin>,
     pub lifecycle_status: LifecycleStatus,
     pub content: Option<Value>,
@@ -125,8 +125,6 @@ pub struct ManagedOrigin {
 pub struct Provenance {
     pub gts_spec_version: String,
     pub gts_impl_version: String,
-    /// Caller-declared attribution. It MUST NOT be used to authorize.
-    pub owning_gear: Option<String>,
     /// `None` for an Instance.
     pub compat_forced: Option<bool>,
 }
@@ -858,7 +856,6 @@ fn into_records(
             Some(Provenance {
                 gts_spec_version: revision.gts_spec_version,
                 gts_impl_version: revision.gts_impl_version,
-                owning_gear: row.owning_gear,
                 compat_forced: revision.compat_forced,
             })
         } else {
@@ -869,9 +866,7 @@ fn into_records(
             EntityRecord {
                 gts_id: row.gts_id,
                 gts_uuid: row.gts_uuid,
-                kind: selection
-                    .contains(EntityField::Kind)
-                    .then_some(row.entity_kind),
+                kind: row.entity_kind,
                 origin: selection
                     .contains(EntityField::Origin)
                     .then_some(ManagedOrigin {

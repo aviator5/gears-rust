@@ -88,10 +88,11 @@ impl Default for FieldSelection {
 }
 
 impl FieldSelection {
-    /// Identity and lifecycle: on every entity whatever `$select` names.
-    pub const MANDATORY_FIELDS: [EntityField; 3] = [
+    /// Identity, kind and lifecycle: on every entity whatever `$select` names.
+    pub const MANDATORY_FIELDS: [EntityField; 4] = [
         EntityField::GtsId,
         EntityField::GtsUuid,
+        EntityField::Kind,
         EntityField::LifecycleStatus,
     ];
 

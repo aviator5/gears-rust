@@ -340,7 +340,12 @@ mod tests {
             assert!(decode(&token, &bound(pattern, &["content"])).is_err());
             let content = encode(AFTER, &bound(pattern, &["content"]))?;
             assert!(decode(&content, &bound(pattern, &[])).is_err());
-            assert!(decode(&content, &bound(pattern, &["content", "kind"])).is_err());
+            assert!(decode(&content, &bound(pattern, &["content", "origin"])).is_err());
+            // `kind` is mandatory, so naming it leaves the binding unchanged.
+            assert_eq!(
+                decode(&content, &bound(pattern, &["content", "kind"]))?,
+                AFTER
+            );
         }
         Ok(())
     }

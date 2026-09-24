@@ -287,9 +287,9 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last \
              three Type Schemas only), plus the `provenance` group. Names are \
              case-insensitive; an empty, duplicate, unknown or nested name is a 400. \
-             `gts_id`, `gts_uuid` and `lifecycle_status` are always returned, whether or \
-             not `$select` names them, so a deleted entity is still readable and reports \
-             it. No other query parameter is accepted.",
+             `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, \
+             whether or not `$select` names them, so a deleted entity is still readable and \
+             reports it. No other query parameter is accepted.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -326,7 +326,7 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
              `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result \
              per requested key, in request order and echoing the key it was asked by: `found` \
              with the selected fields, exactly as the exact read returns them and always \
-             including `gts_id`, `gts_uuid` and `lifecycle_status`, or `not_found`. Query parameters are refused, `$select` included. A key \
+             including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Query parameters are refused, `$select` included. A key \
              named twice collapses onto its first mention; the two spellings of one entity are \
              two keys and get two results. An absent key is not a 404: one missing key must \
              not lose the answers for the others. The If-None-Match header is refused rather \
@@ -366,8 +366,8 @@ fn register_discovery(
              cursor for the next page. `lifecycle_status` is `active` (default), `deleted` \
              (tombstones only) or `all`. Each item is projected by `$select` \
              exactly as GET /types-registry/v2/entities/{{entity_key}} projects it; absent, the \
-             document-free default; `gts_id`, `gts_uuid` and `lifecycle_status` are always \
-             returned. A page never carries a validator. `depth` bounds the number of \
+             document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are \
+             always returned. A page never carries a validator. `depth` bounds the number of \
              identifier segments and `kind` narrows to Type Schemas or Instances; \
              `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page \
              limit. `limit` (alias `$top`) \

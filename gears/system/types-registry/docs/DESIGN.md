@@ -1382,14 +1382,14 @@ pub enum EntityLookup {
     Failed(CanonicalError),
 }
 
-/// Identity and lifecycle are always present; other fields only when selected.
+/// Identity, kind and lifecycle are always present; other fields only when selected.
 pub struct EntitySnapshot {
     pub gts_id: GtsId,
     pub gts_uuid: Uuid,
+    pub kind: EntityKind,
     pub lifecycle_status: LifecycleStatus,
 
     // The rest of the default set.
-    pub kind: Option<EntityKind>,
     pub origin: Option<Origin>,
     pub availability: Option<Availability>,
     /// Whether the Context Tenant owns it; absent without a Context Tenant.
@@ -1414,7 +1414,7 @@ pub struct EntitySnapshot {
     pub effective_traits: Option<JsonDocument>,
     pub effective_traits_schema: Option<JsonDocument>,
 
-    /// The one surviving group: four small fields that always travel together
+    /// The one surviving group: three small fields that always travel together
     /// and have one consumer.
     pub provenance: Option<Provenance>,
 }
@@ -1448,13 +1448,13 @@ pub struct EffectiveArtifacts {
     pub effective_traits_schema: JsonDocument,
 }
 
-/// Managed-only admission provenance. `owning_gear` is attribution.
+/// Managed-only admission provenance: how the current revision was admitted.
 /// `compat_forced`: false when no waiver applied, true when it did, and None
 /// only for Instances. Safe multi-minor upgrades inspect every crossed minor.
+/// The internal `owning_gear` attribution is not a member (see `owning_gear`).
 pub struct Provenance {
     pub gts_spec_version: String,
     pub gts_impl_version: String,
-    pub owning_gear: Option<String>,
     pub compat_forced: Option<bool>,
 }
 
@@ -1566,7 +1566,7 @@ They remain separate because filters cannot carry per-key validators, page absen
 
 Exact reads return deleted entities as deleted/unavailable rather than conflating them with never-issued IDs; discovery excludes them unless `lifecycle_status=deleted|all` asks, and expansion always excludes them. Their `content` and derived documents remain readable because live gear-owned data may still conform under `cpt-cf-types-registry-fr-lifecycle` and `cpt-cf-types-registry-principle-contract-not-object`.
 
-`gts_id`, `gts_uuid` and `lifecycle_status` are mandatory on every returned entity, outside `$select` — like the freshness validator below. A projection that names only `content` still identifies the entity and carries its status, so a caller selecting documents can tell a retired contract from an active one; absence is already `404`/`not_found`.
+`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are mandatory on every returned entity, outside `$select` — like the freshness validator below. A projection that names only `content` still identifies the entity, says whether it is a Type Schema or an Instance, and carries its status, so a caller selecting documents knows which of them apply and can tell a retired contract from an active one; absence is already `404`/`not_found`.
 
 Authorization runs first, then visibility, so a denial is uniform and out-of-scope remains indistinguishable from absent.
 
@@ -1574,7 +1574,7 @@ Authorization runs first, then visibility, so a denial is uniform and out-of-sco
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-field-projection`
 
-`$select` returns the named fields plus the mandatory `gts_id`, `gts_uuid` and `lifecycle_status`. Its document-free default is `gts_id`, `gts_uuid`, `kind`, `origin`, `lifecycle_status`, `availability` and reason, ownership view, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` plus the mandatory fields.
+`$select` returns the named fields plus the mandatory `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`. Its document-free default is `gts_id`, `gts_uuid`, `kind`, `origin`, `lifecycle_status`, `availability` and reason, ownership view, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` plus the mandatory fields.
 
 **Selectable documents are flat, with one group left**, cut by transfer cost rather than by consumer:
 
@@ -1594,7 +1594,7 @@ Authorization runs first, then visibility, so a denial is uniform and out-of-sco
 
 The freshness validator is mandatory read metadata, outside `$select`: single-read `ETag` or batch result envelope.
 
-Callers needing platform guarantees should select `origin` with `effective`; unlike `kind`, origin is not derivable. The server does not enforce the pairing.
+Callers needing platform guarantees should select `origin` with the effective documents; unlike the mandatory `kind`, origin is not returned unless selected and is not derivable from the identifier. The server does not enforce the pairing.
 
 No authored-content digest is selectable: reconciliation selects `content` and compares canonical bytes. Caller/registry `gts-rust` skew may cause a benign false mismatch; submission then terminates `unchanged`.
 
@@ -1704,7 +1704,7 @@ Each gear submits only inventory records whose `owning_gear` matches its generat
 
 `owning_gear` is unverifiable caller-declared attribution, never authorization, visibility, or a second ownership axis. It is required globally, optional for tenant-owned entities, absent externally, and answers whom to contact about a contract.
 
-The REST input and enforcement of `owning_gear` are P1 work alongside platform-plane authorization; P0 accepts no `owning_gear` field.
+The REST input and enforcement of `owning_gear` are P1 work alongside platform-plane authorization; P0 accepts no `owning_gear` field. Exposing it on reads is P1 work too, designed together with the ownership view: P0 persists the attribution on the entity for that upgrade, but no P0 read, SDK snapshot or `provenance` group returns it, and P0 defines no ownership group.
 
 ##### Platform identifiers and the lint
 

@@ -776,7 +776,10 @@ Reduce registry bootstrap to its own/base declarations plus `cfg.entities`. Corr
 P0 attribution through the supported revision/provenance path even when authored content is
 unchanged; a content-only `UpToDate` shortcut must not retain the placeholder. Preserve
 operator/bootstrap attribution for `cfg.entities` and never infer owners from GTS namespaces.
-Only then close C3. Metadata acceptance and verification are tracked in #4827; integration
+Expose `owning_gear` on reads together with the ownership view; P0
+persists it for this upgrade but returns it on no read and defines no ownership group, and
+`provenance` stays `gts_spec_version`, `gts_impl_version` and `compat_forced`. Only then
+close C3. Metadata acceptance and verification are tracked in #4827; integration
 and migration remain epic obligations in #4628 for the P1 task breakdown.
 
 ### P19. Add field projection before the SDK and validator contracts
@@ -800,8 +803,8 @@ allowlist, default, DTO/SDK contract, cursor binding and validator input before 
 one projected lookup; discovery keeps one bounded keyset page and binds the normalized
 selection into its cursor. Document-free reads avoid fetching and parsing documents in
 storage; applying `toolkit::api::select::apply_select` after loading full documents would
-change only response bytes. The result envelope and tombstone lifecycle remain mandatory
-outside selection. T23's reconciliation and hydration helpers explicitly request the
+change only response bytes. The result envelope, `kind` and tombstone lifecycle remain
+mandatory outside selection. T23's reconciliation and hydration helpers explicitly request the
 documents they consume; T29 digests the normalized selection rather than a fixed marker;
 T30 keys cached representations by that same selection. T22b does not add tenant fields,
 federation, or `expand_type_filter`.
@@ -841,8 +844,9 @@ combined filter and projection contract; T24a promotes it with the other v2 rout
 
 **Amendment (2026-09-23).** Discovery adds `lifecycle_status=active|deleted|all`
 (default `active`), an SQL predicate applied before the page limit and bound by the
-cursor (absent equals `active`). All three reads always return `gts_id`, `gts_uuid` and
-`lifecycle_status`, required in OpenAPI and part of every normalized selection. Exact
+cursor (absent equals `active`). All three reads always return `gts_id` and `gts_uuid`
+beside `kind` and `lifecycle_status`, all required in OpenAPI and part of every normalized
+selection. Exact
 reads and `batchGet` are unchanged; SDK expansion requests `active` explicitly.
 
 ## Dependency graph

@@ -3318,7 +3318,7 @@ async fn each_document_is_selected_alone() {
     ] {
         let response = call(&router, exact(CF_TYPE, &format!("?$select={field}"))).await;
         assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
-        let mut expected = vec![field, "gts_id", "gts_uuid", "lifecycle_status"];
+        let mut expected = vec![field, "gts_id", "gts_uuid", "kind", "lifecycle_status"];
         expected.sort_unstable();
         assert_eq!(field_names(&response.body), expected, "{field}");
         assert!(
@@ -3328,8 +3328,8 @@ async fn each_document_is_selected_alone() {
         );
     }
 
-    // Selecting only a document the Instance lacks still returns its identity
-    // and lifecycle on every read, and omits the document.
+    // Selecting only a document the Instance lacks still returns its identity,
+    // kind and lifecycle on every read, and omits the document.
     let select = "resolved_schema";
     let single = call(&router, exact(CF_INSTANCE, &format!("?$select={select}"))).await;
     let batch = call(&router, selective_batch(&[CF_INSTANCE], select)).await;
@@ -3345,9 +3345,10 @@ async fn each_document_is_selected_alone() {
     ] {
         assert_eq!(
             field_names(entity),
-            ["gts_id", "gts_uuid", "lifecycle_status"]
+            ["gts_id", "gts_uuid", "kind", "lifecycle_status"]
         );
         assert_eq!(entity["gts_id"], CF_INSTANCE);
+        assert_eq!(entity["kind"], "instance");
         assert_eq!(entity["lifecycle_status"], "active");
     }
 }
@@ -3399,12 +3400,8 @@ async fn provenance_is_one_group_and_null_where_inapplicable() {
     for provenance in [schema, instance] {
         assert_eq!(
             field_names(provenance),
-            [
-                "compat_forced",
-                "gts_impl_version",
-                "gts_spec_version",
-                "owning_gear"
-            ],
+            ["compat_forced", "gts_impl_version", "gts_spec_version"],
+            "attribution is internal until P1",
         );
         assert!(provenance["gts_spec_version"].is_string(), "{provenance:?}");
         assert!(provenance["gts_impl_version"].is_string(), "{provenance:?}");
@@ -3416,7 +3413,8 @@ async fn provenance_is_one_group_and_null_where_inapplicable() {
     );
 }
 
-/// Identity and lifecycle are mandatory, so a projected tombstone is not an absence.
+/// Identity, kind and lifecycle are mandatory, so a projected tombstone is not an
+/// absence.
 #[tokio::test]
 async fn a_tombstone_selected_for_content_still_reports_its_lifecycle() {
     let router = router_with_db().await;
@@ -3432,8 +3430,9 @@ async fn a_tombstone_selected_for_content_still_reports_its_lifecycle() {
     assert_eq!(single.status, StatusCode::OK, "{:?}", single.body);
     assert_eq!(
         field_names(&single.body),
-        ["content", "gts_id", "gts_uuid", "lifecycle_status"]
+        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"]
     );
+    assert_eq!(single.body["kind"], json!("type_schema"));
     assert_eq!(single.body["lifecycle_status"], json!("deleted"));
     let batch = call(&router, selective_batch(&[CF_TYPE], "content")).await;
     assert_eq!(batch.body["items"][0]["status"], json!("found"));
@@ -3659,6 +3658,7 @@ async fn discovery_projects_selected_documents_across_pages() {
                 "content",
                 "gts_id",
                 "gts_uuid",
+                "kind",
                 "lifecycle_status",
                 "resolved_schema"
             ]
@@ -3667,7 +3667,7 @@ async fn discovery_projects_selected_documents_across_pages() {
     }
     assert_eq!(
         field_names(&items[2]),
-        ["content", "gts_id", "gts_uuid", "lifecycle_status"],
+        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"],
         "the Instance has no resolved_schema",
     );
 
@@ -3691,7 +3691,7 @@ async fn a_page_under_a_metadata_only_selection_carries_only_it() {
     for item in page.body["items"].as_array().expect("items") {
         assert_eq!(
             field_names(item),
-            ["gts_id", "gts_uuid", "lifecycle_status"]
+            ["gts_id", "gts_uuid", "kind", "lifecycle_status"]
         );
     }
 }
@@ -3713,8 +3713,11 @@ async fn a_cursor_is_refused_under_a_different_selection() {
     for (issued, resumed) in [
         ("?limit=1", "?limit=1&$select=content"),
         ("?limit=1&$select=content", "?limit=1"),
-        ("?limit=1&$select=content", "?limit=1&$select=content,kind"),
-        ("?limit=1&$select=gts_id", "?limit=1&$select=kind"),
+        (
+            "?limit=1&$select=content",
+            "?limit=1&$select=content,origin",
+        ),
+        ("?limit=1&$select=gts_id", "?limit=1&$select=origin"),
     ] {
         let cursor = first_cursor(&router, issued).await;
         let response = call(&router, discover(&format!("{resumed}&cursor={cursor}"))).await;
@@ -3743,6 +3746,8 @@ async fn equivalent_selections_resume_one_traversal() {
             "?limit=1&$select=Content,%20GTS_UUID,lifecycle_status",
         ),
         ("?limit=1&$select=gts_id", "?limit=1&$select=gts_uuid"),
+        ("?limit=1&$select=gts_id", "?limit=1&$select=kind"),
+        ("?limit=1&$select=content", "?limit=1&$select=content,kind"),
     ] {
         let cursor = first_cursor(&router, issued).await;
         let original = call(&router, discover(&format!("{issued}&cursor={cursor}"))).await;
@@ -3874,6 +3879,7 @@ async fn discovery_narrows_by_kind_and_intersects_with_pattern_and_select() {
         json!([{
             "gts_id": CF_INSTANCE,
             "gts_uuid": gts::GtsId::try_new(CF_INSTANCE).expect("id").to_uuid(),
+            "kind": "instance",
             "lifecycle_status": "active",
             "content": { "name": "first" },
         }]),
@@ -4067,15 +4073,15 @@ fn discovery_declares_kind_and_lifecycle_status_as_optional_strings() {
 }
 
 /// All three database-backed reads answer with the one `EntityDto`, whose
-/// identity and lifecycle are required and never `null`.
+/// identity, kind and lifecycle are required and never `null`.
 #[test]
-fn every_entity_read_requires_identity_and_lifecycle_in_the_generated_document() {
+fn every_entity_read_requires_identity_kind_and_lifecycle_in_the_generated_document() {
     let doc = generated_openapi();
     let schemas = &doc["components"]["schemas"];
     let entity = &schemas["EntityDto"];
     assert_eq!(
         entity["required"],
-        json!(["gts_id", "gts_uuid", "lifecycle_status"])
+        json!(["gts_id", "gts_uuid", "kind", "lifecycle_status"])
     );
     assert_eq!(entity["properties"]["gts_id"]["type"], "string");
     assert_eq!(
@@ -4084,6 +4090,19 @@ fn every_entity_read_requires_identity_and_lifecycle_in_the_generated_document()
             &entity["properties"]["gts_uuid"]["format"],
         ),
         (&json!("string"), &json!("uuid"))
+    );
+    let kind = &entity["properties"]["kind"];
+    assert_eq!(kind["$ref"], "#/components/schemas/EntityKindDto", "{kind}");
+    assert!(kind.get("oneOf").is_none(), "never nullable: {kind}");
+    let provenance = schemas["ProvenanceDto"]["properties"]
+        .as_object()
+        .expect("provenance properties");
+    let mut members: Vec<&str> = provenance.keys().map(String::as_str).collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        ["compat_forced", "gts_impl_version", "gts_spec_version"],
+        "attribution is not published in P0",
     );
     let body = |path: String, method: &str| {
         doc["paths"][path][method]["responses"]["200"]["content"]["application/json"]["schema"]
@@ -4344,7 +4363,7 @@ async fn toolkit_select_extraction_and_the_v1_cursor_work_together() {
     assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
     assert_eq!(
         field_names(&resumed.body["items"][0]),
-        ["content", "gts_id", "gts_uuid", "lifecycle_status"]
+        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"]
     );
 }
 

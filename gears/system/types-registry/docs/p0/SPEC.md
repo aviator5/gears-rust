@@ -1135,7 +1135,7 @@ and remains open until P1. The rows are kept because other documents cite the nu
 |---|---|---|
 | C1 | **Struck by D2.** Was: the whole entity set held in process memory, so entity count becomes a memory bound | Resolved in P0 — the store is transient per admission unit and bounded by the unit's dependency closure (§8.2) |
 | C2 | `idempotency_scope_hash` digests three constants, so the key namespace is **global**: two unrelated callers reusing one key collide with `409` | Real scope arrives with planes and principals at P1 |
-| C3 | **Process-wide inventory pull and placeholder attribution.** P0 only collects declarations linked into the registry process (§8.4); `owning_gear = "types-registry"` is a compatibility placeholder for all admissions, not the actual declaring gear and never authority | P1 #4628: T22 metadata/filtering, per-gear startup push through the platform client, and correction of existing attribution even when authored content is unchanged. `cfg.entities` keeps explicit operator/bootstrap attribution; no owner is inferred from a GTS namespace |
+| C3 | **Process-wide inventory pull and placeholder attribution.** P0 only collects declarations linked into the registry process (§8.4); `owning_gear = "types-registry"` is a compatibility placeholder for all admissions, not the actual declaring gear and never authority | P1 #4628: T22 metadata/filtering, per-gear startup push through the platform client, correction of existing attribution even when authored content is unchanged, and exposing `owning_gear` on reads alongside the ownership view (§10.2). `cfg.entities` keeps explicit operator/bootstrap attribution; no owner is inferred from a GTS namespace |
 | C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
 | C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. P0 limits access through internal-only mutation routes (C8) | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12) |
@@ -1244,7 +1244,8 @@ materialized documents as **plain fields** — `content`, `resolved_schema`,
 `effective_traits`, `effective_traits_schema` — plus a small `segments` accessor, so a
 consumer that previously called the old models' computed methods reads a field instead.
 No accessor is needed to reach inside a group, because outside `provenance` there is no
-group to reach inside of. Snapshot fields are optional because selection may omit them;
+group to reach inside of. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are plain
+fields, present on every snapshot; the rest are optional because selection may omit them;
 `Some` containing JSON `null` still represents a selected document, while `None` means
 unselected or inapplicable. `origin` has only the managed variant in P0 and carries
 `resource_version` and timestamps; `provenance` follows §10.2. List
@@ -1364,9 +1365,8 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   version. `depth`, `kind` and a non-default `lifecycle_status` join the cursor's filter
   hash as terms added only when present, on top of T22b's pattern/`$select` expression:
   no release preceded T22c, so the wire version stays `CursorV1`'s `1`, and naming or
-  changing any of them is a `400`. An earlier token resumes only while its canonical
-  `$select` is unchanged; making `gts_id`/`gts_uuid` mandatory changed it for every
-  non-default selection, so such tokens are refused.
+  changing any of them is a `400`. A token resumes only while its canonical `$select`
+  is unchanged.
 - **Lifecycle filter (discovery only).** `lifecycle_status=active|deleted|all`, default
   `active`: `active` lists live entities, `deleted` only tombstones, `all` both. It is an
   SQL predicate on the stored status, intersected with the other filters before the page
@@ -1392,8 +1392,10 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   `origin` has only the `managed` variant in P0 and carries `resource_version`, `created_at`
   and `updated_at`; its `external` variant waits for federation. The P0 default omits
   DESIGN's availability/reason and Context Tenant ownership view, which cannot be answered
-  without tenancy. `owning_gear` is attribution, not ownership, and moves under selected
-  `provenance` rather than pretending to be the missing ownership view. REST `origin` is
+  without tenancy. `owning_gear` is internal attribution, not ownership: P0 persists it
+  on the entity (§9) but returns it on no read, neither in `provenance` nor as a
+  stand-in for the missing ownership view, and defines no ownership group. Exposing it
+  is P1 work, designed with that view. REST `origin` is
   an internally tagged object: `{"type":"managed","resource_version":1,
   "created_at":"...","updated_at":"..."}`; timestamps use RFC 3339. Federation's external
   variant adds `{"type":"external","source":"..."}` without changing the managed shape.
@@ -1402,8 +1404,8 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   `provenance`. `content` is the whole authored JSON document for either kind. The three
   effective documents apply only to Type Schemas and are absent on Instances. Each document
   is selected independently and appears at the top level; there is no `effective` or
-  `authored` wrapper. `provenance` is the one group and contains `gts_spec_version`,
-  `gts_impl_version`, `owning_gear` and `compat_forced` (`null` for Instances). Selecting
+  `authored` wrapper. `provenance` is the one group and contains exactly `gts_spec_version`,
+  `gts_impl_version` and `compat_forced` (`null` for Instances). Selecting
   a group returns it whole; selecting a document never projects paths inside its JSON.
 - **No content digest.** Authored content has no stored or selectable digest, so no
   digest name is in the allowlist. Reconciliation selects `content` and
@@ -1417,17 +1419,18 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   reason ToolKit's own parser reports. *Unavailable* means a DESIGN §3.3 field P0 cannot
   answer — `availability` and `owned_by_context_tenant` — and *nested* any name
   containing `.` or `/`. The canonical identity is the selected names sorted and
-  comma-joined, e.g. `content,gts_id,gts_uuid,lifecycle_status`. In particular, reject empty comma
+  comma-joined, e.g. `content,gts_id,gts_uuid,kind,lifecycle_status`. In particular, reject empty comma
   segments such as `$select=content,,kind`: ToolKit's parser currently drops those,
   so the gear checks the raw spelling as well. Honor ToolKit's 2048-character and
-  100-field parser limits. `gts_id`, `gts_uuid` and `lifecycle_status` are mandatory on
-  every entity of all three reads, whatever `$select` names, including a deleted result;
+  100-field parser limits. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are
+  mandatory on every entity of all three reads, whatever `$select` names, including a
+  deleted result, so a narrow projection still says which documents apply;
   they are always in the normalized effective set, so naming them does not change cursor,
   validator or cache identity. Unselected fields
   are omitted, while a selected JSON `null` remains present. `key`, per-key status and
   `etag` are batch result
   envelope metadata outside selection. An exact `ETag` is likewise outside the body.
-  REST DTOs and OpenAPI mark the three mandatory fields required and non-nullable and
+  REST DTOs and OpenAPI mark the four mandatory fields required and non-nullable and
   every other field optional, omitting an unselected one; selected nullable values
   remain present as JSON `null`.
 - **Transport placement.** Exact `GET /entities/{entity_key}` and discovery `GET /entities`
@@ -1866,7 +1869,7 @@ identifier profile refusals, topological order, baseline selection.
 | `effective_traits` of a chain with a trait default at two levels | matches `gts-rust`, not the deleted client-side merge order |
 | `$select` on exact read, `batchGet` and discovery | each applies the same field allowlist and document-free default; exact and batch return the same projected entity for one key; each document can be selected alone |
 | Invalid `$select` | empty, empty comma segment, duplicate, unknown, unavailable, nested and over-limit fields return RFC-9457 `400` naming `$select`; unsupported OData options and unknown unprefixed query keys are refused |
-| Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; `$select=resolved_schema` on an Instance still returns `gts_id`, `gts_uuid`, `lifecycle_status`; a deleted exact read with `$select=content` still includes `lifecycle_status: deleted` |
+| Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; `$select=resolved_schema` on an Instance still returns exactly the mandatory `gts_id`, `gts_uuid`, `kind: instance`, `lifecycle_status`; a deleted exact read with `$select=content` still includes `kind` and `lifecycle_status: deleted` |
 | Metadata-only exact/batch/discovery reads | instrumented storage proves no authored/effective JSON column is fetched or parsed; selected documents are fetched in bounded, snapshot-consistent batches on SQLite, PostgreSQL and MySQL |
 | Content equality and reconciliation | no digest field is selectable; `unchanged` and `UpToDate` follow exact canonical authored-byte equality |
 | Registration policy, four DESIGN §3.2 entries | each admits and refuses exactly what §10.3's table says, including the exact-key-versus-`~*` split |

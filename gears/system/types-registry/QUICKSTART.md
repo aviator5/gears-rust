@@ -99,15 +99,14 @@ curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~" \
 Every read returns this document-free default unless `$select` names fields. Documents
 are selected individually and returned flat: `content` (either kind), `resolved_schema`,
 `effective_traits`, `effective_traits_schema` (Type Schemas only; absent on an Instance),
-plus the `provenance` group (`gts_spec_version`, `gts_impl_version`, `owning_gear`,
-`compat_forced`):
+plus the `provenance` group (`gts_spec_version`, `gts_impl_version`, `compat_forced`):
 
 ```bash
 curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?\$select=content,effective_traits" \
   | python3 -m json.tool
 ```
 
-Names are case-insensitive and order does not matter. `gts_id`, `gts_uuid` and
+Names are case-insensitive and order does not matter. `gts_id`, `gts_uuid`, `kind` and
 `lifecycle_status` are always returned. Any other unselected field is omitted; a
 selected document that is JSON `null` stays `null`. To compare authored content, select
 `content`; there is no content digest. An empty, duplicate, unknown or nested name (`content.title`) is a `400` naming

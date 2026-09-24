@@ -227,14 +227,14 @@ mod tests {
         serde_json::to_value(T::schema()).expect("a schema serializes")
     }
 
-    /// `OpenAPI` must say what `$select` does: identity and lifecycle are always
-    /// present, metadata is never `null`, and a selected document may be `null`.
+    /// `OpenAPI` must say what `$select` does: identity, kind and lifecycle are
+    /// always present, metadata is never `null`, and a selected document may be `null`.
     #[test]
     fn the_entity_schema_declares_projection_accurately() {
         let schema = schema_json::<EntityDto>();
         assert_eq!(
             schema["required"],
-            serde_json::json!(["gts_id", "gts_uuid", "lifecycle_status"])
+            serde_json::json!(["gts_id", "gts_uuid", "kind", "lifecycle_status"])
         );
         let properties = &schema["properties"];
         for field in ["gts_id", "gts_uuid"] {
@@ -261,7 +261,7 @@ mod tests {
         let dto = EntityDto {
             gts_id: "gts.cf.core.example.type.v1~".to_owned(),
             gts_uuid: Uuid::nil(),
-            kind: None,
+            kind: EntityKindDto::TypeSchema,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Deleted,
             content: Some(serde_json::Value::Null),
@@ -275,6 +275,7 @@ mod tests {
             serde_json::json!({
                 "gts_id": "gts.cf.core.example.type.v1~",
                 "gts_uuid": Uuid::nil(),
+                "kind": "type_schema",
                 "lifecycle_status": "deleted",
                 "content": null,
             }),
@@ -808,8 +809,9 @@ pub struct OperationDto {
 
 /// One entity, projected by `$select` (SPEC §10.2).
 ///
-/// `gts_id`, `gts_uuid` and `lifecycle_status` are always present, so a projected
-/// item is identifiable and a tombstone is never mistaken for an absence. An
+/// `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a
+/// projected item is identifiable, its kind needs no second read, and a tombstone is
+/// never mistaken for an absence. An
 /// unselected field is omitted; a selected document that is JSON `null` stays
 /// present as `null`. The three artifacts are absent on an Instance.
 #[derive(Debug, Clone)]
@@ -820,9 +822,8 @@ pub struct EntityDto {
     /// Always present. The Registry Reference: a deterministic `UUIDv5` of the
     /// identifier.
     pub gts_uuid: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub kind: Option<EntityKindDto>,
+    /// Always present.
+    pub kind: EntityKindDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub origin: Option<OriginDto>,
@@ -866,8 +867,6 @@ pub enum OriginDto {
 pub struct ProvenanceDto {
     pub gts_spec_version: String,
     pub gts_impl_version: String,
-    /// Caller-declared attribution. It MUST NOT be used to authorize.
-    pub owning_gear: Option<String>,
     /// Whether ADR-0004 `force` waived a cross-minor check; `null` for Instances.
     pub compat_forced: Option<bool>,
 }
@@ -1060,7 +1059,7 @@ impl From<EntityRecord> for EntityDto {
         Self {
             gts_id: record.gts_id,
             gts_uuid: record.gts_uuid,
-            kind: record.kind.map(Into::into),
+            kind: record.kind.into(),
             origin: record.origin.map(|origin| OriginDto::Managed {
                 resource_version: origin.resource_version,
                 created_at: origin.created_at,
@@ -1074,7 +1073,6 @@ impl From<EntityRecord> for EntityDto {
             provenance: record.provenance.map(|p| ProvenanceDto {
                 gts_spec_version: p.gts_spec_version,
                 gts_impl_version: p.gts_impl_version,
-                owning_gear: p.owning_gear,
                 compat_forced: p.compat_forced,
             }),
         }

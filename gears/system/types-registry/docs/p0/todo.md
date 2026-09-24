@@ -2082,7 +2082,7 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 **Acceptance criteria:**
 - [x] Update SPEC §§2, 8.3, 8.5, 9, 10.1, 10.2 and 16 before coding: fix the exact P0
   field allowlist and default, mandatory
-  `lifecycle_status` and result-envelope metadata, and the intentional P0 omissions from
+  `kind` and `lifecycle_status` and result-envelope metadata, and the intentional P0 omissions from
   DESIGN. Remove the `$select` refusal and fixed-projection statements superseded by P19;
   retain C7 only for absent tenant/visibility dimensions and revise C10's full-response
   rationale without silently raising the 100-key ceiling. Done in the P19 contract revision;
@@ -2098,8 +2098,9 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 - [x] Exact and batch reads accept the same selection and produce the same projected
   entity for one key. Batch `"$select"` is a top-level body field applied to every key;
   per-item `if_none_match` remains declared for T29. `key`, lookup status and future `etag`
-  stay outside projection; `lifecycle_status` is mandatory even when omitted from the
-  selected set, so a projected tombstone is distinguishable from `not_found`
+  stay outside projection; `kind` and `lifecycle_status` are mandatory even when omitted
+  from the selected set, so a projected entity says which documents apply and a projected
+  tombstone is distinguishable from `not_found`
 - [x] Discovery accepts `$select` in the query and returns one bounded page in the same
   canonical order. Its cursor binds the normalized selection as well as `pattern` and
   position: resuming under another selection is `400`; absent and explicit-default
@@ -2146,8 +2147,8 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 
 **Implementation notes:**
 - **One `FieldSelection` bitset** (`TR/src/domain/selection.rs`) is the normalized identity:
-  order, case and duplicates cannot survive construction, `lifecycle_status` is always a
-  member, and `canonical()` is the sorted spelling the cursor binds and T29 will digest.
+  order, case and duplicates cannot survive construction, `kind` and `lifecycle_status`
+  are always members, and `canonical()` is the sorted spelling the cursor binds and T29 will digest.
   The REST parser runs ToolKit's `parse_select` for its limits, then refuses the empty
   comma segments ToolKit drops. Every refusal is `400` naming `$select` with reason
   `INVALID_SELECT`; *unavailable* is `availability` / `owned_by_context_tenant`.
@@ -2160,10 +2161,12 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   `projected_read_backends_test` records the SQL on all three backends: metadata-only
   exact, batch and discovery reads never name a document column, selected ones name only
   theirs, all in one snapshot transaction, at most six statements for a batch.
-- **Wire shape.** `EntityDto` omits unselected fields; only `lifecycle_status` was required
-  in OpenAPI (T22c's amendment adds `gts_id`/`gts_uuid`), metadata is non-nullable, documents are any-JSON (so a selected `null`
+- **Wire shape.** `EntityDto` omits unselected fields; only `kind` and `lifecycle_status`
+  were required in OpenAPI (T22c's amendment adds `gts_id`/`gts_uuid`), metadata is non-nullable, documents are any-JSON (so a selected `null`
   stays). `origin` is `{"type":"managed",resource_version,created_at,updated_at}`;
-  `owning_gear` moved under `provenance`. Instance artifacts are absent even when selected.
+  `provenance` is exactly `gts_spec_version`, `gts_impl_version` and `compat_forced`;
+  `owning_gear` stays internal attribution that no read returns, and exposing it is P1
+  work (SPEC §10.2). Instance artifacts are absent even when selected.
 - **Strict query parameters.** A guard extractor refuses undeclared keys
   (`UNSUPPORTED_QUERY_PARAM`, one violation per key) and repeated keys before ToolKit's
   `OData` extraction. Exact read accepts `$select`; discovery `pattern`, `limit`/`$top`,
@@ -2293,8 +2296,8 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
   `pattern`/`depth` still post-filter in Rust. Exact read and `batchGet` are unchanged
 - [x] The cursor adds a `lifecycle_status` term only for `deleted`/`all`, so absent and
   explicit `active` share one binding and changing the value on resume is `400`
-- [x] `gts_id`, `gts_uuid` and `lifecycle_status` are members of every `FieldSelection`
-  and required, non-nullable `EntityDto` fields. Canonical selections other than the
+- [x] `gts_id` and `gts_uuid` join `kind` and `lifecycle_status` as members of every
+  `FieldSelection` and required, non-nullable `EntityDto` fields. Canonical selections other than the
   default gained `gts_id,gts_uuid`, so a pre-amendment cursor under such a `$select` is
   refused rather than resumed
 - [x] Tests: generated OpenAPI (`OpenApiRegistryImpl`) for the `EntityDto` required set,
@@ -2426,7 +2429,7 @@ remains the deployment-time escape hatch for identities that no gear can own.
       (`plan.md` P12). The shim is one store and one write path — not a dual path — and T26
       deletes it with the trait
 - [ ] Ready mode and the in-memory repository are gone; `ready_mode_tests.rs` deleted. The old model-typed cache goes with the old models, and the four `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys become accepted-and-ignored with a warning naming their T30 replacements
-- [ ] `owning_gear = "types-registry"` remains a compatibility placeholder for P0 admissions. C3 stays open; its source comment describes incomplete attribution and the P1 upgrade, never claims that all declarations belong to the registry. Keep the column and global NOT NULL constraint
+- [ ] `owning_gear = "types-registry"` remains a compatibility placeholder for P0 admissions. C3 stays open; its source comment describes incomplete attribution and the P1 upgrade, never claims that all declarations belong to the registry. Keep the column and global NOT NULL constraint; no read returns the placeholder, since exposing `owning_gear` is P1 work
 - [ ] No entity-derived state survives `init()` — no `ArcSwap`, no entity map, no `GtsOps` field on the gear or the service. Grep-checkable, and the ceilings C1/C4 struck by D2 depend on it
 
 **Verification:**
@@ -2644,7 +2647,7 @@ Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key val
 - [ ] Test: decoding rejects a validator whose version field is unknown rather than treating it as a match
 - [ ] Test: one key under two different selected-field sets has two different validators;
   field order, case, an explicit default set and explicitly naming mandatory
-  `lifecycle_status` do not change the normalized validator when the effective fields match
+  `kind` or `lifecycle_status` do not change the normalized validator when the effective fields match
 - [ ] Test: deletion changes the validator
 
 **Dependencies:** T23 (validator field in the models), T22b (normalized projection and

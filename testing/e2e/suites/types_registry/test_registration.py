@@ -7,6 +7,7 @@ from .helpers import (
     assert_not_found,
     assert_operation,
     read_created,
+    read_entity,
     submit_and_poll,
 )
 
@@ -67,10 +68,12 @@ async def test_register_schema(
             "gts_uuid": "<gts_uuid>",
             "kind": "type_schema",
             "lifecycle_status": "active",
-            "resource_version": 1,
-            "owning_gear": "types-registry",
-            "created_at": "<created_at>",
-            "updated_at": "<updated_at>",
+            "origin": {
+                "type": "managed",
+                "resource_version": 1,
+                "created_at": "<created_at>",
+                "updated_at": "<updated_at>",
+            },
             "content": schema["content"],
             "resolved_schema": schema["content"],
             "effective_traits": {},
@@ -80,12 +83,8 @@ async def test_register_schema(
         },
         operation,
     )
-    by_uuid = await registry_http.get(
-        f"{registry_api_path}/entities/{entity['gts_uuid']}"
-    )
-    assert by_uuid.status_code == 200, by_uuid.text
-    assert by_uuid.headers["content-type"].startswith("application/json")
-    assert_json(by_uuid.json(), entity)
+    by_uuid = await read_entity(registry_http, registry_api_path, entity["gts_uuid"])
+    assert_json(by_uuid, entity)
 
 
 @pytest.mark.scenario("TR-REG-002")
@@ -143,14 +142,13 @@ async def test_register_instance(
             "gts_uuid": "<gts_uuid>",
             "kind": "instance",
             "lifecycle_status": "active",
-            "resource_version": 1,
-            "owning_gear": "types-registry",
-            "created_at": "<created_at>",
-            "updated_at": "<updated_at>",
+            "origin": {
+                "type": "managed",
+                "resource_version": 1,
+                "created_at": "<created_at>",
+                "updated_at": "<updated_at>",
+            },
             "content": instance["content"],
-            "resolved_schema": None,
-            "effective_traits": None,
-            "effective_traits_schema": None,
         },
         operation,
     )
@@ -195,10 +193,12 @@ async def test_register_batch_with_instance_first(
             "gts_uuid": "<gts_uuid>",
             "kind": "type_schema",
             "lifecycle_status": "active",
-            "resource_version": 1,
-            "owning_gear": "types-registry",
-            "created_at": "<created_at>",
-            "updated_at": "<updated_at>",
+            "origin": {
+                "type": "managed",
+                "resource_version": 1,
+                "created_at": "<created_at>",
+                "updated_at": "<updated_at>",
+            },
             "content": schema["content"],
             "resolved_schema": schema["content"],
             "effective_traits": {},
@@ -211,14 +211,13 @@ async def test_register_batch_with_instance_first(
             "gts_uuid": "<gts_uuid>",
             "kind": "instance",
             "lifecycle_status": "active",
-            "resource_version": 1,
-            "owning_gear": "types-registry",
-            "created_at": "<created_at>",
-            "updated_at": "<updated_at>",
+            "origin": {
+                "type": "managed",
+                "resource_version": 1,
+                "created_at": "<created_at>",
+                "updated_at": "<updated_at>",
+            },
             "content": instance["content"],
-            "resolved_schema": None,
-            "effective_traits": None,
-            "effective_traits_schema": None,
         },
     ):
         await read_created(registry_http, registry_api_path, expected_entity, operation)
@@ -301,10 +300,12 @@ async def test_register_batch_with_partial_failure(
             "gts_uuid": "<gts_uuid>",
             "kind": "type_schema",
             "lifecycle_status": "active",
-            "resource_version": 1,
-            "owning_gear": "types-registry",
-            "created_at": "<created_at>",
-            "updated_at": "<updated_at>",
+            "origin": {
+                "type": "managed",
+                "resource_version": 1,
+                "created_at": "<created_at>",
+                "updated_at": "<updated_at>",
+            },
             "content": independent["content"],
             "resolved_schema": independent["content"],
             "effective_traits": {},
