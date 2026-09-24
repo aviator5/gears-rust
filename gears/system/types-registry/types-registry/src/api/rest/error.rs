@@ -603,6 +603,25 @@ impl From<AcceptanceError> for CanonicalError {
             ),
 
             // --- the candidate document ---------------------------------------
+            AcceptanceError::MissingSchemaId { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!(
+                    "Type Schema '{gts_id}' declares no string top-level $id; \
+                     it must be 'gts://{gts_id}'"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            // The declared value is not echoed: it is unbounded caller input.
+            AcceptanceError::SchemaIdMismatch { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!(
+                    "Type Schema '{gts_id}' declares a top-level $id other than \
+                     'gts://{gts_id}'"
+                ),
+                field::VALIDATION_FAILED,
+            ),
             AcceptanceError::MissingDialect { gts_id } => invalid_candidate(
                 gts_id,
                 field::ENTITY_FIELD,
@@ -841,6 +860,16 @@ mod tests {
                 },
                 field::GTS_ID_FIELD,
                 field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::MissingSchemaId { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::SchemaIdMismatch { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::MissingDialect { gts_id: id.clone() },

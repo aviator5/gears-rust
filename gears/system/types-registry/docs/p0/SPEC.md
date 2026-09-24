@@ -339,8 +339,16 @@ out of scope):
 4. Managed identifier profile — refuse an explicit UUID tail (ADR-0001); refuse a minor
    or major 0 in the **last** segment of an Instance identifier (ADR-0004, ADR-0015).
    A minor on a Type Schema identifier is admissible under any prefix.
-5. Declared dialect, Type Schema candidates — top-level `$schema` present and in the
-   closed Draft-07 spelling set; any `$schema` below the root must not differ (ADR-0014).
+5. Declared identity and dialect, Type Schema candidates — the item's `gts_id` is the
+   entity's identity, and the document must agree with it: top-level `$id` is exactly
+   `gts://<gts_id>`, with no trimming, case folding or bare `gts.` spelling. An absent
+   or non-string `$id` is refused as `missing_schema_id`; any other string, malformed or
+   naming another entity, as `schema_id_mismatch`, without echoing the declared value.
+   Both are `400` field violations on `entity` with reason `VALIDATION_FAILED`, before
+   any operation exists, so one such candidate refuses its whole batch. Instances are
+   not checked: their identity is the item's `gts_id` alone. Then top-level `$schema`
+   present and in the closed Draft-07 spelling set; any `$schema` below the root must not
+   differ (ADR-0014).
 6. `force` per candidate — require `allow_compatibility_force` and a waivable
    cross-minor baseline from `compat::select_baseline`. Intra-entity revisions are
    never waivable. Store the request on `operation_item.compat_forced`; each worker

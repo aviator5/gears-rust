@@ -57,6 +57,8 @@ RECEIPT=$(curl -s -X POST "$BASE/types-registry/v2/entities" \
       }')
 ```
 
+A Type Schema's `content.$id` must be exactly `gts://` followed by its `gts_id`. A missing, non-string or different `$id` is a synchronous `400` naming the candidate, with a field violation on `entity` (`VALIDATION_FAILED`); no operation is created and no item in the batch is admitted. Instances have no such check.
+
 The **202 Accepted** response includes `Location`, `Retry-After: 1` and the operation ID:
 
 ```bash

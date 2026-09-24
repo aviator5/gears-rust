@@ -895,6 +895,142 @@ async fn a_zero_precondition_is_refused() {
     assert_eq!(refused.status, StatusCode::BAD_REQUEST);
 }
 
+/// A Type Schema's `$id` must be exactly `gts://<gts_id>` of its item. Every
+/// other shape is a synchronous `400` naming the candidate and the `entity`
+/// field, before any `202` or operation exists.
+#[tokio::test]
+async fn a_type_schema_id_that_does_not_name_its_item_is_refused_synchronously() {
+    let router = router_with_db().await;
+    let cases = [
+        ("absent", None),
+        ("null", Some(Value::Null)),
+        ("a number", Some(json!(7))),
+        ("an object", Some(json!({}))),
+        ("empty", Some(json!(""))),
+        ("malformed", Some(json!("gts://not a gts id"))),
+        ("the bare canonical form", Some(json!(CF_TYPE))),
+        (
+            "another Type Schema",
+            Some(json!(gts_uri!("cf.core.example.other.v1~"))),
+        ),
+        (
+            "another major",
+            Some(json!(gts_uri!("cf.core.example.type.v2~"))),
+        ),
+        ("padded", Some(json!(format!(" gts://{CF_TYPE}")))),
+        (
+            "oversized",
+            Some(json!(format!("gts://{}", "x".repeat(64 * 1024)))),
+        ),
+    ];
+    for (index, (label, declared)) in cases.into_iter().enumerate() {
+        let mut content = schema(CF_TYPE);
+        match declared {
+            Some(value) => content["$id"] = value,
+            None => {
+                content.as_object_mut().expect("object").remove("$id");
+            }
+        }
+        let body = json!({ "items": [{ "gts_id": CF_TYPE, "content": content }] });
+        let refused = call_raw(&router, submit(Some(&format!("key-{index}")), &body)).await;
+        assert_candidate_refusal(&refused, CF_TYPE, "entity", "VALIDATION_FAILED");
+        let description = refused.body["context"]["field_violations"][0]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            description.contains("$id") && description.contains(&format!("gts://{CF_TYPE}")),
+            "{label}: the refusal names $id and the expected URI: {description}",
+        );
+        assert!(
+            !description.contains("xxxx") && !description.contains("not a gts id"),
+            "{label}: the declared $id is not echoed: {description}",
+        );
+    }
+
+    // The same key, now with a matching `$id`, is a fresh acceptance: the refusals
+    // bound no key and left nothing to replay.
+    let accepted = call(&router, submit(Some("key-0"), &one_candidate(CF_TYPE))).await;
+    assert_eq!(
+        accepted.status,
+        StatusCode::ACCEPTED,
+        "got: {:?}",
+        accepted.body
+    );
+    assert_eq!(accepted.body["replayed"], json!(false));
+}
+
+/// One mismatched Type Schema refuses the whole batch: no operation is written or
+/// enqueued, and its valid neighbour is not registered on its own.
+#[tokio::test]
+async fn a_batch_with_one_mismatched_schema_id_writes_no_operation() {
+    use sea_orm::EntityTrait;
+    use toolkit_db::secure::SecureEntityExt;
+    use types_registry::infra::storage::entity::operation;
+
+    let (router, db) = router_and_db().await;
+    let body = json!({
+        "items": [
+            { "gts_id": CF_TYPE, "content": schema(CF_TYPE) },
+            { "gts_id": CF_OTHER, "content": schema(CF_THIRD) },
+        ]
+    });
+    let refused = call_raw(&router, submit(Some("key-batch"), &body)).await;
+    assert_candidate_refusal(&refused, CF_OTHER, "entity", "VALIDATION_FAILED");
+
+    let conn = db.conn().expect("conn");
+    let operations = operation::Entity::find()
+        .secure()
+        .scope_with(&common::allow_all())
+        .all(&conn)
+        .await
+        .expect("read operations");
+    assert!(
+        operations.is_empty(),
+        "a refused batch writes and enqueues no operation: {operations:?}",
+    );
+    let neighbour = call_raw(&router, get(&format!("{V2}/entities/{CF_TYPE}"))).await;
+    assert_eq!(
+        neighbour.status,
+        StatusCode::NOT_FOUND,
+        "the valid neighbour is not committed on its own",
+    );
+}
+
+/// An Instance's identity lives in its item alone, so a value with an unrelated
+/// `$id` is still admitted.
+#[tokio::test]
+async fn an_instance_is_not_held_to_the_schema_id_rule() {
+    let router = router_with_db().await;
+    let typed = call(&router, submit(Some("key-type"), &one_candidate(CF_TYPE))).await;
+    assert_eq!(typed.status, StatusCode::ACCEPTED, "got: {:?}", typed.body);
+    let type_operation = poll(&router, &typed).await;
+    assert_eq!(
+        type_operation["items"][0]["status"],
+        json!("succeeded"),
+        "the type is admitted before its Instance is submitted: {type_operation:?}",
+    );
+
+    let body = json!({
+        "items": [{
+            "gts_id": CF_INSTANCE,
+            "content": { "$id": "urn:unrelated", "name": "first" },
+        }]
+    });
+    let accepted = call(&router, submit(Some("key-instance"), &body)).await;
+    assert_eq!(
+        accepted.status,
+        StatusCode::ACCEPTED,
+        "got: {:?}",
+        accepted.body
+    );
+    let operation = poll(&router, &accepted).await;
+    assert_eq!(
+        operation["items"][0]["status"],
+        json!("succeeded"),
+        "got: {operation:?}"
+    );
+}
+
 #[tokio::test]
 async fn naming_a_version_does_not_get_a_candidate_past_a_closed_region() {
     let router = router_with_db().await;

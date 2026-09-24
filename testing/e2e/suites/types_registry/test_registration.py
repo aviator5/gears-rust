@@ -1,5 +1,7 @@
 """Registration scenarios with input JSON fixtures and complete expected responses."""
 
+import uuid
+
 import pytest
 
 from .helpers import (
@@ -8,8 +10,13 @@ from .helpers import (
     assert_operation,
     read_created,
     read_entity,
+    replace_text,
     submit_and_poll,
 )
+
+
+# Marks a `$id` the scenario removes rather than replaces.
+ABSENT = object()
 
 
 @pytest.fixture
@@ -315,3 +322,93 @@ async def test_register_batch_with_partial_failure(
         },
         operation,
     )
+
+
+def _expected_id_refusal(gts_id, description):
+    return {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "instance": "<request_path>",
+        "trace_id": "<trace_id>",
+        "context": {
+            "resource_type": "gts.cf.types_registry.registry.type.v1~",
+            "resource_name": gts_id,
+            "field_violations": [
+                {"field": "entity", "reason": "VALIDATION_FAILED", "description": description},
+            ],
+        },
+    }
+
+
+@pytest.mark.scenario("TR-REG-005")
+@pytest.mark.parametrize(
+    "declared_id",
+    [
+        pytest.param(ABSENT, id="absent"),
+        pytest.param(7, id="non-string"),
+        pytest.param("gts://not a gts id", id="malformed"),
+        pytest.param("gts://gts.cf.e2e.registration.other.v1~", id="other-type"),
+    ],
+)
+async def test_register_batch_refuses_mismatched_schema_id(
+    registry_http, registry_api_path, registration_fixture, declared_id
+):
+    """A Type Schema `$id` other than `gts://<gts_id>` refuses the whole batch before 202."""
+    schema = registration_fixture("person_schema")
+    instance = registration_fixture("person_instance")
+    namespace = schema["gts_id"].removesuffix("person.v1~")
+    expected_uri = f"gts://{schema['gts_id']}"
+    if declared_id is ABSENT:
+        del schema["content"]["$id"]
+    elif isinstance(declared_id, str):
+        # Keep the other Type Schema inside this test's namespace.
+        schema["content"]["$id"] = declared_id.replace("gts.cf.e2e.registration.", namespace)
+    else:
+        schema["content"]["$id"] = declared_id
+    if isinstance(declared_id, str):
+        # The declared value is never echoed back.
+        description = (
+            f"Type Schema '{schema['gts_id']}' declares a top-level $id other than "
+            f"'{expected_uri}'"
+        )
+    else:
+        description = (
+            f"Type Schema '{schema['gts_id']}' declares no string top-level $id; "
+            f"it must be '{expected_uri}'"
+        )
+
+    response = await registry_http.post(
+        f"{registry_api_path}/entities",
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+        json={"items": [instance, schema]},
+    )
+    assert response.status_code == 400, response.text
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert "location" not in response.headers, response.headers
+    actual = response.json()
+    assert actual["instance"] == response.request.url.path, actual
+    actual["instance"] = "<request_path>"
+    replace_text(actual, "trace_id")
+    assert_json(actual, _expected_id_refusal(schema["gts_id"], description))
+
+    for candidate in (instance, schema):
+        response = await registry_http.get(
+            f"{registry_api_path}/entities/{candidate['gts_id']}"
+        )
+        assert_not_found(
+            response,
+            {
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+                "title": "Not Found",
+                "status": 404,
+                "detail": "<detail>",
+                "instance": "<request_path>",
+                "trace_id": "<trace_id>",
+                "context": {
+                    "resource_type": "gts.cf.types_registry.registry.type.v1~",
+                    "resource_name": candidate["gts_id"],
+                },
+            },
+        )
