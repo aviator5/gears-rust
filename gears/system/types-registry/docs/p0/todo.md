@@ -758,7 +758,7 @@ the first row lands in that state.
 - [x] A positive precondition on a minor-bearing Type Schema is refused during acceptance: ADR-0004 makes that published contract content-immutable, so a change is registered as the next minor rather than appended as a revision
 - [x] Equal authored content yields `unchanged`, creating no revision and not advancing `resource_version`. Both kinds: the rule is shared, the tables are not
 - [x] `unchanged` is impossible for a create or a delete, enforced in code as well as by the CHECK. In code it is **structural**: `commit_creation` returns `CommittedUnit` and both revision commit paths return `RevisionCommit`; the early `unchanged` proof is constructed only for `Precondition::Version`. A creation of existing content is `already_exists`, whatever the content
-- [x] Content hash is a prefilter only; effective artifacts are excluded from equality. `CurrentDocument` and `CurrentInstanceValue` gained `content_hash` so the digest and the bytes travel together, and the decision is `hash == hash && bytes == bytes` — the digest alone would let a collision swallow a real edit
+- [x] Equality is exact comparison of canonical authored bytes; effective artifacts are excluded. `CurrentDocument` and `CurrentInstanceValue` carry the bytes, and the decision is `bytes == bytes`. (A stored FNV-1a `content_hash` prefilter was used here first; it was later removed with its column, see T22b.)
 
 **The concurrency shape, because it is not the obvious one.** The commit transaction runs at
 `READ COMMITTED` (`ports::commit_write`), so a concurrent admission can commit between reading
@@ -1146,7 +1146,7 @@ would compare the same stale vector and drift identically, which is why
 `RevalidationRequired` reads as `None` to `retryable_db_err`.
 
 **Early `unchanged` check.** Before evaluation, revision submissions compare the current
-canonical authored bytes and content hash in a short read-only snapshot. A match produces
+canonical authored bytes in a short read-only snapshot. A match produces
 an internal proof carrying the entity ID and expected `resource_version`, without loading
 the dependency closure, deriving a vector, validating, or materializing artifacts. Its
 commit still claims `entity_write_order` as the first SQL statement, then checks that the
@@ -1248,8 +1248,8 @@ comparison), `TR/tests/revalidation_test.rs` (9 tests),
 `entity_id`, `revision_no`, and `resolution_fingerprint`; vector derivation and refresh
 do not load the three materialized documents merely to compare state. Instance evaluation
 uses the same projection to record its conforming type's revision. `current_documents`
-uses this narrow SQL projection for its pointer read and selects only identity, authored
-text, and content hash from the revision table. `find_current_schema` retains the full
+uses this narrow SQL projection for its pointer read and selects only identity and authored
+text from the revision table. `find_current_schema` retains the full
 artifacts for entity reads. Transaction boundaries and CAS checks remain unchanged.
 `schema_projection_test.rs` checks the executed SQL excludes unused payload columns;
 the repository backend suite verifies projection values on PostgreSQL and MySQL.
@@ -2075,13 +2075,13 @@ and quickstart, for the seven-route completeness check)
 before T23 publishes the SDK models and T29 computes validators (plan P19). An absent
 `$select` returns P0's document-free metadata set; callers explicitly request `content`,
 `resolved_schema`, `effective_traits`, `effective_traits_schema` or `provenance`. The
-default includes managed `origin` and `content_hash`, as fixed in SPEC §10.2. P0 has no
+default includes managed `origin`, as fixed in SPEC §10.2. P0 has no
 availability or tenant fields, so those unavailable DESIGN fields are not advertised or
 synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 
 **Acceptance criteria:**
 - [x] Update SPEC §§2, 8.3, 8.5, 9, 10.1, 10.2 and 16 before coding: fix the exact P0
-  field allowlist and default, the representation of `content_hash`, mandatory
+  field allowlist and default, mandatory
   `lifecycle_status` and result-envelope metadata, and the intentional P0 omissions from
   DESIGN. Remove the `$select` refusal and fixed-projection statements superseded by P19;
   retain C7 only for absent tenant/visibility dimensions and revise C10's full-response
@@ -2131,7 +2131,7 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   baseline failure (`clippy::unused_async_trait_impl` in `libs/toolkit-security`); clippy
   over this gear with only that lint allowed is clean
 - [x] Router tests: default metadata-only response; each document alone; mixed batch;
-  managed `origin` shape, `content_hash` hex encoding, selected `provenance` and its
+  managed `origin` shape, selected `provenance` and its
   Instance null, Instance inapplicable fields; tombstone with `$select=content`; absent
   key; invalid, unknown and unsupported selections; exact/batch parity
 - [x] Router tests: discovery with metadata and document selection, multiple pages,
@@ -2154,8 +2154,8 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 - **Projected reads are new ports beside the admission ones.** `read_current_schemas` /
   `read_current_values` select only the named columns; `current_schemas`,
   `current_documents` and `current_values` are unchanged for admission and dry run.
-  `content_hash` is always read, so a missing current-state row is corruption under every
-  selection. An unselected column is absent from the result set and `SeaORM` reads it into
+  The revision row's identity is always read, so a missing current-state row is corruption
+  under every selection. An unselected column is absent from the result set and `SeaORM` reads it into
   `Option` as `None`; the domain refuses a *selected* column that comes back `None`.
   `projected_read_backends_test` records the SQL on all three backends: metadata-only
   exact, batch and discovery reads never name a document column, selected ones name only
@@ -2175,7 +2175,16 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   binding) is refused; absent and explicit-default selections resume one traversal
   (asserted by comparing whole responses).
 - **Seeded discovery rows** in `api_rest_test.rs` now get a revision and current state,
-  because the default page reads `content_hash`.
+  because every page checks the current revision behind each row.
+- **`content_hash` removed.** The managed digest is no longer selectable, returned or
+  stored: `m20260924_000004_drop_revision_content_hash` drops it from both revision
+  tables, `$select=content_hash` is an unknown-field `400`, and `unchanged` compares
+  canonical authored bytes only. `resource_version` and `resolution_fingerprint` are
+  unchanged. The PRD, DESIGN and ADRs 0002/0004/0005/0006/0007/0011 drop the digest from
+  the external plugin contract too: a source returns only the opaque `external_revision`,
+  which changes with any source-owned response field (canonical content, effective
+  artifacts, lifecycle, ownership scope, tenant enablement) but not with platform-owned
+  availability or visibility, and conditional reads are delegated to the plugin.
 - **Runtime evidence.** Example server as in T22a; `/cf/openapi.json` shows `$select` on
   both GET routes and the body field on `:batchGet`; `curl` exercised the default and
   selective exact read, a selective `batchGet`, continuation under a respelled `$select`,
@@ -2323,8 +2332,8 @@ T26 once every consumer has moved.
 - [ ] **Convenience read helpers as provided methods** over the two required primitives, so consumers keep familiar call shapes and the trait stays object-safe (DESIGN: *"single reads and the kind-narrowed `get_type_schema` / `get_instance` are provided methods over it"*): `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, the `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round trip — the kind is the trailing `~` of the identifier, so a kind-mismatched argument fails locally
 - [ ] `EntitySnapshot` exposes the materialized documents as **plain fields** (`content`, `resolved_schema`, `effective_traits`, `effective_traits_schema`) plus a `segments` accessor, so the ~40 call sites using the old models' computed methods become field reads rather than rewrites
 - [ ] `origin` is the DESIGN managed variant in P0; it carries the read `resource_version`
-  and timestamps used by reconciliation. `content_hash` has the SPEC §10.2 opaque
-  prefilter semantics, and `provenance` is the sole selectable group
+  and timestamps used by reconciliation. There is no content digest (SPEC §10.2), and
+  `provenance` is the sole selectable group
 - [ ] Documents are selectable **individually**, not as an `effective` group: a caller wanting `effective_traits` must not be made to transfer the 1 MB-bounded `resolved_schema` with it (DESIGN §3.3, *Field selection*). T22b supplies the server contract; the SDK models use the same normalized selection and represent omitted fields explicitly
 - [ ] **No `effective_*` recomputation exists in the SDK** — the old `GtsTypeSchema::effective_schema` / `effective_properties` / `effective_required` / `effective_traits` / `effective_traits_schema` are not reproduced. They resolved only the parent `$ref` and left non-parent references unresolved, and `effective_traits` was an admitted approximation (`TODO(#1723)`), so reproducing them would reintroduce both a wrong answer and a `constraint-gts-implementation` violation (SPEC §10.1)
 - [ ] `EntityQuery` carries `limit` and `cursor`, and `EntityPage` carries the next cursor — the trait already declared `EntityPage` in SPEC §10.1, and without these it is a page in name only (D12)

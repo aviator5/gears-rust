@@ -8,7 +8,6 @@ use toolkit_macros::domain_model;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntityField {
     Content,
-    ContentHash,
     EffectiveTraits,
     EffectiveTraitsSchema,
     GtsId,
@@ -21,9 +20,8 @@ pub enum EntityField {
 }
 
 impl EntityField {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 10] = [
         Self::Content,
-        Self::ContentHash,
         Self::EffectiveTraits,
         Self::EffectiveTraitsSchema,
         Self::GtsId,
@@ -39,7 +37,6 @@ impl EntityField {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Content => "content",
-            Self::ContentHash => "content_hash",
             Self::EffectiveTraits => "effective_traits",
             Self::EffectiveTraitsSchema => "effective_traits_schema",
             Self::GtsId => "gts_id",
@@ -98,13 +95,12 @@ impl FieldSelection {
         EntityField::LifecycleStatus,
     ];
 
-    pub const DEFAULT_FIELDS: [EntityField; 6] = [
+    pub const DEFAULT_FIELDS: [EntityField; 5] = [
         EntityField::GtsId,
         EntityField::GtsUuid,
         EntityField::Kind,
         EntityField::Origin,
         EntityField::LifecycleStatus,
-        EntityField::ContentHash,
     ];
 
     #[must_use]

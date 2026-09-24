@@ -227,6 +227,165 @@ async fn an_existing_operation_item_gains_compat_forced_reading_false() {
     );
 }
 
+/// An existing installation must lose the legacy column from both revision
+/// tables when the next migration is applied.
+#[tokio::test]
+async fn an_existing_installation_loses_the_revision_content_hash() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    let tables = [
+        "types_registry__type_schema_revision",
+        "types_registry__instance_revision",
+    ];
+
+    Migrator::up(&db, Some(3))
+        .await
+        .expect("apply migrations before the drop");
+    for table in tables {
+        exec(&db, format!("SELECT content_hash FROM {table}"))
+            .await
+            .unwrap_or_else(|e| panic!("{table} carries the column before upgrade: {e}"));
+    }
+
+    Migrator::up(&db, None).await.expect("apply the rest");
+    for table in tables {
+        assert!(
+            exec(&db, format!("SELECT content_hash FROM {table}"))
+                .await
+                .is_err(),
+            "{table} must no longer carry content_hash",
+        );
+    }
+}
+
+/// A rollback cannot restore valid hashes for existing revisions, so it
+/// refuses before changing either table or the migration ledger.
+#[tokio::test]
+async fn rolling_back_the_content_hash_drop_refuses_while_revisions_exist() {
+    let revisions = [
+        (
+            "types_registry__type_schema_revision",
+            format!(
+                "INSERT INTO types_registry__type_schema_revision \
+                 (entity_id, revision_no, raw_schema, gts_spec_version, gts_impl_version, \
+                  compat_forced, operation_item_id, created_at, updated_at) \
+                 VALUES (1, 1, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+            ),
+        ),
+        (
+            "types_registry__instance_revision",
+            format!(
+                "INSERT INTO types_registry__instance_revision \
+                 (entity_id, revision_no, canonical_value, type_schema_entity_id, \
+                  type_schema_revision_no, gts_spec_version, gts_impl_version, \
+                  operation_item_id, created_at, updated_at) \
+                 VALUES (2, 1, '{{}}', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+            ),
+        ),
+    ];
+    for (table, insert) in revisions {
+        // Foreign keys off so one revision row stands in for a full admission
+        // graph; down only asks whether a row exists.
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        db.execute_raw(stmt(&db, "PRAGMA foreign_keys = OFF;"))
+            .await
+            .expect("disable foreign keys");
+        Migrator::up(&db, None)
+            .await
+            .expect("apply every migration");
+        exec(&db, insert)
+            .await
+            .unwrap_or_else(|e| panic!("insert a revision into {table}: {e}"));
+
+        let mut schemas_before = Vec::new();
+        for revision_table in [
+            "types_registry__type_schema_revision",
+            "types_registry__instance_revision",
+        ] {
+            let row = db
+                .query_one_raw(stmt(
+                    &db,
+                    format!(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{revision_table}'"
+                    ),
+                ))
+                .await
+                .expect("read table schema")
+                .expect("revision table exists");
+            schemas_before.push((
+                revision_table,
+                row.try_get::<String>("", "sql").expect("table DDL"),
+            ));
+        }
+        let applied_before = db
+            .query_one_raw(stmt(&db, "SELECT COUNT(*) AS n FROM seaql_migrations"))
+            .await
+            .expect("count applied migrations")
+            .expect("one row")
+            .try_get::<i64>("", "n")
+            .expect("migration count");
+
+        let err = Migrator::down(&db, Some(1))
+            .await
+            .expect_err("down must refuse while a revision exists");
+        assert!(
+            matches!(&err, sea_orm::DbErr::Migration(message)
+                if message.contains(table) && message.contains("content_hash")),
+            "{table}: {err:?}",
+        );
+
+        for revision_table in [
+            "types_registry__type_schema_revision",
+            "types_registry__instance_revision",
+        ] {
+            assert!(
+                exec(&db, format!("SELECT content_hash FROM {revision_table}"))
+                    .await
+                    .is_err(),
+                "a refused rollback must not restore content_hash to {revision_table}",
+            );
+        }
+
+        for (revision_table, before) in schemas_before {
+            let row = db
+                .query_one_raw(stmt(
+                    &db,
+                    format!(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{revision_table}'"
+                    ),
+                ))
+                .await
+                .expect("read table schema")
+                .expect("revision table exists");
+            assert_eq!(
+                row.try_get::<String>("", "sql").expect("table DDL"),
+                before,
+                "refused rollback changed {revision_table}"
+            );
+        }
+        let row = db
+            .query_one_raw(stmt(&db, format!("SELECT COUNT(*) AS n FROM {table}")))
+            .await
+            .expect("count revisions")
+            .expect("one row");
+        assert_eq!(row.try_get::<i64>("", "n").expect("n"), 1, "{table}");
+        let applied_after = db
+            .query_one_raw(stmt(&db, "SELECT COUNT(*) AS n FROM seaql_migrations"))
+            .await
+            .expect("read migration state")
+            .expect("one row")
+            .try_get::<i64>("", "n")
+            .expect("migration count");
+        assert_eq!(
+            applied_after, applied_before,
+            "refused rollback changed migration state"
+        );
+    }
+}
+
 /// `SQLite`'s INTEGER boolean needs an explicit 0/1 check.
 #[tokio::test]
 async fn the_lowered_compat_forced_boolean_refuses_a_value_outside_zero_and_one() {
@@ -1105,9 +1264,9 @@ async fn every_table_accepts_a_complete_admission_graph() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 1, '{{}}', X'00', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+             VALUES (1, 1, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1129,10 +1288,10 @@ async fn every_table_accepts_a_complete_admission_graph() {
         &db,
         format!(
             "INSERT INTO types_registry__instance_revision \
-             (entity_id, revision_no, canonical_value, content_hash, type_schema_entity_id, \
+             (entity_id, revision_no, canonical_value, type_schema_entity_id, \
               type_schema_revision_no, gts_spec_version, gts_impl_version, operation_item_id, \
               created_at, updated_at) \
-             VALUES (2, 1, '{{}}', X'00', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+             VALUES (2, 1, '{{}}', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1210,9 +1369,9 @@ async fn type_schema_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 0, '{{}}', X'00', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+             VALUES (1, 0, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1222,9 +1381,9 @@ async fn type_schema_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 1, '{{}}', X'00', '0.13', '0.12.0', 7, 1, '{TS}', '{TS}')"
+             VALUES (1, 1, '{{}}', '0.13', '0.12.0', 7, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1290,9 +1449,9 @@ async fn instance_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__type_schema_revision \
-             (entity_id, revision_no, raw_schema, content_hash, gts_spec_version, \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
               gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
-             VALUES (1, 1, '{{}}', X'00', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+             VALUES (1, 1, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1302,10 +1461,10 @@ async fn instance_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__instance_revision \
-             (entity_id, revision_no, canonical_value, content_hash, type_schema_entity_id, \
+             (entity_id, revision_no, canonical_value, type_schema_entity_id, \
               type_schema_revision_no, gts_spec_version, gts_impl_version, operation_item_id, \
               created_at, updated_at) \
-             VALUES (2, 0, '{{}}', X'00', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+             VALUES (2, 0, '{{}}', 1, 1, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
         ),
     )
     .await
@@ -1316,10 +1475,10 @@ async fn instance_revision_numbers_start_at_one() {
         &db,
         format!(
             "INSERT INTO types_registry__instance_revision \
-             (entity_id, revision_no, canonical_value, content_hash, type_schema_entity_id, \
+             (entity_id, revision_no, canonical_value, type_schema_entity_id, \
               type_schema_revision_no, gts_spec_version, gts_impl_version, operation_item_id, \
               created_at, updated_at) \
-             VALUES (2, 1, '{{}}', X'00', 1, 9, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
+             VALUES (2, 1, '{{}}', 1, 9, '0.13', '0.12.0', 2, '{TS}', '{TS}')"
         ),
     )
     .await

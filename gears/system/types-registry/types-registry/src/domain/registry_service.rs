@@ -104,7 +104,6 @@ pub struct EntityRecord {
     pub kind: Option<EntityKind>,
     pub origin: Option<ManagedOrigin>,
     pub lifecycle_status: LifecycleStatus,
-    pub content_hash: Option<ContentHash>,
     pub content: Option<Value>,
     pub resolved_schema: Option<Value>,
     pub effective_traits: Option<Value>,
@@ -119,20 +118,6 @@ pub struct ManagedOrigin {
     pub resource_version: i64,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
-}
-
-/// The eight stored FNV-1a bytes of the canonical authored content: a prefilter,
-/// never proof of equality (ADR-0012).
-#[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ContentHash(pub [u8; 8]);
-
-impl ContentHash {
-    /// Sixteen lowercase hexadecimal digits, most significant byte first.
-    #[must_use]
-    pub fn to_hex(self) -> String {
-        format!("{:016x}", u64::from_be_bytes(self.0))
-    }
 }
 
 #[domain_model]
@@ -855,15 +840,6 @@ fn into_records(
             };
             missing_state(&row.gts_id, what)
         })?;
-        let content_hash = <[u8; 8]>::try_from(state.content_hash.as_slice())
-            .map(ContentHash)
-            .map_err(|_| {
-                ServiceError::CorruptDocument(format!(
-                    "entity '{}' has a {}-byte content hash, expected 8",
-                    row.gts_id,
-                    state.content_hash.len()
-                ))
-            })?;
         let is_schema = row.entity_kind == EntityKind::TypeSchema;
         let document = |field: EntityField, text: Option<String>| {
             select_document(selection, field, is_schema, text, &row.gts_id)
@@ -904,9 +880,6 @@ fn into_records(
                         updated_at: row.updated_at,
                     }),
                 lifecycle_status: row.lifecycle_status,
-                content_hash: selection
-                    .contains(EntityField::ContentHash)
-                    .then_some(content_hash),
                 content,
                 resolved_schema,
                 effective_traits,
@@ -972,7 +945,6 @@ mod tests {
             7,
             CurrentReadRow {
                 entity_id: 7,
-                content_hash: vec![0, 1, 2, 3, 4, 5, 6, 0xff],
                 content: content.map(str::to_owned),
                 resolved_schema: None,
                 effective_traits: None,
@@ -1004,10 +976,6 @@ mod tests {
         )
         .expect("an unselected column is never parsed");
         assert!(records[&7].content.is_none());
-        assert_eq!(
-            records[&7].content_hash.map(ContentHash::to_hex).as_deref(),
-            Some("00010203040506ff")
-        );
     }
 
     #[test]

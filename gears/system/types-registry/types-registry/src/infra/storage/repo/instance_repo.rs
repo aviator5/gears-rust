@@ -83,7 +83,6 @@ impl InstanceRepo {
                 entity_id: r.entity_id,
                 revision_no: r.revision_no,
                 canonical_value: r.canonical_value,
-                content_hash: r.content_hash,
                 type_schema_entity_id: r.type_schema_entity_id,
                 type_schema_revision_no: r.type_schema_revision_no,
             }));
@@ -129,8 +128,7 @@ impl InstanceRepo {
                 .project_all(runner, |query| {
                     let mut query = query
                         .select_only()
-                        .column(instance_revision::Column::EntityId)
-                        .column(instance_revision::Column::ContentHash);
+                        .column(instance_revision::Column::EntityId);
                     if selection.contains(EntityField::Content) {
                         query =
                             query.column_as(instance_revision::Column::CanonicalValue, "content");
@@ -147,7 +145,6 @@ impl InstanceRepo {
                 let provenance = revision.take_provenance();
                 CurrentReadRow {
                     entity_id: revision.entity_id,
-                    content_hash: revision.content_hash,
                     content: revision.content,
                     resolved_schema: None,
                     effective_traits: None,
@@ -199,7 +196,6 @@ impl InstanceRepo {
             entity_id: Set(new.entity_id),
             revision_no: Set(new.revision_no),
             canonical_value: Set(new.canonical_value),
-            content_hash: Set(new.content_hash),
             type_schema_entity_id: Set(new.type_schema_entity_id),
             type_schema_revision_no: Set(new.type_schema_revision_no),
             gts_spec_version: Set(new.gts_spec_version),

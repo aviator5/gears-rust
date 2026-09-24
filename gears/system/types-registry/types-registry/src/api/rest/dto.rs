@@ -11,7 +11,7 @@ use crate::domain::enums::{
 };
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
 use crate::domain::registry_service::{
-    ContentHash, EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
+    EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
 };
 
 /// DTO for a GTS ID segment.
@@ -237,11 +237,10 @@ mod tests {
             serde_json::json!(["gts_id", "gts_uuid", "lifecycle_status"])
         );
         let properties = &schema["properties"];
-        for field in ["gts_id", "gts_uuid", "content_hash"] {
+        for field in ["gts_id", "gts_uuid"] {
             assert_eq!(properties[field]["type"], "string", "{field}: {properties}");
         }
         assert_eq!(properties["gts_uuid"]["format"], "uuid");
-        assert_eq!(properties["content_hash"]["pattern"], "^[0-9a-f]{16}$");
         for field in [
             "content",
             "resolved_schema",
@@ -265,7 +264,6 @@ mod tests {
             kind: None,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Deleted,
-            content_hash: None,
             content: Some(serde_json::Value::Null),
             resolved_schema: None,
             effective_traits: None,
@@ -830,11 +828,6 @@ pub struct EntityDto {
     pub origin: Option<OriginDto>,
     /// Always present. A tombstone stays exact-readable and is listed only on request.
     pub lifecycle_status: LifecycleStatusDto,
-    /// Sixteen lowercase hex digits of the non-cryptographic content digest; a
-    /// prefilter, not proof that two documents are equal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false, pattern = "^[0-9a-f]{16}$")]
-    pub content_hash: Option<String>,
     /// The whole authored document, either kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<serde_json::Value>,
@@ -1074,7 +1067,6 @@ impl From<EntityRecord> for EntityDto {
                 updated_at: origin.updated_at,
             }),
             lifecycle_status: record.lifecycle_status.into(),
-            content_hash: record.content_hash.map(ContentHash::to_hex),
             content: record.content,
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,

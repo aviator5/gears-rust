@@ -191,7 +191,6 @@ async fn metadata_only_reads_fetch_no_document(h: &Harness, backend: &str) {
                 "{what} on {backend} must not select `{column}`: {statements:#?}",
             );
         }
-        assert!(named(&statements, "content_hash"), "{what} on {backend}");
     }
 
     h.recorder.clear();
@@ -265,7 +264,6 @@ async fn absent_columns_read_as_none_and_selected_ones_as_some(h: &Harness, back
         .await
         .expect("light schema read");
     assert_eq!(light.len(), 1, "{backend}");
-    assert_eq!(light[0].content_hash.len(), 8, "{backend}");
     assert!(
         light[0].content.is_none()
             && light[0].resolved_schema.is_none()
@@ -289,7 +287,6 @@ async fn absent_columns_read_as_none_and_selected_ones_as_some(h: &Harness, back
     );
     let provenance = full[0].provenance.as_ref().expect("schema provenance");
     assert_eq!(provenance.compat_forced, Some(false), "{backend}");
-    assert_eq!(full[0].content_hash, light[0].content_hash, "{backend}");
 
     let instance =
         InstanceRepo::read_current(&conn, &scope, &[instance_id], FieldSelection::full())

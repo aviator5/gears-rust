@@ -90,8 +90,7 @@ curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~" \
         "created_at": "2026-09-15T09:15:30Z",
         "updated_at": "2026-09-15T09:15:30Z"
     },
-    "lifecycle_status": "active",
-    "content_hash": "3a1f0c9d4b2e8a71"
+    "lifecycle_status": "active"
 }
 ```
 
@@ -110,8 +109,8 @@ curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?\$select
 
 Names are case-insensitive and order does not matter. `gts_id`, `gts_uuid` and
 `lifecycle_status` are always returned. Any other unselected field is omitted; a
-selected document that is JSON `null` stays `null`. `content_hash` is a non-cryptographic prefilter, not proof two documents are
-equal. An empty, duplicate, unknown or nested name (`content.title`) is a `400` naming
+selected document that is JSON `null` stays `null`. To compare authored content, select
+`content`; there is no content digest. An empty, duplicate, unknown or nested name (`content.title`) is a `400` naming
 `$select`, and any other query parameter is refused.
 
 ### Rehearse a deletion, then perform it
@@ -227,8 +226,7 @@ curl -s "$BASE/types-registry/v2/entities?limit=2&pattern=gts.cf.core.*" \
             "gts_uuid": "d226dd5b-14c8-56da-a718-9cf29becaba1",
             "kind": "type_schema",
             "origin": { "type": "managed", "resource_version": 1, "created_at": "...", "updated_at": "..." },
-            "lifecycle_status": "active",
-            "content_hash": "3a1f0c9d4b2e8a71"
+            "lifecycle_status": "active"
         }
     ],
     "page_info": { "next_cursor": "eyJ2IjoxLCJrIjpb...", "limit": 2 }

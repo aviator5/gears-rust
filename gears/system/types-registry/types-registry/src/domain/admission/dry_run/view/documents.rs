@@ -143,12 +143,7 @@ impl TypeSchemaStore for AdmissionView {
             .await?
             .into_iter()
             .next()
-            .map(|doc| -> CarriedDocument {
-                (
-                    Arc::from(doc.raw_schema.as_str()),
-                    Arc::from(doc.content_hash.as_slice()),
-                )
-            });
+            .map(|doc| -> CarriedDocument { Arc::from(doc.raw_schema.as_str()) });
         // Not `is_ok()`: both compare-and-swap misses already returned above, so
         // failing here means the projection has a current row and the document
         // read found none behind it. That is an inconsistent overlay, not a lost

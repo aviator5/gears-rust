@@ -3209,7 +3209,7 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
                 .await
                 .unwrap_or_else(|e| panic!("seed {id}: {e}"))
                 .expect("a fresh identifier inserts");
-                // A discovery page reads `content_hash` off the current revision, so a
+                // A discovery page checks the current revision behind each row, so a
                 // seeded row needs the same current state admission would write.
                 let item = common::seed_operation_item(tx, id, 1, now).await;
                 let document = serde_json::to_string(&schema(id)).expect("schema json");
@@ -3219,7 +3219,6 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
                     NewRevision {
                         entity_id: row.id,
                         revision_no: 1,
-                        content_hash: types_registry::domain::artifacts::content_hash(&document),
                         raw_schema: document.clone(),
                         gts_spec_version: gts::GTS_SPECIFICATION_VERSION.to_owned(),
                         gts_impl_version: gts::GTS_IMPLEMENTATION_VERSION.to_owned(),
@@ -3243,14 +3242,7 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
 // `$select` on the exact read and `:batchGet` (T22b)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_FIELDS: [&str; 6] = [
-    "content_hash",
-    "gts_id",
-    "gts_uuid",
-    "kind",
-    "lifecycle_status",
-    "origin",
-];
+const DEFAULT_FIELDS: [&str; 5] = ["gts_id", "gts_uuid", "kind", "lifecycle_status", "origin"];
 
 fn exact(key: &str, query: &str) -> Request<Body> {
     get(&format!("{V2}/entities/{key}{query}"))
@@ -3276,7 +3268,7 @@ fn field_names(entity: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn an_absent_select_returns_the_document_free_default_on_both_routes() {
-    let (router, db) = router_and_db_with(false).await;
+    let (router, _db) = router_and_db_with(false).await;
     register_type_and_instance(&router).await;
 
     for key in [CF_TYPE, CF_INSTANCE] {
@@ -3292,10 +3284,7 @@ async fn an_absent_select_returns_the_document_free_default_on_both_routes() {
 
         let explicit = call(
             &router,
-            exact(
-                key,
-                "?$select=gts_id,gts_uuid,kind,origin,lifecycle_status,content_hash",
-            ),
+            exact(key, "?$select=gts_id,gts_uuid,kind,origin,lifecycle_status"),
         )
         .await;
         assert_eq!(explicit.body, single.body, "absent equals explicit default");
@@ -3314,36 +3303,6 @@ async fn an_absent_select_returns_the_document_free_default_on_both_routes() {
         field_names(origin),
         ["created_at", "resource_version", "type", "updated_at"],
     );
-
-    let hash = schema["content_hash"].as_str().expect("hex content_hash");
-    assert_eq!(hash.len(), 16, "{hash}");
-    assert!(
-        hash.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    );
-    assert_eq!(hash, stored_content_hash_hex(&db, CF_TYPE).await);
-}
-
-/// The stored eight bytes, hex-encoded independently of the read path.
-async fn stored_content_hash_hex(db: &Arc<DBProvider<DbError>>, gts_id: &str) -> String {
-    use types_registry::infra::storage::repo::{EntityRepo, TypeSchemaRepo};
-    let conn = db.conn().expect("conn");
-    let scope = common::allow_all();
-    let row = EntityRepo::find_by_gts_id(&conn, &scope, gts_id)
-        .await
-        .expect("read")
-        .expect("entity");
-    let docs = TypeSchemaRepo::current_documents(&conn, &scope, &[row.id])
-        .await
-        .expect("documents");
-    docs[0]
-        .content_hash
-        .iter()
-        .fold(String::new(), |mut hex, b| {
-            use std::fmt::Write as _;
-            write!(hex, "{b:02x}").expect("write to a String");
-            hex
-        })
 }
 
 #[tokio::test]
@@ -3502,7 +3461,7 @@ async fn exact_and_batch_reads_agree_for_every_selection() {
         "gts_id",
         "content,provenance",
         "RESOLVED_SCHEMA, effective_traits",
-        "content,content_hash,effective_traits,effective_traits_schema,gts_id,gts_uuid,kind,\
+        "content,effective_traits,effective_traits_schema,gts_id,gts_uuid,kind,\
          lifecycle_status,origin,provenance,resolved_schema",
     ] {
         for key in [CF_TYPE.to_owned(), CF_INSTANCE.to_owned(), uuid.to_string()] {
@@ -3773,10 +3732,10 @@ async fn equivalent_selections_resume_one_traversal() {
     for (issued, equivalent) in [
         (
             "?limit=1",
-            "?limit=1&$select=gts_id,gts_uuid,kind,origin,lifecycle_status,content_hash",
+            "?limit=1&$select=gts_id,gts_uuid,kind,origin,lifecycle_status",
         ),
         (
-            "?limit=1&$select=content_hash,origin,lifecycle_status,kind,gts_uuid,gts_id",
+            "?limit=1&$select=origin,lifecycle_status,kind,gts_uuid,gts_id",
             "?limit=1",
         ),
         (

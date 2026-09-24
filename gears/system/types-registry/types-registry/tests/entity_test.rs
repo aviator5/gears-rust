@@ -380,7 +380,6 @@ async fn instance_revision_cannot_reference_a_missing_schema_revision() {
         entity_id: Set(ent.id),
         revision_no: Set(1),
         canonical_value: Set(r#"{"name":"orphan"}"#.to_owned()),
-        content_hash: Set(vec![0x09]),
         type_schema_entity_id: Set(ent.id),
         type_schema_revision_no: Set(999),
         gts_spec_version: Set("0.13".to_owned()),
@@ -483,12 +482,10 @@ async fn type_schema_revision_and_current_pointer_round_trip() {
     .await
     .expect("insert entity");
 
-    let hash = vec![0xDE_u8, 0xAD, 0xBE, 0xEF];
     type_schema_revision::ActiveModel {
         entity_id: Set(ent.id),
         revision_no: Set(1),
         raw_schema: Set(r#"{"type":"object"}"#.to_owned()),
-        content_hash: Set(hash.clone()),
         gts_spec_version: Set("0.13".to_owned()),
         gts_impl_version: Set("0.12.0".to_owned()),
         compat_forced: Set(false),
@@ -521,7 +518,7 @@ async fn type_schema_revision_and_current_pointer_round_trip() {
         .await
         .expect("query revision")
         .expect("the row just inserted");
-    assert_eq!(revision.content_hash, hash);
+    assert_eq!(revision.raw_schema, r#"{"type":"object"}"#);
     assert_eq!(revision.gts_spec_version, "0.13");
     assert_eq!(revision.gts_impl_version, "0.12.0");
     assert!(!revision.compat_forced);

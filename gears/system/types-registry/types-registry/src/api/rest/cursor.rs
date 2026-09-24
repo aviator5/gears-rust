@@ -442,14 +442,7 @@ mod tests {
     /// The binding is the canonical set, never the spelling that produced it.
     #[test]
     fn absent_and_explicit_default_selections_are_interchangeable() -> Result<(), CanonicalError> {
-        let explicit = [
-            "origin",
-            "GTS_ID",
-            "content_hash",
-            "kind",
-            "gts_uuid",
-            "lifecycle_status",
-        ];
+        let explicit = ["origin", "GTS_ID", "kind", "gts_uuid", "lifecycle_status"];
         let token = encode(AFTER, &bound(Some(PATTERN), &[]))?;
         assert_eq!(decode(&token, &bound(Some(PATTERN), &explicit))?, AFTER);
         let token = encode(AFTER, &bound(Some(PATTERN), &explicit))?;

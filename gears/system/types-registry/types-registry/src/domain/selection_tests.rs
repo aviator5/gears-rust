@@ -6,19 +6,12 @@ fn parse(names: &[&str]) -> Result<FieldSelection, SelectionError> {
 
 #[test]
 fn absent_selection_equals_the_explicit_default_set() {
-    let explicit = parse(&[
-        "gts_id",
-        "gts_uuid",
-        "kind",
-        "origin",
-        "lifecycle_status",
-        "content_hash",
-    ])
-    .expect("the default spelled out is a valid selection");
+    let explicit = parse(&["gts_id", "gts_uuid", "kind", "origin", "lifecycle_status"])
+        .expect("the default spelled out is a valid selection");
     assert_eq!(explicit, FieldSelection::default());
     assert_eq!(
         FieldSelection::default().canonical(),
-        "content_hash,gts_id,gts_uuid,kind,lifecycle_status,origin"
+        "gts_id,gts_uuid,kind,lifecycle_status,origin"
     );
 }
 
@@ -146,7 +139,6 @@ fn every_field_is_listed_once_in_canonical_order() {
     // A new variant fails to compile here, pointing at `expected`.
     let exhaustive = |field: EntityField| match field {
         F::Content
-        | F::ContentHash
         | F::EffectiveTraits
         | F::EffectiveTraitsSchema
         | F::GtsId
@@ -159,7 +151,6 @@ fn every_field_is_listed_once_in_canonical_order() {
     };
     let expected = [
         F::Content,
-        F::ContentHash,
         F::EffectiveTraits,
         F::EffectiveTraitsSchema,
         F::GtsId,

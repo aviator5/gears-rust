@@ -41,7 +41,6 @@ struct AuthoredDocument {
     entity_id: i64,
     revision_no: i32,
     raw_schema: String,
-    content_hash: Vec<u8>,
 }
 
 /// `SeaORM` reads a column absent from the result set into `Option` as `None`; the
@@ -59,7 +58,6 @@ struct SchemaReadPointer {
 #[derive(FromQueryResult)]
 pub(super) struct RevisionReadColumns {
     pub(super) entity_id: i64,
-    pub(super) content_hash: Vec<u8>,
     pub(super) content: Option<String>,
     pub(super) gts_spec_version: Option<String>,
     pub(super) gts_impl_version: Option<String>,
@@ -150,7 +148,6 @@ impl TypeSchemaRepo {
                         .column(type_schema_revision::Column::EntityId)
                         .column(type_schema_revision::Column::RevisionNo)
                         .column(type_schema_revision::Column::RawSchema)
-                        .column(type_schema_revision::Column::ContentHash)
                         .into_model::<AuthoredDocument>()
                 })
                 .await?;
@@ -164,7 +161,6 @@ impl TypeSchemaRepo {
                     entity_id: r.entity_id,
                     revision_no: r.revision_no,
                     raw_schema: r.raw_schema,
-                    content_hash: r.content_hash,
                     projection: CurrentSchemaCas {
                         revision_no: r.revision_no,
                         resolution_fingerprint: fingerprint,
@@ -259,8 +255,7 @@ impl TypeSchemaRepo {
                 .project_all(runner, |query| {
                     let mut query = query
                         .select_only()
-                        .column(type_schema_revision::Column::EntityId)
-                        .column(type_schema_revision::Column::ContentHash);
+                        .column(type_schema_revision::Column::EntityId);
                     if selection.contains(EntityField::Content) {
                         query = query.column_as(type_schema_revision::Column::RawSchema, "content");
                     }
@@ -290,7 +285,6 @@ impl TypeSchemaRepo {
                 let provenance = revision.take_provenance();
                 Ok(CurrentReadRow {
                     entity_id: pointer.entity_id,
-                    content_hash: revision.content_hash,
                     content: revision.content,
                     resolved_schema: pointer.resolved_schema,
                     effective_traits: pointer.effective_traits,
@@ -351,7 +345,6 @@ impl TypeSchemaRepo {
             entity_id: Set(new.entity_id),
             revision_no: Set(new.revision_no),
             raw_schema: Set(new.raw_schema),
-            content_hash: Set(new.content_hash),
             gts_spec_version: Set(new.gts_spec_version),
             gts_impl_version: Set(new.gts_impl_version),
             compat_forced: Set(new.compat_forced),

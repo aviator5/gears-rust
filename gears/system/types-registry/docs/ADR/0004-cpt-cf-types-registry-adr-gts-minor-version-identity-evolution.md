@@ -286,8 +286,8 @@ The managed identity policy does not rewrite authoritative external identities, 
 * An External Registry Source may expose minor-versioned GTS IDs, major-only GTS IDs, or another source-owned revision convention.
 * Types Registry preserves and returns the exact external GTS ID without storing or normalizing it.
 * Types Registry does not synthesize a major-only GTS ID for `v1.0`, automatically advance references to `v1.1`, or claim that a source-owned immutable ID is mutable.
-* Every live plugin response must provide an opaque `external_revision` and canonical `content_hash`.
-* The same `external_revision` for one exact entity must always identify the same content and hash, and changed canonical content must produce a different revision.
+* Every live plugin response must provide an opaque `external_revision`.
+* The same `external_revision` for one exact entity must always identify the same source-owned response fields — canonical content, effective artifacts, source lifecycle, ownership scope, and source-owned tenant enablement — and a change to any of them must produce a different revision; platform-owned availability and visibility are not its concern (ADR-0002).
 * Types Registry does not require or persist an external versioning profile and does not interpret source revision ordering.
 * The External Registry Source remains responsible for its evolution and compatibility rules; Types Registry applies only the federation response checks defined by ADR-0002 and makes no compatibility claim about source-owned content.
 * The managed version-family definition is a property of Types Registry storage and is not imposed on an External Registry Source. How source lifecycle assertions map onto the platform model is decided by ADR-0008.
@@ -350,7 +350,7 @@ This decision is confirmed when:
 * reference validation accepts every visible and tenant-available non-deleted target, whatever its Lifecycle Status;
 * dependent schemas and references are revalidated without automatic ID or `$ref` rewriting;
 * external minor-versioned identities are resolved live without normalization or synthetic managed IDs;
-* plugin contract tests reject a source that returns different canonical content or content hashes for the same external revision, without requiring Types Registry to persist external revision history;
+* plugin contract tests reject a source that returns a different value of any source-owned response field for the same external revision, without requiring Types Registry to persist external revision history;
 * tests distinguish a valid sequential revision of one identity from a divergent definition that shares no admitted revision lineage with it.
 
 ## Pros and Cons of the Options

@@ -759,8 +759,8 @@ string — the current `InMemoryGtsRepository::list` iterates the store purely a
 container and filters with `GtsIdPattern`, never asking the store a semantic question. And
 by D3 the effective artifacts a reader wants (`resolved_schema`, `effective_traits`,
 `effective_traits_schema`) are already materialized on the current-state row. So a read is
-a selected-column lookup (with a kind-selected current-revision join for `content_hash`,
-`content` or `provenance` when needed) plus `GtsId::matches_pattern` and, for T22c's
+a selected-column lookup (with a kind-selected current-revision join that checks the
+pointer and reads `content` or `provenance` when selected) plus `GtsId::matches_pattern` and, for T22c's
 `depth`, `GtsId::segments().len()` over candidate rows in Rust. The `kind` filter is
 an SQL predicate on the stored kind; the safe pattern prefix is still only a prefilter.
 T22b keeps document columns out of metadata-only reads. No GTS semantics are reimplemented, so
@@ -990,7 +990,7 @@ need the inputs tenancy supplies; DESIGN §3.3's own input table
 | subject visibility-chain version | ✓ **tenant plane only** | **no** — DESIGN: *"a platform read has no subject visibility chain"*, and §8.4 establishes every P0 read is platform-plane |
 | Context Tenant availability-chain version | ✓, only when availability is selected | **no** — availability is out of scope, and the input is conditional even in P1 |
 | routing generation | — external only | **no** — federation is out of scope |
-| `external_revision`, external `content_hash` | — external only | **no** — Externally Managed Entities are out of scope. P0's managed `content_hash` is a selectable field, not a validator input; managed revisions already move `resource_version` |
+| `external_revision` | — external only | **no** — Externally Managed Entities are out of scope; managed revisions already move `resource_version` |
 | normalized projection | ✓ | **yes** — T22b normalizes the actual selected-field set for exact read and `batchGet`. Absent `$select` equals an explicit default set; order and case do not alter the digest. Discovery pages carry no validator |
 
 The tenant inputs are not missing from P0. They **do not participate** in a platform-plane
@@ -1226,8 +1226,8 @@ which defaults to `Active`; the server
 applies the same filter before either projected items or cursors are produced (§10.2).
 
 **Reconciliation takes explicitly supplied desired documents in P0 (T23).** It batch-reads
-their identifiers with `content` selected, compares authored canonical bytes (a matching
-`content_hash` alone is not proof of equality), supplies the read `resource_version` for
+their identifiers with `content` selected, compares authored canonical bytes exactly (there is no
+content digest to shortcut it), supplies the read `resource_version` for
 updates, and returns `UpToDate` without submitting if nothing differs. Otherwise it submits
 bounded batches and polls to terminal outcomes, with bounded retries for missing dependencies
 and a deadline. It never discovers inventory or deletes records absent from the supplied set.
@@ -1247,7 +1247,7 @@ No accessor is needed to reach inside a group, because outside `provenance` ther
 group to reach inside of. Snapshot fields are optional because selection may omit them;
 `Some` containing JSON `null` still represents a selected document, while `None` means
 unselected or inapplicable. `origin` has only the managed variant in P0 and carries
-`resource_version` and timestamps; `content_hash` and `provenance` follow §10.2. List
+`resource_version` and timestamps; `provenance` follows §10.2. List
 helpers explicitly select the documents they read, on the page or through `batchGet`.
 
 **The old models' client-side `effective_*` methods are deleted, and duplication is the
@@ -1286,7 +1286,7 @@ than faked now.
 
 Models: `EntityKey`, `EntityLookup` (`Found` / `Unchanged` / `NotFound`; no `Failed`
 without federation), `EntitySnapshot`, `EntityKind`, `LifecycleStatus`,
-`Origin::Managed`, `ContentHash`, `Provenance`, `Projection`, `FieldSelection`,
+`Origin::Managed`, `Provenance`, `Projection`, `FieldSelection`,
 `EntityQuery`, `EntityPage`, `BatchGet`, `BatchGetItem`,
 `RegisterEntities`, `RegisterItem`, `DeleteEntities`, `DeleteItem`,
 `RegistrationOperation`, `RegistrationItemResult`,
@@ -1388,7 +1388,7 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   **before** the page limit and projection. `limit` and `cursor` control
   traversal, while `$select` controls returned fields; none changes the match predicate.
 - **One document-free default on all three reads.** Absent `$select` is identical to an
-  explicit selection of `gts_id,gts_uuid,kind,origin,lifecycle_status,content_hash`.
+  explicit selection of `gts_id,gts_uuid,kind,origin,lifecycle_status`.
   `origin` has only the `managed` variant in P0 and carries `resource_version`, `created_at`
   and `updated_at`; its `external` variant waits for federation. The P0 default omits
   DESIGN's availability/reason and Context Tenant ownership view, which cannot be answered
@@ -1397,7 +1397,7 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   an internally tagged object: `{"type":"managed","resource_version":1,
   "created_at":"...","updated_at":"..."}`; timestamps use RFC 3339. Federation's external
   variant adds `{"type":"external","source":"..."}` without changing the managed shape.
-- **P0 selectable fields.** The complete allowlist is the six default fields plus
+- **P0 selectable fields.** The complete allowlist is the five default fields plus
   `content`, `resolved_schema`, `effective_traits`, `effective_traits_schema` and
   `provenance`. `content` is the whole authored JSON document for either kind. The three
   effective documents apply only to Type Schemas and are absent on Instances. Each document
@@ -1405,11 +1405,10 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   `authored` wrapper. `provenance` is the one group and contains `gts_spec_version`,
   `gts_impl_version`, `owning_gear` and `compat_forced` (`null` for Instances). Selecting
   a group returns it whole; selecting a document never projects paths inside its JSON.
-- **Hash representation.** `content_hash` is 16 lowercase hexadecimal digits encoding
-  the eight stored big-endian FNV-1a bytes of the canonical authored content. It is a
-  non-cryptographic prefilter, not a proof of content equality; reconciliation compares
-  canonical authored bytes before deciding `UpToDate` or `unchanged`. A dependency refresh
-  changes effective artifacts without changing this hash.
+- **No content digest.** Authored content has no stored or selectable digest, so no
+  digest name is in the allowlist. Reconciliation selects `content` and
+  compares canonical authored bytes before deciding `UpToDate`, and admission compares
+  them before deciding `unchanged`. The `ETag` inputs above are unaffected.
 - **Selection rules.** Field names are case-insensitive with surrounding whitespace
   trimmed, matching ToolKit OData parsing. Normalize them to a sorted, unique canonical
   set; order does not affect identity, while duplicates are rejected by the parser.
@@ -1869,7 +1868,7 @@ identifier profile refusals, topological order, baseline selection.
 | Invalid `$select` | empty, empty comma segment, duplicate, unknown, unavailable, nested and over-limit fields return RFC-9457 `400` naming `$select`; unsupported OData options and unknown unprefixed query keys are refused |
 | Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; `$select=resolved_schema` on an Instance still returns `gts_id`, `gts_uuid`, `lifecycle_status`; a deleted exact read with `$select=content` still includes `lifecycle_status: deleted` |
 | Metadata-only exact/batch/discovery reads | instrumented storage proves no authored/effective JSON column is fetched or parsed; selected documents are fetched in bounded, snapshot-consistent batches on SQLite, PostgreSQL and MySQL |
-| Content hash and reconciliation | wire hash is 16 lowercase hex digits of the stored FNV-1a bytes; a matching hash alone never suppresses an authored-byte difference |
+| Content equality and reconciliation | no digest field is selectable; `unchanged` and `UpToDate` follow exact canonical authored-byte equality |
 | Registration policy, four DESIGN §3.2 entries | each admits and refuses exactly what §10.3's table says, including the exact-key-versus-`~*` split |
 | Per-parameter resolution | longest literal prefix wins; an exact key beats any pattern; an entry omitting `allowed_vendors` is skipped so a less-specific entry supplies it; no entry means closed |
 | `allowed_vendors` of a more specific entry | replaces, never extends, a less-specific set |

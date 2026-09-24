@@ -295,7 +295,7 @@ A managed GTS Identifier names a logical entity that is mutable when major-only 
 | Entity | Description | Schema |
 |---|---|---|
 | Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, the owning gear, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
-| Revision | One immutable admitted definition or value, with the content hash and the specification and implementation versions in force at its admission | `type_schema_revision`, `instance_revision` |
+| Revision | One immutable admitted definition or value, with the specification and implementation versions in force at its admission | `type_schema_revision`, `instance_revision` |
 | Version Family | The set of Version Successors of one another, named by the family key of ADR-0004. Holds an ownership scope and nothing else | `version_family` |
 | Dependency | A direct edge between two Registry Entities: `$ref`, immediate derivation base, or Instance conformance. An `x-gts-ref` target is not one. Nothing transitive is stored | `dependency` |
 | Operation | One accepted mutation: its scoped request identity, its client-visible progress, and one durable outcome per candidate identifier | `operation`, `operation_item` |
@@ -448,7 +448,7 @@ A dry run applies the same checks to the whole batch over one read snapshot and 
 
 The acceptance transaction inserts the operation and candidates and enqueues an outbox message containing only the operation UUID. Candidate content never enters outbox or dead-letter payloads. Atomic enqueue prevents an undispatchable operation or an orphan message; uniqueness on `(idempotency_scope_hash, idempotency_key)` resolves concurrent acceptance, with the loser returning the winner after fingerprint verification.
 
-Authored-content equality is established once by the worker per candidate. The hash is only a prefilter; effective artifacts are excluded because they are projections over current dependencies.
+Authored-content equality is established once by the worker per candidate, by exact comparison of canonical bytes; no content digest is stored. Effective artifacts are excluded because they are projections over current dependencies.
 
 ##### Dispatch and the outbox
 
@@ -832,11 +832,11 @@ No transitive relation is materialized. Derivation and conformance are stored as
 
 ##### Responsibility scope
 
-Matches a canonical identifier against active Source Claims by its first **GTS chain segment** — the whole substring before the first `~`, not one dot-delimited field; for `A~B~`, routing is decided from `A` — orders plugins deterministically, selects at most one source for an exact identifier and every intersecting source for a pattern, fans out batch resolution so each plugin is called at most once, validates every response against the platform boundary — identifier integrity, derived reference equality, claim conformance, agreement between the reported kind and the trailing `~` of the returned identifier, revision and hash consistency — mints and validates federation cursors bound to the plugin configuration revision, and maps source outcomes onto the platform failure vocabulary without ever converting unavailability into absence.
+Matches a canonical identifier against active Source Claims by its first **GTS chain segment** — the whole substring before the first `~`, not one dot-delimited field; for `A~B~`, routing is decided from `A` — orders plugins deterministically, selects at most one source for an exact identifier and every intersecting source for a pattern, fans out batch resolution so each plugin is called at most once, validates every response against the platform boundary — identifier integrity, derived reference equality, claim conformance, agreement between the reported kind and the trailing `~` of the returned identifier, presence and length bound of the opaque `external_revision` — mints and validates federation cursors bound to the plugin configuration revision, and maps source outcomes onto the platform failure vocabulary without ever converting unavailability into absence.
 
 ##### Responsibility boundaries
 
-It persists no external definitions, revisions, hashes, mappings, tombstones, or tenant state, and source-owned validation stays with the source. It never parses returned content, including to detect references across the managed–external boundary. ADR-0011 rejects that live-read-path check; the external half of the rule remains declared but unenforced, with withheld guarantees listed in `cpt-cf-types-registry-fr-externally-managed-entities`. Claim activation belongs to the control-plane validator, and managed resolution never reaches this router.
+It persists no external definitions, revisions, mappings, tombstones, or tenant state, and source-owned validation stays with the source. It never parses returned content, including to detect references across the managed–external boundary. ADR-0011 rejects that live-read-path check; the external half of the rule remains declared but unenforced, with withheld guarantees listed in `cpt-cf-types-registry-fr-externally-managed-entities`. Claim activation belongs to the control-plane validator, and managed resolution never reaches this router.
 
 ##### Related components (by ID)
 
@@ -898,7 +898,7 @@ The commit transaction atomically:
 
 `entity_write_order` serializes overlap validation because string uniqueness cannot constrain intersecting patterns such as `gts.acme.*` and `gts.acme.foo.*`. The final `routing` advance reloads claims and invalidates federated cursors; it is not a second lock. P1 compilation into the same binary changes neither this contract nor ADR-0011's boundary.
 
-Retirement is explicit governance, never a liveness reaction: an unreachable plugin retains its claims and dependent requests fail closed. A retired reservation cannot transfer at runtime. The registry stores none of the predecessor's external identifiers, revisions, or hashes with which to verify a successor's continuity claim, so ADR-0011 defines no takeover operation.
+Retirement is explicit governance, never a liveness reaction: an unreachable plugin retains its claims and dependent requests fail closed. A retired reservation cannot transfer at runtime. The registry stores none of the predecessor's external identifiers or revisions with which to verify a successor's continuity claim, so ADR-0011 defines no takeover operation.
 
 Replacing code behind the same plugin GTS Identity is an ordinary Instance revision: projection and generation change, with no reservation. Changing the plugin identity instead requires either ADR-0013 purge, which releases the namespace, or preferably a shipped migration that retargets it while continuously reserved. Such a migration must:
 
@@ -980,12 +980,12 @@ Per `cpt-cf-types-registry-principle-derive-not-store`, validators are computed 
 | subject visibility-chain version | ✓, tenant plane only | ✓, tenant plane only |
 | Context Tenant availability-chain version | ✓, when availability is selected | ✓, when availability is selected |
 | routing generation | — | ✓ |
-| `external_revision`, `content_hash` | — | ✓, verbatim |
+| `external_revision` | — | ✓, verbatim |
 | normalized projection | ✓ | ✓ |
 
 Routing generation appears only externally: claim changes cannot affect managed results under ADR-0011, but must invalidate tokens tied to an old source. `resolution_fingerprint` appears only for Type Schemas, because Instances have no derived form. When subject and Context Tenant are the same, one chain version fills both roles; a platform read has no subject visibility chain and includes a Context Tenant chain only when it requests availability.
 
-The plugin token must be scoped to `(entity, tenant)` and change whenever exposed content or availability—including tenant enablement—changes. A plugin unable to guarantee this must always answer conditional reads as changed. The registry cannot verify that source-owned state, so it delegates the comparison.
+The plugin token must be scoped to `(entity, tenant)` and change whenever any source-owned response field that affects the platform-visible result changes: canonical content, the effective artifacts of a Type Schema, source lifecycle, ownership scope, or source-owned tenant enablement. It need not change for platform-owned availability or visibility, which the chain-version inputs above cover; equal tokens under equal platform inputs therefore identify an equal platform-visible result. A plugin unable to guarantee this must always answer conditional reads as changed. The registry cannot verify that source-owned state, so it delegates the comparison.
 
 ##### Projection as a validator input
 
@@ -1394,7 +1394,6 @@ pub struct EntitySnapshot {
     pub availability: Option<Availability>,
     /// Whether the Context Tenant owns it; absent without a Context Tenant.
     pub owned_by_context_tenant: Option<bool>,
-    pub content_hash: Option<ContentHash>,
 
     // Explicitly selected; absent when not selected or inapplicable.
     /// The authored document, whichever kind it is. `content` and not
@@ -1575,7 +1574,7 @@ Authorization runs first, then visibility, so a denial is uniform and out-of-sco
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-field-projection`
 
-`$select` returns the named fields plus the mandatory `gts_id`, `gts_uuid` and `lifecycle_status`. Its document-free default is `gts_id`, `gts_uuid`, `kind`, `origin`, `lifecycle_status`, `availability` and reason, ownership view, `content_hash`, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` plus the mandatory fields.
+`$select` returns the named fields plus the mandatory `gts_id`, `gts_uuid` and `lifecycle_status`. Its document-free default is `gts_id`, `gts_uuid`, `kind`, `origin`, `lifecycle_status`, `availability` and reason, ownership view, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` plus the mandatory fields.
 
 **Selectable documents are flat, with one group left**, cut by transfer cost rather than by consumer:
 
@@ -1597,7 +1596,7 @@ The freshness validator is mandatory read metadata, outside `$select`: single-re
 
 Callers needing platform guarantees should select `origin` with `effective`; unlike `kind`, origin is not derivable. The server does not enforce the pairing.
 
-`content_hash` requires one kind-selected revision join on primary key `(entity_id, revision_no)`, but enables reconciliation without documents. Caller/registry `gts-rust` skew may cause a benign false mismatch; submission then terminates `unchanged`.
+No authored-content digest is selectable: reconciliation selects `content` and compares canonical bytes. Caller/registry `gts-rust` skew may cause a benign false mismatch; submission then terminates `unchanged`.
 
 SDK selection uses field constants and a value projection with `light()`, `with(&[…])`, and `full()`. A type parameter would break object-safe `hub.get::<dyn TypesRegistryClient>()`.
 
@@ -1665,7 +1664,7 @@ When registration or deletion terminates successfully, each returned identifier/
 
 ##### Known ceiling
 
-Content duplicates across Context Tenants even when only availability and ownership differ. The store bound turns this into a hit-rate ceiling, not exhaustion. If needed, add projection-specific windows or content-addressed sharing by `content_hash`; neither is justified without measured tenant fan-out.
+Content duplicates across Context Tenants even when only availability and ownership differ. The store bound turns this into a hit-rate ceiling, not exhaustion. If needed, add projection-specific windows or content-addressed sharing; neither is justified without measured tenant fan-out.
 
 ##### Verification
 
@@ -1729,7 +1728,7 @@ The contract is total: both operations are mandatory across the whole claimed id
 
 Plugin conformance tests verify effective artifacts semantically, not only their presence and stability: `$ref` inlining, `allOf` composition along the `$id` chain, RFC 7396 JSON Merge Patch for trait values, and declared-default materialization before completeness checking must match GTS. Types Registry still treats returned external content as source authority and does not recompute these artifacts on the live read path.
 
-The object-safe scoped-ClientHub trait reuses consumer SDK models where semantics match. The Federation Router validates identifier integrity, derived reference equality, claim conformance, kind, revision, and hash before exposure. Shared operation names remain `batch_get_entities` and `list_entities`; source-specific shapes use `SourceLookup`, `SourceQuery`, and `SourcePage`.
+The object-safe scoped-ClientHub trait reuses consumer SDK models where semantics match. The Federation Router validates identifier integrity, derived reference equality, claim conformance, kind, and the presence of `external_revision` before exposure. Shared operation names remain `batch_get_entities` and `list_entities`; source-specific shapes use `SourceLookup`, `SourceQuery`, and `SourcePage`.
 
 Federation is available on both planes, so invocation carries a plane-neutral wrapper over the already-authenticated caller context. It does not convert a platform workload into a tenant subject; `SourceCall.tenant_id` independently names the optional Context Tenant for availability.
 
@@ -1790,13 +1789,14 @@ pub struct SourceProjection {
 
 pub enum SourceLookup {
     Found(Box<SourceEntity>),
-    /// Token still covers content and enablement for this (entity, tenant).
+    /// Token still covers every source-owned field for this (entity, tenant):
+    /// content, effective artifacts, lifecycle, ownership and enablement.
     Unchanged,
     /// Definitively absent in this source; inability to answer is SourceError.
     NotFound,
 }
 
-/// Metadata through content_hash is mandatory for filtering and validation.
+/// Metadata through `revision` is mandatory for filtering and validation.
 pub struct SourceEntity {
     pub gts_id: GtsId,
     /// Must agree with the trailing `~` of `gts_id`; disagreement is
@@ -1810,9 +1810,11 @@ pub struct SourceEntity {
     pub lifecycle: LifecycleStatus,
     /// Present exactly when `SourceCall::tenant_id` was.
     pub tenant_enablement: Option<TenantEnablement>,
-    /// Equal revisions identify equal content; both fields feed the validator.
+    /// Changes whenever a source-owned field above or below changes: canonical
+    /// content, effective artifacts, lifecycle, ownership or tenant enablement.
+    /// Platform-owned availability and visibility are separate validator
+    /// inputs. Conditional reads compare it in the plugin, not here.
     pub revision: SourceRevision,
-    pub content_hash: ContentHash,
 
     // Selected by SourceProjection.
     pub content: Option<JsonDocument>,
@@ -2029,9 +2031,9 @@ sequenceDiagram
             Note over R: A reference encodes no source, so the chain is walked<br/>until one answers or all answer NOT_FOUND
         end
         R->>P: One batch call per plugin, never one per key
-        P-->>R: Authored + effective content, ownership scope,<br/>lifecycle, tenant enablement, external_revision, content hash
+        P-->>R: Authored + effective content, ownership scope,<br/>lifecycle, tenant enablement, external_revision
         R->>G: Derive gts_uuid from the returned identifier
-        R->>R: Validate reference equality, claim conformance, kind against<br/>trailing `~`, ownership scope, revision/hash consistency
+        R->>R: Validate reference equality, claim conformance, kind against<br/>trailing `~`, ownership scope, external_revision present
         alt SOURCE_UNAVAILABLE or INVALID_SOURCE_RESPONSE
             R-->>A: Failure bound to that key alone
             Note over R,A: Never converted into not_found
@@ -2129,8 +2131,8 @@ The reference schema supports the write protocol without reading revision histor
 | Immutable scoped request key and fingerprint, plus asynchronous progress | `operation`, with `UNIQUE (idempotency_scope_hash, idempotency_key)`; per-candidate results live only in `operation_item` |
 | Per-GTS-ID authored candidate, optimistic precondition, result, and diagnostics | `operation_item`, whose `kind` and `dry_run` copies constrain nullable result fields for registration, deletion, and Dry Run |
 | Logical-entity compare-and-swap token | `entity.resource_version` |
-| Exact current Type Schema read, including the authored document and the resolved/effective artifacts | `entity` joined to `type_schema`, and through it to `type_schema_revision` on `(entity_id, revision_no)` for the authored document and its hash |
-| Exact current Instance read | `entity` joined to `instance`, and through it to `instance_revision` on `(entity_id, revision_no)` for the canonical value and its hash |
+| Exact current Type Schema read, including the authored document and the resolved/effective artifacts | `entity` joined to `type_schema`, and through it to `type_schema_revision` on `(entity_id, revision_no)` for the authored document |
+| Exact current Instance read | `entity` joined to `instance`, and through it to `instance_revision` on `(entity_id, revision_no)` for the canonical value |
 | Immutable audit and compatibility baseline | `type_schema_revision`, `instance_revision` |
 | Reverse impact set for target-schema update checks | recursive CTE over `dependency`, reverse index `(to_entity_id, from_entity_id)` |
 | Single owner for every version family under concurrent first admission | unique `version_family.family_key` plus locked ownership check |

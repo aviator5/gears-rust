@@ -282,8 +282,8 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .description(
             "Return one entity, projected by `$select`. The key is either a canonical GTS \
              identifier or the Registry Reference UUID derived from it. Absent `$select` is \
-             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status,\
-             content_hash`; documents are selected individually from `content`, \
+             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; \
+             documents are selected individually from `content`, \
              `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last \
              three Type Schemas only), plus the `provenance` group. Names are \
              case-insensitive; an empty, duplicate, unknown or nested name is a 400. \

@@ -348,7 +348,7 @@ does not survive DESIGN §3.3's own input table
 | subject visibility-chain version | ✓ **tenant plane only** | **not applicable** — DESIGN: *"a platform read has no subject visibility chain"*, and every P0 read is platform-plane (P8) |
 | Context Tenant availability-chain version | ✓, only when availability is selected | not applicable — availability is out of P0 |
 | routing generation | — external only | not applicable — federation is out of P0 |
-| `external_revision`, `content_hash` | — external only | not applicable — Externally Managed Entities are out of P0 |
+| `external_revision` | — external only | not applicable — Externally Managed Entities are out of P0 |
 | normalized projection | ✓ | yes — no `$select` in P0, and DESIGN says absent `$select` *equals an explicit default set*, so it is a constant marker |
 
 The tenant inputs are not missing in P0; they **do not participate** in a platform-plane read.

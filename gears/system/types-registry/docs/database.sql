@@ -276,15 +276,14 @@ CREATE INDEX idx_tr_entity_visibility
     );
 
 
--- Type Schema admission snapshot: authored document, content hash, and
--- validation-engine provenance. The write path treats snapshot fields as immutable;
+-- Type Schema admission snapshot: authored document and validation-engine
+-- provenance. The write path treats snapshot fields as immutable;
 -- the DDL does not enforce immutability. Resolved artifacts belong to current state.
 -- operation_item_id retains the admitting operation provenance until purge.
 CREATE TABLE types_registry__type_schema_revision (
     entity_id                  bigint       NOT NULL,
     revision_no                integer      NOT NULL,
     raw_schema                 text         NOT NULL,
-    content_hash               bytea        NOT NULL,
     gts_spec_version           varchar(32)  NOT NULL,
     gts_impl_version           varchar(32)  NOT NULL,
     -- True when admission explicitly waived cross-minor compatibility.
@@ -306,7 +305,8 @@ CREATE TABLE types_registry__type_schema_revision (
     CONSTRAINT ck_tr_type_schema_revision_no CHECK (revision_no >= 1)
 );
 
--- No content-hash index: equality checks compare only with the current revision.
+-- No content digest or index: `unchanged` compares canonical bytes with the
+-- current revision only.
 
 
 -- Instance admission snapshot, including the exact Type Schema revision that
@@ -317,7 +317,6 @@ CREATE TABLE types_registry__instance_revision (
     entity_id                     bigint       NOT NULL,
     revision_no                   integer      NOT NULL,
     canonical_value               text         NOT NULL,
-    content_hash                  bytea        NOT NULL,
     type_schema_entity_id         bigint       NOT NULL,
     type_schema_revision_no       integer      NOT NULL,
     gts_spec_version              varchar(32)  NOT NULL,
@@ -348,7 +347,7 @@ CREATE TABLE types_registry__instance_revision (
     CONSTRAINT ck_tr_instance_revision_no CHECK (revision_no >= 1)
 );
 
--- No content-hash index; reverse dependency traversal drives schema revalidation.
+-- No content digest or index; reverse dependency traversal drives schema revalidation.
 
 
 -- Current Type Schema revision and its dependency-resolved artifacts. Authored
