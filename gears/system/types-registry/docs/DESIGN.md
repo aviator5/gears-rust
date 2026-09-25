@@ -1143,7 +1143,7 @@ The `If-None-Match` **header** is unavailable here, and refused rather than igno
 | `$select` | query | As above, applied to every item on the page |
 | `limit`, `cursor` | query | Page size and position. `limit` defaults to 50 and may not exceed 100. The bound is on items, not on bytes: a caller selecting documents should page smaller |
 
-The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Results are active-only unless `lifecycle_status` says otherwise, and sort by canonical identifier. Every filter applies before the page limit, so only the last page is short and a page with a cursor is full. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
+The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Before Context Tenant or authorization scope enters the binding, the token needs a server-keyed integrity check (HMAC); an unkeyed binding hash does not protect the token from forgery. Results are active-only unless `lifecycle_status` says otherwise, and sort by canonical identifier. Every filter applies before the page limit, so only the last page is short and a page with a cursor is full. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
 
 The `fr-type-query-assistance` filter forms map as follows:
 
@@ -2234,7 +2234,7 @@ Only P2 construction questions belong here. Known P1 blockers are stated separat
 
 `limits.activation_write_set` (§3.2, default **512**) bounds one atomic refresh; larger candidates are refused rather than partially committed. If an installation legitimately reaches the limit, benchmark the reverse-impact CTE on its graph and consider a generation/staging protocol that raises the limit without exposing mixed state. The largest reverse-impact set measured today is 27.
 
-A discovery page is one statement with no scan budget. Indexes serve a selective segment, `depth=1`, `kind`, and one `lifecycle_status`, tombstone-only listings included. A page still reads `gts_id` order until it fills for `depth` above 1; its cost is the page size divided by the match density. On 18k rows `EXPLAIN` shows these plans on all three backends with every page under 2.2 ms; the slowest is MySQL reading ~3k identifiers for `depth=1` under a broad pattern, where it prefers the pattern's `gts_id` range to `idx_tr_entity_depth`. The benchmark profile should measure these shapes at production scale.
+A discovery page is one statement with no scan budget. Indexes serve a selective segment, `depth=1`, and one `lifecycle_status` with or without `kind`, tombstone-only listings included. A page still reads `gts_id` order until it fills for `depth` above 1; its cost is the page size divided by the match density. `kind` with `lifecycle_status=all` has no `gts_id`-ordered index either. On 18k rows `EXPLAIN` shows these plans on all three backends with every page under 2.2 ms; the slowest is MySQL reading ~3k identifiers for `depth=1` under a broad pattern, where it prefers the pattern's `gts_id` range to `idx_tr_entity_depth`. The benchmark profile should measure these shapes at production scale.
 
 ### Implementation prerequisites
 

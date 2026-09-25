@@ -1,6 +1,6 @@
 //! Projected reads (T22b) against every backend, with the SQL recorded.
 //!
-//! Two properties only a real database shows:
+//! Properties only a real database shows:
 //!
 //! * **An unselected column is not in the `SELECT`.** Metadata-only reads never
 //!   name `raw_schema`, `canonical_value` or an artifact column, so documents are
@@ -9,6 +9,7 @@
 //! * **`SeaORM` reads an absent column into `Option` as `None`** on each driver,
 //!   while a selected column round-trips as `Some`. The domain turns a *selected*
 //!   `None` into corruption, so the two cases cannot be confused.
+//! * **A non-canonical key is absent without a lookup**, on every driver.
 //!
 //! `SQLite` runs unconditionally; `PostgreSQL` and `MySQL` need Docker:
 //!
@@ -36,7 +37,7 @@ use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequ
 use types_registry::domain::enums::OperationKind;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::registry_service::{
-    DiscoveryQuery, EntityKey, EntityLookup, RegistryService,
+    DiscoveryQuery, EntityKey, EntityLookup, MAX_KEY_LEN, RegistryService, ServiceError,
 };
 use types_registry::domain::selection::FieldSelection;
 use types_registry::infra::storage::repo::{EntityRepo, InstanceRepo, TypeSchemaRepo};
@@ -160,8 +161,12 @@ fn assert_read_shape(recorder: &QueryRecorder, backend: &str, what: &str) -> Vec
     events.into_iter().map(|e| e.sql).collect()
 }
 
+/// A whole quoted identifier, so `effective_traits` does not match `effective_traits_schema`.
 fn named(statements: &[String], column: &str) -> bool {
-    statements.iter().any(|sql| sql.contains(column))
+    let quoted = [format!("\"{column}\""), format!("`{column}`")];
+    statements
+        .iter()
+        .any(|sql| quoted.iter().any(|q| sql.contains(q.as_str())))
 }
 
 async fn metadata_only_reads_fetch_no_document(h: &Harness, backend: &str) {
@@ -240,7 +245,12 @@ async fn selected_documents_are_fetched_and_only_they(h: &Harness, backend: &str
         .expect("batch read");
     let statements = assert_read_shape(&h.recorder, backend, "traits batch");
     assert!(named(&statements, "effective_traits"), "{backend}");
-    for column in ["raw_schema", "canonical_value", "resolved_schema"] {
+    for column in [
+        "raw_schema",
+        "canonical_value",
+        "resolved_schema",
+        "effective_traits_schema",
+    ] {
         assert!(!named(&statements, column), "{backend}: {statements:#?}");
     }
     let EntityLookup::Found(schema_record) = &results[0].1 else {
@@ -352,7 +362,67 @@ async fn discovery_fetches_only_selected_documents(h: &Harness, backend: &str) {
     }
 }
 
+/// Non-canonical spellings of a stored identifier, and keys that are no identifier.
+fn non_canonical_keys() -> [String; 4] {
+    [
+        format!("{TYPE} "),
+        TYPE.replace("projread", "projr\u{e9}ad"),
+        "gts.cf.core.projread".to_owned(),
+        "a".repeat(MAX_KEY_LEN),
+    ]
+}
+
+async fn non_canonical_keys_are_absent_without_sql(h: &Harness, backend: &str) {
+    for key in non_canonical_keys() {
+        let key = EntityKey::GtsId(key);
+        let batch = h
+            .service
+            .batch_get(
+                &[EntityKey::GtsId(TYPE.to_owned()), key.clone()],
+                FieldSelection::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("batch read of {key:?} on {backend}: {e}"));
+        assert!(
+            matches!(
+                batch[..],
+                [(_, EntityLookup::Found(_)), (_, EntityLookup::NotFound)]
+            ),
+            "{key:?} on {backend}: {batch:?}",
+        );
+        h.recorder.clear();
+        let exact = h
+            .service
+            .entity(&key, FieldSelection::default())
+            .await
+            .unwrap_or_else(|e| panic!("exact read of {key:?} on {backend}: {e}"));
+        assert!(exact.is_none(), "{key:?} on {backend}: {exact:?}");
+        let events = h.recorder.events();
+        assert!(events.is_empty(), "{key:?} on {backend}: {events:#?}");
+    }
+}
+
+/// The domain refuses what the REST handler refuses early, for any adapter.
+async fn an_over_long_key_is_refused_by_the_service(h: &Harness, backend: &str) {
+    let over = EntityKey::GtsId("a".repeat(MAX_KEY_LEN + 1));
+    let selection = FieldSelection::default();
+    for result in [
+        h.service
+            .batch_get(std::slice::from_ref(&over), selection)
+            .await
+            .map(drop),
+        h.service.entity(&over, selection).await.map(drop),
+    ] {
+        assert!(
+            matches!(result, Err(ServiceError::KeyTooLong { len }) if len == MAX_KEY_LEN + 1),
+            "{backend}: {result:?}",
+        );
+    }
+}
+
 async fn assert_projected_reads(h: &Harness, backend: &str) {
+    non_canonical_keys_are_absent_without_sql(h, backend).await;
+    an_over_long_key_is_refused_by_the_service(h, backend).await;
     metadata_only_reads_fetch_no_document(h, backend).await;
     discovery_fetches_only_selected_documents(h, backend).await;
     selected_documents_are_fetched_and_only_they(h, backend).await;

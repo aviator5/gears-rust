@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
-use gts::GtsIdPattern;
+use gts::{GtsId, GtsIdPattern};
 use serde_json::value::RawValue;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
@@ -18,8 +18,7 @@ use crate::config::TypesRegistryConfig;
 use crate::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
 use crate::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use crate::domain::admission::{
-    Accepted, AdmissionFailureReason, Candidate, OperationDispatch, StoredFailure, SubmitRequest,
-    UnreadableFailure,
+    Accepted, Candidate, OperationDispatch, StoredFailure, SubmitRequest, UnreadableFailure,
 };
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
@@ -205,6 +204,9 @@ pub struct DiscoveryPage {
 /// fan-out with it.
 pub const MAX_BATCH_GET_KEYS: usize = 100;
 
+/// A read key's ceiling in bytes: a GTS identifier runs to 1024.
+pub const MAX_KEY_LEN: usize = 1024;
+
 /// What the service can fail with. One layer above the two admission halves, so a
 /// transport adapter maps one type.
 #[domain_model]
@@ -220,9 +222,9 @@ pub enum ServiceError {
     Db(#[from] DbError),
     #[error("a stored document could not be read as JSON: {0}")]
     CorruptDocument(String),
-    /// A blocking task panicked or was cancelled.
+    /// A blocking task panicked or was cancelled; the source says which.
     #[error("a blocking task did not complete: {0}")]
-    Blocking(String),
+    Blocking(#[source] tokio::task::JoinError),
     /// Registry Reference with no identifier for an asynchronous item outcome.
     #[error("no entity has Registry Reference {gts_uuid}")]
     UnresolvedReference { gts_uuid: Uuid },
@@ -231,6 +233,8 @@ pub enum ServiceError {
         "a batch read must name between 1 and {MAX_BATCH_GET_KEYS} keys; this one named {count}"
     )]
     BatchReadOutOfRange { count: usize },
+    #[error("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}")]
+    KeyTooLong { len: usize },
     /// `limit` outside `1..=limits.page_size_max` (D12).
     #[error("a page size must be between 1 and {max}; this request asked for {limit}")]
     PageSizeOutOfRange { limit: u64, max: u32 },
@@ -252,6 +256,7 @@ impl ServiceError {
             Self::Blocking(_) => "blocking_task",
             Self::UnresolvedReference { .. } => "unresolved_reference",
             Self::BatchReadOutOfRange { .. } => "batch_read_out_of_range",
+            Self::KeyTooLong { .. } => "key_too_long",
             Self::PageSizeOutOfRange { .. } => "page_size_out_of_range",
             Self::InvalidPattern { .. } => "invalid_pattern",
         }
@@ -315,7 +320,8 @@ impl RegistryService {
     /// Fail undecided items and terminalize the operation as a system failure.
     ///
     /// # Errors
-    /// [`ServiceError::Storage`] or [`ServiceError::Db`] if the write fails.
+    /// [`ServiceError::Storage`] or [`ServiceError::Db`] if the write fails, or
+    /// [`ServiceError::Worker`] if the failure payload cannot be encoded.
     pub(crate) async fn record_system_failure(
         &self,
         operation_id: Uuid,
@@ -325,14 +331,9 @@ impl RegistryService {
         let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
         let stores = Arc::clone(&self.stores);
         let scope = Self::scope();
-        // Expose stable codes, never infrastructure error text.
-        let payload = serde_json::json!({
-            "reason": AdmissionFailureReason::SystemFailure.as_str(),
-            "message": "admission could not complete because of a system failure",
-            "error_code": error_code,
-            "operation_id": operation_id,
-        })
-        .to_string();
+        let payload = StoredFailure::system_failure(operation_id, error_code)
+            .to_payload()
+            .map_err(WorkerError::FailureUnencodable)?;
         provider
             .transaction(move |tx| {
                 Box::pin(async move {
@@ -600,6 +601,7 @@ impl RegistryService {
     ///
     /// # Errors
     /// [`ServiceError::BatchReadOutOfRange`] for an empty or over-long batch,
+    /// [`ServiceError::KeyTooLong`] for a key over [`MAX_KEY_LEN`] bytes,
     /// [`ServiceError::Storage`] for a read failure, or
     /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
     pub async fn batch_get(
@@ -616,16 +618,22 @@ impl RegistryService {
         let mut seen: std::collections::HashSet<&EntityKey> =
             std::collections::HashSet::with_capacity(keys.len());
         for key in keys {
+            if let EntityKey::GtsId(gts_id) = key
+                && gts_id.len() > MAX_KEY_LEN
+            {
+                return Err(ServiceError::KeyTooLong { len: gts_id.len() });
+            }
             if seen.insert(key) {
                 requested.push(key.clone());
             }
         }
 
+        // A non-canonical identifier cannot be stored, so it never reaches SQL.
         let gts_ids: Vec<String> = requested
             .iter()
             .filter_map(|key| match key {
-                EntityKey::GtsId(gts_id) => Some(gts_id.clone()),
-                EntityKey::Uuid(_) => None,
+                EntityKey::GtsId(gts_id) if is_canonical(gts_id) => Some(gts_id.clone()),
+                EntityKey::GtsId(_) | EntityKey::Uuid(_) => None,
             })
             .collect();
         let gts_uuids: Vec<Uuid> = requested
@@ -635,6 +643,12 @@ impl RegistryService {
                 EntityKey::GtsId(_) => None,
             })
             .collect();
+        if gts_ids.is_empty() && gts_uuids.is_empty() {
+            return Ok(requested
+                .into_iter()
+                .map(|key| (key, EntityLookup::NotFound))
+                .collect());
+        }
 
         let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
         let scope = Self::scope();
@@ -774,6 +788,10 @@ impl RegistryService {
     }
 }
 
+pub(crate) fn is_canonical(gts_id: &str) -> bool {
+    GtsId::try_new(gts_id).is_ok_and(|id| id.id() == gts_id)
+}
+
 /// The entity ids of one kind, for the kind-specific current-state reads.
 fn ids_of(rows: &[EntityRow], kind: EntityKind) -> Vec<i64> {
     rows.iter()
@@ -818,7 +836,7 @@ async fn build_records(
     }
     tokio::task::spawn_blocking(move || into_records(rows, current, selection))
         .await
-        .map_err(|e| ServiceError::Blocking(e.to_string()))?
+        .map_err(ServiceError::Blocking)?
 }
 
 /// A missing current state, or a selected column that did not come back, is
@@ -998,6 +1016,22 @@ mod tests {
         assert!(
             matches!(result, Err(ServiceError::CorruptDocument(ref d)) if d.contains("gts.cf.core")),
             "{result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_blocking_task_keeps_its_panic_classification() {
+        let panicked = tokio::spawn(async {
+            std::panic::resume_unwind(Box::new("injected record construction panic"));
+        })
+        .await
+        .expect_err("the task panicked");
+        let error = ServiceError::Blocking(panicked);
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<tokio::task::JoinError>());
+        assert!(
+            source.is_some_and(tokio::task::JoinError::is_panic),
+            "{error:?}"
         );
     }
 

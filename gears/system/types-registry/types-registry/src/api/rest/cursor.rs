@@ -31,7 +31,7 @@ use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir, ast, validate_cur
 
 use super::error::{cursor_not_usable, cursor_too_long};
 use crate::domain::enums::{EntityKind, LifecycleFilter};
-use crate::domain::registry_service::DiscoveryQuery;
+use crate::domain::registry_service::{DiscoveryQuery, MAX_KEY_LEN, is_canonical};
 use crate::domain::selection::FieldSelection;
 
 /// The one keyset column. `gts_id` is unique and immutable, which is what makes the
@@ -194,7 +194,10 @@ pub fn resume(cursor: &CursorV1, binding: &Binding<'_>) -> Result<String, Canoni
         return Err(cursor_not_usable("discovery pages forward only"));
     }
     match cursor.k.as_slice() {
-        [after] => Ok(after.clone()),
+        [after] if after.len() <= MAX_KEY_LEN && is_canonical(after) => Ok(after.clone()),
+        [_] => Err(cursor_not_usable(
+            "its position is not a canonical GTS identifier",
+        )),
         keys => Err(cursor_not_usable(&format!(
             "a discovery cursor names exactly one key, not {}",
             keys.len()
@@ -482,9 +485,50 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_position_is_refused() -> Result<(), CanonicalError> {
+        let binding = bound(None, &[]);
+        for k in [
+            "a".repeat(MAX_KEY_LEN + 1),
+            "not a gts id".to_owned(),
+            AFTER.replace("example", "ex\u{e9}mple"),
+            format!("{AFTER} "),
+        ] {
+            let token = CursorV1 {
+                k: vec![k.clone()],
+                o: SortDir::Asc,
+                s: page_order().to_signed_tokens(),
+                f: binding_hash(&binding),
+                d: FORWARD.to_owned(),
+            }
+            .encode()
+            .map_err(|e| CanonicalError::internal(e.to_string()).create())?;
+            let refused = violation(decode(&token, &binding));
+            assert_eq!(refused.field, "cursor", "{k:?}");
+            assert!(
+                refused
+                    .description
+                    .ends_with("not a canonical GTS identifier"),
+                "{k:?}: {refused:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn an_unreadable_token_is_refused() {
-        assert!(decode("not-base64url-json", &bound(None, &[])).is_err());
-        assert!(decode("", &bound(None, &[])).is_err());
+        // `e30` is base64url of `{}`: JSON without the required fields.
+        for token in ["not-base64url-json", "", "e30"] {
+            assert_eq!(violation(decode(token, &bound(None, &[]))).field, "cursor");
+        }
+    }
+
+    #[test]
+    fn a_base64url_token_that_is_not_json_is_refused() {
+        const NOT_JSON: &str = "bm90IGpzb24"; // base64url of `not json`
+        assert_eq!(
+            violation(decode(NOT_JSON, &bound(None, &[]))).field,
+            "cursor"
+        );
     }
 
     /// The version field is the upgrade path, so a token this build does not know
@@ -514,7 +558,7 @@ mod tests {
             }
             .encode()
             .map_err(|e| CanonicalError::internal(e.to_string()).create())?;
-            assert!(decode(&token, &binding).is_err(), "{d}");
+            assert_eq!(violation(decode(&token, &binding)).field, "cursor", "{d}");
         }
         Ok(())
     }

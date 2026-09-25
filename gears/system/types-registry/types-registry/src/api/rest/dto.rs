@@ -12,7 +12,7 @@ use crate::domain::enums::{
 };
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
 use crate::domain::registry_service::{
-    EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
+    EntityLookup, EntityRecord, MAX_BATCH_GET_KEYS, OperationItemRecord, OperationRecord,
 };
 
 /// DTO for a GTS ID segment.
@@ -257,6 +257,58 @@ mod tests {
                 .collect();
             assert_eq!(keys, ["description"], "{field}: {}", properties[field]);
         }
+    }
+
+    #[test]
+    fn the_batch_request_schema_keeps_items_a_plain_array() {
+        let schema = schema_json::<BatchGetRequest>();
+        assert_eq!(schema["required"], serde_json::json!(["items"]), "{schema}");
+        let mut items = schema["properties"]["items"].clone();
+        items
+            .as_object_mut()
+            .expect("a property schema")
+            .remove("description");
+        assert_eq!(
+            items,
+            serde_json::json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/BatchGetItemDto" },
+                "minItems": 1,
+            }),
+        );
+    }
+
+    fn batch_request(items: &[serde_json::Value]) -> serde_json::Result<BatchGetRequest> {
+        serde_json::from_str(&serde_json::json!({ "items": items }).to_string())
+    }
+
+    #[test]
+    fn a_batch_keeps_the_first_items_up_to_the_ceiling_and_counts_all() {
+        for total in [0, 1, MAX_BATCH_GET_KEYS, MAX_BATCH_GET_KEYS + 1, 10_000] {
+            let items: Vec<serde_json::Value> = (0..total)
+                .map(|i| serde_json::json!({ "key": format!("k{i}") }))
+                .collect();
+            let request = batch_request(&items).expect("a well-formed batch parses");
+            assert_eq!(request.items.count(), total);
+            let kept = request.items.into_items();
+            assert_eq!(kept.len(), total.min(MAX_BATCH_GET_KEYS), "{total}");
+            for (i, item) in kept.iter().enumerate() {
+                assert_eq!(item.key, format!("k{i}"));
+            }
+        }
+    }
+
+    #[test]
+    fn only_items_within_the_ceiling_are_validated() {
+        let mut items: Vec<serde_json::Value> = (0..MAX_BATCH_GET_KEYS)
+            .map(|i| serde_json::json!({ "key": format!("k{i}") }))
+            .collect();
+        items.push(serde_json::json!({ "unknown": true }));
+        let past = batch_request(&items).expect("an item past the ceiling is not read");
+        assert_eq!(past.items.count(), MAX_BATCH_GET_KEYS + 1);
+
+        items.swap(0, MAX_BATCH_GET_KEYS);
+        assert!(batch_request(&items).is_err(), "an item within it still is");
     }
 
     #[test]
@@ -1126,17 +1178,73 @@ pub struct BatchGetItemDto {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct BatchGetRequest {
-    /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, enforced on the raw
-    /// item count before any item is processed.
+    /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body
+    /// is parsed. Items past it are counted, not kept.
     ///
     /// [`MAX_BATCH_GET_KEYS`]: crate::domain::registry_service::MAX_BATCH_GET_KEYS
-    #[schema(min_items = 1)]
-    pub items: Vec<BatchGetItemDto>,
+    #[schema(value_type = Vec<BatchGetItemDto>, min_items = 1)]
+    pub items: BatchGetItems,
     /// Fields to return for every key, spelled as the GET routes' `$select`.
     /// Absent is the document-free default.
     #[serde(default, rename = "$select")]
     #[schema(max_length = 2048)]
     pub select: Option<String>,
+}
+
+/// The first [`MAX_BATCH_GET_KEYS`] items and the count of all of them: an
+/// over-long batch is refused by count without one DTO per element.
+#[derive(Debug, Clone)]
+pub struct BatchGetItems {
+    items: Vec<BatchGetItemDto>,
+    count: usize,
+}
+
+impl BatchGetItems {
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    #[must_use]
+    pub fn into_items(self) -> Vec<BatchGetItemDto> {
+        self.items
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BatchGetItems {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Items;
+
+        impl<'de> serde::de::Visitor<'de> for Items {
+            type Value = BatchGetItems;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of batch read items")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while items.len() < MAX_BATCH_GET_KEYS {
+                    let Some(item) = seq.next_element::<BatchGetItemDto>()? else {
+                        let count = items.len();
+                        return Ok(BatchGetItems { items, count });
+                    };
+                    items.push(item);
+                }
+                // Ignore excess item payloads; only their count matters.
+                let mut count = items.len();
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    count += 1;
+                }
+                Ok(BatchGetItems { items, count })
+            }
+        }
+
+        deserializer.deserialize_seq(Items)
+    }
 }
 
 /// `found` or `not_found`.

@@ -75,15 +75,24 @@ pub async fn extract<S: Send + Sync>(
     parts: &mut Parts,
     state: &S,
     allowed: &[&str],
-) -> Result<(ODataQuery, FieldSelection, Vec<(String, String)>), CanonicalError> {
+) -> Result<(ODataQuery, FieldSelection), CanonicalError> {
     let pairs = raw_pairs(parts, state).await?;
     guard(&pairs, allowed)?;
+    odata(parts, state, &pairs).await
+}
+
+/// `ToolKit`'s `OData` extraction, over `pairs` the caller has already guarded.
+async fn odata<S: Send + Sync>(
+    parts: &mut Parts,
+    state: &S,
+    pairs: &[(String, String)],
+) -> Result<(ODataQuery, FieldSelection), CanonicalError> {
     if let Some((_, raw)) = pairs.iter().find(|(key, _)| key == "$select") {
         select::check_raw(raw)?;
     }
     let query = extract_odata_query(parts, state).await?;
     let selection = select::from_names(query.selected_fields())?;
-    Ok((query, selection, pairs))
+    Ok((query, selection))
 }
 
 /// The exact read's one query parameter, `$select`.
@@ -93,7 +102,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ExactReadSelection {
     type Rejection = CanonicalError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let (_, selection, _) = extract(parts, state, EXACT_READ).await?;
+        let (_, selection) = extract(parts, state, EXACT_READ).await?;
         Ok(Self(selection))
     }
 }
@@ -197,7 +206,7 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
             .map(|(_, token)| super::cursor::read(token))
             .transpose()?;
 
-        let (query, selection, _) = extract(parts, state, DISCOVERY).await?;
+        let (query, selection) = odata(parts, state, &pairs).await?;
         let pattern = value(&pairs, "pattern").map(str::to_owned);
         if let Some(p) = &pattern
             && p.len() > 1024

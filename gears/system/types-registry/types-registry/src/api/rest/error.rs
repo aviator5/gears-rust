@@ -6,7 +6,7 @@ use types_registry_sdk::{field, precondition};
 use crate::domain::admission::acceptance::{AcceptanceError, MAX_IDEMPOTENCY_KEY};
 use crate::domain::admission::worker::WorkerError;
 use crate::domain::error::DomainError;
-use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, ServiceError};
+use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
 use crate::domain::selection::{EntityField, SelectionError};
 
 #[resource_error(gts_id!("cf.types_registry.registry.type.v1~"))]
@@ -121,6 +121,13 @@ fn opaque_internal(cause: &dyn std::fmt::Display, at: &'static str) -> Canonical
     CanonicalError::internal(OPAQUE_INTERNAL).create()
 }
 
+/// A response body `serde_json` refused to encode: a defect of ours, and not a
+/// blocking-task failure, so it is logged under its own step.
+#[must_use]
+pub fn response_not_serialized(cause: &serde_json::Error) -> CanonicalError {
+    opaque_internal(cause, "response serialization")
+}
+
 impl From<ServiceError> for CanonicalError {
     fn from(e: ServiceError) -> Self {
         match e {
@@ -167,6 +174,7 @@ impl From<ServiceError> for CanonicalError {
                 format!("the pattern is not a GTS identifier pattern: {message}"),
                 field::INVALID_QUERY,
             ),
+            ServiceError::KeyTooLong { len } => key_too_long(len),
         }
     }
 }
@@ -267,6 +275,9 @@ impl From<WorkerError> for CanonicalError {
             // Exhaustive only: `process_item` retries or records revalidation exhaustion.
             WorkerError::RevalidationRequired(drift) => {
                 opaque_internal(&drift.to_string(), "admission")
+            }
+            WorkerError::FailureUnencodable(inner) => {
+                opaque_internal(&inner, "failure payload encoding")
             }
             WorkerError::Storage(inner) => opaque_internal(&inner, "storage write"),
             WorkerError::Db(inner) => opaque_internal(&inner, "database write"),
@@ -479,13 +490,12 @@ fn selectable_fields() -> String {
     EntityField::ALL.map(EntityField::name).join(", ")
 }
 
-/// Reject a batch-get `key` item whose raw byte length exceeds the GTS identifier
-/// ceiling (1 024 bytes).
+/// Reject a read key over [`MAX_KEY_LEN`] bytes, whichever layer spotted it.
 #[must_use]
 pub fn key_too_long(len: usize) -> CanonicalError {
     invalid_field(
         violation_field::KEY,
-        format!("each key must be at most 1024 bytes; this one is {len}"),
+        format!("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}"),
         field::VALIDATION_FAILED,
     )
 }

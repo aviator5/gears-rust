@@ -26,7 +26,7 @@ use crate::domain::enums::OperationKind;
 use crate::domain::error::DomainError;
 use crate::domain::registry_service::{
     DeleteRequest, DeleteTarget, DiscoveryQuery, EntityKey, EntityLookup, MAX_BATCH_GET_KEYS,
-    RegistryService, ServiceError,
+    MAX_KEY_LEN, RegistryService, ServiceError,
 };
 use crate::domain::selection::FieldSelection;
 use crate::domain::service::TypesRegistryService;
@@ -122,9 +122,11 @@ pub async fn get_entity(
 // ---------------------------------------------------------------------------
 //
 // Mapping steps only. Every one of these reads a request, calls exactly one domain
-// method, and maps the result — no policy, no limit, no existence check and no
-// vocabulary decision lives here, which is what lets a future `api/grpc` adapter
-// reuse the same domain surface (SPEC §8.4).
+// method, and maps the result — no policy, no existence check and no vocabulary
+// decision lives here, which is what lets a future `api/grpc` adapter reuse the
+// same domain surface (SPEC §8.4). Size bounds checked here only fail early; the
+// domain enforces the same ones for every adapter. The one exception is a batch
+// item's `if_none_match`, which no domain method receives until T29 compares it.
 //
 // The handlers above this line are the pre-database path T27 deletes.
 
@@ -367,14 +369,11 @@ async fn json_body<T: serde::Serialize + Send + 'static>(
     }
     let bytes = tokio::task::spawn_blocking(move || serde_json::to_vec(&value))
         .await
-        .map_err(|e| ServiceError::Blocking(e.to_string()))?
-        .map_err(|e| ServiceError::Blocking(e.to_string()))?;
+        .map_err(ServiceError::Blocking)?
+        .map_err(|e| super::error::response_not_serialized(&e))?;
     let content_type = HeaderValue::from_static("application/json");
     Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
 }
-
-/// A GTS identifier runs to 1024 bytes; a UUID is 36.
-const MAX_KEY_LEN: usize = 1024;
 
 /// `POST /types-registry/v2/entities:batchGet`
 ///
@@ -401,18 +400,17 @@ pub async fn batch_get_entities(
 
     // Bounded before any per-item work, and on the raw count: duplicates still cost
     // parsing and must not stretch the ceiling.
-    if req.items.is_empty() || req.items.len() > MAX_BATCH_GET_KEYS {
-        return Err(ServiceError::BatchReadOutOfRange {
-            count: req.items.len(),
-        }
-        .into());
+    let count = req.items.count();
+    if count == 0 || count > MAX_BATCH_GET_KEYS {
+        return Err(ServiceError::BatchReadOutOfRange { count }.into());
     }
+    let items = req.items.into_items();
     // `if_none_match` is length-checked but not compared: no read emits a
     // validator until T29.
-    let mut spelling_map: HashMap<EntityKey, String> = HashMap::with_capacity(req.items.len());
-    let mut keys: Vec<EntityKey> = Vec::with_capacity(req.items.len());
-    for item in req.items {
-        // Bounded before EntityKey::parse: a GTS identifier runs to 1024 bytes.
+    let mut spelling_map: HashMap<EntityKey, String> = HashMap::with_capacity(items.len());
+    let mut keys: Vec<EntityKey> = Vec::with_capacity(items.len());
+    for item in items {
+        // Before `EntityKey::parse` copies the key; the domain repeats the check.
         if item.key.len() > MAX_KEY_LEN {
             return Err(super::error::key_too_long(item.key.len()));
         }
@@ -439,7 +437,11 @@ pub async fn batch_get_entities(
             .into_iter()
             .map(|(key, lookup)| {
                 let key = spelling_map.remove(&key).ok_or_else(|| {
-                    tracing::error!("types_registry batch read answered a key it was not asked");
+                    tracing::error!(
+                        unexpected_key = ?key,
+                        batch_size = keys.len(),
+                        "types_registry batch read answered a key it was not asked"
+                    );
                     CanonicalError::internal("the registry could not match a batch read result")
                         .create()
                 })?;
@@ -535,6 +537,31 @@ mod tests {
             repo,
             crate::config::TypesRegistryConfig::default(),
         ))
+    }
+
+    /// A body `serde_json` refuses, as an out-of-range timestamp would be.
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("injected serialization failure"))
+        }
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_body_that_does_not_serialize_is_not_reported_as_a_blocking_task() {
+        let selection = FieldSelection::parse(&["content"]).expect("valid");
+        let Err(refused) = json_body(Unserializable, selection).await else {
+            panic!("the body cannot be serialized");
+        };
+        assert_eq!(
+            toolkit_canonical_errors::Problem::from(refused).status,
+            Some(500)
+        );
+        assert!(logs_contain("injected serialization failure"));
+        assert!(logs_contain(r#"at="response serialization""#));
+        assert!(!logs_contain("blocking task"));
     }
 
     #[tokio::test]

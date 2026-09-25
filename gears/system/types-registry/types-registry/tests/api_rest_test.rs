@@ -2787,7 +2787,18 @@ async fn an_empty_batch_read_is_refused() {
 
     let response = call(&router, batch_get(&json!({ "items": [] }))).await;
 
-    assert_field_refusal(&response, "items", "VALIDATION_FAILED");
+    assert_batch_count_refused(&response, 0);
+}
+
+fn assert_batch_count_refused(response: &Response, count: usize) {
+    assert_field_refusal(response, "items", "VALIDATION_FAILED");
+    let description = &response.body["context"]["field_violations"][0]["description"];
+    assert!(
+        description
+            .as_str()
+            .is_some_and(|d| d.ends_with(&format!("this one named {count}"))),
+        "{description}",
+    );
 }
 
 /// The batch ceiling is **100 keys**, matching the write ceiling rather than
@@ -2828,7 +2839,21 @@ async fn a_batch_read_is_bounded_at_its_ceiling() {
     );
 
     let past_ceiling = call(&router, batch_get(&keys(&refs))).await;
-    assert_field_refusal(&past_ceiling, "items", "VALIDATION_FAILED");
+    assert_batch_count_refused(&past_ceiling, MAX_BATCH_GET_KEYS + 1);
+}
+
+/// Items past the ceiling are counted, not kept, and the refusal still names the
+/// exact count.
+#[tokio::test]
+async fn an_oversized_batch_read_is_refused_with_its_exact_count() {
+    let router = router_with_db().await;
+    let items: Vec<Value> = (0..10_000)
+        .map(|i| json!({ "key": format!("k{i}") }))
+        .collect();
+
+    let response = call(&router, batch_get(&json!({ "items": items }))).await;
+
+    assert_batch_count_refused(&response, 10_000);
 }
 
 // --- discovery ---------------------------------------------------------------
@@ -2972,6 +2997,45 @@ async fn a_batch_key_over_1024_bytes_is_refused() {
     let over = "a".repeat(1025);
     let refused = call(&router, batch_get(&json!({ "items": [{ "key": over }] }))).await;
     assert_field_refusal(&refused, "key", "VALIDATION_FAILED");
+}
+
+/// An item's `if_none_match` has the key's bound: 1024 bytes are served, 1025 refused.
+#[tokio::test]
+async fn a_batch_validator_over_1024_bytes_is_refused() {
+    let router = router_with_db().await;
+    let item =
+        |len: usize| json!({ "items": [{ "key": CF_TYPE, "if_none_match": "v".repeat(len) }] });
+
+    let served = call(&router, batch_get(&item(1024))).await;
+    assert_eq!(served.status, StatusCode::OK, "{:?}", served.body);
+    assert_eq!(served.body["items"][0]["status"], json!("not_found"));
+
+    let refused = call(&router, batch_get(&item(1025))).await;
+    assert_field_refusal(&refused, "if_none_match", "VALIDATION_FAILED");
+}
+
+/// The exact read shares the batch key bound; a non-canonical spelling is absent.
+#[tokio::test]
+async fn an_exact_read_bounds_its_key_and_matches_only_the_canonical_spelling() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+
+    let refused = call(&router, exact(&"a".repeat(1025), "")).await;
+    assert_field_refusal(&refused, "key", "VALIDATION_FAILED");
+
+    for key in [
+        "a".repeat(1024),
+        format!("{CF_TYPE}%20"),
+        format!("{CF_TYPE}%C3%A9"),
+    ] {
+        let response = call(&router, exact(&key, "")).await;
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_FOUND,
+            "{key}: {:?}",
+            response.body
+        );
+    }
 }
 
 /// A pattern is bounded at 1024 bytes before `gts-rust` parses it.
@@ -4000,6 +4064,68 @@ async fn discovery_refuses_undeclared_and_unsupported_parameters() {
     }
 }
 
+/// The pair ceiling counts raw pairs. No 32-pair discovery request is otherwise
+/// valid (the vocabulary is smaller and repeats are refused), so the 32-pair case
+/// proves only that it passes the count guard and reaches the parameter guard,
+/// which names at most 16 unknown keys.
+#[tokio::test]
+async fn the_pair_ceiling_counts_raw_pairs_and_unknown_keys_are_reported_up_to_16() {
+    let router = router_with_db().await;
+    let unknown = |n: usize| {
+        let pairs: Vec<String> = (0..n).map(|i| format!("x{i}=1")).collect();
+        format!("?{}", pairs.join("&"))
+    };
+
+    let at = call(&router, discover(&unknown(32))).await;
+    assert_eq!(at.status, StatusCode::BAD_REQUEST, "{:?}", at.body);
+    let violations = at.body["context"]["field_violations"]
+        .as_array()
+        .expect("field_violations is an array");
+    let fields: Vec<&str> = violations
+        .iter()
+        .map(|v| {
+            assert_eq!(v["reason"], json!("UNSUPPORTED_QUERY_PARAM"), "{v}");
+            v["field"].as_str().expect("a field name")
+        })
+        .collect();
+    let first_16: Vec<String> = (0..16).map(|i| format!("x{i}")).collect();
+    assert_eq!(fields, first_16, "32 pairs pass the count guard");
+
+    let over = call(&router, discover(&unknown(33))).await;
+    assert_field_refusal(&over, "query", "VALIDATION_FAILED");
+    assert_eq!(
+        over.body["context"]["field_violations"][0]["description"],
+        json!("at most 32 query parameters are accepted; this request has 33"),
+    );
+}
+
+/// Caller input echoed into a refusal is cut to its first 64 characters.
+#[tokio::test]
+async fn echoed_caller_input_is_cut_to_64_characters() {
+    let router = router_with_db().await;
+    let long = "k".repeat(2048);
+    let shown = &long[..64];
+
+    let kind = call(&router, discover(&format!("?kind={long}"))).await;
+    assert_field_refusal(&kind, "kind", "VALIDATION_FAILED");
+    assert_eq!(
+        kind.body["context"]["field_violations"][0]["description"],
+        json!(format!(
+            "kind must be `type_schema` or `instance`, not `{shown}`"
+        )),
+    );
+
+    let unknown = call(&router, discover(&format!("?{long}=1"))).await;
+    assert_field_refusal(&unknown, shown, "UNSUPPORTED_QUERY_PARAM");
+    let description = unknown.body["context"]["field_violations"][0]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        description.starts_with(&format!("unsupported query parameter `{shown}`;")),
+        "{description}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Discovery by `kind` (T22c)
 // ---------------------------------------------------------------------------
@@ -4466,7 +4592,10 @@ async fn toolkit_select_extraction_and_the_v1_cursor_work_together() {
 
     let too_long = format!("gts_id,{}", "x".repeat(2_048));
     let too_many = vec!["kind"; 101].join(",");
-    for select in [too_long.as_str(), too_many.as_str()] {
+    for (select, description) in [
+        (too_long.as_str(), "$select too long"),
+        (too_many.as_str(), "$select contains too many fields"),
+    ] {
         let response = call(&router, discover(&format!("?$select={select}"))).await;
         assert_eq!(
             response.status,
@@ -4479,7 +4608,7 @@ async fn toolkit_select_extraction_and_the_v1_cursor_work_together() {
             json!({
                 "field": "$select",
                 "reason": "INVALID_SELECT",
-                "description": response.body["context"]["field_violations"][0]["description"],
+                "description": description,
             }),
         );
     }
