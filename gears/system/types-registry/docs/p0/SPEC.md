@@ -1899,8 +1899,8 @@ identifier profile refusals, topological order, baseline selection.
 | Discovery pattern semantics | a generated corpus is discovered under every wildcard cut, bare `~*`, minors pinned in early segments, instance tails and UUID-tail patterns, returning exactly what `GtsId::matches_pattern` accepts on SQLite, PostgreSQL and MySQL; a UUID-tail identifier is refused at storage |
 | Invalid discovery filters | `depth=0`, negative, non-integer and overflow values, plus unknown `kind` and legacy `is_schema`, return RFC-9457 `400` with the offending field named |
 | `limit` above `page_size_max` | refused, not silently clamped |
-| Cursor traversal over a matching set larger than one page | every matching entity (active by default) appears exactly once across pages |
-| Entity admitted mid-traversal | the traversal stays consistent: no duplicate and no skipped predecessor, because the cursor is a keyset over an immutable unique `gts_id` |
+| Cursor traversal over a matching set larger than one page, unchanged while it is walked | every matching entity (active by default) appears exactly once across pages |
+| Entity admitted mid-traversal | every entity that continues to match throughout the traversal appears exactly once; a newly admitted `gts_id` behind the cursor is skipped, while one ahead of it can appear. The cursor is a keyset over an immutable unique `gts_id`, not a snapshot, so it never repeats an entity but does not freeze membership |
 | Cursor with an unknown version | rejected rather than reinterpreted |
 | Cursor resumed with another selection or filter | changing `$select`, `pattern`, `depth` or `kind` is rejected with `400`; absent `$select` and the explicit default field set resume interchangeably |
 | Filtered cursor traversal | mixed depths and kinds across multiple pages produce each matching entity exactly once, under any `lifecycle_status`; every page with a cursor is full and the last page has none |
@@ -2029,8 +2029,9 @@ is the executable task list. The number is kept because other documents cite it.
     move (§8.5).
 15. Exact read, `batchGet` and discovery honor one normalized `$select` contract and
     return document-free managed metadata by default. `GET /entities` is bounded in
-    item count and its cursor traverses the matching set (active by default) exactly once under one
-    `pattern`/`depth`/`kind`/`lifecycle_status` filter and one selection;
+    item count; under one `pattern`/`depth`/`kind`/`lifecycle_status` filter and one
+    selection its cursor returns no entity twice and returns every entity that matches
+    (active by default) for the whole traversal exactly once;
     selected documents are fetched only on request. P0 has no aggregate response-byte
     budget (§10.2, D12–D14, C10).
 16. Every admission decision is diagnosable from the emitted signals alone (§8.6): each terminal

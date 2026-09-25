@@ -3301,7 +3301,7 @@ fn the_discovery_query_parameters_are_declared() {
             false,
             "integer".to_owned(),
             None,
-            None,
+            Some(1.0),
         ),
         (
             "cursor".to_owned(),
@@ -4649,4 +4649,23 @@ fn discovery_declares_depth_as_a_positive_integer() {
     assert!(!depth.2);
     assert_eq!(depth.3, "integer");
     assert_eq!(depth.5, Some(1.0));
+}
+
+/// `limit=0` is refused, so neither the request nor the page reports a zero size.
+/// The maximum is configured, so neither side declares one.
+#[test]
+fn discovery_declares_the_page_size_as_positive_on_request_and_page() {
+    let doc = generated_openapi();
+    let params = doc["paths"][format!("{V2}/entities")]["get"]["parameters"]
+        .as_array()
+        .expect("discovery parameters")
+        .clone();
+    let limit = params
+        .iter()
+        .find(|p| p["name"] == "limit")
+        .expect("limit is declared");
+    assert_eq!(limit["schema"], json!({ "type": "integer", "minimum": 1 }));
+    let applied = &doc["components"]["schemas"]["PageInfoDto"]["properties"]["limit"];
+    assert_eq!(applied["minimum"], 1, "{applied}");
+    assert!(applied.get("maximum").is_none(), "{applied}");
 }

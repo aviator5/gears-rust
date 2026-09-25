@@ -296,10 +296,11 @@ curl -s "$BASE/types-registry/v2/entities?pattern=gts.cf.core.example.event.v1~*
 unknown `kind`, and the v1 spelling `is_schema` are `400`.
 
 `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the `pattern`, `depth`,
-`kind` and normalized `$select` it was issued for. Resuming under any of them changed —
-including adding or dropping a filter — or with a token of an unknown version, is a `400`
-rather than a page spliced out of two traversals. An absent `$select` and the explicit
-default set are the same selection.
+`kind`, `lifecycle_status` and normalized `$select` it was issued for. Resuming under any
+of them changed — including adding or dropping a filter — or with a token of an unknown
+version, is a `400` rather than a page spliced out of two traversals. An absent `$select`
+and the explicit default set are the same selection, as are an absent `lifecycle_status`
+and `active`.
 
 `limit` (alias `$top`) defaults to 50 and may not exceed 100; `0` or `101` is a `400`.
 A caller selecting documents should page smaller. `$filter`, `$orderby`, `$skip`, v1

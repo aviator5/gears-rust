@@ -422,12 +422,14 @@ fn register_discovery(
                      value, empty or repeated, is a 400",
                 ),
         )
-        // `query_param_typed` takes description before type; swapping them silently emits `string`.
-        .query_param_typed(
-            "limit",
-            false,
-            format!("Page size, 1 to {max}. Defaults to {default}. Alias: $top"),
-            "integer",
+        // `ParamSpec` has no `maximum`, and this one is configured, so the description states it.
+        .param(
+            ParamSpec::query("limit")
+                .param_type("integer")
+                .minimum(1.0)
+                .description(format!(
+                    "Page size, 1 to {max}. Defaults to {default}. Alias: $top"
+                )),
         )
         .query_param(
             "cursor",

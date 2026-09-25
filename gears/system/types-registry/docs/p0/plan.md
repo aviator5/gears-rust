@@ -1042,7 +1042,7 @@ revision or resource version. `make e2e-local` stays green with no e2e file edit
 **Checkpoint 6** — the new trait and explicit-document reconciliation helper work against
 a mock consumer without inventory metadata or per-gear inventory filtering. **All seven v2 routes are complete** (T20a, T22a, T22b, T22c, P17/P19/P20):
 `batchGet` returns explicit per-key results; discovery is bounded and content-free by default, filters in SQL before the page limit, and its cursor
-traverses a stable matching set exactly once under one `pattern`/`depth`/`kind` filter and
+traverses an unchanged matching set exactly once under one `pattern`/`depth`/`kind` filter and
 normalized `$select`, and all three reads
 project the requested fields. OpenAPI covers every route and
 `QUICKSTART.md` covers reads and mutations. Gear tests, `make lychee` and unchanged

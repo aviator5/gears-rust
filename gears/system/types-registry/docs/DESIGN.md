@@ -1143,7 +1143,7 @@ The `If-None-Match` **header** is unavailable here, and refused rather than igno
 | `$select` | query | As above, applied to every item on the page |
 | `limit`, `cursor` | query | Page size and position. `limit` defaults to 50 and may not exceed 100. The bound is on items, not on bytes: a caller selecting documents should page smaller |
 
-The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Before Context Tenant or authorization scope enters the binding, the token needs a server-keyed integrity check (HMAC); an unkeyed binding hash does not protect the token from forgery. Results are active-only unless `lifecycle_status` says otherwise, and sort by canonical identifier. Every filter applies before the page limit, so only the last page is short and a page with a cursor is full. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
+The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Before Context Tenant or authorization scope enters the binding, the token needs a server-keyed integrity check (HMAC); an unkeyed binding hash does not protect the token from forgery. Results are active-only unless `lifecycle_status` says otherwise, and sort by canonical identifier. Managed filters apply before the page limit, so a managed page carrying a cursor is full. Federated paging follows *Federation Router*, where a page may end short at a source boundary or after re-filtering, so callers rely on the cursor alone and page until `next_cursor` is absent. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
 
 The `fr-type-query-assistance` filter forms map as follows:
 
@@ -2158,7 +2158,7 @@ The leased ToolKit outbox gives multi-pod exclusion without leader election. Dat
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-deployment-config`
 
-Two capability switches, one retention window, one registration policy, and five input bounds are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
+Two capability switches, one retention window, one registration policy, five input bounds, and the discovery page size with its maximum are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
 
 ```yaml
 gears:
@@ -2173,6 +2173,8 @@ gears:
         resolution_closure: 64
         batch_candidates: 100
         activation_write_set: 512
+        page_size_default: 50            # §3.3, discovery page size
+        page_size_max: 100               # §3.3, largest `limit`; at most 100
       registration_policy:               # §3.2, Registration policy
         "gts.acme.*":                     # onboard one vendor
           allowed_vendors: [acme]
@@ -2193,7 +2195,8 @@ gears:
 | `allow_compatibility_force` | bool | `false` | Enables candidate `force`. When disabled, real and Dry Run requests receive a deployment-configuration refusal rather than silent ignore |
 | `allow_purge` | bool | `false` | Whether the operator purge-job entry point exists in this deployment. Where false the job refuses execution before scanning |
 | `operation_retention` | duration | `30d` | How long a terminal, unpinned operation is kept before the sweep may remove it |
-| `limits.*` | size or count | §3.2 | The five server-owned bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
+| `limits.*` | size or count | §3.2 | Besides the page size below, the five server-owned bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
+| `limits.page_size_default`, `limits.page_size_max` | count | `50`, `100` | The discovery page size applied when a request names no `limit`, and the largest `limit` accepted (§3.3). The default is not a bound; the maximum bounds each request's `limit` and may not exceed 100. Both must be positive and the default may not exceed the maximum, or startup fails |
 | `registration_policy` | map of GTS pattern to `allowed_vendors` and `tenant_ownable` | empty | Opens otherwise closed regions (§3.2). Invalid patterns or parameters fail startup. `allowed_vendors: ["*"]` admits every vendor; omitted parameters inherit by the per-parameter resolution rule. Operators document effective values; refusals name region and parameter |
 
 Limits change request admissibility, so Dry Run is relative to both installation state and configuration (`cpt-cf-types-registry-constraint-single-installation`). A refusal names the bound and configured value.

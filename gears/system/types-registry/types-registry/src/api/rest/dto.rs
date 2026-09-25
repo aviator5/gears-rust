@@ -1180,8 +1180,6 @@ pub struct BatchGetItemDto {
 pub struct BatchGetRequest {
     /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body
     /// is parsed. Items past it are counted, not kept.
-    ///
-    /// [`MAX_BATCH_GET_KEYS`]: crate::domain::registry_service::MAX_BATCH_GET_KEYS
     #[schema(value_type = Vec<BatchGetItemDto>, min_items = 1)]
     pub items: BatchGetItems,
     /// Fields to return for every key, spelled as the GET routes' `$select`.
@@ -1305,6 +1303,7 @@ pub struct PageInfoDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// The page size actually applied, which is the default when the caller named none.
+    #[schema(minimum = 1)]
     pub limit: u32,
 }
 

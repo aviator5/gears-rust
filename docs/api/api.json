@@ -1411,7 +1411,7 @@
             ]
           },
           "items": {
-            "description": "No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, enforced on the raw\nitem count before any item is processed.\n\n[`MAX_BATCH_GET_KEYS`]: crate::domain::registry_service::MAX_BATCH_GET_KEYS",
+            "description": "No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body\nis parsed. Items past it are counted, not kept.",
             "items": {
               "$ref": "#/components/schemas/BatchGetItemDto"
             },
@@ -5346,7 +5346,7 @@
         "type": "object"
       },
       "EntityDto": {
-        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a\nprojected item is identifiable, its kind needs no second read, and a tombstone is\nnever mistaken for an absence. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts are absent on an Instance.",
+        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a\nprojected item is identifiable, its kind needs no second read, and a tombstone is\nnever mistaken for an absence. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts are absent on an Instance. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
         "properties": {
           "content": {
             "description": "The whole authored document, either kind."
@@ -9926,7 +9926,7 @@
           "limit": {
             "description": "The page size actually applied, which is the default when the caller named none.",
             "format": "int32",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "next_cursor": {
@@ -53271,7 +53271,7 @@
         "operationId": "types_registry.list_entities",
         "parameters": [
           {
-            "description": "A GTS identifier pattern (GTS spec §10), with or without a wildcard. With one trailing `*`, starting at a segment token or the version, it matches every identifier under that prefix, derived types and Instances included (e.g. gts.acme.core.*, gts.acme.core.events.user_created.v1~*). Without `*` it must be a valid GTS identifier: a Type Schema identifier matches itself, every type derived from it and every Instance of them (e.g. gts.acme.core.events.user_created.v1~); an Instance identifier matches that Instance. In either form a segment that gives only a major version (`v1`) matches every minor of that major (`v1`, `v1.0`, `v1.3`), while a given minor matches only itself. A pattern that does not parse is a 400",
+            "description": "A GTS identifier pattern (GTS spec section 10), with or without a wildcard. With one trailing `*`, starting at a segment token or the version, it matches every identifier under that prefix, derived types and Instances included (e.g. gts.acme.core.*, gts.acme.core.events.user_created.v1~*). Without `*` it must be a valid GTS identifier: a Type Schema identifier matches itself, every type derived from it and every Instance of them (e.g. gts.acme.core.events.user_created.v1~); an Instance identifier matches that Instance. In either form a segment that gives only a major version (`v1`) matches every minor of that major (`v1`, `v1.0`, `v1.3`), while a given minor matches only itself. A pattern that does not parse is a 400",
             "in": "query",
             "name": "pattern",
             "required": false,
@@ -53313,6 +53313,7 @@
             "name": "limit",
             "required": false,
             "schema": {
+              "minimum": 1,
               "type": "integer"
             }
           },
@@ -53830,7 +53831,7 @@
         ]
       },
       "get": {
-        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group. Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted.",
+        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group. Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted.",
         "operationId": "types_registry.get_entity",
         "parameters": [
           {
