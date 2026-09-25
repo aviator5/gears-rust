@@ -1376,7 +1376,7 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
         .expect("the entity is still there");
     assert_eq!(second_read.origin.map(|o| o.resource_version), Some(2));
     assert_eq!(
-        second_read.content,
+        common::doc(second_read.content.as_deref()),
         Some(base_schema("label")),
         "B reads A's newest authored document"
     );

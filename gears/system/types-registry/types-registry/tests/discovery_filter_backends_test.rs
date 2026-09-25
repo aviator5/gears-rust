@@ -1,9 +1,9 @@
 //! Discovery filters (T22c) in `EntityRepo::list_page`, on every backend.
 //!
-//! `kind` and `lifecycle` are SQL predicates on stored columns; `depth` and `pattern` are
-//! decided in Rust over SQL-prefiltered rows, which is where a sparse match set meets
-//! the scan budget. `SQLite` runs unconditionally; `PostgreSQL` and `MySQL` need
-//! Docker:
+//! `pattern`, `depth`, `kind` and `lifecycle` are all SQL predicates applied before
+//! `LIMIT`, so a sparse match set still fills every page but the last.
+//! `discovery_pattern_backends_test` covers pattern semantics. `SQLite` runs
+//! unconditionally; `PostgreSQL` and `MySQL` need Docker:
 //!
 //! ```text
 //! cargo test -p cf-gears-types-registry --features integration --test discovery_filter_backends_test
@@ -91,7 +91,8 @@ async fn seed_in(db: &Provider, ids: &[&str], family: Option<&str>) {
     }
 }
 
-/// Every page of a traversal under `filter`, `limit` rows at a time.
+/// Every page of a traversal under `filter`, `limit` rows at a time. A page with
+/// a continuation must be full.
 async fn traverse(db: &Provider, filter: &ListFilter, limit: u32) -> Vec<String> {
     let conn = db.conn().expect("conn");
     let mut seen = Vec::new();
@@ -100,12 +101,14 @@ async fn traverse(db: &Provider, filter: &ListFilter, limit: u32) -> Vec<String>
         let page = EntityRepo::list_page(&conn, &allow_all(), filter, request)
             .await
             .expect("page");
+        let full = page.items.len() == limit as usize;
         assert!(page.items.len() <= limit as usize);
         seen.extend(page.items.into_iter().map(|row| row.gts_id));
-        if !page.has_more {
+        let Some(next) = page.next_after else {
             return seen;
-        }
-        request = PageRequest::after(page.next_after.expect("a cursor while more remains"), limit);
+        };
+        assert!(full, "a page with a continuation is full");
+        request = PageRequest::after(next, limit);
     }
     panic!("the traversal did not end");
 }
@@ -201,11 +204,10 @@ async fn depth_bounds_parsed_segments_and_composes(db: &Provider, backend: &str)
     );
 }
 
-/// More non-matching rows between two matches than one call may scan: some page
-/// comes back empty with a continuation, and the traversal still reaches the match
-/// past the gap, exactly once.
-async fn a_sparse_depth_traversal_crosses_the_scan_budget(db: &Provider, backend: &str) {
-    const GAP: usize = 2_100;
+/// Many non-matching rows between two matches: the first page of one row holds
+/// the first match, the second the last one, and nothing follows.
+async fn a_sparse_depth_filter_fills_its_pages(db: &Provider, backend: &str) {
+    const GAP: usize = 300;
     let first = gts_id!("cf.core.dfs.aaa.v1~");
     let last = gts_id!("cf.core.dfs.zzz.v1~");
     let gap: Vec<String> = (0..GAP)
@@ -227,31 +229,66 @@ async fn a_sparse_depth_traversal_crosses_the_scan_budget(db: &Provider, backend
         max_chain_depth: NonZeroU8::new(1),
     };
     let conn = db.conn().expect("conn");
-    let mut seen = Vec::new();
-    let mut empty_with_more = 0;
-    let mut request = PageRequest::first(1);
-    loop {
-        let page = EntityRepo::list_page(&conn, &allow_all(), &filter, request)
-            .await
-            .expect("page");
-        if page.items.is_empty() && page.has_more {
-            empty_with_more += 1;
-        }
-        seen.extend(page.items.into_iter().map(|row| row.gts_id));
-        if !page.has_more {
-            break;
-        }
-        request = PageRequest::after(page.next_after.expect("a cursor while more remains"), 1);
-    }
+    let page = EntityRepo::list_page(&conn, &allow_all(), &filter, PageRequest::first(1))
+        .await
+        .expect("first page");
     assert_eq!(
-        seen,
+        page.items
+            .iter()
+            .map(|row| row.gts_id.as_str())
+            .collect::<Vec<_>>(),
+        [first],
+        "on {backend}"
+    );
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &filter,
+        PageRequest::after(page.next_after.expect("a continuation"), 1),
+    )
+    .await
+    .expect("second page");
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|row| row.gts_id.as_str())
+            .collect::<Vec<_>>(),
+        [last],
+        "on {backend}"
+    );
+    assert_eq!(page.next_after, None, "nothing follows on {backend}");
+    assert_eq!(
+        traverse(db, &filter, 2).await,
         [first, last],
-        "no match skipped or repeated on {backend}"
+        "on {backend}"
     );
-    assert!(
-        empty_with_more >= 1,
-        "the gap exceeds one scan budget, so a page must be empty yet continue on {backend}",
-    );
+}
+
+/// Exactly `limit` matches fit one page with no continuation; no match is an
+/// empty page with none.
+async fn the_last_page_has_no_continuation(db: &Provider, backend: &str) {
+    let conn = db.conn().expect("conn");
+    let base = GtsIdPattern::try_new(gts_id!("cf.core.dfb.base.v1~cf.core.dfb.mid.v1~*"))
+        .expect("pattern");
+    let filter = ListFilter {
+        pattern: Some(base),
+        ..ListFilter::default()
+    };
+    let page = EntityRepo::list_page(&conn, &allow_all(), &filter, PageRequest::first(2))
+        .await
+        .expect("page");
+    assert_eq!(page.items.len(), 2, "mid and its leaf on {backend}");
+    assert_eq!(page.next_after, None, "exactly a full page on {backend}");
+
+    let none = ListFilter {
+        pattern: Some(GtsIdPattern::try_new(gts_id!("cf.core.dfb.absent.*")).expect("pattern")),
+        ..ListFilter::default()
+    };
+    let page = EntityRepo::list_page(&conn, &allow_all(), &none, PageRequest::first(2))
+        .await
+        .expect("page");
+    assert!(page.items.is_empty(), "on {backend}");
+    assert_eq!(page.next_after, None, "on {backend}");
 }
 
 async fn tombstone(db: &Provider, gts_id: &str) {
@@ -266,11 +303,11 @@ async fn tombstone(db: &Provider, gts_id: &str) {
         .expect("active row deletes");
 }
 
-/// Two tombstones around more active rows than one call may scan. `deleted` skips
-/// the actives in SQL; `all` with `depth` crosses the budget through empty pages
-/// and still reaches both; `active` never shows a tombstone.
+/// Two tombstones around many active rows: `deleted` lists only them, `active`
+/// never shows one, `all` lists both kinds once, and `all` with `depth` returns
+/// the two tombstones as full pages of one.
 async fn lifecycle_is_an_sql_predicate_across_sparse_pages(db: &Provider, backend: &str) {
-    const GAP: usize = 2_100;
+    const GAP: usize = 300;
     let near = gts_id!("cf.core.dfl.aaa.v1~");
     let far = gts_id!("cf.core.dfl.zzz.v1~");
     let gap: Vec<String> = (0..GAP)
@@ -305,36 +342,18 @@ async fn lifecycle_is_an_sql_predicate_across_sparse_pages(db: &Provider, backen
             .is_empty(),
         "active never lists a tombstone on {backend}",
     );
-    let active = traverse(db, &filter(LifecycleFilter::Active, None), 500).await;
+    let active = traverse(db, &filter(LifecycleFilter::Active, None), 100).await;
     assert_eq!(active, gap, "active is unchanged on {backend}");
-    let mut all = traverse(db, &filter(LifecycleFilter::All, None), 500).await;
+    let mut all = traverse(db, &filter(LifecycleFilter::All, None), 100).await;
     all.sort();
     let mut want = gap.clone();
     want.extend([near.to_owned(), far.to_owned()]);
     want.sort();
     assert_eq!(all, want, "all is both, each once, on {backend}");
-
-    let conn = db.conn().expect("conn");
-    let sparse = filter(LifecycleFilter::All, NonZeroU8::new(1));
-    let (mut seen, mut empty_with_more) = (Vec::new(), 0);
-    let mut request = PageRequest::first(1);
-    loop {
-        let page = EntityRepo::list_page(&conn, &allow_all(), &sparse, request)
-            .await
-            .expect("page");
-        if page.items.is_empty() && page.has_more {
-            empty_with_more += 1;
-        }
-        seen.extend(page.items.into_iter().map(|row| row.gts_id));
-        if !page.has_more {
-            break;
-        }
-        request = PageRequest::after(page.next_after.expect("a cursor while more remains"), 1);
-    }
-    assert_eq!(seen, [near, far], "no tombstone skipped on {backend}");
-    assert!(
-        empty_with_more >= 1,
-        "the gap spans a scan budget on {backend}"
+    assert_eq!(
+        traverse(db, &filter(LifecycleFilter::All, NonZeroU8::new(1)), 1).await,
+        [near, far],
+        "no tombstone skipped on {backend}"
     );
 }
 
@@ -342,7 +361,8 @@ async fn assert_filters(db: &Provider, backend: &str) {
     seed(db, ROWS).await;
     kind_is_an_sql_predicate_intersected_with_the_pattern(db, backend).await;
     depth_bounds_parsed_segments_and_composes(db, backend).await;
-    a_sparse_depth_traversal_crosses_the_scan_budget(db, backend).await;
+    the_last_page_has_no_continuation(db, backend).await;
+    a_sparse_depth_filter_fills_its_pages(db, backend).await;
     lifecycle_is_an_sql_predicate_across_sparse_pages(db, backend).await;
 }
 

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use types_registry::domain::selection::FieldSelection;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::macros::datetime;
@@ -34,7 +35,7 @@ use types_registry::infra::storage::entity::{
 };
 
 mod common;
-use common::{TestDir, allow_all, stores, test_db, test_db_file};
+use common::{TestDir, allow_all, doc, stores, test_db, test_db_file};
 
 const BOOT: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
@@ -280,31 +281,38 @@ async fn a_schema_and_instance_survive_database_reopen() {
     assert_eq!(schema_by_uuid.gts_uuid, schema_by_id.gts_uuid);
     assert_eq!(schema_by_uuid.gts_id, schema_by_id.gts_id);
 
-    assert_eq!(schema_by_id.content.as_ref(), Some(&authored_schema));
+    assert_eq!(
+        doc(schema_by_id.content.as_deref()).as_ref(),
+        Some(&authored_schema)
+    );
     let stored_raw: Value =
         serde_json::from_str(&after.schema_revisions[0].raw_schema).expect("raw_schema is JSON");
     assert_eq!(stored_raw, authored_schema);
 
+    // The artifacts are served verbatim: the stored canonical text, byte for byte.
     let persisted_schema = &after.schemas[0];
     assert_eq!(
-        schema_by_id.resolved_schema,
-        Some(serde_json::from_str(&persisted_schema.resolved_schema).expect("resolved schema")),
+        schema_by_id.resolved_schema.as_deref().map(RawValue::get),
+        Some(persisted_schema.resolved_schema.as_str()),
     );
     assert_eq!(
-        schema_by_id.effective_traits,
-        Some(serde_json::from_str(&persisted_schema.effective_traits).expect("effective traits")),
+        schema_by_id.effective_traits.as_deref().map(RawValue::get),
+        Some(persisted_schema.effective_traits.as_str()),
     );
     assert_eq!(
-        schema_by_id.effective_traits_schema,
-        Some(
-            serde_json::from_str(&persisted_schema.effective_traits_schema)
-                .expect("effective traits schema"),
-        ),
+        schema_by_id
+            .effective_traits_schema
+            .as_deref()
+            .map(RawValue::get),
+        Some(persisted_schema.effective_traits_schema.as_str()),
     );
 
     assert_eq!(instance_by_id.gts_id, CF_INSTANCE);
     assert_eq!(instance_by_id.origin.map(|o| o.resource_version), Some(1));
-    assert_eq!(instance_by_id.content.as_ref(), Some(&authored_instance));
+    assert_eq!(
+        doc(instance_by_id.content.as_deref()).as_ref(),
+        Some(&authored_instance)
+    );
     assert!(instance_by_id.resolved_schema.is_none());
     assert!(instance_by_id.effective_traits.is_none());
     assert!(instance_by_id.effective_traits_schema.is_none());

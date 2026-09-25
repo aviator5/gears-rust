@@ -30,7 +30,7 @@ fn every_supported_backend_dispatches_to_the_shared_up_list() {
     }
 }
 
-/// Down re-adds the `NOT NULL` column only on empty tables. SQLite requires a
+/// Down re-adds the `NOT NULL` column only on empty tables. `SQLite` requires a
 /// default when adding that column.
 #[test]
 fn down_restores_a_defaulted_not_null_column_per_backend() {

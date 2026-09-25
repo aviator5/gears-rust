@@ -631,16 +631,19 @@ impl PageRequest {
 }
 
 /// What a discovery page is restricted to; every absent field and the default
-/// `lifecycle` mean no restriction beyond active entities.
+/// `lifecycle` mean no restriction beyond active entities. Every field is
+/// decided in SQL before the page limit.
 #[domain_model]
 #[derive(Clone, Debug, Default)]
 pub struct ListFilter {
+    /// Parsed by `gts-rust`, compiled to stored-segment predicates.
     pub pattern: Option<gts::GtsIdPattern>,
-    /// Decided by the stored `entity.kind`, in SQL.
+    /// The stored `entity.kind`.
     pub kind: Option<EntityKind>,
-    /// Decided by the stored `entity.lifecycle_status`, in SQL.
+    /// The stored `entity.lifecycle_status`.
     pub lifecycle: LifecycleFilter,
-    /// Inclusive maximum of parsed `GtsId::segments()`, decided in Rust.
+    /// Inclusive maximum of the stored `entity.chain_depth`
+    /// (`GtsId::segments().len()`).
     pub max_chain_depth: Option<std::num::NonZeroU8>,
 }
 
@@ -649,16 +652,19 @@ pub struct ListFilter {
 #[derive(Clone, Debug)]
 pub struct EntityPage {
     pub items: Vec<EntityRow>,
-    /// The last `gts_id` the SQL prefilter **consumed**, which is what the next
-    /// request resumes after. It is not necessarily the last item returned: rows
-    /// the pattern rejected were still consumed, and skipping them again would
-    /// re-scan them on every page.
+    /// The last returned `gts_id` when another row matches, else `None`. A page
+    /// with a continuation is always full.
     pub next_after: Option<String>,
-    /// `true` when the scan stopped on the page limit or the scan budget rather
-    /// than on exhausting the range. It may over-report — stopping exactly on the
-    /// last row of a range looks the same as stopping early — which is the safe
-    /// direction: the caller asks once more and gets an empty page.
-    pub has_more: bool,
+}
+
+impl EntityPage {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            next_after: None,
+        }
+    }
 }
 
 /// Entity identity and lifecycle.
@@ -709,15 +715,9 @@ pub trait EntityStore: Send + Sync {
         gts_uuids: &[Uuid],
     ) -> Result<Vec<EntityRow>, ScopeError>;
 
-    /// One bounded keyset page of entities matching `filter`, active only unless
+    /// One keyset page of entities matching `filter`, active only unless
     /// `filter.lifecycle` asks for tombstones (ADR-0008). Every filter applies
-    /// before a row counts toward the limit.
-    ///
-    /// The pattern is `gts-rust`'s, never SQL's: the implementation may narrow with
-    /// a range over the identifier, but only [`gts::GtsId::matches_pattern`] decides
-    /// what a page contains (`constraint-gts-implementation`). One call is bounded
-    /// in work as well as in results, so a page may come back short of its limit
-    /// with [`EntityPage::has_more`] still set.
+    /// before a row counts toward the limit, so only the last page is short.
     async fn list_page(
         &self,
         tx: &DbTx<'_>,

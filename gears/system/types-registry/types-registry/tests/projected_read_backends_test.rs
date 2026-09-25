@@ -30,7 +30,7 @@ use toolkit_db::test_support::{QueryKind, QueryRecorder, connect_with_recorder};
 use toolkit_db::{ConnectOpts, DBProvider, Db, DbError};
 use toolkit_gts::gts_id;
 
-use common::{allow_all, stores};
+use common::{allow_all, doc, stores};
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums::OperationKind;
@@ -225,7 +225,11 @@ async fn selected_documents_are_fetched_and_only_they(h: &Harness, backend: &str
     let EntityLookup::Found(schema_record) = &results[0].1 else {
         panic!("type found on {backend}");
     };
-    assert_eq!(schema_record.content, Some(schema()), "{backend}");
+    assert_eq!(
+        doc(schema_record.content.as_deref()),
+        Some(schema()),
+        "{backend}"
+    );
     assert!(schema_record.resolved_schema.is_none(), "{backend}");
 
     h.recorder.clear();

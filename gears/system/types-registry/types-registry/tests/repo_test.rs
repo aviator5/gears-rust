@@ -290,12 +290,10 @@ async fn insert_starts_the_resource_version_at_one() {
 // entity — pattern list and keyset paging
 // ---------------------------------------------------------------------------
 
-/// The prefilter is a prefix range, deliberately wider than the pattern: it stops
-/// short of the last literal segment so version and minor flexibility cannot make
-/// it exclude a real match. Everything it over-admits is rejected in Rust by
-/// `GtsId::matches_pattern`, the only authority on GTS semantics.
+/// The pattern is exact in SQL: siblings inside the identifier range, another
+/// major and another type never reach the page.
 #[tokio::test]
-async fn list_returns_exactly_what_the_pattern_accepts_not_what_sql_admits() {
+async fn list_returns_exactly_what_the_pattern_accepts() {
     let db = test_db().await;
     seed(
         &db,
@@ -323,16 +321,14 @@ async fn list_returns_exactly_what_the_pattern_accepts_not_what_sql_admits() {
     assert_eq!(
         ids,
         vec![CUSTOMER_V1],
-        "the prefix range admits the sibling `other.v1~` and `type.v2~`; only \
-         matches_pattern may decide"
+        "neither `other.v1~` nor `type.v2~` matches"
     );
 }
 
 /// A trailing `~*` covers the derived chain **and the base itself**: a bare
 /// segment is an "implicit derived-type coverage" envelope in the GTS spec
 /// (§3.6), so `…v1~` and `…v1~*` accept the same set. The point of the test is
-/// that the prefix range does not lose the longer chained identifiers, whose
-/// bytes extend past the base — under-narrowing is the failure this guards.
+/// that the chained identifiers, whose bytes extend past the base, are kept.
 #[tokio::test]
 async fn list_with_a_trailing_wildcard_returns_the_base_and_its_derived_identifiers() {
     let db = test_db().await;
@@ -362,7 +358,7 @@ async fn list_with_a_trailing_wildcard_returns_the_base_and_its_derived_identifi
         ids,
         vec![CUSTOMER_V1, CUSTOMER_V1_DERIVED_A, CUSTOMER_V1_DERIVED_B],
     );
-    assert!(!page.has_more);
+    assert_eq!(page.next_after, None);
 }
 
 #[tokio::test]
@@ -464,10 +460,11 @@ async fn keyset_paging_yields_every_row_exactly_once() {
             .expect("page");
         assert!(page.items.len() <= 3, "a page never exceeds its limit");
         seen.extend(page.items.iter().map(|m| m.gts_id.clone()));
-        if !page.has_more {
+        let Some(next) = page.next_after else {
             break;
-        }
-        request = PageRequest::after(page.next_after.expect("cursor when more remains"), 3);
+        };
+        assert_eq!(page.items.len(), 3, "a page with a continuation is full");
+        request = PageRequest::after(next, 3);
     }
 
     let mut expected = ids.clone();
@@ -539,19 +536,13 @@ async fn a_row_inserted_mid_traversal_neither_duplicates_nor_hides() {
     );
 }
 
-/// The list read must never load the whole match set to slice it in memory. That is
-/// a claim about work, not results, so the fixture makes the two differ: a range
-/// full of rows the pattern rejects, with the single match sorted last.
+/// A sparse pattern costs no extra round trips: the only match, sorted after
+/// thousands of rows in its identifier range, arrives on the first page with no
+/// continuation.
 ///
-/// A read that materialised the range would return the match on the first page; a
-/// bounded scan cannot, and says so with `has_more`. So the observable signature is
-/// *at least one page that found nothing and asked to be called again*, then the
-/// match arriving exactly once.
-///
-/// `v9~` sorts after every `v2xxx~` in byte order (`'9' > '2'`), which puts the
-/// match beyond the first scan. The decoy count only has to exceed the scan budget.
+/// `v9~` sorts after every `v2xxx~` in byte order (`'9' > '2'`).
 #[tokio::test]
-async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
+async fn a_sparse_pattern_returns_its_match_on_the_first_page() {
     const MATCH: &str = gts_id!("acme.crm.customer.type.v9~");
     const DECOYS: i32 = 2100;
 
@@ -561,8 +552,7 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
         Box::pin(async move {
             let scope = allow_all();
             for i in 0..DECOYS {
-                // In the prefix range `gts.acme.crm.customer.type.`, rejected by
-                // the pattern, and sorted ahead of the match.
+                // Inside `gts.acme.crm.customer.type.`, sorted ahead of the match.
                 let id = format!("{}acme.crm.customer.type.v2{i:04}~", gts::GTS_ID_PREFIX);
                 EntityRepo::insert(tx, &scope, new_entity(&id, family_id))
                     .await
@@ -576,35 +566,20 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
 
     let conn = db.conn().expect("conn");
     let pattern = GtsIdPattern::try_new(MATCH).expect("pattern");
-    let mut found: Vec<String> = Vec::new();
-    let mut empty_pages = 0;
-    let mut completed = false;
-    let mut request = PageRequest::first(10);
-    for _ in 0..64 {
-        let page = EntityRepo::list_page(&conn, &allow_all(), &by_pattern(&pattern), request)
-            .await
-            .expect("page");
-        if page.items.is_empty() {
-            empty_pages += 1;
-        }
-        found.extend(page.items.iter().map(|m| m.gts_id.clone()));
-        if !page.has_more {
-            completed = true;
-            break;
-        }
-        request = PageRequest::after(page.next_after.expect("cursor when more remains"), 10);
-    }
-
-    assert!(
-        completed,
-        "the bounded page walk exhausted its 64-request test budget"
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("page");
+    let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
+    assert_eq!(ids, vec![MATCH]);
+    assert_eq!(
+        page.next_after, None,
+        "no continuation after the last match"
     );
-    assert!(
-        empty_pages > 0,
-        "a bounded scan must return at least one page that found nothing; a read \
-         that materialised the range would have found the match immediately"
-    );
-    assert_eq!(found, vec![MATCH], "the match arrives exactly once");
 }
 
 // ---------------------------------------------------------------------------

@@ -177,10 +177,10 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
             .await
             .expect("page");
         seen.extend(page.items.iter().map(|m| m.gts_id.clone()));
-        if !page.has_more {
+        let Some(next) = page.next_after else {
             break;
-        }
-        request = PageRequest::after(page.next_after.expect("cursor when more remains"), 2);
+        };
+        request = PageRequest::after(next, 2);
     }
 
     let mut expected: Vec<String> = BYTE_ORDERED.iter().map(|s| (*s).to_owned()).collect();
@@ -192,8 +192,8 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
     );
 }
 
-/// The prefix range narrows in SQL and `GtsId::matches_pattern` decides, on every
-/// backend. `ab` shares the range with `a_b` but not the pattern.
+/// The segment filter is exact on every backend: `ab` shares a byte prefix with
+/// `a_b` but not the pattern.
 async fn pattern_list_agrees_with_gts(db: &Provider, backend: &str) {
     let conn = db.conn().expect("conn");
     let pattern = GtsIdPattern::try_new(gts_id!("acme.crm.a_b.type.v1~")).expect("pattern");
@@ -209,7 +209,7 @@ async fn pattern_list_agrees_with_gts(db: &Provider, backend: &str) {
     assert_eq!(
         ids,
         vec![gts_id!("acme.crm.a_b.type.v1~")],
-        "only matches_pattern may decide, on {backend}"
+        "exactly the pattern's match on {backend}"
     );
 }
 

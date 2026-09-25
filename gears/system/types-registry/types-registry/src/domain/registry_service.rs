@@ -7,7 +7,7 @@ use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use gts::GtsIdPattern;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
 use toolkit_db::{DBProvider, Db, DbError};
@@ -95,7 +95,8 @@ pub struct OperationItemRecord {
 }
 
 /// Projected by the selection: an optional field is `Some` only when selected and
-/// applicable; `Some(Value::Null)` is a selected JSON `null`.
+/// applicable; a selected JSON `null` is `Some` holding the text `null`. Documents
+/// are the stored canonical text, validated but never parsed into a tree.
 #[domain_model]
 #[derive(Clone, Debug)]
 pub struct EntityRecord {
@@ -104,10 +105,10 @@ pub struct EntityRecord {
     pub kind: EntityKind,
     pub origin: Option<ManagedOrigin>,
     pub lifecycle_status: LifecycleStatus,
-    pub content: Option<Value>,
-    pub resolved_schema: Option<Value>,
-    pub effective_traits: Option<Value>,
-    pub effective_traits_schema: Option<Value>,
+    pub content: Option<Box<RawValue>>,
+    pub resolved_schema: Option<Box<RawValue>>,
+    pub effective_traits: Option<Box<RawValue>>,
+    pub effective_traits_schema: Option<Box<RawValue>>,
     pub provenance: Option<Provenance>,
 }
 
@@ -157,7 +158,7 @@ pub enum EntityLookup {
 #[domain_model]
 #[derive(Clone, Debug, Default)]
 pub struct DiscoveryQuery {
-    /// A GTS wildcard pattern, decided by `gts-rust` and never by SQL.
+    /// A GTS pattern: parsed by `gts-rust`, matched in SQL over stored segments.
     pub pattern: Option<String>,
     /// Exclusive keyset lower bound: the position the previous page stopped at.
     pub after: Option<String>,
@@ -180,9 +181,7 @@ pub struct DiscoveryPage {
     /// for a transport adapter to restate, so REST and a future gRPC adapter
     /// cannot report different defaults for the same read.
     pub limit: u32,
-    /// Where the next page resumes; `None` once the range is exhausted. Rows the
-    /// pattern rejected were consumed too, so this is not necessarily the last item
-    /// returned. May be `Some` before an empty last page, never `None` early.
+    /// The last returned `gts_id` when another match exists, else `None`.
     pub next_after: Option<String>,
 }
 
@@ -726,7 +725,7 @@ impl RegistryService {
                 .filter(|limit| (1..=max).contains(limit))
                 .ok_or(ServiceError::PageSizeOutOfRange { limit: asked, max })?,
         };
-        // Compiled by `gts-rust`, the sole authority on the pattern grammar
+        // Parsed by `gts-rust`, the sole authority on the pattern grammar
         // (`constraint-gts-implementation`). A string it refuses is a refused
         // request, not an empty page: the two are indistinguishable to a caller
         // that mistyped a wildcard.
@@ -770,7 +769,7 @@ impl RegistryService {
         Ok(DiscoveryPage {
             items: order.iter().filter_map(|id| records.remove(id)).collect(),
             limit,
-            next_after: page.next_after.filter(|_| page.has_more),
+            next_after: page.next_after,
         })
     }
 }
@@ -807,8 +806,8 @@ async fn read_current(
         .collect())
 }
 
-/// [`into_records`], off the executor when documents are selected: parsing them is
-/// CPU work proportional to up to a page of 1 MB documents.
+/// [`into_records`], off the executor when documents are selected: validating them
+/// still scans every byte of up to a page of 1 MB documents.
 async fn build_records(
     rows: Vec<EntityRow>,
     current: BTreeMap<i64, CurrentReadRow>,
@@ -892,21 +891,23 @@ fn select_document(
     is_schema: bool,
     text: Option<String>,
     gts_id: &str,
-) -> Result<Option<Value>, ServiceError> {
+) -> Result<Option<Box<RawValue>>, ServiceError> {
     let applicable = field == EntityField::Content || is_schema;
     if !selection.contains(field) || !applicable {
         return Ok(None);
     }
     let text = text.ok_or_else(|| missing_state(gts_id, field.name()))?;
-    parse_stored(&text, gts_id).map(Some)
+    raw_stored(text, gts_id).map(Some)
 }
 
 fn missing_state(gts_id: &str, what: &str) -> ServiceError {
     ServiceError::CorruptDocument(format!("entity '{gts_id}' has no {what}"))
 }
 
-fn parse_stored(text: &str, gts_id: &str) -> Result<Value, ServiceError> {
-    serde_json::from_str(text)
+/// Validated, not trusted: a `RawValue` is written to the response verbatim, so
+/// text that is not JSON must fail here rather than corrupt the body.
+fn raw_stored(text: String, gts_id: &str) -> Result<Box<RawValue>, ServiceError> {
+    RawValue::from_string(text)
         .map_err(|e| ServiceError::CorruptDocument(format!("'{gts_id}': {e}")))
 }
 
@@ -981,7 +982,23 @@ mod tests {
             content(),
         )
         .expect("valid");
-        assert_eq!(records[&7].content, Some(Value::Null));
+        assert_eq!(
+            records[&7].content.as_deref().map(RawValue::get),
+            Some("null")
+        );
+    }
+
+    #[test]
+    fn a_selected_document_that_is_not_json_is_corruption() {
+        let result = into_records(
+            vec![row(EntityKind::Instance)],
+            state(Some("not json")),
+            content(),
+        );
+        assert!(
+            matches!(result, Err(ServiceError::CorruptDocument(ref d)) if d.contains("gts.cf.core")),
+            "{result:?}",
+        );
     }
 
     #[test]

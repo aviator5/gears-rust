@@ -362,8 +362,9 @@ fn register_discovery(
         .operation_id("types_registry.list_entities")
         .summary("Discover GTS entities")
         .description(format!(
-            "Return one bounded page of entities, ordered by canonical identifier, with the \
-             cursor for the next page. `lifecycle_status` is `active` (default), `deleted` \
+            "Return one bounded page of entities, ordered by canonical identifier, with a \
+             cursor only when another match remains; a page with a cursor is full. \
+             `lifecycle_status` is `active` (default), `deleted` \
              (tombstones only) or `all`. Each item is projected by `$select` \
              exactly as GET /types-registry/v2/entities/{{entity_key}} projects it; absent, the \
              document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are \
@@ -385,8 +386,16 @@ fn register_discovery(
         .query_param(
             "pattern",
             false,
-            "A GTS wildcard pattern (e.g. gts.acme.core.*). Decided by gts-rust; a string it \
-             refuses is a 400, not an empty page",
+            "A GTS identifier pattern (GTS spec section 10), with or without a wildcard. With one \
+             trailing `*`, starting at a segment token or the version, it matches every \
+             identifier under that prefix, derived types and Instances included (e.g. \
+             gts.acme.core.*, gts.acme.core.events.user_created.v1~*). Without `*` it must \
+             be a valid GTS identifier: a Type Schema identifier matches itself, every type \
+             derived from it and every Instance of them (e.g. \
+             gts.acme.core.events.user_created.v1~); an Instance identifier matches that \
+             Instance. In either form a segment that gives only a major version (`v1`) \
+             matches every minor of that major (`v1`, `v1.0`, `v1.3`), while a given minor \
+             matches only itself. A pattern that does not parse is a 400",
         )
         // `ParamSpec` has no `maximum`, so the upper bound is stated in the description.
         .param(

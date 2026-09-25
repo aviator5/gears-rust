@@ -218,14 +218,11 @@ resolution, `compare_documents`, derivation chains, instance validation. All of 
 inside admission, over one candidate and what that candidate consumes. That set is exactly
 the dependency closure, which the `dependency` table already supplies (D5).
 
-**What reads need is rows.** Verified rather than assumed:
-`InMemoryGtsRepository::list` (`in_memory_repo.rs:241-274`) iterates the store as a plain row
-container and filters with `GtsIdPattern`, which is a pure function in `gts-id` over the
-identifier string — it never asks the store a semantic question. Exact reads are keyed
-lookups. And D3 already materializes `resolved_schema` / `effective_traits` /
-`effective_traits_schema` on the current-state row. So a read is a `SELECT` plus, for a
-pattern query, `GtsId::matches_pattern` in Rust. Nothing about GTS semantics is
-reimplemented, so `constraint-gts-implementation` is untouched.
+**What reads need is rows.** Pattern matching is a pure function of the parsed
+identifier — it never asks a store a semantic question. Exact reads are keyed lookups. And
+D3 already materializes `resolved_schema` / `effective_traits` / `effective_traits_schema`
+on the current-state row. So a read is a `SELECT`; for discovery, one `SELECT` whose
+pattern joins the admission-time parsed segments (P20, SPEC D14).
 
 **And the snapshot was not merely unnecessary for reads, it was wrong for them.** SPEC §13
 requires *"two pods, commit on A, B's first post-commit read sees it"*
@@ -826,9 +823,10 @@ existing `type_schema`/`instance` enum. Both work without `pattern` and intersec
 it when supplied; discovery stays active-only by default. P0 still omits `origin`,
 `availability`, `scope`, `tenant_id`, legacy segment filters and generic `$filter`.
 
-**Boundary and order.** Keep GTS matching and depth semantics in `gts-id`; use the stored
-kind as an SQL predicate and treat any SQL identifier-prefix range as a candidate
-prefilter only. Apply both filters before page limits and `$select`. Extend the versioned
+**Boundary and order.** `gts-id` parses identifiers and patterns; admission stores
+`chain_depth` and the parsed segments, and the repository compiles the parsed pattern into
+exact per-segment joins (SPEC D14). Every filter, including `kind` and `lifecycle_status`,
+is SQL before `LIMIT limit + 1` and `$select`. Extend the versioned
 cursor with canonical optional `depth` and `kind`, rejecting continuation under a
 changed filter; an absent field is distinct from an explicit value. This requires T22b's
 cursor contract first and fixes `EntityQuery` before T23 publishes the SDK. T29's
@@ -836,10 +834,11 @@ per-entity validator does not gain filter inputs: a validator describes one sele
 entity, while a discovery page has none.
 
 **Implementation slices.** First add `kind` through the query, repository, REST and
-router tests. Then add parsed-segment `depth`, cursor binding and mixed-filter traversal
-tests on all three backends. The second slice must preserve progress through sparse
-results under T22a's scan budget: a page may be empty while a continuation exists, but
-it may neither skip a later match nor claim completion early. Checkpoint 6 reviews the
+router tests. Then add `depth`, cursor binding and mixed-filter traversal tests on all
+three backends. Last, migration 000005 materializes `chain_depth` and
+`entity_gts_segment` (no backfill; it refuses a non-empty `entity`), the pattern compiles
+to SQL, and a differential corpus pins it to `GtsId::matches_pattern` per backend. A
+page with a cursor is full; no page is empty unless nothing matches. Checkpoint 6 reviews the
 combined filter and projection contract; T24a promotes it with the other v2 routes.
 
 **Amendment (2026-09-23).** Discovery adds `lifecycle_status=active|deleted|all`
@@ -1042,7 +1041,7 @@ revision or resource version. `make e2e-local` stays green with no e2e file edit
 
 **Checkpoint 6** — the new trait and explicit-document reconciliation helper work against
 a mock consumer without inventory metadata or per-gear inventory filtering. **All seven v2 routes are complete** (T20a, T22a, T22b, T22c, P17/P19/P20):
-`batchGet` returns explicit per-key results; discovery is bounded and content-free by default, its cursor
+`batchGet` returns explicit per-key results; discovery is bounded and content-free by default, filters in SQL before the page limit, and its cursor
 traverses a stable matching set exactly once under one `pattern`/`depth`/`kind` filter and
 normalized `$select`, and all three reads
 project the requested fields. OpenAPI covers every route and
@@ -1072,7 +1071,9 @@ behave as Checkpoints 5 and 6 proved them, now on the promoted v1 paths. All 16 
 | A cached entry can be stale inside its freshness window | Low | DESIGN §3.3's sanctioned trade, and now bounded further: T29's validators let T30 revalidate rather than guess, `fresh` gives an authoritative read, `0s` disables the window, and invalidation is immediate on an observed terminal outcome |
 | The validator field reaches the SDK models after consumers have migrated | **High** — a second migration across 20+ gears | T23 carries the field from the start, before T25/T26 move any consumer; T29 only fills it in (P9) |
 | A narrow projection reuses a validator or cache entry for a wider representation | **High** — an incomplete answer can be accepted as current | T22b defines one normalized field set; T29 digests it into the validator and T30 keys representations by it (P19) |
-| A sparse `depth`/`kind` discovery page skips a later match or resumes under changed filters | **High** — incomplete traversal looks successful | T22c filters before page limits, keeps T22a's scan-position progress, binds both filters into the cursor, and tests mixed-depth/mixed-kind traversal across the scan budget (P20) |
+| A sparse `depth`/`kind` discovery page skips a later match or resumes under changed filters | **High** — incomplete traversal looks successful | T22c decides every filter in SQL before `LIMIT limit + 1`, binds the filters into the cursor, and tests sparse and mixed-depth/mixed-kind traversal: pages with a cursor are full (P20) |
+| The SQL pattern compiler drifts from `gts-id` matching | **High** — discovery silently omits or adds entities | A differential corpus on all three backends compares every pattern shape with `GtsId::matches_pattern`; exhaustive segment matches break the build on a new `gts-id` variant; a `gts-rust` upgrade reruns it (SPEC D14) |
+| A filter selective on no index reads a wide identifier range in one statement | Medium — slower pages without a scan budget | The first segment bounds a `gts_id` range; `idx_tr_entity_gts_segment_lookup`, `idx_tr_entity_depth`, `idx_tr_entity_kind_lifecycle` and `idx_tr_entity_lifecycle` serve selective segments, `depth=1`, `kind` and one lifecycle status; `EXPLAIN` on 18k rows confirms them on all three backends, every page under 2.2 ms; DESIGN names the residue |
 | A materialized `effective_*` value differs from the deleted client-side computation | Medium — reads as a regression, invites a "fix" back to the old wrong answer | 12 call sites in `account-management`, `resource-group`, `credstore` consume those methods today. The old ones resolved only the parent `$ref` and approximated trait defaults (`TODO(#1723)`), so `gts-rust` is authoritative; T25/T26 carry an explicit criterion to accept the new value, and SPEC §13 pins the outside-the-chain `$ref` case as a test |
 | Document-free discovery default changes list reads at ~87 call sites | Medium | The SDK helpers select documents internally, on the page or via `batchGet`, so call shapes survive (P10); T23 fixes the helper shape before T25/T26 touch a consumer |
 | Read-shape change reaches e2e alongside the `POST` break | Medium | T28 handles paged discovery and explicit document selection on exact/batch reads through its shared helpers; route stability is `unstable`. Under P12 both breaks arrive at once: T24 deletes old v1 and T24a promotes the async surface |

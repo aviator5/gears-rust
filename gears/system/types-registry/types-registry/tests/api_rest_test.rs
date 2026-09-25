@@ -172,7 +172,7 @@ async fn router_with(v1_ready: bool) -> TestApi {
 }
 
 /// The router plus the provider behind it, for the discovery tests that seed
-/// rows directly, without outbox workers competing for SQLite's write lock.
+/// rows directly, without outbox workers competing for `SQLite`'s write lock.
 async fn router_and_db() -> (TestApi, Arc<DBProvider<DbError>>) {
     router_and_db_configured(false, TypesRegistryConfig::default()).await
 }
@@ -2974,7 +2974,7 @@ async fn a_batch_key_over_1024_bytes_is_refused() {
     assert_field_refusal(&refused, "key", "VALIDATION_FAILED");
 }
 
-/// A pattern is bounded at 1024 bytes before `gts-rust` compiles it.
+/// A pattern is bounded at 1024 bytes before `gts-rust` parses it.
 #[tokio::test]
 async fn a_pattern_over_1024_bytes_is_refused_before_compilation() {
     let router = router_with_db().await;
@@ -3079,7 +3079,7 @@ async fn a_cursor_is_refused_under_a_different_pattern() {
     assert_field_refusal(&response, "cursor", "VALIDATION_FAILED");
 }
 
-/// The pattern is compiled by `gts-rust`, and a string it refuses is a `400` naming
+/// The pattern is parsed by `gts-rust`, and a string it refuses is a `400` naming
 /// the parameter rather than an empty page.
 #[tokio::test]
 async fn an_unparsable_pattern_is_refused() {
@@ -3090,11 +3090,10 @@ async fn an_unparsable_pattern_is_refused() {
     assert_field_refusal(&response, "pattern", "INVALID_QUERY");
 }
 
-/// SQL only narrows. The prefix range admits the sibling major that the pattern
-/// then rejects, and excludes the identifier outside it — `GtsId::matches_pattern`
-/// is the only authority on what a page contains (`repo/mod.rs`).
+/// The pattern is exact: neither the sibling type nor the other major of the
+/// same type is on the page.
 #[tokio::test]
-async fn a_pattern_narrows_by_prefix_range_and_is_decided_in_rust() {
+async fn a_pattern_returns_exactly_its_matches() {
     let (router, db) = router_and_db().await;
     seed_ids(
         &db,
@@ -3108,20 +3107,61 @@ async fn a_pattern_narrows_by_prefix_range_and_is_decided_in_rust() {
     assert_eq!(
         page_ids(&page.body),
         vec![CF_TYPE],
-        "`other.v1~` is outside the prefix range and `type.v2~` inside it but not a \
-         match: {:?}",
+        "neither `other.v1~` nor `type.v2~` matches: {:?}",
         page.body,
     );
 }
 
-/// One `list_page` call is bounded by its scan budget, so a page over a sparse
-/// pattern can find nothing and still ask to be called again. A read that
-/// materialized the range would return the match immediately.
-///
-/// `v9~` sorts after every `v2xxxx~` in byte order, which puts the single match
-/// beyond the first scan; the decoy count only has to exceed the budget.
+/// A minor in a non-last segment pins that minor; an absent one matches every
+/// minor. Walked with `limit=1`, so the cursor carries the same filter.
 #[tokio::test]
-async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
+async fn a_minor_in_an_early_segment_is_matched_exactly() {
+    const V1: &str = gts_id!("cf.core.example.type.v1~cf.core.example.child.v1~");
+    const V1_2: &str = gts_id!("cf.core.example.type.v1.2~cf.core.example.child.v1~");
+    const V1_2_LEAF: &str =
+        gts_id!("cf.core.example.type.v1.2~cf.core.example.child.v1~cf.core.example.leaf.v1");
+    const V1_2_OTHER: &str = gts_id!("cf.core.example.type.v1.2~cf.core.example.other.v1~");
+    const V1_3: &str = gts_id!("cf.core.example.type.v1.3~cf.core.example.child.v1~");
+
+    let (router, db) = router_and_db().await;
+    seed_ids(&db, &[V1, V1_2, V1_2_LEAF, V1_2_OTHER, V1_3]).await;
+
+    for (pattern, want) in [
+        (
+            gts_id!("cf.core.example.type.v1.2~cf.core.example.child.v1~"),
+            vec![V1_2, V1_2_LEAF],
+        ),
+        (
+            gts_id!("cf.core.example.type.v1.2~cf.core.example.child.*"),
+            vec![V1_2, V1_2_LEAF],
+        ),
+        (
+            gts_id!("cf.core.example.type.v1.2~*"),
+            vec![V1_2, V1_2_LEAF, V1_2_OTHER],
+        ),
+        (
+            gts_id!("cf.core.example.type.v1~cf.core.example.child.v1~"),
+            vec![V1, V1_2, V1_2_LEAF, V1_3],
+        ),
+        (gts_id!("cf.core.example.type.v1.0~*"), vec![]),
+    ] {
+        let items = traverse(&router, &format!("?limit=1&pattern={pattern}")).await;
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["gts_id"].as_str().expect("id"))
+            .collect();
+        let mut want = want;
+        want.sort_unstable();
+        assert_eq!(ids, want, "{pattern}");
+    }
+}
+
+/// A sparse pattern still answers on the first page: the single match sorts after
+/// thousands of rows sharing its identifier prefix, and no cursor follows.
+///
+/// `v9~` sorts after every `v2xxxx~` in byte order.
+#[tokio::test]
+async fn a_sparse_pattern_returns_its_match_on_the_first_page() {
     const MATCH: &str = gts_id!("cf.core.example.type.v9~");
     const DECOYS: u32 = 2100;
 
@@ -3133,37 +3173,13 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     seed_ids(&db, &refs).await;
 
-    let mut found: Vec<String> = Vec::new();
-    let mut empty_pages = 0;
-    let mut query = format!("?limit=10&pattern={MATCH}");
-    let mut completed = false;
-    for _ in 0..64 {
-        let page = call(&router, discover(&query)).await;
-        assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
-        let ids = page_ids(&page.body);
-        if ids.is_empty() {
-            empty_pages += 1;
-        }
-        found.extend(ids);
-        let Some(cursor) = page.body["page_info"]["next_cursor"].as_str() else {
-            completed = true;
-            break;
-        };
-        query = format!("?limit=10&pattern={MATCH}&cursor={cursor}");
-    }
-
+    let page = call(&router, discover(&format!("?limit=10&pattern={MATCH}"))).await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    assert_eq!(page_ids(&page.body), vec![MATCH.to_owned()]);
     assert!(
-        completed,
-        "the bounded page walk exhausted its request budget"
-    );
-    assert!(
-        empty_pages > 0,
-        "a bounded scan must return at least one page that found nothing",
-    );
-    assert_eq!(
-        found,
-        vec![MATCH.to_owned()],
-        "the match arrives exactly once"
+        page.body["page_info"]["next_cursor"].is_null(),
+        "no cursor after the last match: {:?}",
+        page.body
     );
 }
 
@@ -4404,11 +4420,10 @@ async fn a_cursor_is_refused_under_a_different_depth() {
     assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
 }
 
-/// A seeded depth-1 row, then more depth-2 rows than one call may scan, then
-/// another depth-1 row: a page comes back empty with a continuation and the walk
-/// still reaches the far match.
+/// A depth-1 row, thousands of depth-2 rows, then another depth-1 row: each
+/// `limit=1` page holds one match, and the second page has no cursor.
 #[tokio::test]
-async fn a_sparse_depth_traversal_progresses_through_empty_pages() {
+async fn a_sparse_depth_traversal_returns_full_pages() {
     let (router, db) = router_and_db().await;
     let near = format!("{}cf.core.example.aaa.v1~", gts::GTS_ID_PREFIX);
     let far = format!("{}cf.core.example.zzz.v1~", gts::GTS_ID_PREFIX);
@@ -4426,33 +4441,18 @@ async fn a_sparse_depth_traversal_progresses_through_empty_pages() {
     seed_ids(&db, &ids).await;
 
     for base in ["?limit=1&depth=1", "?limit=1&depth=1&lifecycle_status=all"] {
-        let mut seen = Vec::new();
-        let mut empty_with_more = 0;
-        let mut next: Option<String> = None;
-        for _ in 0..20 {
-            let uri = match &next {
-                Some(cursor) => format!("{base}&cursor={cursor}"),
-                None => base.to_owned(),
-            };
-            let page = call(&router, discover(&uri)).await;
-            assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
-            let ids = page_ids(&page.body);
-            next = page.body["page_info"]["next_cursor"]
-                .as_str()
-                .map(str::to_owned);
-            if ids.is_empty() && next.is_some() {
-                empty_with_more += 1;
-            }
-            seen.extend(ids);
-            if next.is_none() {
-                break;
-            }
-        }
-        assert!(next.is_none(), "{base}: the traversal must end");
-        assert_eq!(seen, [near.as_str(), far.as_str()], "{base}");
+        let first = call(&router, discover(base)).await;
+        assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+        assert_eq!(page_ids(&first.body), [near.as_str()], "{base}");
+        let cursor = first.body["page_info"]["next_cursor"]
+            .as_str()
+            .expect("a cursor while a match remains");
+        let second = call(&router, discover(&format!("{base}&cursor={cursor}"))).await;
+        assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
+        assert_eq!(page_ids(&second.body), [far.as_str()], "{base}");
         assert!(
-            empty_with_more >= 1,
-            "{base}: the gap spans a whole scan budget"
+            second.body["page_info"]["next_cursor"].is_null(),
+            "{base}: no cursor after the last match"
         );
     }
 }

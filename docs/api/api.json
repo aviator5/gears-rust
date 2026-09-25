@@ -9930,7 +9930,7 @@
             "type": "integer"
           },
           "next_cursor": {
-            "description": "Present while the traversal has more to give. Absent means this page is the\nlast one — the only end-of-traversal signal, so a caller stops on its\nabsence rather than on a short page.",
+            "description": "Present exactly when another match exists, and then the page is full.\nAbsent means this page is the last one.",
             "type": [
               "string",
               "null"
@@ -53267,11 +53267,11 @@
     },
     "/types-registry/v2/entities": {
       "get": {
-        "description": "Return one bounded page of entities, ordered by canonical identifier, with the cursor for the next page. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
+        "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
         "operationId": "types_registry.list_entities",
         "parameters": [
           {
-            "description": "A GTS wildcard pattern (e.g. gts.acme.core.*). Decided by gts-rust; a string it refuses is a 400, not an empty page",
+            "description": "A GTS identifier pattern (GTS spec §10), with or without a wildcard. With one trailing `*`, starting at a segment token or the version, it matches every identifier under that prefix, derived types and Instances included (e.g. gts.acme.core.*, gts.acme.core.events.user_created.v1~*). Without `*` it must be a valid GTS identifier: a Type Schema identifier matches itself, every type derived from it and every Instance of them (e.g. gts.acme.core.events.user_created.v1~); an Instance identifier matches that Instance. In either form a segment that gives only a major version (`v1`) matches every minor of that major (`v1`, `v1.0`, `v1.3`), while a given minor matches only itself. A pattern that does not parse is a 400",
             "in": "query",
             "name": "pattern",
             "required": false,

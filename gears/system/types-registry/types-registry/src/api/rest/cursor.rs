@@ -210,7 +210,7 @@ mod tests {
     use super::*;
 
     const AFTER: &str = "gts.cf.core.example.type.v1~";
-    const PATTERN: &str = "gts.cf.core.example.*";
+    const PATTERN_WILDCARD: &str = "gts.cf.core.example.*";
 
     fn bound<'a>(pattern: Option<&'a str>, select: &[&str]) -> Binding<'a> {
         filtered(pattern, None, None, select)
@@ -239,9 +239,9 @@ mod tests {
     fn a_cursor_round_trips_its_position() -> Result<(), CanonicalError> {
         let token = encode(AFTER, &bound(None, &[]))?;
         assert_eq!(decode(&token, &bound(None, &[]))?, AFTER);
-        let filtered = encode(AFTER, &bound(Some(PATTERN), &["content"]))?;
+        let filtered = encode(AFTER, &bound(Some(PATTERN_WILDCARD), &["content"]))?;
         assert_eq!(
-            decode(&filtered, &bound(Some(PATTERN), &["content"]))?,
+            decode(&filtered, &bound(Some(PATTERN_WILDCARD), &["content"]))?,
             AFTER
         );
         Ok(())
@@ -251,11 +251,11 @@ mod tests {
     /// readable off it, or a caller will start editing one.
     #[test]
     fn the_token_does_not_spell_the_query_out() -> Result<(), CanonicalError> {
-        let binding = bound(Some(PATTERN), &["content"]);
+        let binding = bound(Some(PATTERN_WILDCARD), &["content"]);
         let cursor = read(&encode(AFTER, &binding)?)?;
         let filter = cursor.f.expect("the selection is always bound");
         assert_eq!(Some(&filter), binding_hash(&binding).as_ref());
-        for needle in [PATTERN, "content"] {
+        for needle in [PATTERN_WILDCARD, "content"] {
             assert!(!filter.contains(needle), "{filter}");
         }
         Ok(())
@@ -325,17 +325,17 @@ mod tests {
 
     #[test]
     fn a_cursor_from_another_pattern_is_refused() -> Result<(), CanonicalError> {
-        let token = encode(AFTER, &bound(Some(PATTERN), &[]))?;
+        let token = encode(AFTER, &bound(Some(PATTERN_WILDCARD), &[]))?;
         assert!(decode(&token, &bound(Some("gts.cf.other.*"), &[])).is_err());
         assert!(decode(&token, &bound(None, &[])).is_err());
         let unfiltered = encode(AFTER, &bound(None, &[]))?;
-        assert!(decode(&unfiltered, &bound(Some(PATTERN), &[])).is_err());
+        assert!(decode(&unfiltered, &bound(Some(PATTERN_WILDCARD), &[])).is_err());
         Ok(())
     }
 
     #[test]
     fn a_cursor_from_another_selection_is_refused() -> Result<(), CanonicalError> {
-        for pattern in [None, Some(PATTERN)] {
+        for pattern in [None, Some(PATTERN_WILDCARD)] {
             let token = encode(AFTER, &bound(pattern, &[]))?;
             assert!(decode(&token, &bound(pattern, &["content"])).is_err());
             let content = encode(AFTER, &bound(pattern, &["content"]))?;
@@ -359,7 +359,7 @@ mod tests {
             Some(EntityKind::Instance),
         ];
         let depths = [None, Some(1), Some(2), Some(255)];
-        for pattern in [None, Some(PATTERN)] {
+        for pattern in [None, Some(PATTERN_WILDCARD)] {
             for issued in kinds.iter().flat_map(|k| depths.map(|d| (*k, d))) {
                 let token = encode(AFTER, &filtered(pattern, issued.0, issued.1, &[]))?;
                 for resumed in kinds.iter().flat_map(|k| depths.map(|d| (*k, d))) {
@@ -385,7 +385,7 @@ mod tests {
         ];
         let with = |lifecycle| Binding {
             lifecycle,
-            ..bound(Some(PATTERN), &["content"])
+            ..bound(Some(PATTERN_WILDCARD), &["content"])
         };
         for issued in filters {
             let token = encode(AFTER, &with(issued))?;
@@ -415,8 +415,11 @@ mod tests {
         for (pattern, t22b_filter) in [
             (None, select.clone()),
             (
-                Some(PATTERN),
-                ast::Expr::And(Box::new(equals("gts_id", PATTERN)), Box::new(select)),
+                Some(PATTERN_WILDCARD),
+                ast::Expr::And(
+                    Box::new(equals("gts_id", PATTERN_WILDCARD)),
+                    Box::new(select),
+                ),
             ),
         ] {
             let token = CursorV1 {
@@ -448,10 +451,13 @@ mod tests {
     #[test]
     fn absent_and_explicit_default_selections_are_interchangeable() -> Result<(), CanonicalError> {
         let explicit = ["origin", "GTS_ID", "kind", "gts_uuid", "lifecycle_status"];
-        let token = encode(AFTER, &bound(Some(PATTERN), &[]))?;
-        assert_eq!(decode(&token, &bound(Some(PATTERN), &explicit))?, AFTER);
-        let token = encode(AFTER, &bound(Some(PATTERN), &explicit))?;
-        assert_eq!(decode(&token, &bound(Some(PATTERN), &[]))?, AFTER);
+        let token = encode(AFTER, &bound(Some(PATTERN_WILDCARD), &[]))?;
+        assert_eq!(
+            decode(&token, &bound(Some(PATTERN_WILDCARD), &explicit))?,
+            AFTER
+        );
+        let token = encode(AFTER, &bound(Some(PATTERN_WILDCARD), &explicit))?;
+        assert_eq!(decode(&token, &bound(Some(PATTERN_WILDCARD), &[]))?, AFTER);
         let reordered = encode(AFTER, &bound(None, &["kind", "content"]))?;
         assert_eq!(
             decode(&reordered, &bound(None, &["Content", " kind"]))?,

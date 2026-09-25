@@ -1,5 +1,6 @@
 //! REST DTOs for the Types Registry gear.
 
+use serde_json::value::RawValue;
 use uuid::Uuid;
 
 use gts::GtsIdSegment;
@@ -247,12 +248,14 @@ mod tests {
             "effective_traits",
             "effective_traits_schema",
         ] {
-            // Any JSON value, `null` included: no `type` narrows it.
-            assert!(
-                properties[field].get("type").is_none(),
-                "{field}: {}",
-                properties[field]
-            );
+            // Any JSON value, `null` included: nothing but the description, as
+            // `serde_json::Value` declared it before the `RawValue` switch.
+            let keys: Vec<&String> = properties[field]
+                .as_object()
+                .expect("a property schema")
+                .keys()
+                .collect();
+            assert_eq!(keys, ["description"], "{field}: {}", properties[field]);
         }
     }
 
@@ -264,7 +267,7 @@ mod tests {
             kind: EntityKindDto::TypeSchema,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Deleted,
-            content: Some(serde_json::Value::Null),
+            content: Some(RawValue::from_string("null".to_owned()).expect("JSON")),
             resolved_schema: None,
             effective_traits: None,
             effective_traits_schema: None,
@@ -813,7 +816,8 @@ pub struct OperationDto {
 /// projected item is identifiable, its kind needs no second read, and a tombstone is
 /// never mistaken for an absence. An
 /// unselected field is omitted; a selected document that is JSON `null` stays
-/// present as `null`. The three artifacts are absent on an Instance.
+/// present as `null`. The three artifacts are absent on an Instance. Documents
+/// are written as stored, canonical text: keys sorted, no insignificant whitespace.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EntityDto {
@@ -831,16 +835,20 @@ pub struct EntityDto {
     pub lifecycle_status: LifecycleStatusDto,
     /// The whole authored document, either kind.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<serde_json::Value>,
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub content: Option<Box<RawValue>>,
     /// Type Schemas only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolved_schema: Option<serde_json::Value>,
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub resolved_schema: Option<Box<RawValue>>,
     /// Type Schemas only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_traits: Option<serde_json::Value>,
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub effective_traits: Option<Box<RawValue>>,
     /// Type Schemas only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_traits_schema: Option<serde_json::Value>,
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub effective_traits_schema: Option<Box<RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub provenance: Option<ProvenanceDto>,
@@ -1112,6 +1120,8 @@ pub struct BatchGetItemDto {
 
 /// A batch read. Unknown fields are refused, so a misspelled `$select` is not
 /// answered with the default set.
+// `$select` is the OData wire name, not a snake_case choice.
+#[allow(unknown_lints, de0803_api_snake_case)]
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
@@ -1182,9 +1192,8 @@ pub struct EntityLookupsDto {
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct PageInfoDto {
-    /// Present while the traversal has more to give. Absent means this page is the
-    /// last one — the only end-of-traversal signal, so a caller stops on its
-    /// absence rather than on a short page.
+    /// Present exactly when another match exists, and then the page is full.
+    /// Absent means this page is the last one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// The page size actually applied, which is the default when the caller named none.

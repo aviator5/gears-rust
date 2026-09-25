@@ -40,7 +40,7 @@ Types Registry is a control plane for type contracts. It owns the identity, defi
 
 A Registry Reference is a deterministic UUID derived from the canonical GTS Identifier and persisted by domain gears in place of the identifier string (ADR-0001). A managed identifier names a logical entity with immutable authored history: a major-only identifier is mutable through retained revisions, while a minor-bearing identifier is admitted once and pins references at that minor. Minor sequences are contiguous; compatibility is enforced across each stable Type Schema major except where a cross-minor waiver is explicitly recorded, while major 0 is exempt and quarantined from stable schemas' resolution closures and derivation chains (ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0015). Revisions retain admission snapshots, while the current-state projection materializes effective artifacts and may change when floating dependencies advance.
 
-Registration and deletion use one asynchronous read/reconcile/conditional-write protocol. Acceptance binds the `Idempotency-Key` to the request fingerprint, persists the operation and candidates with a ToolKit outbox message in one transaction, and returns the operation; a worker performs dependency-aware partial admission and records an outcome for every candidate. Purge is the only mutation outside this path: synchronous, operator-invoked, and disabled by default (ADR-0012, ADR-0013). The read and query shape follows from GTS identity: `chain_ids()` derives hierarchy without graph traversal, canonical identifiers support indexed range prefilters confirmed by the GTS matcher, and relationships needed for deletion safety and impact analysis are stored as flat managed dependency edges.
+Registration and deletion use one asynchronous read/reconcile/conditional-write protocol. Acceptance binds the `Idempotency-Key` to the request fingerprint, persists the operation and candidates with a ToolKit outbox message in one transaction, and returns the operation; a worker performs dependency-aware partial admission and records an outcome for every candidate. Purge is the only mutation outside this path: synchronous, operator-invoked, and disabled by default (ADR-0012, ADR-0013). The read and query shape follows from GTS identity: `chain_ids()` derives hierarchy without graph traversal, managed discovery matches patterns exactly in SQL over stored parsed segments while external results are confirmed by the GTS matcher, and relationships needed for deletion safety and impact analysis are stored as flat managed dependency edges.
 
 ### 1.2 Architecture Drivers
 
@@ -56,7 +56,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | `cpt-cf-types-registry-fr-validate-type-derivation` | Identifier-derived chain validation against every managed base under one resolution-closure dialect. See *Compatibility & Evolution Policy* in §3.2. |
 | `cpt-cf-types-registry-fr-gts-validation` | All GTS semantics come from `gts-rust`; the managed profile adds Draft-07 and identifier restrictions, while federation does not reinterpret source content. See §2.2, *Admission Pipeline*, and *Compatibility & Evolution Policy* in §3.2. |
 | `cpt-cf-types-registry-fr-ref-tracking` | Flat managed dependency edges for derivation, `$ref`, and Instance-to-schema relationships; used for deletion safety and impact analysis. `x-gts-ref` creates no edge. See *Dependency Graph & Deletion Safety* in §3.2. |
-| `cpt-cf-types-registry-fr-type-query-assistance` | Indexed identifier-range prefilter plus authoritative GTS matching, source-major federation, and a bounded complete Registry Reference set. See *Query Assistance & Discovery* in §3.2. |
+| `cpt-cf-types-registry-fr-type-query-assistance` | Exact managed matching in SQL over stored parsed segments, GTS matcher confirmation of external results, source-major federation, and a bounded complete Registry Reference set. See *Query Assistance & Discovery* in §3.2. |
 | `cpt-cf-types-registry-fr-tenant-ownership` | Global or tenant ownership stored on each Managed Entity; tenant visibility follows the directed descendant relation, computed from the subject tenant; boolean `read`/`list` grants gate the operation without altering that relation. See *Visibility Resolver* and *Read authorization* in §3.2. |
 | `cpt-cf-types-registry-fr-registration-authority` | Global writes use `PlatformSecurityContext`; tenant writes use PDP grants over the candidate identifier, evaluated before identifier availability. See *Tenant-plane authorization* and *Platform-plane authorization* in §3.2. |
 | `cpt-cf-types-registry-fr-registration-policy` | Closed-by-default creation policy over admitted vendors and tenant ownership, resolved exact-then-longest per parameter before authorization. See *Registration policy* in §3.2. |
@@ -77,7 +77,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-types-registry-nfr-lookup-latency` | Exact lookup p95 < 10 ms | Identity, current-state read, availability | Derived references, keyed current-state joins, SQL availability evaluation, no plugin call on managed reads, and one cached authorization decision per request rather than per entity. | Benchmark profile in §4. |
-| `cpt-cf-types-registry-nfr-query-latency` | Bounded search p95 < 100 ms (P2) | Discovery and query assistance | Indexed identifier ranges, GTS post-filtering, and bounded source-major federation. | Benchmark profile in §4. |
+| `cpt-cf-types-registry-nfr-query-latency` | Bounded search p95 < 100 ms (P2) | Discovery and query assistance | Indexed exact managed filters before the page limit, GTS matching of external results, and bounded source-major federation. | Benchmark profile in §4. |
 | `cpt-cf-types-registry-nfr-multi-pod-correctness` | Every pod's first post-commit read sees the mutation | Database, outbox worker, derived caches | One authoritative database, leased outbox dispatch, idempotent guarded commits, and no process-local authority. | Integration tests for duplicate delivery, lease expiry, concurrent family admission, and cross-pod read-after-commit. |
 | `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current after the client observes the mutation | SDK client cache | Projection-scoped validators, fail-closed revalidation, immediate invalidation of submitted keys, and bounded freshness for indirectly affected keys. | Integration tests in §3.3, *The client-side cache*. |
 
@@ -216,7 +216,9 @@ Types Registry decides what a type contract is, who may see it, and whether a te
 
 Types Registry does not implement GTS. Parsing, canonicalization, chain derivation, pattern matching and coverage, reference extraction, schema resolution, trait merging, content-model classification, compatibility, and casting all come from `gts-rust`. Any behaviour the registry needs and the implementation lacks is a change request against `gts-rust`, not a local approximation.
 
-The design depends on the behaviours enumerated in §4, *Implementation prerequisites*, rather than on a named library version. In particular, compatibility is accepted-instance-set inclusion and content models are classified on resolved effective schemas. Identifier range scans are candidate prefilters only; every managed and external result is confirmed by the GTS matcher.
+The design depends on the behaviours enumerated in §4, *Implementation prerequisites*, rather than on a named library version. In particular, compatibility is accepted-instance-set inclusion and content models are classified on resolved effective schemas.
+
+Managed discovery is the one place GTS matching runs in SQL. `gts-rust` parses both the stored identifier, whose segments admission materializes, and the pattern; the repository compiles the parsed pattern segments into exact predicates over the stored segments, mirroring the implementation's matcher field for field. Differential tests against `GtsId::matches_pattern` on every backend are the contract. External results are still confirmed by the GTS matcher.
 
 **ADRs**: `cpt-cf-types-registry-adr-type-schema-evolution-compatibility`, `cpt-cf-types-registry-adr-managed-external-boundary`
 
@@ -244,7 +246,7 @@ An installation has one authoritative database served by many pods; every guaran
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-constraint-multi-backend`
 
-Storage behaves identically on SQLite, PostgreSQL, and MySQL. The repository layer owns explicit identifier-range bounds, UUID representation, backend-safe set chunking, and compare-and-swap; none leaks into the domain.
+Storage behaves identically on SQLite, PostgreSQL, and MySQL. The repository layer owns explicit identifier-range bounds, the stored-segment pattern compiler, UUID representation, backend-safe set chunking, and compare-and-swap; none leaks into the domain.
 
 Reverse-impact queries use a repository-owned recursive CTE over `dependency`, built with `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001); no closure or raw query is maintained separately. The CTE uses `UNION`, applies `limits.activation_write_set` as its depth cap, and returns distinct entity IDs for converging paths. Admissions exceeding that set bound are refused; [database.sql](./database.sql) defines the exact query constraints. To guarantee that every traversal allowed by the application bound can complete on `MySQL`, every Types Registry session must have `cte_max_recursion_depth` at least as large as that bound. This is an operational capacity prerequisite over the actual session value, not validation against a vendor default. A shallower traversal can still complete with a lower database limit; if a traversal exhausts it, the ordinary storage error aborts and rolls back the admission transaction.
 
@@ -850,7 +852,7 @@ It persists no external definitions, revisions, mappings, tombstones, or tenant 
 
 ##### Responsibility scope
 
-Compiles a validated pattern into a bounded range predicate over the canonical identifier, post-filters candidates through the GTS matcher, expands version-family membership and derivation-hierarchy constraints from the identifier chain — membership rather than compatibility, since a reference set carries no per-edge provenance — traverses sources source-major, and serves paged discovery. SDK `expand_type_filter` composes those pages into one complete deduplicated set of Registry References — or `QUERY_EXPANSION_LIMIT_EXCEEDED`, or a failure when completeness cannot be established; the server keeps no expansion count.
+Compiles a `gts-rust`-parsed pattern into exact predicates over stored managed segments, confirms external results with the GTS matcher, expands version-family membership and derivation-hierarchy constraints from the identifier chain — membership rather than compatibility, since a reference set carries no per-edge provenance — traverses sources source-major, and serves paged discovery. SDK `expand_type_filter` composes those pages into one complete deduplicated set of Registry References — or `QUERY_EXPANSION_LIMIT_EXCEEDED`, or a failure when completeness cannot be established; the server keeps no expansion count.
 
 ##### Responsibility boundaries
 
@@ -945,7 +947,7 @@ The tenant surface runs on the business listener with `SecurityContext`. `owner_
 | `DELETE` | `/types-registry/v1/entities/{entity_key}` | Delete exactly one entity, its precondition in the query | `202` with the operation; `200` only when replaying a key whose operation is already terminal | unstable |
 | `GET` | `/types-registry/v1/operations/{operation_id}` | Poll an operation in the same authorization scope | `200` with progress and all per-GTS-ID results known so far | unstable |
 
-`GET /entities` is ordinary paged discovery. Its default projection is document-free; an explicit `$select` may name documents, and changes only the representation — never a mode or a traversal cap. A traversal may exceed 1000 entities and ends only when `next_cursor` is absent; a short or empty page may still carry one. Three intentionally absent routes are worth recording:
+`GET /entities` is ordinary paged discovery. Its default projection is document-free; an explicit `$select` may name documents, and changes only the representation — never a mode or a traversal cap. A traversal may exceed 1000 entities and ends only when `next_cursor` is absent. Managed filters apply before the page limit, so a managed page carrying a cursor is full; federated paging follows *Federation Router*, and callers rely on the cursor alone. Three intentionally absent routes are worth recording:
 
 - **Type filter expansion** is a tenant-plane SDK helper, not a route: `expand_type_filter` pages discovery with `$select=gts_uuid&lifecycle_status=active&availability=available` and deduplicates. It enforces a documented maximum of 1000 distinct references: the 1001st fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`, and exactly 1000 with a `next_cursor` keeps paging until exhaustion or overflow. Any page, source, context or routing failure discards the accumulated prefix; no partial `ConcreteReferenceSet` is exposed. Completeness is over the traversal, not one instant, as ADR-0001 and `cpt-cf-types-registry-fr-type-query-assistance` specify. Results have no validator and must not be cached because ADR-0010 availability may change without entity mutation. A direct REST caller expanding a filter applies the same rules itself.
 - **Dependent enumeration** is replaced by mutation Dry Run, which executes the same revalidation and reports blockers. Platform-plane deletion Dry Run covers hidden dependants under ADR-0009; no requirement needs the non-blocking remainder.
@@ -1130,7 +1132,7 @@ The `If-None-Match` **header** is unavailable here, and refused rather than igno
 
 | Parameter | Where | Meaning |
 |---|---|---|
-| `pattern` | query | A GTS wildcard pattern. Compiles to a range predicate over the canonical identifier, which the GTS matcher then confirms |
+| `pattern` | query | A GTS pattern, parsed by `gts-rust`. Managed rows are matched exactly in SQL over their stored segments (§2.2); external results are confirmed by the GTS matcher |
 | `depth` | query | Maximum chain length. A GTS wildcard is greedy across `~`, so a pattern alone cannot exclude types derived from what it matches; pattern plus depth is also how a version family is enumerated exactly, which is what ADR-0008 asks of discovery. A version-less pattern collects every major and, where the family carries them, every minor |
 | `kind` | query | `type_schema` or `instance` |
 | `lifecycle_status` | query | `active` (default), `deleted` (tombstones only) or `all`. Bound by the cursor; absent equals `active` |
@@ -1141,7 +1143,7 @@ The `If-None-Match` **header** is unavailable here, and refused rather than igno
 | `$select` | query | As above, applied to every item on the page |
 | `limit`, `cursor` | query | Page size and position. `limit` defaults to 50 and may not exceed 100. The bound is on items, not on bytes: a caller selecting documents should page smaller |
 
-The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Results are active-only unless `lifecycle_status` says otherwise, and sort by canonical identifier. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
+The cursor binds query, subject visibility context, Context Tenant, authorization scope, routing generation, and per-source position. It is rejected after routing or context changes rather than splicing distinct traversals. Results are active-only unless `lifecycle_status` says otherwise, and sort by canonical identifier. Every filter applies before the page limit, so only the last page is short and a page with a cursor is full. Unstable Type Schemas remain discoverable because no stability filter exists; D3 addresses that additive gap.
 
 The `fr-type-query-assistance` filter forms map as follows:
 
@@ -2072,10 +2074,9 @@ sequenceDiagram
             A->>Z: list, registry metatype resource
             Z-->>A: Allow or deny, gear-wide in P1
         end
-        A->>G: Compile the pattern to explicit identifier bounds
-        A->>D: Index range scan, visibility and availability in one predicate
-        A->>G: Confirm each candidate with the GTS matcher
-        Note over A,G: The range is a pre-filter — matching is segment-wise,<br/>so the matcher decides
+        A->>G: Parse the pattern
+        A->>D: Segment joins, visibility and availability in one statement
+        Note over A,D: Managed matching is exact in SQL,<br/>differentially tested against the GTS matcher
         opt managed rows exhausted and a claim intersects the pattern
             A->>R: Continue source-major, next plugin in priority order
             R->>P: list_entities(pattern, source cursor, projection)
@@ -2233,6 +2234,8 @@ Only P2 construction questions belong here. Known P1 blockers are stated separat
 
 `limits.activation_write_set` (§3.2, default **512**) bounds one atomic refresh; larger candidates are refused rather than partially committed. If an installation legitimately reaches the limit, benchmark the reverse-impact CTE on its graph and consider a generation/staging protocol that raises the limit without exposing mixed state. The largest reverse-impact set measured today is 27.
 
+A discovery page is one statement with no scan budget. Indexes serve a selective segment, `depth=1`, `kind`, and one `lifecycle_status`, tombstone-only listings included. A page still reads `gts_id` order until it fills for `depth` above 1; its cost is the page size divided by the match density. On 18k rows `EXPLAIN` shows these plans on all three backends with every page under 2.2 ms; the slowest is MySQL reading ~3k identifiers for `depth=1` under a broad pattern, where it prefers the pattern's `gts_id` range to `idx_tr_entity_depth`. The benchmark profile should measure these shapes at production scale.
+
 ### Implementation prerequisites
 
 Five prerequisites block implementation: the benchmark profile above, one external confirmation, and three protocol/contract/schema alignments below.
@@ -2253,7 +2256,7 @@ No ADR-0015 quarantine preflight is needed because the release introducing the c
 4. **Per-content-model property addition/removal**, discriminated in both directions.
 5. **Checker specification and implementation versions**, persisted on admission for future reinterpretation under ADR-0003.
 6. **Document-level comparison** that resolves both sides and fails instead of comparing unresolved documents.
-7. **Registration-policy matching properties**: trailing wildcard includes its root; a prefixed wildcard requires a suffix; trailing wildcard ignores the type marker; major-only pattern includes its minors. These are pinned in `gts-id` `GtsIdPattern::matches_views` tests `test_trailing_chain_wildcard_matches_empty_suffix`, `test_prefixed_chain_wildcard_requires_a_suffix`, and `test_trailing_wildcard_ignores_type_marker`.
+7. **Registration-policy matching properties**: trailing wildcard includes its root; a prefixed wildcard requires a suffix; trailing wildcard ignores the type marker; major-only pattern includes its minors. These are pinned in `gts-id` `GtsIdPattern::matches_views` tests `test_trailing_chain_wildcard_matches_empty_suffix`, `test_prefixed_chain_wildcard_requires_a_suffix`, and `test_trailing_wildcard_ignores_type_marker`. Managed discovery's SQL compiler must reproduce the same properties, which its differential tests assert per backend.
 8. **Pattern containment** for Source Claim overlap. Rooted grammar provides anchoring, and ADR-0011 prevents claims slicing into a chain.
 
 **`toolkit-db` outbox reliance — no longer a prerequisite.** P1 reuses `toolkit-db`'s leased outbox rather than implementing another, as `ledger`, `file-storage`, and `chat-engine` do. This needed a sign-off while the outbox was an experimental feature; `toolkit-db` 0.12.0 made it unconditional, so no approval is outstanding (SPEC §4).

@@ -103,7 +103,7 @@ correctness core, not scope.
 | D11 | **P0 retains registry-side inventory pull; per-gear push moves to P1** | Supersedes the original P0 push decision (plan P4/P18). types-registry seeds all linked inventory plus `cfg.entities` through the outbox, requiring every seed item to be `succeeded` or `unchanged` before publishing its client. T23 reconciles explicitly supplied documents for existing registration callers; no per-gear inventory filter or new inventory startup calls in P0. C3 remains open until P1 integrates inventory attribution and push with the platform-plane client |
 | D12 | **`GET /entities` becomes a bounded page with a cursor, document-free by default** | The old shape returns every match with full `content` in one response. A `limit` without a cursor would make the endpoint incomplete, so both land together. P19 adds `$select` on this page and the two exact-key routes; selected documents are explicit and the discovery cursor binds the normalized selection (§10.2) |
 | D13 | **P0 field projection on all three reads** (plan P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity, T29 validators and T30 cache keys (§10.2) |
-| D14 | **Discovery gains `depth` and `kind` in P0** (plan P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`. They compose with `pattern` and `lifecycle_status` (default `active`) before page limits and projection. The cursor binds these filters so continuation cannot splice different result sets (§10.2) |
+| D14 | **Discovery filters by `pattern`, `depth`, `kind` and `lifecycle_status`, all exact SQL before `LIMIT`** (plan P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`; `lifecycle_status` defaults to `active`. Admission materializes `entity.chain_depth` and one `entity_gts_segment` row per parsed segment; the repository compiles the `gts-rust`-parsed pattern into one join per constrained segment and fetches `limit + 1`, so only the last page is short. The cursor binds the filters so continuation cannot splice different result sets (§8.2, §10.2) |
 
 ---
 
@@ -175,7 +175,7 @@ store-build cache. Everything else comes from the workspace.
 
 | Concern | Choice |
 |---|---|
-| GTS semantics | `gts` / `gts-id` / `gts-macros` **0.12.0** — **sole** source, no local approximation (`constraint-gts-implementation`). Upgrade from 0.11.0 is part of this task, §7 |
+| GTS semantics | `gts` / `gts-id` / `gts-macros` **0.12.0** — **sole** source, no local approximation (`constraint-gts-implementation`). Upgrade from 0.11.0 is part of this task, §7. Discovery's SQL pattern compiler mirrors the `gts-id` matcher under differential tests (D14) |
 | Persistence | SeaORM via `toolkit-db` `DBProvider`, `sea-orm-migration` |
 | Async dispatch | `toolkit-db` outbox, leased mode, table prefix `types_registry__outbox` |
 | REST | Axum via `OperationBuilder`, utoipa, RFC-9457 problem details |
@@ -762,17 +762,17 @@ instance validation against a type. All of that happens **inside** admission, on
 candidate plus what it consumes.
 
 Reads need rows. The exact-read primitive is a keyed lookup, and the list primitive is
-identifier matching that `gts-id` already implements as a pure function on the identifier
-string — the current `InMemoryGtsRepository::list` iterates the store purely as a row
-container and filters with `GtsIdPattern`, never asking the store a semantic question. And
+identifier matching, a pure function of the parsed identifier — no store question. And
 by D3 the effective artifacts a reader wants (`resolved_schema`, `effective_traits`,
 `effective_traits_schema`) are already materialized on the current-state row. So a read is
 a selected-column lookup (with a kind-selected current-revision join that checks the
-pointer and reads `content` or `provenance` when selected) plus `GtsId::matches_pattern` and, for T22c's
-`depth`, `GtsId::segments().len()` over candidate rows in Rust. The `kind` filter is
-an SQL predicate on the stored kind; the safe pattern prefix is still only a prefilter.
-T22b keeps document columns out of metadata-only reads. No GTS semantics are reimplemented, so
-`constraint-gts-implementation` is not touched.
+pointer and reads `content` or `provenance` when selected). Discovery (D14) decides every
+filter in one statement: `kind` and `lifecycle_status` on stored columns, `depth` on the
+materialized `chain_depth`, and `pattern` as joins on `entity_gts_segment`, the segments
+`GtsId::segments()` produced at admission. `gts-rust` parses both sides; the repository
+only compiles the parsed pattern (`repo/segment_filter.rs`), and differential tests pin it
+to `GtsId::matches_pattern` on every backend. T22b keeps document columns out of
+metadata-only reads.
 
 **Why the process-local snapshot was rejected.** A snapshot rebuilt after each local
 admission unit cannot satisfy the multi-pod read criterion of §13 — *"two pods, commit on
@@ -1081,7 +1081,7 @@ Successful admissions carry no compatibility diagnostics.
 
 ## 9. Database
 
-`database.sql` is the normative target. P0 creates **10 of its 11 tables**, omitting only
+`database.sql` is the normative target. P0 creates **11 of its 12 tables**, omitting only
 `source_claim` (federation). The exception is `coordination_state`, which arrives in its
 own second migration rather than the initial one, because the initial migration is
 already applied on every existing installation and would never deliver a new table to it.
@@ -1105,7 +1105,8 @@ every P0 entity.
 | Table | P0 |
 |---|---|
 | `version_family` | full, global scope only |
-| `entity` | full, global scope only |
+| `entity` | full, global scope only; `chain_depth` materialized (D14) |
+| `entity_gts_segment` | full — one row per parsed segment, written with the entity (D14) |
 | `type_schema_revision` | full |
 | `instance_revision` | full |
 | `type_schema` | full — artifacts materialized (D3) |
@@ -1124,6 +1125,10 @@ Migration notes:
 - `coordination_state` in its own second migration, `m2026NNNN_000002_coordination_state.rs`,
   seeding `entity_write_order` at sequence zero with a migration timestamp; re-running it
   against a database that already has the table and row preserves both.
+- `entity.chain_depth`, `entity_gts_segment` and the discovery indexes in
+  `m20260925_000005_entity_gts_segment.rs`. It has no backfill, so it refuses while
+  `entity` holds a row; SQLite's `chain_depth` is nullable with a CHECK rejecting NULL,
+  because SQLite cannot add a `NOT NULL` column without a default.
 - Outbox tables come from `outbox_migrations_with_prefix("types_registry__outbox")`,
   not from this migration.
 - `routing` is not seeded, because federation has not landed: its migration will seed
@@ -1366,7 +1371,8 @@ match in one array, each item carrying full `content`; old exact reads likewise 
 documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field selection:
 
 - **A page, not a list.** `limit` defaults to 50 and may not exceed 100; the response
-  carries a cursor when more remains. Ordering is by canonical identifier, which is what
+  carries a cursor exactly when another match remains, and a page with a cursor is full
+  (the query fetches `limit + 1`). Ordering is by canonical identifier, which is what
   makes the cursor a plain keyset — `gts_id` is unique
   and immutable, so a page boundary cannot drift or duplicate. Cursors come from
   `toolkit-odata`, which already encodes them as versioned base64url and refuses an unknown
@@ -1378,17 +1384,17 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
 - **Lifecycle filter (discovery only).** `lifecycle_status=active|deleted|all`, default
   `active`: `active` lists live entities, `deleted` only tombstones, `all` both. It is an
   SQL predicate on the stored status, intersected with the other filters before the page
-  limit and scan budget, so a sparse set of tombstones is neither skipped nor charged to
-  the budget. Unknown, empty or repeated values are a `400` naming `lifecycle_status`.
+  limit. Unknown, empty or repeated values are a `400` naming `lifecycle_status`.
   Exact reads and `batchGet` are unchanged: they always return tombstones by key.
-- **P0 discovery filters.** `pattern` is a GTS wildcard matched by `gts-rust` after a
-  safe indexed prefix prefilter. `depth` is an optional **inclusive maximum number of
+- **P0 discovery filters.** `pattern` is a GTS pattern parsed by `gts-rust` and matched
+  exactly in SQL over the stored segments (D14). `depth` is an optional **inclusive maximum number of
   GTS identifier segments**: a one-segment root has depth 1, and a derived type or
   Instance tail adds one for each segment. The same rule applies with or without
   `pattern`; a filter of `depth=2` includes depth 1 and 2. REST accepts an integer
   `1..=255` (the SDK uses `u8`) and refuses zero, negative, non-integer and overflow
-  values with an RFC-9457 `depth` field violation. Count parsed `GtsId::segments()`;
-  do not count `~` characters or traverse dependency edges. `kind` is optional and
+  values with an RFC-9457 `depth` field violation. Count parsed `GtsId::segments()`,
+  stored as `entity.chain_depth`; do not count `~` characters or traverse dependency
+  edges. `kind` is optional and
   accepts only `type_schema` or `instance`, using the stored `entity.kind` and the
   same enum as read results; unknown values are `400` naming `kind`. The old v1
   `is_schema` spelling is not an alias. A caller may
@@ -1889,14 +1895,15 @@ identifier profile refusals, topological order, baseline selection.
 | Discovery page | bounded by `limit`, ordered by canonical identifier, deleted entities absent by default; `content` absent by default and present only when selected |
 | Discovery `lifecycle_status` | `active` (default), `deleted` and `all` list live, tombstoned and both; composes with `pattern`/`depth`/`kind` across sparse pages; malformed or repeated values are `400`; the cursor binds the normalized value |
 | Discovery `depth` and `kind` | a one-segment Type Schema matches `depth=1`, a two-segment derived schema or Instance does not; `depth=2` includes both levels, while `kind=type_schema` and `kind=instance` partition the same active fixture set |
-| Combined discovery filters | `pattern`, `depth` and `kind` intersect before page limits; a sparse post-filter cannot skip a later match or terminate traversal early, and filtering is independent of `$select` |
+| Combined discovery filters | `pattern`, `depth`, `kind` and `lifecycle_status` intersect in SQL before `LIMIT`; a sparse match set returns full pages, never an empty page with a cursor, and filtering is independent of `$select` |
+| Discovery pattern semantics | a generated corpus is discovered under every wildcard cut, bare `~*`, minors pinned in early segments, instance tails and UUID-tail patterns, returning exactly what `GtsId::matches_pattern` accepts on SQLite, PostgreSQL and MySQL; a UUID-tail identifier is refused at storage |
 | Invalid discovery filters | `depth=0`, negative, non-integer and overflow values, plus unknown `kind` and legacy `is_schema`, return RFC-9457 `400` with the offending field named |
 | `limit` above `page_size_max` | refused, not silently clamped |
 | Cursor traversal over a matching set larger than one page | every matching entity (active by default) appears exactly once across pages |
 | Entity admitted mid-traversal | the traversal stays consistent: no duplicate and no skipped predecessor, because the cursor is a keyset over an immutable unique `gts_id` |
 | Cursor with an unknown version | rejected rather than reinterpreted |
 | Cursor resumed with another selection or filter | changing `$select`, `pattern`, `depth` or `kind` is rejected with `400`; absent `$select` and the explicit default field set resume interchangeably |
-| Filtered cursor traversal | mixed depths and kinds across multiple pages produce each matching entity exactly once, under any `lifecycle_status`, including when the scan budget ends a sparse page |
+| Filtered cursor traversal | mixed depths and kinds across multiple pages produce each matching entity exactly once, under any `lifecycle_status`; every page with a cursor is full and the last page has none |
 | SDK cache under two selections | different normalized sets occupy different entries; reordered/default-equivalent selections reuse one entry |
 | `list_instances` helper over a document-free default | selects documents on the page or through `batchGet` and returns payloads, so the call shape consumers use is preserved |
 | Two pods, concurrent dependency change | commit-time revision-vector mismatch rolls back and retries |
@@ -1925,7 +1932,8 @@ references.
   code organisation, layering, DB access and test shape. **Ignore
   `guidelines/DNA/languages/RUST.md` — it is outdated.**
 - Take GTS semantics from `gts-rust`. A missing behaviour is an upstream change request,
-  never a local approximation (`constraint-gts-implementation`).
+  never a local approximation (`constraint-gts-implementation`). Discovery's SQL
+  compiler is the one mirror, and it stays under differential tests (D14).
 - Keep repositories on `runner: &impl DBRunner` and the Secure ORM; raw SQL only in
   migration definitions.
 - Validate at the admission boundary before touching storage.

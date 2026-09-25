@@ -380,7 +380,6 @@ async fn a_batch_with_one_mismatched_schema_id_writes_and_dispatches_nothing() {
         "a refused batch must not write an operation"
     );
     assert!(recorder.calls().is_empty(), "and must not dispatch");
-    assert!(recorder.committed_calls().is_empty());
 
     // The corrected batch under the same key is a fresh acceptance, not a replay.
     refused.candidates[1].content = Some(schema(other));

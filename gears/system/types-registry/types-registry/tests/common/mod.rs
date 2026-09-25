@@ -173,6 +173,11 @@ where
 /// The database-backed persistence ports, as the gear wires them. Tests that
 /// drive `accept` / `run_operation` / `RegistryService` pass this: the domain names
 /// only its ports, so the adapter is chosen here exactly as `init()` chooses it.
+/// A read document as a tree, to compare with an authored `json!` value.
+pub fn doc(raw: Option<&serde_json::value::RawValue>) -> Option<serde_json::Value> {
+    raw.map(|raw| serde_json::from_str(raw.get()).expect("a read document is JSON"))
+}
+
 pub fn stores() -> Arc<dyn types_registry::domain::ports::Stores> {
     Arc::new(types_registry::infra::storage::Repos)
 }

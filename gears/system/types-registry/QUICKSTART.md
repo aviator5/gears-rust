@@ -244,7 +244,7 @@ curl -s "$BASE/types-registry/v2/entities?limit=20&pattern=gts.cf.core.*&\$selec
 
 Or page identifiers first and read documents for the keys you pick through `:batchGet`,
 in batches of at most 100 keys. Keep the same `$select` on every
-continuation and stop only when `next_cursor` is absent; a short page may still carry one:
+continuation and stop when `next_cursor` is absent:
 
 ```bash
 # Page, collecting identifiers until next_cursor is absent.
@@ -273,10 +273,9 @@ for i in range(0, len(keys), 100):
     done
 ```
 
-The traversal ends when `page_info.next_cursor` is **absent** — not when a page comes back
-short. One page is bounded in work as well as in results, so a selective `pattern` over a
-large table can legitimately return nothing and still hand back a cursor asking to be
-called again.
+Every filter applies before the page limit, so a page with a `next_cursor` is always full,
+and only the last page is short or, when nothing matches, empty. `pattern` is exact: a
+concrete segment matches any minor unless the pattern names one, in any position.
 
 ### Filter by chain depth and kind
 
@@ -294,8 +293,7 @@ curl -s "$BASE/types-registry/v2/entities?pattern=gts.cf.core.example.event.v1~*
 ```
 
 `depth` must be an integer from 1 to 255; `0`, negative, fractional or larger values, an
-unknown `kind`, and the v1 spelling `is_schema` are `400`. A filtered page may come back
-empty and still carry a `next_cursor`: follow it until the cursor is absent.
+unknown `kind`, and the v1 spelling `is_schema` are `400`.
 
 `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the `pattern`, `depth`,
 `kind` and normalized `$select` it was issued for. Resuming under any of them changed —

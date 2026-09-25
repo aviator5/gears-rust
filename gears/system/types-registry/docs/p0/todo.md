@@ -184,23 +184,22 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 - [x] No raw SQL; all queries go through the typed builder
 - [x] Compare-and-swap on `resource_version` is a single statement whose affected-row count is the success signal. A stale precondition is `Ok(false)`, not an error — an ordinary concurrent-writer outcome the caller turns into `412`
 - [x] Family create-then-read works on all three backends. **The "locked read" half of the original criterion is not achievable:** `DBRunner` hides the raw executor and the secure builder exposes no lock clause, so a repository cannot take `SELECT … FOR UPDATE`. `create_or_get` makes `uq_tr_version_family_key` the serialization point instead — the loser's conflict is **absorbed** (`ON CONFLICT DO NOTHING`), not raised, and then re-read. Serializing the *validation* window needs the toolkit advisory lock on the `Db` handle, which is service-layer (T12); `lock_order` is the ordering half. Now **run** on both container backends, inside a transaction as well as on a pooled connection — see the correction below
-- [x] Read primitives for the database read path (SPEC D2, §8.2): a keyed exact read, and a list read that prefilters in SQL on the stored columns and then applies `GtsId::matches_pattern` in Rust. **GTS identifier matching is never translated into SQL** — the prefix range is deliberately *wider* than the pattern (it drops the final segment, because minor-version flexibility would otherwise make the range exclude a real match), and `GtsId::matches_pattern` alone decides
-- [x] The list read is a **keyset page**: `gts_id > :after ORDER BY gts_id LIMIT :n`, excluding deleted rows, so a page boundary cannot drift or duplicate (D12). It reports whether more remains — `has_more` may over-report, which is the safe direction — and never loads the whole match set: SQL is asked for bounded batches, each row is tested as it arrives, and the scan stops on the page limit or the scan budget
+- [x] Read primitives for the database read path (SPEC D2, §8.2): a keyed exact read, and a list read decided entirely in SQL over stored columns (SPEC D14)
+- [x] The list read is a **keyset page**: `gts_id > :after ORDER BY gts_id LIMIT :n + 1`, excluding deleted rows, so a page boundary cannot drift or duplicate (D12). It returns a cursor exactly when another row matches and never loads the whole match set
 - [x] A dependency-closure read: given candidate identifiers, return them plus the transitive closure of what they consume, walking `dependency` edges (D5), `gts_id`-sorted. Candidates with no entity row are **reported** in `missing_roots` rather than failing the read, because a first admission's own candidate is exactly that case
 
 **Verification:**
-- [x] Gear tests (see [Commands](#commands)) — 161 lib + 149 integration tests, of which 18 are `repo_test.rs` and 7 are `repo_tests.rs`
+- [x] Gear tests (see [Commands](#commands)) — 161 lib + 149 integration tests, of which 18 are `repo_test.rs`
 - [x] Test: concurrent `version_family` creation yields exactly one row — 8 tasks against a file-backed pool; `SQLITE_BUSY` is retried rather than pretended away, and the assertion is on the end state
 - [x] Test: CAS with a stale version affects zero rows and is reported as such
-- [x] Test: list read with a wildcard pattern returns exactly what `GtsId::matches_pattern` accepts, including a case the SQL prefilter admits but the pattern rejects. **Two fixture identifiers had to be fixed first:** `…v1~x.a.type.v1~` does not parse (a chain segment is a full `vendor.package.namespace.type.vMAJOR`), so `matches_pattern` rejected it and the test had been passing for the wrong reason. The `v1~*` expectation was also wrong — a bare segment is an implicit derived-type envelope (GTS spec §3.6), so `…v1~` and `…v1~*` accept the same set, base included
+- [x] Test: list read with a wildcard pattern returns exactly what `GtsId::matches_pattern` accepts, including siblings in the same identifier range. A chain segment is a full `vendor.package.namespace.type.vMAJOR`, and a bare segment is an implicit derived-type envelope (GTS spec §3.6), so `…v1~` and `…v1~*` accept the same set, base included
 - [x] Test: keyset paging over a set larger than one page yields every row exactly once, and a row inserted mid-traversal neither duplicates an earlier row nor hides a later one
 - [x] Test: closure read over a chain returns the whole chain and nothing outside it — plus termination on a row that contradicts acyclicity. The relation is a DAG (ADR-0012), so the `seen` set is what keeps the walk linear in entities rather than in converging paths; termination on a contradicting row is defence in depth, retitled at T14 when the invariant gained a test of its own
 - [x] `cargo test --workspace` (excluding the two macro crates, as `make test-no-macros` does) — passes, so no regression in any other gear
 - [x] PostgreSQL / MySQL repository primitives — **run, and they found two defects.** `tests/repo_backends_test.rs` covers the properties `SQLite` cannot demonstrate: the unique-conflict handling, the keyset cursor's binary collation, and now the same two races **inside a transaction**, which is the only shape production uses. Both container suites pass; see the correction below. Run: `cargo test -p cf-gears-types-registry --features integration --test repo_backends_test`
 
 **Added beyond the acceptance criteria:**
-- **Boundedness is tested, not asserted.** 2100 rows inside the prefix range that the pattern rejects, with the single match sorted last: a read that materialised the range would return it on the first page, a bounded scan cannot. Mutation-checked by raising `SCAN_BUDGET`
-- **The SQL batch adapts.** With a pattern, 256 rows per round trip so a sparse match set does not cost one trip per match; without one, the page's own remainder, because nothing can be rejected and reading ahead is waste. Still capped at 256 either way — the remainder is caller-supplied, and one round trip's memory must not be
+- **Sparse matches cost no extra pages.** 2100 rows share the match's identifier prefix and sort ahead of it; the match still arrives on the first page, with no cursor after it
 - **`replace_outgoing` treats its edge list as a set** — `(from, kind, to)` is the primary key, so a schema that `$ref`s one base twice would otherwise be a PK violation mid-admission. Mutation-checked
 - **A second deletion is proved to be a no-op** — `mark_deleted` requires `Active`, so a repeated call reports failure and leaves `deleted_at` where it was; the read-back also pins the `LifecycleStatus` enum lowering through `Expr::value`, which no `ActiveModel` covers
 - **Two pre-existing T3 clippy failures fixed** (`make clippy` runs `--all-features`, so both would have failed CI): `entity_test.rs`'s bare-connection reads, allowed at file scope with the reason that the file tests the entity rather than the scope; and an unbackticked `PostgreSQL` in `migration_backends_test.rs`'s module header
@@ -222,7 +221,6 @@ in-transaction backends test, and each was confirmed to fail with its fix revert
 **Dependencies:** T3
 **Files touched:**
 - `TR/src/infra/storage/repo.rs` — NEW, three repositories (**split into `repo/` — one file per repository — after Checkpoint 1**, see the Phase 2 preamble)
-- `TR/src/infra/storage/repo_tests.rs` — NEW, 7 in-source tests for the SQL prefilter
 - `TR/src/infra/storage/mod.rs` — `pub mod repo`
 - `TR/tests/repo_test.rs` — NEW, 17 `SQLite` tests against the migrated schema
 - `TR/tests/repo_backends_test.rs` — NEW, 2 container-backed tests behind `integration`
@@ -1961,8 +1959,8 @@ First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. T22 is d
   `effective_traits_schema` or validator (§8.5)
 - [x] Exact/batch reads retain full representations and D3 artifacts
 - [x] Reject `$select` with an RFC-9457 problem naming the parameter (§10.2)
-- [x] Exercise `EntityRepo::list_page` scan-budget boundary and prefix range through the route
-- [x] Use T4's DB reads; apply `GtsId::matches_pattern` in Rust to prefiltered rows
+- [x] Exercise sparse and exact pattern pages through the route
+- [x] Use T4's DB reads; decide the pattern in SQL over stored segments (SPEC D14)
 - [x] OpenAPI includes RFC-9457 errors for all seven routes: exact/list/batch/operation reads
   and registration/batch deletion/single deletion
 - [x] All mutations keep `exposed = false` until platform identity/PDP checks precede dispatch
@@ -1979,7 +1977,7 @@ First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. T22 is d
 **Verification:**
 - [x] Gear tests (see [Commands](#commands)), including `TR/tests/api_rest_test.rs` driven
       through the real router: per-key batch outcomes, exact/batch key-classification parity,
-      pagination, scan-budget boundary, prefix range, `$select` and cursor-version refusals
+      pagination, sparse and exact patterns, `$select` and cursor-version refusals
 - [x] `make e2e-local` — unchanged and still green, no e2e file edited (P12)
 - [ ] `make lychee` — **not run.** The target stops on `ensure-submodules` in this worktree
       (`docs/web-docs` and friends are uninitialized), and its path list is
@@ -2210,8 +2208,9 @@ separately, each with its focused tests and a working gear.
 **Description:** Add DESIGN §3.3's `depth` and `kind` filters to `GET /entities` on the
 interim v2 route before T23 publishes `EntityQuery` (plan P20, SPEC D14/§10.2). These
 filters intersect with `pattern` and active-only discovery, before pagination and
-T22b's `$select`; they do not change exact read or `batchGet`. Keep T22a's page-size and
-scan-budget bounds. T22a's completed pattern-only filter record remains historical.
+T22b's `$select`; they do not change exact read or `batchGet`. Every discovery filter is
+exact SQL before `LIMIT limit + 1` (SPEC D14). T22a's completed pattern-only filter record
+remains historical.
 
 **Acceptance criteria:**
 - [x] REST accepts optional `depth=1..255` and `kind=type_schema|instance` with typed
@@ -2219,20 +2218,27 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
   one-segment roots have depth 1, and derived schemas and Instance tails add one
   segment each. The SDK uses `EntityFilter::max_chain_depth: Option<u8>` and
   `kind: Option<EntityKind>`. No `pattern` is required for either filter
-- [x] Filter active rows by stored `entity.kind` in SecureORM/SQL; keep the indexed
-  identifier-prefix range as a safe prefilter and let `gts-rust` decide `pattern`
-  matches and parsed chain depth. Intersect all filters before counting a page item
-  or hydrating selected documents. Do not hand-count `~`, walk dependency edges,
-  materialize the full result set or add per-entity queries
+- [x] Filter by stored `entity.kind` and `entity.chain_depth` in SecureORM/SQL, and match
+  `pattern` exactly in SQL: `gts-rust` parses it, and the repository compiles the parsed
+  segments into joins on `entity_gts_segment`. Intersect all filters before counting a
+  page item or hydrating selected documents. No Rust post-filter; do not hand-count `~`,
+  walk dependency edges, materialize the full result set or add per-entity queries
+- [x] Migration `m20260925_000005_entity_gts_segment` adds `entity.chain_depth`
+  (`GtsId::segments().len()`), `entity_gts_segment` (0-based `segment_no`, binary
+  `segment_name`, `major`, nullable `minor`, `is_type`; FK cascade; lookup index) and
+  the entity indexes `idx_tr_entity_depth`, `idx_tr_entity_kind_lifecycle` and
+  `idx_tr_entity_lifecycle` on all
+  three backends, without backfill: `up` refuses a non-empty `entity`. Admission writes
+  the segments in its transaction and refuses a UUID-tail identifier
 - [x] Extend discovery's versioned cursor identity with canonical optional `depth`
   and `kind`, alongside `pattern` and T22b's normalized selection. A continuation
   changing any filter returns `400`; absence is distinct from an explicit value.
   No release preceded T22c, so by decision the wire version stays `CursorV1`'s `1`: a
   token without the new dimensions resumes only under the same absent `depth`/`kind`
   and the same `pattern`/`$select`, and is refused as soon as either filter is named;
-  it is never read as an unfiltered traversal of a filtered query. Keep ordering by canonical `gts_id`, the scan
-  budget, progress through sparse matches and the possibility of an empty page with
-  a continuation; no matching active row is skipped or duplicated
+  it is never read as an unfiltered traversal of a filtered query. Keep ordering by
+  canonical `gts_id`. The cursor is the last returned row and appears only when another
+  match exists, so a page with a cursor is full; no matching row is skipped or duplicated
 - [x] Reject zero, negative, fractional, non-numeric and overflow `depth`, unknown
   `kind`, duplicate/unknown parameters and legacy v1 `is_schema` with RFC-9457 field
   violations. `kind` is an enum rather than a free string; neither generic `$filter`
@@ -2242,8 +2248,10 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
 **Implementation order:**
 1. Add typed `kind` filtering through REST, domain and SQL with router/backend tests.
 2. Add GTS segment `depth`, cursor binding and sparse multi-page traversal tests;
-   update OpenAPI and quickstart. Each slice leaves the gear building and its focused
-   tests green.
+   update OpenAPI and quickstart.
+3. Materialize `chain_depth` and segments (migration 000005), compile `pattern` to SQL,
+   and pin it with the differential corpus. Each slice leaves the gear building and its
+   focused tests green.
 
 **Verification:**
 - [x] `make fmt`, gear tests on SQLite (1049) and both container backends (45, including
@@ -2254,20 +2262,36 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
 - [x] Router tests: `depth=1` versus `depth=2` on roots, derived schemas and
   Instances; each `kind`; all combinations with `pattern`, `$select`, absent
   filters and tombstones; typed OpenAPI and RFC-9457 invalid-input responses
-- [x] Repository/backend tests: SQL kind predicate, exact GTS pattern/depth
-  post-filter, sparse scan-budget boundary, empty page with continuation and
+- [x] Repository/backend tests: SQL kind and depth predicates, sparse filters returning
+  full pages, exactly-`limit` and empty results without a cursor, and
   mixed-depth/mixed-kind traversal without omission or duplication on all three backends
+- [x] Differential test (`discovery_pattern_backends_test`): every generated pattern —
+  wildcard cuts, bare `~*`, early-segment minors, instance tails, UUID-tail patterns —
+  composed with `depth`, `kind` and `lifecycle`, returns exactly what
+  `GtsId::matches_pattern` accepts on SQLite, PostgreSQL and MySQL
+  (`make test-types-registry-db` 48/48; gear tests 1088/1088)
+- [x] `EXPLAIN` of each page's recorded statement over 18k rows, after `ANALYZE`, on all
+  three backends: a
+  broad pattern reads `gts_id` order with an early `LIMIT`; a sparse minor drives from
+  `idx_tr_entity_gts_segment_lookup`; `depth=1` uses `idx_tr_entity_depth`; `kind` uses
+  `idx_tr_entity_kind_lifecycle`; tombstone-only uses `idx_tr_entity_lifecycle`; no page
+  sorts more than its matches. MySQL: broad 0.80 ms, sparse kind 0.52 ms, tombstones
+  0.35 ms, `depth=1` under a broad pattern 2.10 ms (~3k rows read). A lifecycle-first
+  kind index was rejected: MySQL used it for every page and sorted (broad 23.5 ms)
 - [x] Cursor tests: changing each of `pattern`, `depth`, `kind` or `$select` returns
   `400`, unchanged filters resume, and an old cursor version is refused
 - [x] Manual `/cf/docs` and `curl` traversal with `pattern`, `depth`, `kind`,
   `$select` and a second page; `QUICKSTART.md` shows the inclusive depth rule
 
 **Implementation notes:**
-- **`EntityRepo::list_page` takes one `ListFilter`** (`pattern`, `kind`,
-  `max_chain_depth`). `kind` is an SQL predicate on `entity.kind`; `pattern` and `depth`
-  are decided in Rust by one `GtsId` parse (`matches_pattern`, `segments().len()`), with
-  the prefix range still only a prefilter. All filters apply before a row counts toward the
-  limit, under T22a's scan budget and batch size, inside the page's snapshot.
+- **`EntityRepo::list_page` takes one `ListFilter`** and runs one statement through
+  `SecureSelect::project_all`: `kind`, `lifecycle` and `depth` on entity columns (`depth=1`
+  as equality, for `idx_tr_entity_depth`), and one inner join per constrained pattern
+  segment. `repo/segment_filter.rs` mirrors `matches_views`: a concrete segment pins name,
+  major and type marker, and minor only when given; a wildcard pins its given name prefix
+  (a byte range, not `LIKE`) and major; a bare `*` adds nothing; a UUID tail cannot match.
+  The first segment also bounds a `gts_id` range, an access path only. `LIMIT limit + 1`
+  decides the cursor.
 - **Depth range is the domain's.** REST accepts plain decimal digits only (`u8::from_str`
   would take `+5`) and refuses overflow; `0` parses and `discover` refuses it as
   `DepthOutOfRange`, so a future gRPC adapter gets the same rule. Every refusal names
@@ -2292,8 +2316,8 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
 **Amendment (2026-09-23): lifecycle filter and mandatory identity.**
 - [x] Discovery accepts `lifecycle_status=active|deleted|all` (default `active`); unknown,
   empty or repeated values are `400` naming it. It is an SQL predicate in
-  `ListFilter::lifecycle`, applied with `kind` before the scan budget and page limit;
-  `pattern`/`depth` still post-filter in Rust. Exact read and `batchGet` are unchanged
+  `ListFilter::lifecycle`, applied with the other filters before the page limit. Exact
+  read and `batchGet` are unchanged
 - [x] The cursor adds a `lifecycle_status` term only for `deleted`/`all`, so absent and
   explicit `active` share one binding and changing the value on resume is `400`
 - [x] `gts_id` and `gts_uuid` join `kind` and `lifecycle_status` as members of every
@@ -2303,15 +2327,19 @@ scan-budget bounds. T22a's completed pattern-only filter record remains historic
 - [x] Tests: generated OpenAPI (`OpenApiRegistryImpl`) for the `EntityDto` required set,
   its use by all three reads, and `lifecycle_status` as an optional string parameter
   (`ParamSpec` has no `enum`/`default`; vocabulary is in the description); REST lifecycle
-  traversal, malformed values and cursor binding; repository tombstones across a sparse
-  scan budget on all three backends
+  traversal, malformed values and cursor binding; repository tombstones among many active
+  rows on all three backends
 
 **Dependencies:** T22b (projection and cursor contract); T22a (bounded discovery).
 Must complete before T23 fixes the SDK `EntityQuery` shape. No dependency on deferred
 inventory T22 or on tenancy/federation.
 **Files likely touched:** `TR/src/domain/registry_service.rs`,
-`TR/src/infra/storage/repo/entity_repo.rs`, `TR/src/api/rest/{dto,handlers,routes,cursor}.rs`,
-`TR/tests/{api_rest_test,repo_backends_test}.rs`, `QUICKSTART.md`.
+`TR/src/infra/storage/repo/{entity_repo,segment_filter}.rs`,
+`TR/src/infra/storage/entity/{entity,entity_gts_segment}.rs`,
+`TR/src/infra/storage/migrations/m20260925_000005_entity_gts_segment.rs`,
+`TR/src/api/rest/{dto,handlers,routes,cursor}.rs`,
+`TR/tests/{api_rest_test,repo_backends_test,discovery_pattern_backends_test}.rs`,
+`docs/database.sql`, `QUICKSTART.md`.
 **Scope:** L across the discovery REST/domain/repository path; split into the two
 working implementation slices above.
 
