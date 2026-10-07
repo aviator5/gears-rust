@@ -474,6 +474,42 @@ fn authenticated() {
 }
 
 #[test]
+fn platform_authenticated_requires_the_platform_plane() {
+    let platform = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/a")
+        .platform_authenticated()
+        .no_license_required()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert!(platform.spec.authenticated);
+    assert_eq!(platform.spec.auth_plane, AuthPlane::Platform);
+}
+
+#[test]
+fn every_auth_declaration_classifies_as_its_operation_auth() {
+    let authed = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/a")
+        .authenticated()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert_eq!(authed.spec.auth(), OperationAuth::Authenticated);
+    let anon = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/a")
+        .anonymous()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert_eq!(anon.spec.auth(), OperationAuth::Anonymous);
+    let platform = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/a")
+        .platform_authenticated()
+        .no_license_required()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert_eq!(platform.spec.auth(), OperationAuth::Platform);
+
+    // The pair no builder produces fails closed.
+    let mut inconsistent = anon.spec;
+    inconsistent.auth_plane = AuthPlane::Platform;
+    assert_eq!(inconsistent.auth(), OperationAuth::Platform);
+}
+
+#[test]
 fn anonymous_is_internal_by_default() {
     let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
         .anonymous()

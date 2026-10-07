@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl};
+use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl, OperationAuth};
 use toolkit::lifecycle::ReadySignal;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::{
@@ -263,6 +263,8 @@ impl ApiGateway {
         // bearer-token enforcement. It is NOT external visibility (`exposed`);
         // an anonymous route may still be externally exposed or not.
         let mut anonymous_routes = std::collections::HashSet::new();
+        // Platform routes require a validated internal token; a bearer alone is refused.
+        let mut platform_routes = std::collections::HashSet::new();
 
         anonymous_routes.insert((Method::GET, "/docs".to_owned()));
         anonymous_routes.insert((Method::GET, "/openapi.json".to_owned()));
@@ -286,17 +288,13 @@ impl ApiGateway {
 
             let route_key = (spec.method.clone(), spec.path.clone());
 
-            // Auth axis: `authenticated` requires a JWT; `!authenticated` is
-            // anonymous (auth-skip). Visibility (`exposed`) is a *separate*
-            // axis (gateway registration) and does NOT affect the auth decision.
-            // The builder typestate forces an explicit choice, so every spec'd
-            // route lands in exactly one set; `require_auth_by_default` remains
-            // the fallback for paths with no matching spec.
-            if spec.authenticated {
-                authenticated_routes.insert(route_key);
-            } else {
-                anonymous_routes.insert(route_key);
-            }
+            // Auth and gateway visibility are independent. Explicit route policy overrides
+            // require_auth_by_default; platform auth takes precedence on every host.
+            match spec.auth() {
+                OperationAuth::Platform => platform_routes.insert(route_key),
+                OperationAuth::Authenticated => authenticated_routes.insert(route_key),
+                OperationAuth::Anonymous => anonymous_routes.insert(route_key),
+            };
         }
 
         let requirements_count = authenticated_routes.len();
@@ -314,6 +312,7 @@ impl ApiGateway {
             &config,
             authenticated_routes,
             anonymous_routes,
+            platform_routes,
             proxy_registry,
         )?;
 
@@ -381,16 +380,10 @@ impl ApiGateway {
         // Build route policy once
         let route_policy = self.build_route_policy_from_specs()?;
 
-        // IMPORTANT: `axum::Router::layer(...)` behaves like Tower layers: the **last** added layer
-        // becomes the **outermost** layer and therefore runs **first** on the request path.
-        //
-        // Desired request execution order (outermost -> innermost):
+        // Layers run in reverse registration order (outermost first):
         // SetRequestId -> PropagateRequestId -> Trace -> push_req_id_to_extensions
         // -> Timeout -> BodyLimit -> CORS -> MIME validation -> PreAuthThrottling -> ErrorMapping
-        // -> Auth -> ScopeEnforcement -> PostAuthThrottling -> License -> Router
-        //
-        // Therefore we must add layers in the reverse order (innermost -> outermost) below.
-        // Due future refactoring, this order must be maintained.
+        // -> Auth -> PlatformGate -> ScopeEnforcement -> PostAuthThrottling -> License -> Router
 
         // 14) Propagate MatchedPath to response extensions (route_layer — innermost).
         // This copies MatchedPath from the request (populated by Axum route matching)
@@ -460,6 +453,12 @@ impl ApiGateway {
             ));
         }
 
+        // 10b) Always enforce platform admission after auth and before tenant scope checks.
+        router = router.layer(from_fn_with_state(
+            route_policy.clone(),
+            auth::platform_gate_middleware,
+        ));
+
         // 10) Auth
         if config.auth_disabled {
             // Build security contexts for compatibility during migration
@@ -473,11 +472,18 @@ impl ApiGateway {
                  This mode bypasses authentication and is intended ONLY for single-user on-premises deployments without an IdP. \
                  Permission checks and secure ORM still apply. DO NOT use this mode in multi-tenant or production environments."
             );
+            // A synthetic tenant context could admit a forged bearer on a platform route.
+            let policy = route_policy;
             router = router.layer(from_fn(
                 move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                     let sec_context = default_security_context.clone();
+                    let requirement = policy.requirement_of(&req);
+                    req.extensions_mut()
+                        .insert(auth::ResolvedRequirement(requirement));
                     async move {
-                        req.extensions_mut().insert(sec_context);
+                        if requirement != auth::AuthRequirement::Platform {
+                            req.extensions_mut().insert(sec_context);
+                        }
                         next.run(req).await
                     }
                 },

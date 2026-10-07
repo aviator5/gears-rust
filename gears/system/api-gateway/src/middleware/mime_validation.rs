@@ -168,6 +168,7 @@ mod tests {
             responses: vec![],
             handler_id: "test".to_owned(),
             authenticated: false,
+            auth_plane: toolkit::api::AuthPlane::Tenant,
             exposed: false,
             license_requirement: None,
             throttling: None,

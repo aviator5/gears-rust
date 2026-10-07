@@ -588,6 +588,14 @@ fn check_key_type(
             spec.path
         );
     }
+    if spec.auth_plane == toolkit::api::AuthPlane::Platform {
+        bail!(
+            "throttling: zone '{zone}' is identity-keyed but operation {} {} is platform-authenticated; \
+             a platform caller carries no tenant identity to key on",
+            spec.method,
+            spec.path
+        );
+    }
     if cfg.auth_disabled {
         bail!(
             "throttling: zone '{zone}' is identity-keyed but auth_disabled=true; every request \

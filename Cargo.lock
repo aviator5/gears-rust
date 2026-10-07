@@ -4041,6 +4041,7 @@ dependencies = [
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract-macros",
  "cf-gears-toolkit-http",
+ "cf-gears-toolkit-http-middleware",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
@@ -4185,6 +4186,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-test",
  "utoipa",
 ]
 
@@ -4270,6 +4272,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

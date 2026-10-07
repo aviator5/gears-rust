@@ -16,6 +16,9 @@ maintaining their own.
     a `PlatformSecurityContext` plus `PeerAuthenticated`
 - Header extractors for `Authorization: Bearer` and `X-ToolKit-Internal-Token`
 - `AnonymousRoute` marker so routes that carry no JWT pass through without `401`
+- Per-route policy for gear listeners: `RouteAuthPolicy` + `route_auth_middleware`
+  select auth before both planes; `platform_route_middleware` requires a validated
+  internal token and refuses any unvalidated presented credential
 - Renders rejections as canonical RFC 9457 `application/problem+json`
 
 ## What it does NOT do
