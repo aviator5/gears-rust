@@ -19,17 +19,17 @@ use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 use toolkit_security::PlatformSecurityContext;
 
 use crate::contract::PlatformTypesRegistryApi;
-use crate::entity_models::{
-    BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup, FieldSelection,
-    LifecycleStatus, Projection,
-};
 use crate::ext::jittered;
 use crate::ext::{MAX_BATCH_GET_KEYS, bounded, deadline_from_now};
 use crate::item_failure::{AdmissionFailure, context, reason};
-use crate::reconcile::{
+use crate::models::{
+    BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup, FieldSelection,
+    LifecycleStatus, Projection,
+};
+use crate::publication::reconcile::{
     Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile,
 };
-use crate::supervised::{StatusReporter, Supervised, spawn_supervised};
+use crate::publication::supervised::{StatusReporter, Supervised, spawn_supervised};
 
 /// Minimum cycle pause, including jitter, prevents instant failures from spinning.
 pub const MIN_CYCLE_BACKOFF: Duration = Duration::from_millis(50);

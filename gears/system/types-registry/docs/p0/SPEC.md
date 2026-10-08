@@ -1497,7 +1497,11 @@ one. Gear names in diagnostics are not identity or authority.
 `list_entities`, keeping the contract minimal and object-safe while preserving the call shapes
 consumers already use: `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, their
 `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round
-trip, since the kind is the trailing `~` of the identifier. `EntitySnapshot` likewise exposes the
+trip, since the kind is the trailing `~` of the identifier. One change to those shapes: the
+plural reads answer `Result<HashMap<key, Result<EntitySnapshot, _>>, CanonicalError>`. Each key
+is answered on its own — absence or a refused identifier is that key's error — while a batch
+read that fails fails the call, so an outage is never spread across the keys as if each had
+been answered. `EntitySnapshot` likewise exposes the
 materialized documents as **plain fields** — `content`, `resolved_schema`,
 `effective_traits`, `effective_traits_schema` — plus a small `segments` accessor, so a
 consumer that previously called the old models' computed methods reads a field instead.
@@ -1878,16 +1882,22 @@ in addition to that vendor's own namespace.
 gears/system/types-registry/
 ├── docs/p0/{SPEC,plan,todo}.md           ← this spec, its plan and task list
 ├── types-registry-sdk/src/
-│   ├── api.rs                            DELETED once consumers migrate (D6)
-│   ├── contract.rs                       NEW  PlatformTypesRegistryApi (#[toolkit::contract]) + PlatformTypesRegistryApiExt
-│   ├── tenant_contract.rs                NEW  TypesRegistryApi: tenant-plane entity reads (D17, T24a)
-│   ├── models.rs                         shrinks: the old models go with the old trait (D6)
-│   ├── entity_models.rs                  NEW  P0 models per §10.1 — no serde
-│   ├── reconcile.rs                      NEW  reconciliation + `publish_gts`, returning the SDK's publication status
+│   ├── legacy/                           the old trait, its models and its mock; DELETED at T31 (D6)
+│   ├── contract.rs                       NEW  both #[toolkit::contract] traits: PlatformTypesRegistryApi and
+│   │                                          TypesRegistryApi, the tenant-plane entity reads (D17, T24a)
+│   ├── ext.rs                            NEW  PlatformTypesRegistryApiExt and TypesRegistryApiExt: helpers
+│   │                                          composed from the contracts
+│   ├── models.rs                         NEW  P0 models per §10.1 — no serde
+│   ├── publication/                      NEW  per-gear publication: `mod.rs` the publication status,
+│   │                                          `publish.rs` `publish_gts`, `reconcile.rs` reconciliation,
+│   │                                          `supervised.rs` the supervised publisher task
+│   ├── error.rs                          TypesRegistryError, the opt-in projection of CanonicalError (ADR 0005)
+│   ├── field.rs, reason.rs, gts.rs,      its wire vocabulary; `item_failure.rs` is the per-item failure
+│   │   precondition.rs, item_failure.rs       (`AdmissionFailure`) inside an operation
+│   ├── testing_platform.rs               NEW  in-memory PlatformTypesRegistryApi (`test-util`); `testing.rs` at T31
 │   ├── cache/                            NEW  client cache as a decorator over dyn PlatformTypesRegistryApi (§8.3)
-│   ├── rest_client/                      NEW  behind `rest-client`: hand-written client, wire DTOs,
-│   │                                          DirectoryResolvingClient wiring (D15)
-│   └── error.rs                          extend: precondition_failed, blocked_by_*
+│   └── rest_client/                      NEW  behind `rest-client`: hand-written client, wire DTOs,
+│                                              DirectoryResolvingClient wiring (D15)
 libs/toolkit-gts{,-macros}/               declare_gts_inventory!, per-crate collectors (D16);
                                           the process-global inventory is removed at T37
 libs/toolkit/src/                         Gear::post_wiring hook, generic readiness contribution (D16),
@@ -1904,7 +1914,7 @@ libs/toolkit/src/                         Gear::post_wiring hook, generic readin
     │   ├── ports.rs                       NEW  persistence ports + the row / input types
     │   ├── service.rs                    rewritten
     │   └── repo.rs                       rewritten: async, DB-backed traits
-    ├── domain/local_client.rs            PlatformTypesRegistryApi over the domain service; passes ctx through
+    ├── api/local_client.rs               PlatformTypesRegistryApi over the domain service; passes ctx through
     ├── infra/
     │   ├── storage/
     │   │   ├── entity/                    NEW  one file per entity, 9 tables (`02`)

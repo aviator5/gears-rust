@@ -2591,7 +2591,7 @@ T47 for the always-submit change below, now T41.)*
   remaining violations are context.<name>/value. Unknown reasons/context round-trip.
   Default list helpers select content and schema materializations; explicit Select
   is preserved.
-- `api::local_client::PlatformLocalClient` shares REST cursor/tag encoding and
+- `api::local_client::LocalClient` shares REST cursor/tag encoding and
   errors. Accepted-submit read-back failures are Aborted with operation ID; an
   injected outbox/database test proves same-key recovery. ClientHub registration
   waits for T29.
@@ -2612,15 +2612,15 @@ T47 for the always-submit change below, now T41.)*
 status, `PublisherVersion`, supervision helper)
 **Files likely touched:**
 - `TR-SDK/src/contract.rs`
-- `TR-SDK/src/entity_models.rs`
-- `TR-SDK/src/reconcile.rs`
+- `TR-SDK/src/models.rs`
+- `TR-SDK/src/publication/reconcile.rs`
 - `TR-SDK/src/lib.rs`
 - `TR/src/domain/local_client.rs`
 **Scope:** M
 
 ---
 
-### - [ ] T24a: `TypesRegistryApi` tenant contract, its extension helpers and local client
+### - [x] T24a: `TypesRegistryApi` tenant contract, its extension helpers and local client
 
 **Description:** The read-only tenant-plane `TypesRegistryApi` — `SecurityContext` first;
 exact read, `batchGet` and discovery — with `TypesRegistryApiExt` convenience reads and a
@@ -2632,16 +2632,30 @@ resolving wrappers and `#[provides]` are T27a.
 Commits inside the task: (1) tenant contract and extension helpers; (2) tenant local client.
 
 **Acceptance criteria:**
-- [ ] `TypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: `&SecurityContext` first on every method, `Result<_, CanonicalError>`, `#[idempotency(SafeRead)]`, no default methods. Object-safe: `hub.get::<dyn TypesRegistryApi>()` compiles and the extension methods are callable on it
-- [ ] The tenant contract shares the platform's semantic models, projection and validators; it has no mutation and no operation access
-- [ ] `TypesRegistryApiExt`, blanket-implemented for `T: TypesRegistryApi + ?Sized`, offers the read conveniences of `PlatformTypesRegistryApiExt` — `get_type_schema`, `get_instance`, their plural and `_by_uuid` variants, `list_type_schemas`, `list_instances` — with the same local kind narrowing and explicit document selection. One implementation of the helper logic serves both extension traits; no copy, and no mutation helper
-- [ ] Its local client reuses the platform lookups, encodings and errors — no second domain implementation — and returns what the platform local client returns for the same request, `unchanged` and cursors included
-- [ ] The local client applies no tenant scope and records no principal from the `SecurityContext` in P0; the C2/C6 source comments say so. It is verified in fixture hosts only — the existing embedded consumers stay on the legacy client until T31
+- [x] `TypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: `&SecurityContext` first on every method, `Result<_, CanonicalError>`, `#[idempotency(SafeRead)]`, no default methods. Object-safe: `hub.get::<dyn TypesRegistryApi>()` compiles and the extension methods are callable on it
+- [x] The tenant contract shares the platform's semantic models, projection and validators; it has no mutation and no operation access
+- [x] `TypesRegistryApiExt`, blanket-implemented for `T: TypesRegistryApi + ?Sized`, offers the read conveniences of `PlatformTypesRegistryApiExt` — `get_type_schema`, `get_instance`, their plural and `_by_uuid` variants, `list_type_schemas`, `list_instances` — with the same local kind narrowing and explicit document selection. One implementation of the helper logic serves both extension traits; no copy, and no mutation helper
+- [x] Its local client reuses the platform lookups, encodings and errors — no second domain implementation — and returns what the platform local client returns for the same request, `unchanged` and cursors included
+- [x] The local client applies no tenant scope and records no principal from the `SecurityContext` in P0; the C2/C6 source comments say so. It is verified in fixture hosts only — the existing embedded consumers stay on the legacy client until T31
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-types-registry-sdk`: extension helpers over a fake tenant API — kind mismatch refused locally without a call, explicit selection preserved, list helpers select the documents their callers read
-- [ ] `cargo nextest run -p cf-gears-types-registry --test tenant_local_client_test` (new target): exact read, `batchGet` `found` then `unchanged` under the same `$select`, discovery cursor, and parity with the platform local client
-- [ ] Gear tests; `make fmt`, `make clippy`
+- [x] `cargo test -p cf-gears-types-registry-sdk`: extension helpers over a fake tenant API — kind mismatch refused locally without a call, explicit selection preserved, list helpers select the documents their callers read
+- [x] `cargo nextest run -p cf-gears-types-registry --test tenant_local_client_test` (new target): exact read, `batchGet` `found` then `unchanged` under the same `$select`, discovery cursor, and parity with the platform local client
+- [x] Gear tests; `make fmt`, `make clippy`
+
+**Outcome (two commits).** Verified with scoped `cargo fmt --check` and `cargo clippy -D warnings`
+for both crates.
+
+- `TypesRegistryApi` has two methods, `batch_get_entities` and `list_entities`: the tenant
+  REST plane's three routes map onto them as on the platform contract, the exact read being
+  an extension helper over the batch read.
+- `TypesRegistryApiExt` and `PlatformTypesRegistryApiExt` bind their contract and context into
+  one private `EntityReads`; the helpers exist once. `FakePlatformRegistry` serves both contracts
+  from one store through shared inherent reads.
+- `api::local_client::LocalClient` (renamed from `PlatformLocalClient`) implements both traits
+  over two shared inherent reads, so parity is structural; `tenant_local_client_test` compares
+  every tenant answer, validators, cursors and refusals included, with the platform's.
+  The gear registers neither client in its ClientHub; fixture hosts construct it.
 
 **Dependencies:** T24
 **Files likely touched:** `TR-SDK/src/{tenant_contract,ext,lib}.rs` and their tests, `TR/src/api/local_client.rs`, `TR/tests/tenant_local_client_test.rs`
@@ -3049,10 +3063,11 @@ removed — it remains the deployment-time escape hatch for identities no gear c
 - [ ] The legacy v1 routes T9a restored are deleted **together with** the repository they read — `POST /v1/entities` (`types_registry.register`), `GET /v1/entities/{gts_id}` (`types_registry.get`) and the in-memory `GET /v1/entities` list. A route left pointing at a deleted repository is the failure mode; T32 then promotes v2 onto those paths
 - [ ] **Every consumer moves onto the new SDK in this task**, mechanically. The assignment is derived by grep: every crate that references `TypesRegistryClient`, declares GTS entities or calls `toolkit_gts::inventory::submit!` is listed, and the grep is recorded (~30 crates)
 - [ ] Each consumer declares `#[consumes(contract = PlatformTypesRegistryApi, from = "types-registry", …)]` **and keeps `deps = [types_registry]`**: the init order is built from `deps` (`libs/toolkit/src/registry.rs:560`), and `#[consumes]` wiring runs only after every `init`, so a consumer that still calls the registry in `init` needs the registry initialized first and resolves the local client from the `ClientHub` directly. Phase 8 drops each gear's `deps` together with its last startup call
-- [ ] Read sites move mechanically: T24's extension helpers keep the call shapes, so a read migration is a `use` change, the context argument, and field reads where a computed method was used. No consumer recomputes effective artifacts locally (D3)
+- [ ] Read sites move mechanically: T24's extension helpers keep the call shapes, so a read migration is a `use` change, the context argument, and field reads where a computed method was used. The one exception is the plural reads (`get_type_schemas`, `get_instances`, their `_by_uuid` variants), which gained an outer `Result`: a site handles the failed call explicitly instead of finding the error repeated in every key — `settings-service`'s `declaration/service.rs`, which drops per-key errors, and `account-management`'s `checker.rs`, which sniffs them for transport faults, are rewritten accordingly. No consumer recomputes effective artifacts locally (D3)
 - [ ] Every `register(...)` site becomes **synchronous reconciliation** through the local client — T24's helper: batch-read, compare, `expected_resource_version` for differing entities, submit, wait — still inside `init`, under one bounded deadline. Plain `register_and_await` is not enough: after a configuration-built Instance changes, the next start would submit a creation for an existing entity. Every item outcome is handled; `RegisterResult::ensure_all_ok` is gone and no site treats `pending` as success. Each site passes its gear's own `PublisherContext`; nothing sends it before T39. `rate-provider-sdk`'s shared `register_rate_provider_plugin` moves with it
 - [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
 - [ ] `TypesRegistryClient`, its models (`RegisterResult`, `RegisterSummary`, `TypeSchemaQuery`, `InstanceQuery`, `GtsTypeSchema`, `GtsInstance`) and `testing::MockTypesRegistryClient` are deleted — the whole `TR-SDK/src/legacy/` directory and the legacy block in `TR-SDK/src/lib.rs`; `types-registry-sdk` exports only the new surface. `GtsTypeId` / `GtsInstanceId` stay as root re-exports of `gts`. `precondition.rs` and `TypesRegistryError::ParentNotRegistered` are checked: if only the old `register` pre-check emits them, they go too, and crate docs and comments stop naming the old trait
+- [ ] With the legacy `testing` module gone, `TR-SDK/src/testing_platform.rs` becomes `testing.rs`, so the in-memory `PlatformTypesRegistryApi` is `types_registry_sdk::testing` like every other SDK's test support; consumers' test imports move with it
 - [ ] Every registration the audit lists as depending on a later registrant is resolved here — reordered, folded into the linked inventory, or moved to the registrant that owns the dependency
 - [ ] Ready mode and the in-memory repository are gone; `ready_mode_tests.rs` deleted. The four `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys become accepted-and-ignored with a warning naming their T28 replacements, and the production host wraps its clients in the T28 cache
 - [ ] `owning_gear = "types-registry"` remains a compatibility placeholder until T39 renames the column to `publisher_name` and the first publication carrying a publisher claims the row (T40); binding it to the authenticated workload stays P1 (C3). Its source comment describes incomplete attribution and that path. Keep the column and its NOT NULL constraint; no read returns the placeholder
@@ -3527,7 +3542,7 @@ Every P0 mutation is global and platform-plane, so after this task no write bypa
 - [ ] `make e2e-local` green with every request carrying a publisher
 
 **Dependencies:** T40
-**Files likely touched:** `TR-SDK/src/{reconcile,publication,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/api/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
+**Files likely touched:** `TR-SDK/src/publication/{reconcile,mod,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/api/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
 **Scope:** L — writers first, then the requirement as its own commit
 
 ---
