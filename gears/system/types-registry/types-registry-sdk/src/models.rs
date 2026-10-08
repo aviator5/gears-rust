@@ -58,11 +58,9 @@ impl fmt::Display for EntityKey {
     }
 }
 
-/// Opaque registry freshness bytes (SPEC §8.5); equality only, never recomputed here.
-///
-/// The registry's validator token, never an HTTP entity-tag: a REST transport strips the
-/// RFC 9110 quotes on receipt and restores them on send, so a token is the same bytes from
-/// any client.
+/// Opaque freshness token (SPEC §8.5), compared by equality and never recomputed here.
+/// REST strips RFC 9110 entity-tag quotes on receipt and restores them on send;
+/// all clients expose the same token bytes.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Validator(Vec<u8>);
 
@@ -103,6 +101,9 @@ impl From<EntityKey> for BatchGetItem {
         }
     }
 }
+
+/// Batch-read key ceiling (SPEC C10); larger reads are split.
+pub const MAX_BATCH_GET_KEYS: usize = 100;
 
 /// A batch read: every key answered under one projection.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -8,10 +8,9 @@
 //!
 //! # Domain, not transport
 //!
-//! The page position is a stored `gts_id` — [`DiscoveryQuery::after`] — and the
-//! token is how the registry hands it out: which query it binds is a pagination rule,
-//! so it lives here and every adapter passes the token through as it is. Refusals are
-//! [`ServiceError`]s; the API ladder turns them into canonical errors.
+//! Tokens bind the stored `gts_id` position ([`DiscoveryQuery::after`]) to its query.
+//! Adapters pass them through unchanged; the API ladder maps [`ServiceError`] refusals
+//! to canonical errors.
 //!
 //! # What the cursor binds
 //!
@@ -216,8 +215,8 @@ mod tests {
 
     use super::*;
 
-    const AFTER: &str = "gts.cf.core.example.type.v1~";
-    const PATTERN_WILDCARD: &str = "gts.cf.core.example.*";
+    const AFTER: &str = toolkit_gts::gts_id!("cf.core.example.type.v1~");
+    const PATTERN_WILDCARD: &str = toolkit_gts::gts_id!("cf.core.example.*");
 
     fn bound<'a>(pattern: Option<&'a str>, select: &[&str]) -> Binding<'a> {
         filtered(pattern, None, None, select)
@@ -333,7 +332,13 @@ mod tests {
     #[test]
     fn a_cursor_from_another_pattern_is_refused() -> Result<(), CanonicalError> {
         let token = encode(AFTER, &bound(Some(PATTERN_WILDCARD), &[]))?;
-        assert!(decode(&token, &bound(Some("gts.cf.other.*"), &[])).is_err());
+        assert!(
+            decode(
+                &token,
+                &bound(Some(toolkit_gts::gts_id!("cf.other.*")), &[])
+            )
+            .is_err()
+        );
         assert!(decode(&token, &bound(None, &[])).is_err());
         let unfiltered = encode(AFTER, &bound(None, &[]))?;
         assert!(decode(&unfiltered, &bound(Some(PATTERN_WILDCARD), &[])).is_err());

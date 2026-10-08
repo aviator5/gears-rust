@@ -1,6 +1,5 @@
-//! Helper methods over the two contracts (SPEC §10.1). They are not part of either
-//! contract's IR and need no registration: each trait is blanket-implemented, so
-//! importing it adds its methods to the client.
+//! Helpers over both contracts (SPEC §10.1), outside contract IR. Blanket
+//! implementations make the methods available by importing the extension trait.
 //!
 //! # Which one a client uses
 //!
@@ -20,21 +19,17 @@
 //!     .await?;
 //! ```
 //!
-//! A client that implements both contracts (the local client, the test fake) has each
-//! helper name twice once both traits are imported: call it through a typed trait object
-//! or with UFCS (`TypesRegistryApiExt::get_type_schema(&client, …)`). A `dyn` client
-//! implements one contract, so it never meets that ambiguity.
+//! With both traits imported, dual-contract clients have ambiguous helper names.
+//! Use a typed trait object or UFCS (`TypesRegistryApiExt::get_type_schema(&client, …)`).
 //!
 //! Identifier kind checks are local; a UUID of the other kind is `NotFound`.
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use gts::{GtsId, GtsInstanceId, GtsTypeId};
 use tokio_util::sync::CancellationToken;
-use toolkit::tokio::time::{Instant, sleep_until};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
@@ -42,24 +37,16 @@ use uuid::Uuid;
 use crate::contract::PlatformTypesRegistryApi;
 use crate::contract::TypesRegistryApi;
 use crate::field;
-use crate::gts::{OperationResource, TypeResource};
+use crate::gts::TypeResource;
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, Entity, EntityField,
-    EntityKey, EntityKind, EntityLookup, FieldSelection, IdempotencyKey, Instance, JsonDocument,
-    ListEntitiesRequest, ListEntitiesResponse, OperationStatus, Projection, PublisherContext,
-    RegisterEntitiesRequest, RegistrationOperation, TypeSchema,
+    EntityKey, EntityKind, EntityLookup, FieldSelection, Instance, JsonDocument,
+    ListEntitiesRequest, ListEntitiesResponse, Projection, PublisherContext, TypeSchema,
 };
 use crate::reconcile::{ReconcileOptions, Reconciliation, reconcile};
 
-/// Batch-read key ceiling (SPEC C10); larger reads are split.
-pub const MAX_BATCH_GET_KEYS: usize = 100;
-
-/// Initial polling backoff, doubling to [`POLL_INTERVAL_MAX`].
-/// Transports apply Retry-After inside `get_operation`; semantic models carry no pacing hints.
-pub const POLL_INTERVAL_INITIAL: Duration = Duration::from_millis(50);
-
-/// Longest interval between two operation polls.
-pub const POLL_INTERVAL_MAX: Duration = Duration::from_secs(1);
+pub use crate::models::MAX_BATCH_GET_KEYS;
+pub use crate::submit::{POLL_INTERVAL_INITIAL, POLL_INTERVAL_MAX};
 
 /// Page limit preventing endless traversal and unbounded accumulation.
 pub const MAX_LIST_PAGES: usize = 1_000;
@@ -70,18 +57,16 @@ pub const MAX_LIST_PAGES: usize = 1_000;
 /// them, including this trait's own `DeadlineExceeded` and `Cancelled`.
 #[async_trait]
 pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
-    /// Reconcile `desired` under `options` (SPEC §10.1): absent identifiers are submitted as
-    /// creations, differing ones as updates, so content drift is an update, not a conflict.
-    /// Safe to call on every start; it never deletes what `desired` omits.
+    /// Reconcile `desired` under `options` (SPEC §10.1): create absent identifiers and
+    /// update differing content. Safe on every start; omitted identifiers are never deleted.
     ///
-    /// [`Reconciliation::UpToDate`] means every document already matched and nothing was
-    /// submitted. `Ok(Reconciled(..))` does not mean the whole set was admitted: it may hold
-    /// `Rejected` (e.g. an incompatible Type Schema change) and `Pending` outcomes, including
-    /// those left when the deadline or the passes run out.
+    /// [`Reconciliation::UpToDate`] means all documents matched without submission.
+    /// `Ok(Reconciled(..))` may include `Rejected` (e.g. incompatible changes) or `Pending`
+    /// outcomes, including those left by deadline or pass exhaustion.
     ///
-    /// Cancellation or dropping the future loses in-flight keys while accepted writes
-    /// continue; a later call recovers through re-reads and preconditions. Prefer the token
-    /// and `options.deadline` to an outer timeout.
+    /// Cancellation or dropping loses in-flight keys; accepted writes continue. A later
+    /// call recovers through reads and preconditions. Prefer the token and `options.deadline`
+    /// over an outer timeout.
     ///
     /// # Errors
     /// `InvalidArgument` for an unrepresentable deadline, `Cancelled` on cancellation. Registry failures are per-identifier
@@ -618,120 +603,6 @@ fn list_default(kind: EntityKind) -> FieldSelection {
             EntityField::EffectiveTraits,
             EntityField::EffectiveTraitsSchema,
         ]),
-    }
-}
-
-/// Submit and poll under one deadline; reconciliation's submit step.
-pub(crate) async fn await_registration<A: PlatformTypesRegistryApi + ?Sized>(
-    api: &A,
-    ctx: &PlatformSecurityContext,
-    key: IdempotencyKey,
-    request: RegisterEntitiesRequest,
-    deadline: Instant,
-    cancel: &CancellationToken,
-) -> Result<RegistrationOperation, CanonicalError> {
-    let mut operation = bounded(
-        deadline,
-        cancel,
-        None,
-        api.register_entities(ctx, key, request),
-    )
-    .await??;
-    let operation_id = operation.operation_id;
-    let mut interval = POLL_INTERVAL_INITIAL;
-    while operation.status != OperationStatus::Completed {
-        bounded(
-            deadline,
-            cancel,
-            Some(operation_id),
-            sleep_until(Instant::now() + interval),
-        )
-        .await?;
-        interval = (interval * 2).min(POLL_INTERVAL_MAX);
-        let polled = bounded(
-            deadline,
-            cancel,
-            Some(operation_id),
-            api.get_operation(ctx, operation_id),
-        )
-        .await??;
-        let crate::models::Operation::Registration(polled) = polled else {
-            return Err(OperationResource::unknown(format!(
-                "the registry answered a poll of registration operation {operation_id} \
-                 with a deletion"
-            ))
-            .with_resource(operation_id.to_string())
-            .create());
-        };
-        operation = polled;
-    }
-    Ok(operation)
-}
-
-/// Equal jitter in [backoff/2, backoff] spreads concurrent retries.
-pub(crate) fn jittered(backoff: Duration) -> Duration {
-    use rand::RngExt as _;
-    let half = backoff / 2;
-    let spread = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
-    half + Duration::from_nanos(rand::rng().random_range(0..=spread))
-}
-
-/// `now + budget`, or `InvalidArgument` for a budget no clock can represent.
-pub(crate) fn deadline_from_now(budget: Duration) -> Result<Instant, CanonicalError> {
-    Instant::now().checked_add(budget).ok_or_else(|| {
-        TypeResource::invalid_argument()
-            .with_field_violation(
-                field::DEADLINE_FIELD,
-                format!("a deadline of {budget:?} from now cannot be represented"),
-                field::INVALID_DEADLINE,
-            )
-            .create()
-    })
-}
-
-/// Deadline/cancellation win before the first poll and when simultaneously ready.
-/// `timeout_at` alone polls first, allowing a ready write after expiry.
-pub(crate) async fn bounded<F: std::future::Future>(
-    deadline: Instant,
-    cancel: &CancellationToken,
-    operation_id: Option<Uuid>,
-    future: F,
-) -> Result<F::Output, CanonicalError> {
-    if cancel.is_cancelled() {
-        return Err(stopped(operation_id, StopCause::Cancelled));
-    }
-    if Instant::now() >= deadline {
-        return Err(stopped(operation_id, StopCause::Deadline));
-    }
-    toolkit::tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(stopped(operation_id, StopCause::Cancelled)),
-        () = sleep_until(deadline) => Err(stopped(operation_id, StopCause::Deadline)),
-        outcome = future => Ok(outcome),
-    }
-}
-
-enum StopCause {
-    Cancelled,
-    Deadline,
-}
-
-/// Stop waiting while accepted writes continue; timeout names the operation, cancellation
-/// requires replay with the caller’s key.
-fn stopped(operation_id: Option<Uuid>, cause: StopCause) -> CanonicalError {
-    match (cause, operation_id) {
-        (StopCause::Cancelled, _) => OperationResource::cancelled().create(),
-        (StopCause::Deadline, Some(id)) => OperationResource::deadline_exceeded(format!(
-            "the deadline passed while operation {id} was still running; it was not \
-             cancelled, and retrying with the same idempotency key replays it"
-        ))
-        .with_resource(id.to_string())
-        .create(),
-        (StopCause::Deadline, None) => OperationResource::deadline_exceeded(
-            "the deadline passed before the registry acknowledged the submission; retry \
-             with the same idempotency key to learn its outcome",
-        )
-        .create(),
     }
 }
 
