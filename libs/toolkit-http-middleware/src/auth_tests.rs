@@ -425,7 +425,16 @@ async fn platform_echo(
     }
 }
 
-/// `OoP` order: route policy → platform auth → tenant auth → gate; auth planes are optional.
+/// Tenant subject on an anonymous route: `anonymous` or `subject`.
+async fn anon_echo(Extension(ctx): Extension<SecurityContext>) -> &'static str {
+    if ctx.is_anonymous() {
+        "anonymous"
+    } else {
+        "subject"
+    }
+}
+
+/// Stack built by [`layer_route_auth`]; auth planes are optional.
 /// `/p` is platform, `/anon` anonymous, `/auth` authenticated, `/unlisted` unspecified.
 fn platform_route_app(bearer: bool, internal: bool) -> Router {
     let policy: RouteAuthPolicy = [
@@ -437,28 +446,17 @@ fn platform_route_app(bearer: bool, internal: bool) -> Router {
     .into_iter()
     .collect();
 
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/p", get(platform_echo).post(platform_echo))
-        .route("/anon", get(|| async { "anon" }))
+        .route("/anon", get(anon_echo))
         .route("/auth", get(|| async { "auth" }))
-        .route("/unlisted", get(|| async { "unlisted" }))
-        .layer(axum::middleware::from_fn(platform_route_middleware));
-    if bearer {
-        router = router.layer(axum::middleware::from_fn_with_state(
-            Arc::new(SubjectAuthenticator),
-            security_context_middleware::<SubjectAuthenticator>,
-        ));
-    }
-    if internal {
-        router = router.layer(axum::middleware::from_fn_with_state(
-            Arc::new(StubInternalAuthenticator),
-            internal_auth_middleware::<StubInternalAuthenticator>,
-        ));
-    }
-    router.layer(axum::middleware::from_fn_with_state(
-        Arc::new(policy),
-        route_auth_middleware,
-    ))
+        .route("/unlisted", get(|| async { "unlisted" }));
+    layer_route_auth(
+        router,
+        policy,
+        bearer.then(|| DynBearerAuthenticator::new(SubjectAuthenticator)),
+        internal.then(|| DynInternalAuthenticator::new(StubInternalAuthenticator)),
+    )
 }
 
 const BEARER_TENANT: &str = "Bearer tenant-token";
@@ -680,20 +678,48 @@ async fn the_gate_does_not_admit_the_outbound_marker() {
 }
 
 #[tokio::test]
-async fn the_policy_reaches_anonymous_and_authenticated_routes() {
-    let (status, _, _) = call(
+async fn anonymous_routes_get_a_security_context_with_or_without_a_tenant_plane() {
+    for bearer_plane in [true, false] {
+        let (status, _, body) = call(
+            platform_route_app(bearer_plane, true),
+            Method::GET,
+            "/anon",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, "anonymous"),
+            "no credentials (tenant plane {bearer_plane})"
+        );
+    }
+    let (status, _, body) = call(
         platform_route_app(true, true),
         Method::GET,
         "/anon",
-        None,
+        Some(BEARER_TENANT),
         None,
     )
     .await;
     assert_eq!(
-        status,
-        StatusCode::OK,
-        "anonymous route without credentials"
+        (status, body.as_str()),
+        (StatusCode::OK, "subject"),
+        "a validated bearer replaces the anonymous context"
     );
+    let result = call(
+        platform_route_app(true, true),
+        Method::GET,
+        "/anon",
+        Some(BEARER_FORGED),
+        None,
+    )
+    .await;
+    assert_401(&result, "a presented bearer is still validated");
+}
+
+#[tokio::test]
+async fn the_policy_reaches_anonymous_and_authenticated_routes() {
     let result = call(
         platform_route_app(true, true),
         Method::GET,

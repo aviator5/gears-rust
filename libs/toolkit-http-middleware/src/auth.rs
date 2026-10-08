@@ -13,13 +13,13 @@
 //!   injected [`InternalAuthenticator`], inserting [`PeerAuthenticated`] and a
 //!   [`PlatformSecurityContext`] for workload-policy / platform handlers.
 //!
-//! **Middleware order:** when both are installed, [`internal_auth_middleware`]
-//! runs **before** [`security_context_middleware`] (DESIGN § 3.2). The two middlewares are
-//! independent: each handles its own plane and the planes are mutually exclusive
-//! per request — system calls carry `X-ToolKit-Internal-Token` (no JWT); user
-//! calls carry `Authorization: Bearer` (no internal token). [`PeerAuthenticated`]
-//! is never a prerequisite for JWT validation; [`security_context_middleware`] does not
-//! consult it.
+//! **Middleware order:** install the stack with [`layer_route_auth`], which applies
+//! [`route_auth_middleware`] (policy) → [`internal_auth_middleware`] →
+//! [`security_context_middleware`] → [`platform_route_middleware`] (gate) → handler
+//! (DESIGN § 3.2). Platform routes fail closed only when the gate sits inside both
+//! planes, so prefer the helper over wiring the four layers by hand. The two planes are
+//! independent: each handles its own credential, and [`PeerAuthenticated`] is never a
+//! prerequisite for JWT validation; [`security_context_middleware`] does not consult it.
 //!
 //! Routes that carry no tenant JWT (probes, platform-plane-only handlers) are
 //! marked with the [`AnonymousRoute`] request extension by the gear/bootstrap
@@ -31,17 +31,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{MatchedPath, Request, State},
-    middleware::Next,
+    middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
 };
 use http::{Method, header::AUTHORIZATION};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 use toolkit_security::{
-    AuthNError, BearerAuthenticator, InternalAuthNError, InternalAuthenticator, PeerAuthenticated,
-    PlatformAuthEnforced, PlatformSecurityContext, SecurityContext,
+    AuthNError, BearerAuthenticator, DynBearerAuthenticator, DynInternalAuthenticator,
+    InternalAuthNError, InternalAuthenticator, PeerAuthenticated, PlatformAuthEnforced,
+    PlatformSecurityContext, SecurityContext,
 };
+
+/// Listener auth policy derived from `OperationSpec`, installed before both auth planes.
+pub use toolkit_security::RouteAuth;
 
 use crate::security::{
     InternalTokenHttpError, SecurityContextHttpError, extract_bearer_http,
@@ -75,20 +80,6 @@ const AUTH_INFRA_FAILURE_DETAIL: &str = "authentication infrastructure failure";
 #[derive(Clone, Copy, Debug)]
 pub struct AnonymousRoute;
 
-/// Listener auth policy derived from `OperationSpec`, installed before both auth planes.
-/// Non-exhaustive: consumers must handle future policies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RouteAuth {
-    /// A validated tenant bearer is required (`.authenticated()`).
-    Authenticated,
-    /// No credential required; presented credentials are validated. Also sets [`AnonymousRoute`].
-    Anonymous,
-    /// Requires a validated internal token; a bearer alone is refused
-    /// (`.platform_authenticated()`).
-    Platform,
-}
-
 /// Auth by method and exact [`MatchedPath`] template; undeclared HEAD inherits GET.
 #[derive(Clone, Debug, Default)]
 pub struct RouteAuthPolicy {
@@ -121,6 +112,23 @@ impl RouteAuthPolicy {
             }
         })
     }
+
+    /// `METHOD path` of every [`RouteAuth::Platform`] route, sorted.
+    #[must_use]
+    pub fn platform_routes(&self) -> Vec<String> {
+        let mut routes: Vec<String> = self
+            .routes
+            .iter()
+            .flat_map(|(method, paths)| {
+                paths
+                    .iter()
+                    .filter(|(_, auth)| **auth == RouteAuth::Platform)
+                    .map(move |(path, _)| format!("{method} {path}"))
+            })
+            .collect();
+        routes.sort_unstable();
+        routes
+    }
 }
 
 impl FromIterator<(Method, String, RouteAuth)> for RouteAuthPolicy {
@@ -133,8 +141,50 @@ impl FromIterator<(Method, String, RouteAuth)> for RouteAuthPolicy {
     }
 }
 
+/// Layer the route policy, both auth planes and the platform gate onto `router` in the order
+/// `cpt-cf-adr-two-plane-auth` requires: policy → platform plane → tenant plane → gate → handler.
+///
+/// A missing authenticator leaves its plane uninstalled. Platform routes still fail closed
+/// (the gate is always installed), and a warning names them when no internal authenticator
+/// can admit a caller.
+pub fn layer_route_auth<S>(
+    router: Router<S>,
+    policy: RouteAuthPolicy,
+    bearer: Option<DynBearerAuthenticator>,
+    internal: Option<DynInternalAuthenticator>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let mut router = router.layer(from_fn(platform_route_middleware));
+    if let Some(bearer) = bearer {
+        router = router.layer(from_fn_with_state(
+            Arc::new(bearer),
+            security_context_middleware::<DynBearerAuthenticator>,
+        ));
+    }
+    if let Some(internal) = internal {
+        router = router.layer(from_fn_with_state(
+            Arc::new(internal),
+            internal_auth_middleware::<DynInternalAuthenticator>,
+        ));
+    } else {
+        let platform_routes = policy.platform_routes();
+        if !platform_routes.is_empty() {
+            tracing::warn!(
+                routes = ?platform_routes,
+                "platform routes are declared but no internal authenticator is installed; \
+                 every request to them will be refused with 401"
+            );
+        }
+    }
+    router.layer(from_fn_with_state(Arc::new(policy), route_auth_middleware))
+}
+
 /// Install route policy outside both auth planes as a router layer; `MethodRouter` is too late.
-/// Unlisted routes require a bearer.
+/// Unlisted routes require a bearer. Anonymous routes get an anonymous
+/// [`SecurityContext`] that a validated bearer replaces, so handlers extracting
+/// `Extension<SecurityContext>` work without credentials and without a tenant plane.
 pub async fn route_auth_middleware(
     State(policy): State<Arc<RouteAuthPolicy>>,
     mut request: Request,
@@ -147,6 +197,9 @@ pub async fn route_auth_middleware(
     if let Some(auth) = auth {
         if auth == RouteAuth::Anonymous {
             request.extensions_mut().insert(AnonymousRoute);
+            request
+                .extensions_mut()
+                .insert(SecurityContext::anonymous());
         }
         request.extensions_mut().insert(auth);
     }
@@ -196,7 +249,8 @@ impl IntoResponse for PlatformRefusal {
     }
 }
 
-/// Check platform admission and log refusals at debug.
+/// Check platform admission and log refusals at info, with the caller's subject when a
+/// validated tenant context is present.
 ///
 /// # Errors
 /// [`PlatformRefusal`] for unvalidated required credentials.
@@ -221,10 +275,15 @@ pub fn admit_platform(request: &Request) -> Result<(), PlatformRefusal> {
     let route = extensions
         .get::<MatchedPath>()
         .map_or_else(|| request.uri().path(), MatchedPath::as_str);
-    tracing::debug!(
+    let subject_id = extensions
+        .get::<SecurityContext>()
+        .filter(|ctx| !ctx.is_anonymous())
+        .map(SecurityContext::subject_id);
+    tracing::info!(
         method = %request.method(),
         route,
         reason = refusal.reason(),
+        subject_id = ?subject_id,
         "platform route refused"
     );
     Err(refusal)

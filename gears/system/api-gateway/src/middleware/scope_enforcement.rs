@@ -199,7 +199,9 @@ pub async fn scope_enforcement_middleware(
         return next.run(req).await;
     }
 
-    // `PlatformAdmitted` proves platform admission; tenant token scopes do not apply.
+    // `PlatformAdmitted` proves platform admission; tenant token scopes do not apply. A tenant
+    // `SecurityContext` from a bearer presented alongside stays in the request unchecked
+    // against these rules, so platform handlers must not authorize on it.
     if req.extensions().get::<PlatformAdmitted>().is_some() {
         return next.run(req).await;
     }

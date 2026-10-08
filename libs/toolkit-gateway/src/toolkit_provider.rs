@@ -22,12 +22,17 @@ use toolkit_security::constants::INTERNAL_TOKEN_SECURITY_SCHEME;
 /// HTTP method keys recognized when scanning an `OpenAPI` path item.
 const HTTP_METHOD_KEYS: [&str; 7] = ["get", "put", "post", "delete", "patch", "head", "options"];
 
+/// Platform-authenticated `(method, path)` routes of one gear.
+type PlatformRoutes = HashSet<(http::Method, String)>;
+
 /// A [`GatewayProvider`] that reverse-proxies through the built-in `api-gateway`
 /// by updating a shared in-process [`ProxyRegistry`].
 pub struct ToolKitGatewayProvider {
     registry: Arc<ProxyRegistry>,
-    /// Platform `(gear, method, path)` warnings already emitted; suppress repeated polls.
-    reported_platform: Mutex<HashSet<(String, String, String)>>,
+    /// Platform routes already warned about, per gear: the gear's latest reported set, so
+    /// repeated polls stay quiet, retired paths are forgotten, and a gear with no
+    /// registered instance left is dropped.
+    reported_platform: Mutex<HashMap<GearName, PlatformRoutes>>,
 }
 
 impl ToolKitGatewayProvider {
@@ -36,32 +41,41 @@ impl ToolKitGatewayProvider {
     pub fn new(registry: Arc<ProxyRegistry>) -> Self {
         Self {
             registry,
-            reported_platform: Mutex::new(HashSet::new()),
+            reported_platform: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Warn once per gear/route about exposed platform operations that cannot be published.
+    /// Warn about exposed platform operations that cannot be published, once per route while
+    /// the gear keeps declaring it. The gear's set is replaced by `platform`, so a retired
+    /// route is forgotten and warns again if it comes back.
     fn report_platform(
         &self,
         gear: &GearName,
         instance_id: &str,
         platform: &[(http::Method, String)],
     ) {
-        if platform.is_empty() {
-            return;
-        }
+        let current: PlatformRoutes = platform.iter().cloned().collect();
         let mut reported = self.reported_platform.lock();
-        for (method, path) in platform {
-            if reported.insert((gear.to_string(), method.to_string(), path.clone())) {
-                tracing::warn!(
-                    gear = %gear,
-                    instance_id,
-                    method = %method,
-                    path = %path,
-                    "exposed operation is platform-authenticated; not published as a proxied route",
-                );
-            }
+        let previous = reported.remove(gear).unwrap_or_default();
+        for (method, path) in current.difference(&previous) {
+            tracing::warn!(
+                gear = %gear,
+                instance_id,
+                method = %method,
+                path = %path,
+                "exposed operation is platform-authenticated; not published as a proxied route",
+            );
         }
+        if !current.is_empty() {
+            reported.insert(gear.clone(), current);
+        }
+    }
+
+    /// Forget the platform warnings of gears that no longer have a registered instance.
+    fn prune_reported(&self) {
+        self.reported_platform
+            .lock()
+            .retain(|gear, _| self.registry.contains_gear(gear));
     }
 
     /// Returns the shared registry, e.g. to build a [`Forwarder`](crate::Forwarder)
@@ -104,6 +118,7 @@ impl GatewayProvider for ToolKitGatewayProvider {
         instance_id: &str,
     ) -> Result<(), GatewayError> {
         let removed = self.registry.deregister(gear, instance_id);
+        self.prune_reported();
         tracing::info!(gear = %gear, instance_id, removed, "deregistering gear proxy routes");
         Ok(())
     }
@@ -191,6 +206,7 @@ impl GatewayProvider for ToolKitGatewayProvider {
             );
         }
         self.registry.apply(additions, removals);
+        self.prune_reported();
     }
 }
 
@@ -619,6 +635,38 @@ mod tests {
                 Err(format!("unexpected warnings: {warned:?}"))
             }
         });
+    }
+
+    #[tokio::test]
+    async fn platform_warnings_follow_the_gears_current_routes_and_instances() {
+        let registry = Arc::new(ProxyRegistry::new());
+        let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
+        let gear = GearName::new("calc");
+        let endpoint = Endpoint::parse("http://calc:8080").unwrap();
+        let reported = |provider: &ToolKitGatewayProvider| {
+            provider.reported_platform.lock().get(&gear).map(|routes| {
+                routes
+                    .iter()
+                    .map(|(_, path)| path.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        provider.report_platform(&gear, "calc-a", &[(http::Method::GET, "/old".to_owned())]);
+        provider.report_platform(&gear, "calc-a", &[(http::Method::GET, "/new".to_owned())]);
+        assert_eq!(
+            reported(&provider),
+            Some(vec!["/new".to_owned()]),
+            "a retired route is forgotten"
+        );
+
+        for instance in ["calc-a", "calc-b"] {
+            registry.register(gear.clone(), instance, endpoint.clone(), vec![]);
+        }
+        provider.deregister_routes(&gear, "calc-a").await.unwrap();
+        assert!(reported(&provider).is_some(), "another instance remains");
+        provider.deregister_routes(&gear, "calc-b").await.unwrap();
+        assert_eq!(reported(&provider), None, "the last instance is gone");
     }
 
     #[test]

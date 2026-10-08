@@ -127,7 +127,7 @@ fn operation_vendor_extensions(
 
     // GatewayProvider selects proxy routes via this extension (key shared with toolkit-gateway).
     // The edge strips platform tokens, so platform routes stay unexposed.
-    if spec.exposed && spec.auth() != operation_builder::OperationAuth::Platform {
+    if spec.exposed && spec.auth != operation_builder::RouteAuth::Platform {
         ext.insert(
             "x-toolkit-visibility".to_owned(),
             serde_json::Value::String("exposed".to_owned()),
@@ -314,12 +314,12 @@ impl OpenApiRegistryImpl {
             op = op.responses(responses.build());
 
             // Platform operations require internalToken, not bearerAuth.
-            let scheme = match spec.auth() {
-                operation_builder::OperationAuth::Platform => {
+            let scheme = match spec.auth {
+                operation_builder::RouteAuth::Platform => {
                     Some(operation_builder::INTERNAL_TOKEN_SECURITY_SCHEME)
                 }
-                operation_builder::OperationAuth::Authenticated => Some("bearerAuth"),
-                operation_builder::OperationAuth::Anonymous => None,
+                operation_builder::RouteAuth::Authenticated => Some("bearerAuth"),
+                operation_builder::RouteAuth::Anonymous => None,
             };
             if let Some(scheme) = scheme {
                 op = op.security(utoipa::openapi::security::SecurityRequirement::new(
@@ -365,7 +365,7 @@ impl OpenApiRegistryImpl {
         components = components.security_scheme(
             operation_builder::INTERNAL_TOKEN_SECURITY_SCHEME,
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                "X-ToolKit-Internal-Token",
+                toolkit_security::constants::INTERNAL_TOKEN_HEADER,
                 "Platform-plane workload credential, validated by the receiving listener",
             ))),
         );
@@ -422,7 +422,7 @@ impl OpenApiRegistry for OpenApiRegistryImpl {
         // Normalize platform visibility at registration; warn once instead of on each document
         // build.
         let mut spec = std::borrow::Cow::Borrowed(spec);
-        if spec.exposed && spec.auth() == operation_builder::OperationAuth::Platform {
+        if spec.exposed && spec.auth == operation_builder::RouteAuth::Platform {
             tracing::warn!(
                 method = %spec.method,
                 path = %spec.path,
@@ -740,8 +740,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: handler.to_owned(),
-            authenticated: false,
-            auth_plane: operation_builder::AuthPlane::Tenant,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -872,8 +871,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_test".to_owned(),
-            authenticated: false,
-            auth_plane: operation_builder::AuthPlane::Tenant,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -1039,8 +1037,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_users_id".to_owned(),
-            authenticated: false,
-            auth_plane: operation_builder::AuthPlane::Tenant,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -1101,8 +1098,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "post_upload".to_owned(),
-            authenticated: false,
-            auth_plane: operation_builder::AuthPlane::Tenant,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: Some(vec!["application/octet-stream"]),
@@ -1182,8 +1178,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_test".to_owned(),
-            authenticated: false,
-            auth_plane: operation_builder::AuthPlane::Tenant,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -1238,8 +1233,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "register".to_owned(),
-            authenticated: true,
-            auth_plane: operation_builder::AuthPlane::Platform,
+            auth: operation_builder::RouteAuth::Platform,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -1250,7 +1244,7 @@ mod tests {
         spec.method = Method::GET;
         spec.handler_id = "read".to_owned();
         spec.operation_id = Some("read".to_owned());
-        spec.auth_plane = operation_builder::AuthPlane::Tenant;
+        spec.auth = operation_builder::RouteAuth::Authenticated;
         registry.register_operation(&spec);
 
         let json =
@@ -1269,7 +1263,7 @@ mod tests {
         let scheme = &json["components"]["securitySchemes"]["internalToken"];
         assert_eq!(scheme["type"], "apiKey");
         assert_eq!(scheme["in"], "header");
-        assert_eq!(scheme["name"], "X-ToolKit-Internal-Token");
+        assert_eq!(scheme["name"], "x-toolkit-internal-token");
     }
 
     #[test]
@@ -1292,8 +1286,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_ping".to_owned(),
-            authenticated: false,
-            auth_plane: operation_builder::AuthPlane::Tenant,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: true,
             throttling: None,
             allowed_request_content_types: None,
@@ -1349,8 +1342,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "post_platform".to_owned(),
-            authenticated: true,
-            auth_plane: operation_builder::AuthPlane::Platform,
+            auth: operation_builder::RouteAuth::Platform,
             exposed: true,
             throttling: None,
             allowed_request_content_types: None,

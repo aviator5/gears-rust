@@ -22649,7 +22649,7 @@
       "internalToken": {
         "description": "Platform-plane workload credential, validated by the receiving listener",
         "in": "header",
-        "name": "X-ToolKit-Internal-Token",
+        "name": "x-toolkit-internal-token",
         "type": "apiKey"
       }
     }

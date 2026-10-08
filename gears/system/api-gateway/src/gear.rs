@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl, OperationAuth};
+use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl, RouteAuth};
 use toolkit::lifecycle::ReadySignal;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::{
@@ -258,16 +258,18 @@ impl ApiGateway {
 
     /// Build route policy from operation specs.
     fn build_route_policy_from_specs(&self) -> Result<auth::GatewayRoutePolicy> {
-        let mut authenticated_routes = std::collections::HashSet::new();
-        // Anonymous (no-auth) routes. This is the *auth* axis: routes here skip
-        // bearer-token enforcement. It is NOT external visibility (`exposed`);
-        // an anonymous route may still be externally exposed or not.
-        let mut anonymous_routes = std::collections::HashSet::new();
-        // Platform routes require a validated internal token; a bearer alone is refused.
-        let mut platform_routes = std::collections::HashSet::new();
-
-        anonymous_routes.insert((Method::GET, "/docs".to_owned()));
-        anonymous_routes.insert((Method::GET, "/openapi.json".to_owned()));
+        // Auth and gateway visibility are independent: `RouteAuth::Anonymous` is the *auth*
+        // axis (no bearer required), NOT external visibility (`exposed`). Explicit route
+        // policy overrides require_auth_by_default; platform auth takes precedence on every
+        // host.
+        let mut routes = vec![
+            (Method::GET, "/docs".to_owned(), RouteAuth::Anonymous),
+            (
+                Method::GET,
+                "/openapi.json".to_owned(),
+                RouteAuth::Anonymous,
+            ),
+        ];
 
         // In main/both mode the health probes are merged onto the main router *before* the
         // middleware stack (see `rest_finalize`), so the auth layer resolves them: mark them
@@ -279,26 +281,31 @@ impl ApiGateway {
             HealthServeMode::Main | HealthServeMode::Both
         ) {
             for path in [HEALTHZ_PATH, READYZ_PATH, HEALTH_DETAIL_PATH] {
-                anonymous_routes.insert((Method::GET, path.to_owned()));
+                routes.push((Method::GET, path.to_owned(), RouteAuth::Anonymous));
             }
         }
 
-        for spec in &self.openapi_registry.operation_specs {
+        routes.extend(self.openapi_registry.operation_specs.iter().map(|spec| {
             let spec = spec.value();
+            (spec.method.clone(), spec.path.clone(), spec.auth)
+        }));
 
-            let route_key = (spec.method.clone(), spec.path.clone());
+        let count = |auth: RouteAuth| routes.iter().filter(|route| route.2 == auth).count();
+        let requirements_count = count(RouteAuth::Authenticated);
+        let anonymous_routes_count = count(RouteAuth::Anonymous);
+        let platform_routes: Vec<String> = routes
+            .iter()
+            .filter(|route| route.2 == RouteAuth::Platform)
+            .map(|(method, path, _)| format!("{method} {path}"))
+            .collect();
 
-            // Auth and gateway visibility are independent. Explicit route policy overrides
-            // require_auth_by_default; platform auth takes precedence on every host.
-            match spec.auth() {
-                OperationAuth::Platform => platform_routes.insert(route_key),
-                OperationAuth::Authenticated => authenticated_routes.insert(route_key),
-                OperationAuth::Anonymous => anonymous_routes.insert(route_key),
-            };
+        if !platform_routes.is_empty() && self.internal_authenticator.lock().is_none() {
+            tracing::warn!(
+                routes = ?platform_routes,
+                "platform routes are declared but no `internal_auth` is configured; \
+                 every request to them will be refused with 401"
+            );
         }
-
-        let requirements_count = authenticated_routes.len();
-        let anonymous_routes_count = anonymous_routes.len();
 
         // When the embedded-edge reverse proxy is enabled, hand the auth policy the
         // shared proxy registry so dynamically-registered proxy routes are enforced
@@ -308,19 +315,14 @@ impl ApiGateway {
             .gateway_proxy
             .enabled
             .then(|| Arc::clone(&self.proxy_registry));
-        let route_policy = auth::build_route_policy(
-            &config,
-            authenticated_routes,
-            anonymous_routes,
-            platform_routes,
-            proxy_registry,
-        )?;
+        let route_policy = auth::build_route_policy(&config, routes, proxy_registry)?;
 
         tracing::info!(
             auth_disabled = config.auth_disabled,
             require_auth_by_default = config.require_auth_by_default,
             requirements_count = requirements_count,
             anonymous_routes_count = anonymous_routes_count,
+            platform_routes_count = platform_routes.len(),
             "Route policy built from operation specs"
         );
 

@@ -1019,21 +1019,3 @@ async fn platform_routes_fail_closed_without_an_authenticator() {
         );
     }
 }
-
-#[test]
-fn an_inconsistent_spec_fails_closed() {
-    use crate::api::operation_builder::AuthPlane;
-    let mut spec =
-        crate::api::OperationBuilder::<crate::api::Missing, crate::api::Missing, ()>::get("/x")
-            .anonymous()
-            .handler(|| async { "ok" })
-            .json_response(StatusCode::OK, "OK")
-            .spec()
-            .clone();
-    spec.auth_plane = AuthPlane::Platform;
-    let policy = route_auth_policy([&spec]);
-    assert_eq!(
-        policy.resolve(&Method::GET, "/x"),
-        Some(RouteAuth::Platform)
-    );
-}

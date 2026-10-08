@@ -49,15 +49,12 @@ use url::Url;
 
 use cf_system_sdks::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_http_middleware::{
-    RouteAuth, RouteAuthPolicy, internal_auth_middleware, platform_route_middleware,
-    route_auth_middleware, security_context_middleware,
-};
+use toolkit_http_middleware::{RouteAuthPolicy, layer_route_auth};
 use toolkit_security::{DynBearerAuthenticator, DynInternalAuthenticator};
 
 use super::readiness::ReadinessState;
 use crate::api::canonical_error_middleware;
-use crate::api::operation_builder::{OperationAuth, OperationSpec};
+use crate::api::operation_builder::OperationSpec;
 
 /// `Retry-After` (seconds) advertised while the gear is draining.
 const DRAIN_RETRY_AFTER_SECONDS: u64 = 5;
@@ -472,21 +469,14 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 // Router assembly
 // ---------------------------------------------------------------------------
 
-/// Derive auth from [`OperationSpec::auth`], preserving platform precedence.
+/// Derive the listener policy from [`OperationSpec::auth`].
 pub(super) fn route_auth_policy<S>(specs: impl IntoIterator<Item = S>) -> RouteAuthPolicy
 where
     S: std::ops::Deref<Target = OperationSpec>,
 {
     specs
         .into_iter()
-        .map(|spec| {
-            let auth = match spec.auth() {
-                OperationAuth::Platform => RouteAuth::Platform,
-                OperationAuth::Authenticated => RouteAuth::Authenticated,
-                OperationAuth::Anonymous => RouteAuth::Anonymous,
-            };
-            (spec.method.clone(), spec.path.clone(), auth)
-        })
+        .map(|spec| (spec.method.clone(), spec.path.clone(), spec.auth))
         .collect()
 }
 
@@ -498,30 +488,17 @@ fn layer_gear_router(
     drain_guard: DrainGuard,
     options: &OopServeOptions,
 ) -> Router {
-    // Always install the gate inside auth: missing authenticators must fail closed.
-    let mut gear = gear_router.layer(from_fn(platform_route_middleware));
-
-    // Auth planes (installed only when injected). Add tenant plane first so it
-    // is *inner* to the platform plane — `internal_auth_middleware` must run
-    // BEFORE `security_context_middleware` (`cpt-cf-adr-two-plane-auth`).
-    if let Some(bearer) = options.bearer_authenticator.clone() {
-        gear = gear.layer(from_fn_with_state(
-            Arc::new(bearer),
-            security_context_middleware::<DynBearerAuthenticator>,
-        ));
-    }
-    if let Some(internal) = options.internal_authenticator.clone() {
-        gear = gear.layer(from_fn_with_state(
-            Arc::new(internal),
-            internal_auth_middleware::<DynInternalAuthenticator>,
-        ));
-    }
-
-    // Policy runs outside both planes; router layers already have the matched path template.
-    gear = gear.layer(from_fn_with_state(
-        Arc::new(route_auth),
-        route_auth_middleware,
-    ));
+    // Policy, both auth planes (each only when injected) and the platform gate, in the
+    // order `cpt-cf-adr-two-plane-auth` requires. A missing internal authenticator fails
+    // closed for platform routes only; without a tenant authenticator, tenant routes are
+    // served without bearer validation (the bearer authenticator is optional, see
+    // `resolve_bearer_authenticator`).
+    let mut gear = layer_route_auth(
+        gear_router,
+        route_auth,
+        options.bearer_authenticator.clone(),
+        options.internal_authenticator.clone(),
+    );
 
     // Drain guard sits just inside the canonical-error layer: it rejects new
     // requests while draining and tracks the in-flight count (catching handler

@@ -1528,57 +1528,6 @@ const PLATFORM_CASES: &[AxisCase<'static>] = &[
     ),
 ];
 
-const INCONSISTENT_PATH: &str = "/tests/v1/api/inconsistent";
-
-/// Hand-built platform spec with `authenticated: false`, which the builder cannot produce.
-pub struct InconsistentSpecGear;
-
-impl RestApiCapability for InconsistentSpecGear {
-    fn register_rest(
-        &self,
-        _ctx: &GearCtx,
-        router: Router,
-        openapi: &dyn OpenApiRegistry,
-    ) -> Result<Router> {
-        let mut spec = OperationBuilder::<_, _, ()>::get(INCONSISTENT_PATH)
-            .operation_id("test_axis.inconsistent")
-            .anonymous()
-            .handler(context_free_handler)
-            .text_response(http::StatusCode::OK, "OK", "text/plain")
-            .spec()
-            .clone();
-        spec.auth_plane = toolkit::api::AuthPlane::Platform;
-        assert!(!spec.authenticated, "the inconsistent pair under test");
-        openapi.register_operation(&spec);
-        Ok(router.route(INCONSISTENT_PATH, axum::routing::get(context_free_handler)))
-    }
-}
-
-#[tokio::test]
-async fn an_inconsistent_platform_spec_fails_closed_at_the_gateway() {
-    let cases: &[AxisCase<'_>] = &[
-        (None, None, StatusCode::UNAUTHORIZED, "no credential"),
-        (
-            Some(AXIS_BEARER),
-            None,
-            StatusCode::UNAUTHORIZED,
-            "valid bearer alone",
-        ),
-        (
-            None,
-            Some(AXIS_INTERNAL_SECRET),
-            StatusCode::OK,
-            "valid token",
-        ),
-    ];
-    for (bearer, token, want, case) in cases {
-        let router = create_router_serving(axis_config(true), &InconsistentSpecGear).await;
-        let (status, body, _) =
-            axis_call(router, Method::GET, INCONSISTENT_PATH, *bearer, *token).await;
-        assert_eq!(status, *want, "{case}: {body}");
-    }
-}
-
 #[tokio::test]
 async fn platform_routes_require_a_validated_internal_token_at_the_gateway() {
     let config = axis_config(true);
@@ -1810,12 +1759,6 @@ async fn discovered_axis_routes() {
     use toolkit_gateway::{
         Endpoint, GatewayProvider, GearName, OpenApiSpec, ProxyRegistry, ToolKitGatewayProvider,
     };
-
-    // The scheme name toolkit emits is the one discovery reads.
-    assert_eq!(
-        toolkit::api::INTERNAL_TOKEN_SECURITY_SCHEME,
-        toolkit_security::constants::INTERNAL_TOKEN_SECURITY_SCHEME
-    );
 
     let openapi = OpenApiRegistryImpl::new();
     let router = OperationBuilder::get(AXIS_PATH)

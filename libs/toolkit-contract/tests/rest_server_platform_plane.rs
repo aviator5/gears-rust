@@ -2,7 +2,10 @@
 //! (`cpt-cf-adr-two-plane-auth`), for owned and borrowed `PlatformSecurityContext`.
 
 #![cfg(all(feature = "rest-client", feature = "rest-server"))]
-#![allow(clippy::unwrap_used)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "test setup; a failed bind or request should fail the test"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,16 +13,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::Router;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use toolkit::api::{AuthPlane, OpenApiInfo, OpenApiRegistryImpl};
+use toolkit::api::{OpenApiInfo, OpenApiRegistryImpl};
 use toolkit_contract::runtime::config::{ClientConfig, InternalTokenProvider};
 use toolkit_contract::runtime::transport_error::TransportError;
 use toolkit_contract::{contract, rest_contract};
-use toolkit_http_middleware::{
-    RouteAuth, RouteAuthPolicy, internal_auth_middleware, platform_route_middleware,
-    route_auth_middleware,
-};
+use toolkit_http_middleware::{RouteAuth, RouteAuthPolicy, layer_route_auth};
+use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 use toolkit_security::{
-    InternalAuthNError, InternalAuthenticator, PlatformIdentity, PlatformSecurityContext,
+    DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, PlatformIdentity,
+    PlatformSecurityContext,
 };
 
 const GOOD_TOKEN: &str = "good-internal-token";
@@ -113,20 +115,16 @@ async fn start_server() -> (String, serde_json::Value, Arc<AtomicUsize>) {
         .iter()
         .map(|entry| {
             let spec = entry.value();
-            assert_eq!(spec.auth_plane, AuthPlane::Platform, "{}", spec.path);
-            (spec.method.clone(), spec.path.clone(), RouteAuth::Platform)
+            assert_eq!(spec.auth, RouteAuth::Platform, "{}", spec.path);
+            (spec.method.clone(), spec.path.clone(), spec.auth)
         })
         .collect();
-    let app = router
-        .layer(axum::middleware::from_fn(platform_route_middleware))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(StubInternalAuthenticator),
-            internal_auth_middleware::<StubInternalAuthenticator>,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(policy),
-            route_auth_middleware,
-        ));
+    let app = layer_route_auth(
+        router,
+        policy,
+        None,
+        Some(DynInternalAuthenticator::new(StubInternalAuthenticator)),
+    );
 
     let doc = openapi.build_openapi(&OpenApiInfo::default()).unwrap();
     let spec = serde_json::to_value(&doc).unwrap();
@@ -181,32 +179,36 @@ async fn a_validated_internal_token_reaches_the_service() {
 #[tokio::test]
 async fn a_missing_or_forged_token_is_refused_before_the_service() {
     let (base_url, _, calls) = start_server().await;
-    let marker = PlatformSecurityContext::outbound_marker();
+    let http = toolkit_http::HttpClientBuilder::new().build().unwrap();
 
-    for token in [None, Some("forged")] {
-        let client = client(&base_url, token);
-        assert!(
-            SysApi::owned(&client, marker.clone(), "a".to_owned())
-                .await
-                .is_err(),
-            "owned, token {token:?}"
-        );
-        assert!(
-            SysApi::borrowed(&client, &marker, "b".to_owned())
-                .await
-                .is_err(),
-            "borrowed, token {token:?}"
-        );
+    for path in ["owned", "borrowed"] {
+        for (token, reason) in [
+            (None, "MISSING_INTERNAL_TOKEN"),
+            (Some("forged"), "INTERNAL_AUTH_FAILED"),
+        ] {
+            let mut request = http.get(&format!("{base_url}/api/sys/v1/{path}/a"));
+            if let Some(token) = token {
+                request = request.header(INTERNAL_TOKEN_HEADER, token);
+            }
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body = String::from_utf8_lossy(&response.bytes().await.unwrap()).into_owned();
+            assert_eq!(
+                status,
+                http::StatusCode::UNAUTHORIZED,
+                "{path}, token {token:?}: {body}"
+            );
+            assert!(body.contains(reason), "{path}, token {token:?}: {body}");
+        }
     }
 
-    let status = toolkit_http::HttpClientBuilder::new()
-        .build()
-        .unwrap()
-        .get(&format!("{base_url}/api/sys/v1/owned/a"))
-        .send()
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(status, http::StatusCode::UNAUTHORIZED);
+    // The generated client surfaces the same refusal as an error.
+    let marker = PlatformSecurityContext::outbound_marker();
+    let client = client(&base_url, Some("forged"));
+    assert!(
+        SysApi::borrowed(&client, &marker, "b".to_owned())
+            .await
+            .is_err()
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

@@ -455,27 +455,8 @@ pub struct LicenseReqSpec {
 /// Shared platform `OpenAPI` apiKey scheme, re-exported to prevent discovery drift.
 pub use toolkit_security::constants::INTERNAL_TOKEN_SECURITY_SCHEME;
 
-/// Credential plane refining [`OperationSpec::authenticated`].
-/// Platform routes require an internal token on every host and are never advertised for proxying.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AuthPlane {
-    /// Tenant bearer (`.authenticated()`), or none (`.anonymous()`).
-    #[default]
-    Tenant,
-    /// Validated internal token; bearer alone refused (`.platform_authenticated()`).
-    Platform,
-}
-
-/// Shared auth classification for listeners, gateway, and `OpenAPI` via [`OperationSpec::auth`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OperationAuth {
-    /// No credential required (`.anonymous()`).
-    Anonymous,
-    /// A validated tenant bearer (`.authenticated()`).
-    Authenticated,
-    /// Validated internal token (`.platform_authenticated()`); bearer alone refused.
-    Platform,
-}
+/// Per-route credential requirement, shared with listeners and the gateway.
+pub use toolkit_security::RouteAuth;
 
 /// Simplified operation specification for the type-safe builder
 #[derive(Clone, Debug)]
@@ -491,19 +472,14 @@ pub struct OperationSpec {
     pub responses: Vec<ResponseSpec>,
     /// Internal handler id; can be used by registry/generator to map a handler identity
     pub handler_id: String,
-    /// Auth axis: whether this operation requires a validated tenant JWT.
-    /// `true` = authenticated (bearer required); `false` = anonymous (a missing
-    /// bearer is allowed — a present bearer is still always re-validated).
-    /// Independent of [`exposed`](Self::exposed); maps 1:1 to the
-    /// `AnonymousRoute` marker in the `OoP` per-gear middleware (`!authenticated`).
-    pub authenticated: bool,
-    /// Credential-plane refinement; `.platform_authenticated()` sets Platform and `authenticated`.
-    pub auth_plane: AuthPlane,
+    /// Auth axis: which credential this operation requires. Set by the builder's
+    /// `.authenticated()`, `.anonymous()` or `.platform_authenticated()`. Independent of
+    /// [`exposed`](Self::exposed).
+    pub auth: RouteAuth,
     /// Visibility axis: whether this route is registered in the gateway for
     /// external access (`true`) or is internal-only, reachable only via
     /// inter-gear communication (`false`). Defaults to `false` (internal).
-    /// Independent of [`authenticated`](Self::authenticated) — an exposed route
-    /// may still require a JWT.
+    /// Independent of [`auth`](Self::auth) — an exposed route may still require a JWT.
     pub exposed: bool,
     /// Optional zone-based throttling configuration for this operation.
     /// Binds the operation to gateway throttling zones and carries the
@@ -522,16 +498,6 @@ pub struct OperationSpec {
 }
 
 impl OperationSpec {
-    /// Effective auth: Platform wins even when a hand-built spec has `authenticated: false`.
-    #[must_use]
-    pub const fn auth(&self) -> OperationAuth {
-        match (self.auth_plane, self.authenticated) {
-            (AuthPlane::Platform, _) => OperationAuth::Platform,
-            (AuthPlane::Tenant, true) => OperationAuth::Authenticated,
-            (AuthPlane::Tenant, false) => OperationAuth::Anonymous,
-        }
-    }
-
     /// Replace a response with the same status and content type while retaining
     /// headers that were already declared for that response. The declared
     /// response becomes the most recent response so subsequent headers attach
@@ -774,8 +740,7 @@ impl<S> OperationBuilder<Missing, Missing, S, AuthNotSet> {
                 request_body: None,
                 responses: Vec::new(),
                 handler_id,
-                authenticated: false,
-                auth_plane: AuthPlane::Tenant,
+                auth: RouteAuth::Anonymous,
                 exposed: false,
                 throttling: None,
                 allowed_request_content_types: None,
@@ -1338,8 +1303,7 @@ where
     /// # }
     /// ```
     pub fn authenticated(mut self) -> OperationBuilder<H, R, S, AuthSet, L> {
-        self.spec.authenticated = true;
-        self.spec.auth_plane = AuthPlane::Tenant;
+        self.spec.auth = RouteAuth::Authenticated;
         OperationBuilder {
             spec: self.spec,
             method_router: self.method_router,
@@ -1356,8 +1320,7 @@ where
     /// [`INTERNAL_TOKEN_SECURITY_SCHEME`]; discovery excludes the route. Handlers read
     /// `Extension<PlatformSecurityContext>`; a license decision is still required.
     pub fn platform_authenticated(mut self) -> OperationBuilder<H, R, S, AuthSet, L> {
-        self.spec.authenticated = true;
-        self.spec.auth_plane = AuthPlane::Platform;
+        self.spec.auth = RouteAuth::Platform;
         OperationBuilder {
             spec: self.spec,
             method_router: self.method_router,
@@ -1398,8 +1361,7 @@ where
     /// # let _ = router;
     /// ```
     pub fn anonymous(mut self) -> OperationBuilder<H, R, S, AuthSet, LicenseSet> {
-        self.spec.authenticated = false;
-        self.spec.auth_plane = AuthPlane::Tenant;
+        self.spec.auth = RouteAuth::Anonymous;
         OperationBuilder {
             spec: self.spec,
             method_router: self.method_router,

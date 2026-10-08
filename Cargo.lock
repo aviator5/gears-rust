@@ -1804,6 +1804,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rust-embed",
+ "secrecy",
  "serde",
  "serde-saphyr 1.3.0",
  "serde_json",
