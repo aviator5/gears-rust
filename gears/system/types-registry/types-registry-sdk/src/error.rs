@@ -31,7 +31,7 @@
 //! | legacy: batch register, required parent type-schema absent | [`TypesRegistryError::ParentNotRegistered`] | — (in-process) |
 //! | anything else (forward-compat) | [`TypesRegistryError::Other`] | — |
 //!
-//! Legacy rows belong to [`TypesRegistryClient`], which T31 deletes together with them.
+//! Legacy rows belong to [`TypesRegistryClient`], which T38 deletes together with them.
 //!
 //! Resource-scoped variants ([`TypesRegistryError::NotFound`] /
 //! [`TypesRegistryError::AlreadyExists`]) carry `resource_type`; decode it with

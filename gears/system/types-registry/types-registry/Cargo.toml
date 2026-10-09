@@ -93,6 +93,8 @@ tokio = { workspace = true, features = [
     "net",
     "test-util",
 ] }
+# The SDK's contract conformance checks, run against the local client.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../types-registry-sdk", features = ["test-util"] }
 # SQLite and transaction observation for dispatch tests.
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # PostgreSQL / MySQL bring-up for the `integration` suite. Not optional --

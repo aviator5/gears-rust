@@ -1332,7 +1332,7 @@ impl From<EntityRecord> for EntityDto {
 }
 
 // ---------------------------------------------------------------------------
-// The two read surfaces: `:batchGet` and discovery (T22a, T22b)
+// The two read surfaces: `:batchGet` and discovery (T24, T25)
 // ---------------------------------------------------------------------------
 //
 // Exact read and `batchGet` share [`EntityDto`] and one `$select` normalization, so

@@ -453,7 +453,7 @@ async fn a_stored_document_that_is_not_json_names_its_entity() {
 }
 
 /// The builder composes inside a **write** transaction the caller opened, which is
-/// what T13's edge writes and T19's batching will need: the store is built and the
+/// what T14's edge writes and T20's batching will need: the store is built and the
 /// rows are written under one transaction rather than two. Every other test here
 /// uses the read-only snapshot instead, so this one exists to pin the write case.
 #[tokio::test]

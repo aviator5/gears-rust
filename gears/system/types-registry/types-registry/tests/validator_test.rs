@@ -1,5 +1,5 @@
 //! Freshness validators and conditional reads through the database read path
-//! (T22d, SPEC §8.5).
+//! (T27, SPEC §8.5).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 

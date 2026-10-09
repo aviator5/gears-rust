@@ -1,24 +1,27 @@
-//! The fake answers reads under the real client's contract: projection-scoped validators,
-//! first-mention duplicates, lifecycle and depth filters, query-bound cursors.
+//! The fake's own surface: seeds, documents, faults, strict mode, admission hooks, inspection and
+//! wiring. Its read and write contract is [`super::conformance`], which the registry's local
+//! client passes too.
 
-use std::num::NonZeroU8;
+use std::sync::Arc;
+use std::time::Duration;
 
-use serde_json::json;
-use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
+use serde_json::{Value, json};
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
-use super::FakePlatformRegistry;
-use crate::contract::PlatformTypesRegistryApi;
-use crate::field;
+use super::{Call, Fault, MockTypesRegistry, Seed};
+use crate::contract::{PlatformTypesRegistryApi, TypesRegistryApi};
+use crate::item_failure::{AdmissionFailure, AdmissionFailureReason, context};
 use crate::models::{
-    BatchGetEntitiesRequest, BatchGetItem, DeleteEntitiesRequest, DeleteItem, EntityField,
-    EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection, IdempotencyKey,
-    LifecycleFilter, ListEntitiesRequest, PageRequest, Projection, PublisherContext,
+    BatchGetEntitiesRequest, BatchGetItem, CandidateStatus, EntityField, EntityKey, EntityLookup,
+    FieldSelection, IdempotencyKey, LifecycleStatus, ListEntitiesRequest, Origin, Projection,
+    PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationItemResult,
 };
 
-const TYPE: &str = "gts.cf.test.pkg.a.v1~";
-const OTHER: &str = "gts.cf.test.pkg.b.v1~";
-const CHAINED: &str = "gts.cf.test.pkg.a.v1~cf.test.pkg.child.v1~";
+const BASE: &str = "gts.cf.test.pkg.base.v1~";
+const CHILD: &str = "gts.cf.test.pkg.base.v1~cf.test.pkg.child.v1~";
+const TOY: &str = "gts.cf.test.pkg.toy.v1~";
+const OTHER: &str = "gts.cf.test.pkg.other.v1~";
 
 fn ctx() -> PlatformSecurityContext {
     PlatformSecurityContext::outbound_marker()
@@ -28,237 +31,410 @@ fn key(id: &str) -> EntityKey {
     EntityKey::GtsId(gts::GtsId::try_new(id).expect("valid identifier"))
 }
 
-fn content_only() -> Projection {
-    Projection::Select(FieldSelection::with(&[EntityField::Content]))
+fn base(traits: &Value) -> Value {
+    json!({
+        "$id": format!("gts://{BASE}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "x-gts-traits-schema": { "type": "object", "properties": traits },
+    })
 }
 
-async fn read(
-    fake: &FakePlatformRegistry,
-    items: Vec<BatchGetItem>,
+fn child() -> Value {
+    json!({
+        "$id": format!("gts://{CHILD}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "allOf": [{ "$ref": format!("gts://{BASE}") }],
+        "x-gts-traits": { "tier": "gold" },
+    })
+}
+
+fn tier() -> Value {
+    json!({ "tier": { "type": "string", "default": "basic" } })
+}
+
+fn tier_and_region() -> Value {
+    json!({
+        "tier": { "type": "string", "default": "basic" },
+        "region": { "type": "string", "default": "eu" },
+    })
+}
+
+fn documents() -> Projection {
+    Projection::Select(FieldSelection::with(&[
+        EntityField::ResolvedSchema,
+        EntityField::EffectiveTraits,
+        EntityField::EffectiveTraitsSchema,
+    ]))
+}
+
+fn light() -> Projection {
+    Projection::Select(FieldSelection::light())
+}
+
+async fn get(
+    fake: &MockTypesRegistry,
+    keys: &[EntityKey],
     projection: Projection,
-) -> EntityLookup {
-    let mut answers = fake
-        .batch_get_entities(
-            &ctx(),
-            BatchGetEntitiesRequest {
-                items,
-                projection,
-                fresh: false,
-            },
-        )
-        .await
-        .expect("reads")
-        .0;
-    assert_eq!(answers.len(), 1, "one key, one answer");
-    answers.remove(&key(TYPE)).expect("the key is answered")
-}
-
-async fn ids(fake: &FakePlatformRegistry, filter: EntityFilter) -> Vec<String> {
-    fake.list_entities(
+) -> Result<Vec<EntityLookup>, CanonicalError> {
+    let mut answers = PlatformTypesRegistryApi::batch_get_entities(
+        fake,
         &ctx(),
-        ListEntitiesRequest {
-            filter,
-            ..ListEntitiesRequest::default()
+        BatchGetEntitiesRequest {
+            items: keys.iter().cloned().map(BatchGetItem::from).collect(),
+            projection,
+            fresh: false,
         },
     )
-    .await
-    .expect("lists")
-    .items
-    .into_iter()
-    .map(|e| e.gts_id.to_string())
-    .collect()
+    .await?
+    .0;
+    Ok(keys
+        .iter()
+        .map(|k| answers.remove(k).expect("every key is answered"))
+        .collect())
+}
+
+async fn traits(fake: &MockTypesRegistry, id: &str) -> Result<Value, CanonicalError> {
+    match get(fake, &[key(id)], documents()).await?.remove(0) {
+        EntityLookup::Found { entity, .. } => Ok(entity.effective_traits.expect("selected")),
+        other => panic!("{id}: {other:?}"),
+    }
+}
+
+fn create(id: &str, content: Value) -> RegisterItem {
+    RegisterItem {
+        gts_id: gts::GtsId::try_new(id).expect("valid identifier"),
+        content,
+        expected_resource_version: None,
+        force: false,
+    }
+}
+
+async fn register(
+    fake: &MockTypesRegistry,
+    key: &str,
+    items: Vec<RegisterItem>,
+) -> Result<Vec<RegistrationItemResult>, CanonicalError> {
+    let request = RegisterEntitiesRequest {
+        items,
+        dry_run: false,
+        publisher: PublisherContext {
+            name: "fake-test".to_owned(),
+            version: "1.0.0".parse().expect("version"),
+        },
+    };
+    let operation = fake
+        .register_entities(&ctx(), IdempotencyKey::new(key).expect("key"), request)
+        .await?;
+    Ok(operation.items)
+}
+
+fn unavailable() -> CanonicalError {
+    CanonicalError::service_unavailable().create()
 }
 
 #[tokio::test]
-async fn a_validator_read_under_one_projection_does_not_condition_another() {
-    let fake = FakePlatformRegistry::new();
-    fake.seed(TYPE, json!({}));
-    let EntityLookup::Found { etag, .. } =
-        read(&fake, vec![key(TYPE).into()], Projection::Default).await
-    else {
-        panic!("seeded");
-    };
-    let conditional = || BatchGetItem {
-        key: key(TYPE),
-        if_none_match: Some(etag.clone()),
-    };
-
-    assert!(matches!(
-        read(&fake, vec![conditional()], Projection::Default).await,
-        EntityLookup::Unchanged { .. }
-    ));
-    assert!(matches!(
-        read(&fake, vec![conditional()], content_only()).await,
-        EntityLookup::Found { .. }
-    ));
+async fn the_fake_conforms_to_the_contract() {
+    super::conformance::run(&MockTypesRegistry::new()).await;
 }
 
+// ---- seeds and documents ----------------------------------------------------------------------
+
 #[tokio::test]
-async fn a_repeated_key_is_answered_under_its_first_mention() {
-    let fake = FakePlatformRegistry::new();
-    fake.seed(TYPE, json!({}));
-    let EntityLookup::Found { etag, .. } =
-        read(&fake, vec![key(TYPE).into()], Projection::Default).await
-    else {
-        panic!("seeded");
-    };
-    let conditional = BatchGetItem {
-        key: key(TYPE),
-        if_none_match: Some(etag),
-    };
+async fn seeded_types_resolve_their_documents_in_any_order() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(CHILD, child());
+    fake.seed(BASE, base(&tier()));
 
-    let lookup = read(
-        &fake,
-        vec![key(TYPE).into(), conditional.clone()],
-        Projection::Default,
-    )
-    .await;
-    assert!(matches!(lookup, EntityLookup::Found { .. }), "{lookup:?}");
-
-    let lookup = read(
-        &fake,
-        vec![conditional, key(TYPE).into()],
-        Projection::Default,
-    )
-    .await;
-    assert!(
-        matches!(lookup, EntityLookup::Unchanged { .. }),
-        "{lookup:?}"
+    assert_eq!(
+        traits(&fake, CHILD).await.expect("resolves"),
+        json!({ "tier": "gold" })
     );
 }
 
 #[tokio::test]
-async fn discovery_applies_the_lifecycle_filter() {
-    let fake = FakePlatformRegistry::new().completing_after(0);
-    fake.seed(TYPE, json!({}));
-    fake.seed(OTHER, json!({}));
-    fake.delete_entities(
-        &ctx(),
-        IdempotencyKey::new("delete-b").expect("key"),
-        DeleteEntitiesRequest {
-            items: vec![DeleteItem {
-                key: key(OTHER),
-                expected_resource_version: 1,
-            }],
-            dry_run: false,
-            publisher: PublisherContext {
-                name: "fake-test".to_owned(),
-                version: "1.0.0".parse().expect("version"),
-            },
-        },
+async fn a_type_that_does_not_resolve_fails_only_a_read_of_its_documents() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(TOY, json!({ "not": "a schema" }));
+
+    let light = get(&fake, &[key(TOY)], light()).await.expect("reads");
+    assert!(matches!(light[0], EntityLookup::Found { .. }));
+    let error = get(&fake, &[key(TOY)], documents())
+        .await
+        .expect_err("its documents cannot be produced");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_seed_sets_version_and_lifecycle() {
+    let fake = MockTypesRegistry::new();
+    fake.seed_entity(Seed::new(TOY, json!({})).version(7).deleted());
+
+    let lookup = get(
+        &fake,
+        &[key(TOY)],
+        Projection::Select(FieldSelection::with(&[EntityField::Origin])),
     )
     .await
-    .expect("deletes");
-
-    let with = |lifecycle| EntityFilter {
-        lifecycle,
-        ..EntityFilter::default()
+    .expect("reads")
+    .remove(0);
+    let EntityLookup::Found { entity, .. } = lookup else {
+        panic!("{lookup:?}");
     };
-    assert_eq!(ids(&fake, with(LifecycleFilter::Active)).await, [TYPE]);
-    assert_eq!(ids(&fake, with(LifecycleFilter::Deleted)).await, [OTHER]);
-    assert_eq!(ids(&fake, with(LifecycleFilter::All)).await, [TYPE, OTHER]);
-}
-
-#[tokio::test]
-async fn discovery_applies_the_chain_depth_filter() {
-    let fake = FakePlatformRegistry::new();
-    fake.seed(TYPE, json!({}));
-    fake.seed(CHAINED, json!({}));
-
-    let depth = |d| EntityFilter {
-        max_chain_depth: NonZeroU8::new(d),
-        ..EntityFilter::default()
-    };
-    assert_eq!(ids(&fake, depth(1)).await, [TYPE]);
-    assert_eq!(ids(&fake, depth(2)).await, [TYPE, CHAINED]);
-}
-
-#[tokio::test]
-async fn a_cursor_resumes_only_the_query_that_issued_it() {
-    let fake = FakePlatformRegistry::new();
-    fake.seed(TYPE, json!({}));
-    fake.seed(OTHER, json!({}));
-    let first = ListEntitiesRequest {
-        page: PageRequest {
-            limit: Some(1),
-            cursor: None,
-        },
-        ..ListEntitiesRequest::default()
-    };
-    let cursor = fake
-        .list_entities(&ctx(), first.clone())
-        .await
-        .expect("lists")
-        .next
-        .expect("a second page");
-    let resumed = |mut request: ListEntitiesRequest| {
-        request.page.cursor = Some(cursor.clone());
-        request
-    };
-
-    let page = fake
-        .list_entities(&ctx(), resumed(first.clone()))
-        .await
-        .expect("the same query resumes");
-    assert_eq!(page.items[0].gts_id.to_string(), OTHER);
-
-    let refiltered = |filter: EntityFilter| ListEntitiesRequest {
-        filter,
-        ..first.clone()
-    };
-    for changed in [
-        ListEntitiesRequest {
-            projection: content_only(),
-            ..first.clone()
-        },
-        refiltered(EntityFilter {
-            pattern: Some(gts::GtsIdPattern::try_new("gts.cf.test.*").expect("valid pattern")),
-            ..EntityFilter::default()
-        }),
-        refiltered(EntityFilter {
-            kind: Some(EntityKind::TypeSchema),
-            ..EntityFilter::default()
-        }),
-        refiltered(EntityFilter {
-            lifecycle: LifecycleFilter::All,
-            ..EntityFilter::default()
-        }),
-        refiltered(EntityFilter {
-            max_chain_depth: NonZeroU8::new(1),
-            ..EntityFilter::default()
-        }),
-    ] {
-        let error = fake
-            .list_entities(&ctx(), resumed(changed.clone()))
-            .await
-            .expect_err("a changed query cannot resume");
-        let CanonicalError::InvalidArgument {
-            ctx: InvalidArgument::FieldViolations { field_violations },
+    assert_eq!(entity.lifecycle_status, LifecycleStatus::Deleted);
+    assert!(matches!(
+        entity.origin,
+        Some(Origin::Managed {
+            resource_version: 7,
             ..
-        } = &error
-        else {
-            panic!("not a field violation for {changed:?}: {error:?}");
-        };
-        assert_eq!(
-            field_violations[0].field,
-            field::CURSOR_FIELD,
-            "{changed:?}"
-        );
-        assert_eq!(
-            field_violations[0].reason,
-            field::VALIDATION_FAILED,
-            "{changed:?}"
-        );
-    }
+        })
+    ));
+    assert_eq!(
+        fake.content(TOY),
+        None,
+        "content() answers active entities only"
+    );
+}
 
-    let wider = ListEntitiesRequest {
-        page: PageRequest {
-            limit: Some(10),
-            cursor: None,
-        },
-        ..first
-    };
-    fake.list_entities(&ctx(), resumed(wider))
+#[tokio::test]
+async fn a_seeded_tombstone_fixes_its_documents_on_its_own_first_successful_read() {
+    let fake = MockTypesRegistry::new();
+    fake.seed_entity(Seed::new(CHILD, child()).deleted());
+    fake.seed(TOY, json!({}));
+
+    // Reading anything else, or the tombstone before it can resolve, fixes nothing.
+    get(&fake, &[key(TOY)], light()).await.expect("reads");
+    traits(&fake, CHILD).await.expect_err("no parent yet");
+
+    fake.seed(BASE, base(&tier()));
+    assert_eq!(
+        traits(&fake, CHILD).await.expect("resolves"),
+        json!({ "tier": "gold" })
+    );
+
+    fake.seed(BASE, base(&tier_and_region()));
+    assert_eq!(
+        traits(&fake, CHILD).await.expect("still resolves"),
+        json!({ "tier": "gold" }),
+        "the tombstone kept the documents of its first successful read"
+    );
+}
+
+#[tokio::test]
+async fn seed_inventory_stores_the_linked_declarations() {
+    const PLUGIN: &str = "gts.cf.toolkit.plugins.plugin.v1~";
+    let fake = MockTypesRegistry::new();
+
+    fake.seed_inventory();
+
+    assert!(
+        fake.content(PLUGIN).is_some(),
+        "toolkit-gts declares {PLUGIN}"
+    );
+    let lookup = get(&fake, &[key(PLUGIN)], documents())
         .await
-        .expect("the page size is not part of the binding");
+        .expect("a declared type resolves")
+        .remove(0);
+    assert!(matches!(lookup, EntityLookup::Found { .. }), "{lookup:?}");
+}
+
+// ---- faults -----------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_matching_rule_counts_a_call_and_the_first_admitting_one_applies() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(TOY, json!({}));
+    fake.inject(Fault::on(Call::BatchGet).first(1).fail(unavailable()));
+    fake.inject(
+        Fault::on(Call::BatchGet)
+            .nth(2)
+            .fail(CanonicalError::internal("second").create()),
+    );
+
+    let first = get(&fake, &[key(TOY)], light()).await.expect_err("first");
+    assert!(
+        matches!(first, CanonicalError::ServiceUnavailable { .. }),
+        "{first:?}"
+    );
+    let second = get(&fake, &[key(TOY)], light()).await.expect_err("second");
+    assert!(
+        matches!(second, CanonicalError::Internal { .. }),
+        "{second:?}"
+    );
+    get(&fake, &[key(TOY)], light())
+        .await
+        .expect("the third passes");
+    assert_eq!(fake.calls(Call::BatchGet), 3, "failed calls are counted");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rule_delays_then_fails_and_the_attempt_is_still_recorded() {
+    let fake = MockTypesRegistry::new();
+    fake.inject(
+        Fault::on(Call::Register)
+            .from(1)
+            .delay(Duration::from_secs(10))
+            .fail(unavailable()),
+    );
+    let started = toolkit::tokio::time::Instant::now();
+
+    register(&fake, "k", vec![create(TOY, json!({}))])
+        .await
+        .expect_err("fails");
+
+    assert!(started.elapsed() >= Duration::from_secs(10));
+    assert_eq!(fake.submissions().len(), 1);
+    assert_eq!(fake.registered()[0].gts_id.to_string(), TOY);
+}
+
+#[tokio::test]
+async fn a_key_rule_matches_an_identifier_and_its_registry_reference() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(TOY, json!({}));
+    fake.seed(OTHER, json!({}));
+    let reference = gts::GtsId::try_new(TOY).expect("valid").to_uuid();
+    fake.inject(Fault::on(Call::BatchGet).key(reference).fail(unavailable()));
+
+    get(&fake, &[key(TOY)], light())
+        .await
+        .expect_err("the identifier names the same entity");
+    get(&fake, &[key(OTHER), key(TOY)], light())
+        .await
+        .expect_err("any key of the batch matches");
+    get(&fake, &[key(OTHER)], light())
+        .await
+        .expect("another key passes");
+}
+
+#[tokio::test]
+async fn an_any_rule_applies_to_every_method() {
+    let fake = MockTypesRegistry::new();
+    fake.inject(Fault::any().fail(unavailable()));
+
+    PlatformTypesRegistryApi::list_entities(&fake, &ctx(), ListEntitiesRequest::default())
+        .await
+        .expect_err("lists fail");
+    fake.get_operation(&ctx(), uuid::Uuid::nil())
+        .await
+        .expect_err("polls fail");
+}
+
+#[test]
+#[should_panic(expected = "a key selector never matches")]
+fn a_key_rule_on_a_method_without_keys_is_refused() {
+    MockTypesRegistry::new().inject(Fault::on(Call::List).key(key(TOY)));
+}
+
+// ---- admission --------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admission_rejects_and_waits_on_dependencies_as_told() {
+    let fake = MockTypesRegistry::new().completing_after(0);
+    fake.reject(TOY, AdmissionFailureReason::InvalidSchema);
+    fake.depends_on(OTHER, BASE);
+
+    let items = register(
+        &fake,
+        "first",
+        vec![create(TOY, json!({})), create(OTHER, json!({}))],
+    )
+    .await
+    .expect("accepted");
+    let failure = |i: usize| {
+        AdmissionFailure::from_canonical(items[i].error.as_ref().expect("failed"))
+            .expect("an admission failure")
+    };
+    assert_eq!(failure(0).reason, AdmissionFailureReason::InvalidSchema);
+    assert_eq!(
+        failure(1).reason,
+        AdmissionFailureReason::DependencyNotFound
+    );
+    assert_eq!(failure(1).context(context::DEPENDENCY_ID), Some(BASE));
+
+    fake.seed(BASE, base(&tier()));
+    let items = register(&fake, "second", vec![create(OTHER, json!({}))])
+        .await
+        .expect("accepted");
+    assert_eq!(items[0].status, CandidateStatus::Succeeded);
+}
+
+// ---- strict mode ------------------------------------------------------------------------------
+
+#[tokio::test]
+#[should_panic(expected = "unexpected BatchGet call")]
+async fn strict_mode_panics_on_a_method_it_was_not_told_to_allow() {
+    let fake = MockTypesRegistry::strict();
+    fake.seed(TOY, json!({}));
+    let _unreached = get(&fake, &[key(TOY)], light()).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "unexpected read of")]
+async fn strict_mode_panics_on_a_read_of_an_unexpected_key() {
+    let fake = MockTypesRegistry::strict();
+    fake.allow(Call::BatchGet);
+    let _unreached = get(&fake, &[key(TOY)], light()).await;
+}
+
+#[tokio::test]
+async fn strict_mode_answers_stored_and_expected_absent_keys() {
+    let fake = MockTypesRegistry::strict();
+    fake.allow(Call::BatchGet);
+    fake.seed(TOY, json!({}));
+    fake.expect_absent(key(OTHER));
+
+    let answers = get(&fake, &[key(TOY), key(OTHER)], light())
+        .await
+        .expect("reads");
+    assert!(matches!(answers[0], EntityLookup::Found { .. }));
+    assert!(matches!(answers[1], EntityLookup::NotFound));
+}
+
+// ---- inspection and wiring --------------------------------------------------------------------
+
+#[tokio::test]
+async fn reads_and_registrations_are_recorded_in_order() {
+    let fake = MockTypesRegistry::new();
+    get(&fake, &[key(TOY), key(OTHER)], light())
+        .await
+        .expect("reads");
+    register(
+        &fake,
+        "k",
+        vec![create(TOY, json!({})), create(OTHER, json!({}))],
+    )
+    .await
+    .expect("accepted");
+
+    assert_eq!(fake.reads(), [key(TOY), key(OTHER)]);
+    let registered: Vec<String> = fake
+        .registered()
+        .iter()
+        .map(|i| i.gts_id.to_string())
+        .collect();
+    assert_eq!(registered, [TOY, OTHER]);
+    assert_eq!(fake.calls(Call::BatchGet), 1);
+    assert_eq!(fake.calls(Call::Register), 1);
+    assert_eq!(fake.calls(Call::List), 0);
+}
+
+#[tokio::test]
+async fn install_registers_one_fake_under_both_contracts() {
+    let fake = Arc::new(MockTypesRegistry::new());
+    let hub = toolkit::ClientHub::new();
+    fake.install(&hub);
+
+    let platform = hub
+        .get::<dyn PlatformTypesRegistryApi>()
+        .expect("the platform contract resolves");
+    hub.get::<dyn TypesRegistryApi>()
+        .expect("the tenant contract resolves");
+    platform
+        .list_entities(&ctx(), ListEntitiesRequest::default())
+        .await
+        .expect("lists");
+    assert_eq!(fake.calls(Call::List), 1, "the hub serves this fake");
 }

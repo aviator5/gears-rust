@@ -1,4 +1,4 @@
-//! Unit tests for the pure batch ordering (T19, SPEC §8.1 steps 1–2).
+//! Unit tests for the pure batch ordering (T20, SPEC §8.1 steps 1–2).
 //!
 //! Every test here runs without a database, which is the point of the ordering
 //! being a function of a candidate set: the cycle cases below are exactly the
@@ -328,7 +328,7 @@ fn an_unparsable_candidate_is_ordered_rather_than_dropped() {
 /// rather than an omission: the only kind that submits none is a deletion, whose
 /// ordering is the **reverse** of a registration's — a dependant must go before
 /// the base it consumes. Ordering deletions by the registration graph would be
-/// exactly backwards, so T20 owns the question and this function stays silent on
+/// exactly backwards, so T21 owns the question and this function stays silent on
 /// it. Acceptance refuses every non-registration kind until then, so nothing
 /// reaches here with `content: None`.
 #[test]
@@ -394,7 +394,7 @@ fn every_candidate_is_either_ordered_or_refused_exactly_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Deletion order (T20): the reverse relation, over stored edges
+// Deletion order (T21): the reverse relation, over stored edges
 // ---------------------------------------------------------------------------
 
 /// Identifiers in the order a batch would be deleted in.

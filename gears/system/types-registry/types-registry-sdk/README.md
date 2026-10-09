@@ -11,12 +11,13 @@ This crate defines the transport-agnostic interface for the Types Registry gear:
 - **`ListQuery`** - Query builder for filtering entity listings
 - **`TypesRegistryError`** - Error types for all operations
 
-### `PlatformTypesRegistryApi` (P0, replaces `TypesRegistryClient` at T31)
+### `PlatformTypesRegistryApi` (P0, replaces `TypesRegistryClient` at T38)
 
 - **`PlatformTypesRegistryApi`** — platform contract: batch reads, discovery, registration, deletion and operation reads. Mutations return read-back operations.
 - **`PlatformTypesRegistryApiExt`** — kind-narrowed reads, paginated lists and `reconcile_entities_and_await`: brings the registry to explicit documents (creates absent, updates differing, returns `UpToDate` without submitting when all match) and reports a `ReconcileOutcome` per identifier.
 - **`AdmissionFailure`** — lossless item-error reason, message and context.
-- **`testing_platform::FakePlatformRegistry`** (`test-util`) — in-memory test implementation.
+- **`testing_platform::MockTypesRegistry`** (`test-util`) — the test double for both contracts. State is seeded (`seed`, `Seed`, `seed_inventory`) or written through the contract; Type Schema documents are resolved by `gts-rust` as admission does. `Fault` rules fail or delay calls, `reject` / `depends_on` decide admission, `strict()` panics on an unexpected call, and `calls` / `reads` / `registered` record what happened. `install` registers it in a `ClientHub` under both contracts.
+- **`testing_platform::conformance::run`** (`test-util`) — contract checks the fake and the registry's local client both pass.
 
 ## Usage
 

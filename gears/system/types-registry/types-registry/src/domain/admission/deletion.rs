@@ -1,4 +1,4 @@
-//! Deletion protocol (T20, SPEC §8.1 step 4, DESIGN §3.7).
+//! Deletion protocol (T21, SPEC §8.1 step 4, DESIGN §3.7).
 //!
 //! Tombstones remain exact-readable and serve as compatibility baselines until
 //! purge (ADR-0013). Deletion allocates no revision and needs no evaluation.

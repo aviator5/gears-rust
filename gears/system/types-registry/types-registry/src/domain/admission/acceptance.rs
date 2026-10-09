@@ -58,7 +58,7 @@ pub(crate) const MAX_IDEMPOTENCY_KEY: usize = 255;
 
 /// Why a request is refused before it becomes an operation.
 ///
-/// One variant per reason, so T16 can count them separately: a single
+/// One variant per reason, so T17 can count them separately: a single
 /// `Refused(String)` would make "refusals by reason" a log-parsing exercise.
 #[domain_model]
 #[derive(Debug, thiserror::Error)]

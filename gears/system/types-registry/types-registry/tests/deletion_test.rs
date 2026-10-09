@@ -1,4 +1,4 @@
-//! Deletion safety (T20, SPEC §8.1 step 4, DESIGN §3.7).
+//! Deletion safety (T21, SPEC §8.1 step 4, DESIGN §3.7).
 //! Tombstones remain readable and usable as baselines; live direct dependants
 //! block deletion under the admission write-order claim.
 
@@ -88,7 +88,7 @@ fn referencing(gts_id: &str, target: &str) -> Value {
 }
 
 /// The same shape with `x-gts-ref`, which is an instance-value constraint and
-/// creates **no** dependency edge (T18).
+/// creates **no** dependency edge (T19).
 fn constraining(gts_id: &str, pattern: &str) -> Value {
     holder(gts_id, "x-gts-ref", &json!(pattern))
 }
@@ -360,7 +360,7 @@ async fn a_transitive_dependant_does_not_block() {
     );
 }
 
-/// `x-gts-ref` is an instance-value constraint and creates no edge (T18), so
+/// `x-gts-ref` is an instance-value constraint and creates no edge (T19), so
 /// there is no registered dependant to find. The paired `$ref` case above is
 /// otherwise identical, which is what makes this the distinction and not a
 /// coincidence.
@@ -519,7 +519,7 @@ async fn the_same_key_for_a_dry_run_and_a_commit_is_a_conflict_not_a_replay() {
 }
 
 // ---------------------------------------------------------------------------
-// Batch order (T20)
+// Batch order (T21)
 // ---------------------------------------------------------------------------
 
 async fn delete_batch(db: &Provider, key: &str, targets: &[(&str, i64)]) -> OperationOutcome {

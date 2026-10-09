@@ -324,7 +324,7 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
         })
     ));
 
-    // T22d's token itself: the RFC 9110 quotes are REST's representation, not the validator.
+    // T27's token itself: the RFC 9110 quotes are REST's representation, not the validator.
     let selection = DomainSelection::parse(&["content", "origin"]).expect("selection");
     let DomainLookup::Found { etag: domain, .. } = h
         .service
@@ -864,4 +864,11 @@ async fn discovery_honours_a_chain_depth() {
         "{:?}",
         ids(&deep)
     );
+}
+
+/// The checks the SDK's fake also passes: the two cannot drift apart unnoticed.
+#[tokio::test]
+async fn the_local_client_conforms_to_the_contract() {
+    let h = harness().await;
+    types_registry_sdk::testing_platform::conformance::run(&h.client).await;
 }

@@ -65,7 +65,7 @@ async fn an_implementation_registered_in_the_client_hub_answers_through_the_trai
     use crate::models::{BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup};
 
     const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
-    let fake = crate::testing_platform::FakePlatformRegistry::new();
+    let fake = crate::testing_platform::MockTypesRegistry::new();
     fake.seed(TYPE, serde_json::json!({}));
     let hub = toolkit::ClientHub::new();
     hub.register::<dyn super::PlatformTypesRegistryApi>(
@@ -153,7 +153,7 @@ async fn the_client_hub_resolves_the_tenant_trait_object_and_its_helpers() {
     use crate::models::Projection;
 
     const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
-    let fake = crate::testing_platform::FakePlatformRegistry::new();
+    let fake = crate::testing_platform::MockTypesRegistry::new();
     fake.seed(TYPE, serde_json::json!({}));
     let hub = toolkit::ClientHub::new();
     hub.register::<dyn super::TypesRegistryApi>(Arc::new(fake) as Arc<dyn super::TypesRegistryApi>);

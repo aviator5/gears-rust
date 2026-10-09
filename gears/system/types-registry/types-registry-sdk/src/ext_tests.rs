@@ -15,10 +15,19 @@ use crate::models::{
     OperationStatus, PageRequest, Projection, PublisherContext, RegisterEntitiesRequest,
     RegisterItem, RegistrationOperation,
 };
-use crate::testing_platform::{FakePlatformRegistry, ReadFault};
+use crate::testing_platform::{Call, Fault, MockTypesRegistry, ProtocolFault};
 
 const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
 const INSTANCE: &str = "gts.cf.test.pkg.thing.v1~cf.test.pkg.one.v1";
+
+/// A minimal Type Schema that resolves.
+fn schema(id: &str) -> serde_json::Value {
+    json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": format!("gts://{id}"),
+        "type": "object"
+    })
+}
 
 fn ctx() -> PlatformSecurityContext {
     PlatformSecurityContext::outbound_marker()
@@ -75,7 +84,7 @@ async fn submit_and_await<A: PlatformTypesRegistryApi + ?Sized>(
 #[tokio::test(start_paused = true)]
 async fn a_consumer_round_trips_submit_poll_and_read_through_the_trait() {
     let api: Arc<dyn PlatformTypesRegistryApi> =
-        Arc::new(FakePlatformRegistry::new().completing_after(3));
+        Arc::new(MockTypesRegistry::new().completing_after(3));
 
     let operation = submit_and_await(
         &*api,
@@ -102,7 +111,7 @@ async fn a_consumer_round_trips_submit_poll_and_read_through_the_trait() {
 
 #[tokio::test(start_paused = true)]
 async fn an_operation_nothing_drains_fails_on_its_deadline_naming_the_operation() {
-    let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
+    let fake = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
 
     let error = submit_and_await(
         &*fake,
@@ -128,7 +137,7 @@ async fn an_operation_nothing_drains_fails_on_its_deadline_naming_the_operation(
 
 #[tokio::test]
 async fn an_unrepresentable_deadline_is_refused_before_any_submit() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
 
     let error = submit_and_await(
         &fake,
@@ -149,7 +158,7 @@ async fn an_unrepresentable_deadline_is_refused_before_any_submit() {
 
 #[tokio::test(start_paused = true)]
 async fn cancellation_stops_waiting_without_cancelling_the_write() {
-    let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
+    let fake = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
     let cancel = CancellationToken::new();
     let waiter = {
         let fake = Arc::clone(&fake);
@@ -179,7 +188,7 @@ async fn cancellation_stops_waiting_without_cancelling_the_write() {
 
 #[tokio::test]
 async fn an_unchecked_id_of_the_other_kind_is_refused_without_a_round_trip() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
 
     let error = fake
         .get_type_schema(&ctx(), &GtsTypeId::new(INSTANCE), Projection::Default)
@@ -192,12 +201,12 @@ async fn an_unchecked_id_of_the_other_kind_is_refused_without_a_round_trip() {
         .expect_err("a Type Schema identifier");
     assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
 
-    assert_eq!(fake.batch_reads(), 0);
+    assert_eq!(fake.calls(Call::BatchGet), 0);
 }
 
 #[tokio::test]
 async fn a_reference_to_the_other_kind_is_not_found() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     fake.seed(INSTANCE, json!({}));
     let uuid = id(INSTANCE).to_uuid();
 
@@ -224,7 +233,7 @@ async fn a_reference_to_the_other_kind_is_not_found() {
 
 #[tokio::test]
 async fn a_key_named_twice_gets_the_one_answer_under_each_spelling() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     fake.seed(TYPE, json!({}));
 
     let by_id = fake
@@ -245,7 +254,7 @@ async fn a_key_named_twice_gets_the_one_answer_under_each_spelling() {
 
 #[tokio::test]
 async fn every_asked_key_is_answered_and_absence_is_none() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     fake.seed(TYPE, json!({}));
     let absent = type_id("gts.cf.test.pkg.absent.v1~");
 
@@ -265,7 +274,7 @@ async fn every_asked_key_is_answered_and_absence_is_none() {
 
 #[tokio::test]
 async fn a_large_read_is_split_into_bounded_batches_and_answers_every_key() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     let ids: Vec<GtsTypeId> = (0..150)
         .map(|n| type_id(&format!("gts.cf.test.pkg.thing{n}.v1~")))
         .collect();
@@ -278,14 +287,14 @@ async fn a_large_read_is_split_into_bounded_batches_and_answers_every_key() {
         .await
         .expect("the reads succeed");
 
-    assert_eq!(fake.batch_reads(), 2);
+    assert_eq!(fake.calls(Call::BatchGet), 2);
     assert_eq!(answers.len(), 150);
     assert!(answers.values().all(Option::is_some));
 }
 
 #[tokio::test]
 async fn one_malformed_identifier_fails_the_call_before_any_read() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     let mut ids: Vec<GtsTypeId> = (0..150)
         .map(|n| type_id(&format!("gts.cf.test.pkg.thing{n}.v1~")))
         .collect();
@@ -298,7 +307,7 @@ async fn one_malformed_identifier_fails_the_call_before_any_read() {
 
     assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
     assert_eq!(
-        fake.batch_reads(),
+        fake.calls(Call::BatchGet),
         0,
         "not even the valid first batch is read"
     );
@@ -306,9 +315,9 @@ async fn one_malformed_identifier_fails_the_call_before_any_read() {
 
 #[tokio::test]
 async fn a_mislabeled_kind_is_a_protocol_fault_not_absence() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     fake.seed(TYPE, json!({}));
-    fake.fault_reads(ReadFault::MislabelKind);
+    fake.protocol_fault(ProtocolFault::MislabelKind);
     let uuid = id(TYPE).to_uuid();
 
     // By UUID the kind is not known up front, so a mislabel could pass as "the other kind".
@@ -340,9 +349,9 @@ async fn a_mislabeled_kind_is_a_protocol_fault_not_absence() {
 
 #[tokio::test]
 async fn an_unanswered_key_fails_the_call_rather_than_reading_as_absent() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     fake.seed(TYPE, json!({}));
-    fake.fault_reads(ReadFault::DropAnswers);
+    fake.protocol_fault(ProtocolFault::DropAnswers);
 
     let error = fake
         .batch_get_type_schemas(&ctx(), &[type_id(TYPE)], Projection::Default)
@@ -357,8 +366,8 @@ async fn an_unanswered_key_fails_the_call_rather_than_reading_as_absent() {
 
 #[tokio::test]
 async fn list_helpers_select_their_documents_by_default_and_follow_every_page() {
-    let fake = FakePlatformRegistry::new();
-    fake.seed(TYPE, json!({ "type": "object" }));
+    let fake = MockTypesRegistry::new();
+    fake.seed(TYPE, schema(TYPE));
     for n in 0..3 {
         fake.seed(
             &format!("gts.cf.test.pkg.thing.v1~cf.test.pkg.i{n}.v1"),
@@ -408,10 +417,13 @@ async fn list_helpers_select_their_documents_by_default_and_follow_every_page() 
         .await
         .expect("lists");
     assert_eq!(schemas.len(), 1);
-    assert_eq!(schemas[0].content, Some(json!({ "type": "object" })));
+    assert_eq!(schemas[0].content, Some(schema(TYPE)));
     assert_eq!(
-        schemas[0].resolved_schema,
-        Some(json!({ "x-fake-resolved": { "type": "object" } })),
+        schemas[0]
+            .resolved_schema
+            .as_ref()
+            .map(|s| s["type"].clone()),
+        Some(json!("object")),
         "the default selection reads the resolved schema"
     );
     assert!(
@@ -426,11 +438,12 @@ async fn list_helpers_select_their_documents_by_default_and_follow_every_page() 
 
 #[tokio::test]
 async fn a_list_helper_refuses_a_page_that_repeats_its_cursor() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     for n in 0..3 {
-        fake.seed(&format!("gts.cf.test.pkg.t{n}.v1~"), json!({}));
+        let id = format!("gts.cf.test.pkg.t{n}.v1~");
+        fake.seed(&id, schema(&id));
     }
-    fake.repeat_list_cursor();
+    fake.protocol_fault(ProtocolFault::RepeatListCursor);
     let query = ListEntitiesRequest {
         page: PageRequest {
             limit: Some(1),
@@ -452,9 +465,10 @@ async fn a_list_helper_refuses_a_page_that_repeats_its_cursor() {
 
 #[tokio::test]
 async fn a_list_helper_stops_after_its_page_bound() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     for n in 0..=super::MAX_LIST_PAGES {
-        fake.seed(&format!("gts.cf.test.pkg.t{n}.v1~"), json!({}));
+        let id = format!("gts.cf.test.pkg.t{n}.v1~");
+        fake.seed(&id, schema(&id));
     }
     let query = ListEntitiesRequest {
         page: PageRequest {
@@ -477,14 +491,18 @@ async fn a_list_helper_stops_after_its_page_bound() {
 
 #[tokio::test]
 async fn a_failed_batch_fails_the_whole_call_and_reads_no_further() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     let ids: Vec<GtsTypeId> = (0..250)
         .map(|n| type_id(&format!("gts.cf.test.pkg.t{n:03}.v1~")))
         .collect();
     for id in &ids {
         fake.seed(id.as_ref(), json!({}));
     }
-    fake.fault_reads(ReadFault::FailOnly(2));
+    fake.inject(
+        Fault::on(Call::BatchGet)
+            .nth(2)
+            .fail(CanonicalError::service_unavailable().create()),
+    );
 
     let error = fake
         .batch_get_type_schemas(&ctx(), &ids, Projection::Default)
@@ -495,12 +513,16 @@ async fn a_failed_batch_fails_the_whole_call_and_reads_no_further() {
         matches!(error, CanonicalError::ServiceUnavailable { .. }),
         "the call fails with the read's own error, once: {error:?}"
     );
-    assert_eq!(fake.batch_reads(), 2, "no batch is read after the failure");
+    assert_eq!(
+        fake.calls(Call::BatchGet),
+        2,
+        "no batch is read after the failure"
+    );
 }
 
 #[tokio::test]
 async fn an_empty_read_needs_no_transport() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
 
     let none = fake
         .batch_get_instances_by_uuid(&ctx(), &[], Projection::Default)
@@ -512,12 +534,12 @@ async fn an_empty_read_needs_no_transport() {
         .await
         .expect("an empty read reads nothing");
     assert!(none.is_empty());
-    assert_eq!(fake.batch_reads(), 0);
+    assert_eq!(fake.calls(Call::BatchGet), 0);
 }
 
 #[tokio::test(start_paused = true)]
 async fn polls_back_off_from_the_initial_interval_to_the_cap() {
-    let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
+    let fake = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
     let budget = Duration::from_secs(10);
 
     submit_and_await(
@@ -539,13 +561,13 @@ async fn polls_back_off_from_the_initial_interval_to_the_cap() {
         expected += 1;
         interval = (interval * 2).min(super::POLL_INTERVAL_MAX);
     }
-    assert_eq!(fake.polls(), expected);
+    assert_eq!(fake.calls(Call::GetOperation), expected);
     assert_eq!(expected, 13);
 }
 
 #[tokio::test]
 async fn a_list_helper_refuses_a_query_for_the_other_kind() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
     let mut query = ListEntitiesRequest::default();
     query.filter.kind = Some(EntityKind::Instance);
 
@@ -559,8 +581,8 @@ async fn a_list_helper_refuses_a_query_for_the_other_kind() {
 
 #[tokio::test(start_paused = true)]
 async fn a_slow_submit_spends_the_one_budget_and_the_deadline_still_names_the_operation() {
-    let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
-    fake.delay_submits(Duration::from_secs(3));
+    let fake = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
+    fake.inject(Fault::on(Call::Register).delay(Duration::from_secs(3)));
     let started = tokio::time::Instant::now();
 
     let error = submit_and_await(
@@ -590,8 +612,8 @@ async fn a_slow_submit_spends_the_one_budget_and_the_deadline_still_names_the_op
 
 #[tokio::test(start_paused = true)]
 async fn a_submit_that_never_answers_returns_by_the_deadline() {
-    let fake = FakePlatformRegistry::new();
-    fake.delay_submits(Duration::from_secs(3600));
+    let fake = MockTypesRegistry::new();
+    fake.inject(Fault::on(Call::Register).delay(Duration::from_secs(3600)));
     let started = tokio::time::Instant::now();
 
     let error = submit_and_await(
@@ -611,8 +633,8 @@ async fn a_submit_that_never_answers_returns_by_the_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn a_poll_that_never_answers_returns_by_the_deadline_naming_the_operation() {
-    let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
-    fake.delay_polls(Duration::from_secs(3600));
+    let fake = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
+    fake.inject(Fault::on(Call::GetOperation).delay(Duration::from_secs(3600)));
     let started = tokio::time::Instant::now();
 
     let error = submit_and_await(
@@ -637,7 +659,7 @@ async fn a_poll_that_never_answers_returns_by_the_deadline_naming_the_operation(
 
 #[tokio::test(start_paused = true)]
 async fn a_spent_budget_submits_nothing_even_to_an_instant_registry() {
-    let fake = FakePlatformRegistry::new();
+    let fake = MockTypesRegistry::new();
 
     let error = submit_and_await(
         &fake,
@@ -668,7 +690,7 @@ mod tenant {
 
     use gts::{GtsInstanceId, GtsTypeId};
 
-    use super::{FakePlatformRegistry, INSTANCE, TYPE, id, instance_id, type_id};
+    use super::{Call, INSTANCE, MockTypesRegistry, TYPE, id, instance_id, type_id};
     use crate::TypesRegistryApiExt;
     use crate::contract::TypesRegistryApi;
     use crate::models::{
@@ -681,7 +703,7 @@ mod tenant {
 
     #[tokio::test]
     async fn an_unchecked_id_of_the_other_kind_is_refused_without_a_round_trip() {
-        let fake = FakePlatformRegistry::new();
+        let fake = MockTypesRegistry::new();
         let api: &dyn TypesRegistryApi = &fake;
 
         let error = api
@@ -699,12 +721,12 @@ mod tenant {
             .expect_err("a Type Schema identifier");
         assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
 
-        assert_eq!(fake.batch_reads(), 0);
+        assert_eq!(fake.calls(Call::BatchGet), 0);
     }
 
     #[tokio::test]
     async fn reads_answer_by_identifier_and_by_reference_within_their_kind() {
-        let fake = FakePlatformRegistry::new();
+        let fake = MockTypesRegistry::new();
         fake.seed(TYPE, json!({ "type": "object" }));
         fake.seed(INSTANCE, json!({ "n": 1 }));
         let api: &dyn TypesRegistryApi = &fake;
@@ -742,12 +764,16 @@ mod tenant {
             .await
             .expect("the reads succeed");
         assert!(instances[&id(INSTANCE).to_uuid()].is_some());
-        assert_eq!(fake.batch_reads(), 5, "the two-key read is one batch");
+        assert_eq!(
+            fake.calls(Call::BatchGet),
+            5,
+            "the two-key read is one batch"
+        );
     }
 
     #[tokio::test]
     async fn an_explicit_selection_reaches_the_read() {
-        let fake = FakePlatformRegistry::new();
+        let fake = MockTypesRegistry::new();
         fake.seed(INSTANCE, json!({ "n": 1 }));
         let api: &dyn TypesRegistryApi = &fake;
 
@@ -773,8 +799,8 @@ mod tenant {
 
     #[tokio::test]
     async fn list_helpers_select_their_documents_by_default_and_follow_every_page() {
-        let fake = FakePlatformRegistry::new();
-        fake.seed(TYPE, json!({ "type": "object" }));
+        let fake = MockTypesRegistry::new();
+        fake.seed(TYPE, super::schema(TYPE));
         for n in 0..3 {
             fake.seed(
                 &format!("gts.cf.test.pkg.thing.v1~cf.test.pkg.i{n}.v1"),
@@ -822,7 +848,7 @@ mod tenant {
 
     #[tokio::test]
     async fn a_list_helper_refuses_a_query_for_the_other_kind() {
-        let fake = FakePlatformRegistry::new();
+        let fake = MockTypesRegistry::new();
         let api: &dyn TypesRegistryApi = &fake;
         let mut query = ListEntitiesRequest::default();
         query.filter.kind = Some(EntityKind::TypeSchema);

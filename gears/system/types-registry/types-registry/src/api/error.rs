@@ -195,7 +195,7 @@ impl From<ServiceError> for CanonicalError {
             ServiceError::CorruptDocument(detail) => {
                 opaque_internal(&detail, "stored document parse")
             }
-            // The three read-surface envelope refusals (T22a). Each names the
+            // The three read-surface envelope refusals (T24). Each names the
             // request field the caller has to change, and each states the bound
             // rather than the configuration key holding it — as
             // `AcceptanceError::BatchTooLarge` does, and for the same reason.

@@ -1,4 +1,4 @@
-//! The admission path's emission sites (T16).
+//! The admission path's emission sites (T17).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -48,13 +48,13 @@ const ABSENT: &str = gts_id!("cf.core.obsv.absent.v1~");
 /// A minor-bearing family, for the cross-minor verdicts and the waived one.
 const M2_0: &str = gts_id!("cf.core.obsv.minor.v2.0~");
 const M2_1: &str = gts_id!("cf.core.obsv.minor.v2.1~");
-/// T18's fixtures: an unstable entity, a stable type derived from it, a stable
+/// T19's fixtures: an unstable entity, a stable type derived from it, a stable
 /// Instance of it, and a stable entity whose revision restates the dialect.
 const UNSTABLE: &str = gts_id!("cf.core.obsv.draft.v0~");
 const DERIVED_FROM_UNSTABLE: &str = gts_id!("cf.core.obsv.draft.v0~cf.core.obsv.leaf.v1~");
 const INSTANCE_OF_UNSTABLE: &str = gts_id!("cf.core.obsv.draft.v0~cf.core.obsv.first.v1");
 const RESTATED: &str = gts_id!("cf.core.obsv.restated.v1~");
-/// T19: a minor pair whose lower member fails, so the upper is blocked by the
+/// T20: a minor pair whose lower member fails, so the upper is blocked by the
 /// implicit predecessor edge rather than by anything it authored.
 const MINOR_V1_0: &str = gts_id!("cf.core.obsv.blocked.v1.0~");
 const MINOR_V1_1: &str = gts_id!("cf.core.obsv.blocked.v1.1~");
@@ -1001,7 +1001,7 @@ async fn a_redelivered_pass_still_carries_the_operation_facts() {
 }
 
 // ---------------------------------------------------------------------------
-// Compatibility verdicts, emitted end to end through `run_operation` (T17, P16)
+// Compatibility verdicts, emitted end to end through `run_operation` (T18, P16)
 // ---------------------------------------------------------------------------
 
 /// Compatible revisions increment the verdict counter despite producing no refusal.
@@ -1328,7 +1328,7 @@ async fn the_quarantine_and_dialect_refusals_each_carry_their_own_reason_label()
     );
 }
 
-/// T19: a blocked candidate is counted like any other refusal, so a batch's
+/// T20: a blocked candidate is counted like any other refusal, so a batch's
 /// blocked fan-out is one query rather than a read of every item row. Both
 /// blocking kinds appear under their own `reason`, never merged.
 #[tokio::test]
@@ -1428,10 +1428,10 @@ fn referencing_target(gts_id: &str, target: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// T20: the mode and kind labels, emitted end to end
+// T21: the mode and kind labels, emitted end to end
 // ---------------------------------------------------------------------------
 
-/// T20's fixtures: a subject to delete, and a `$ref` holder that refuses it.
+/// T21's fixtures: a subject to delete, and a `$ref` holder that refuses it.
 const DEL_SUBJECT: &str = gts_id!("cf.core.obsv.delsubject.v1~");
 const DEL_HOLDER: &str = gts_id!("cf.core.obsv.delholder.v1~");
 

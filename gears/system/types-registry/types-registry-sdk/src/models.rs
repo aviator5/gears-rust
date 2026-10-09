@@ -110,7 +110,7 @@ pub const MAX_BATCH_GET_KEYS: usize = 100;
 pub struct BatchGetEntitiesRequest {
     pub items: Vec<BatchGetItem>,
     pub projection: Projection,
-    /// Bypass cache freshness and revalidate (§8.3, T28); transports ignore this SDK-only flag.
+    /// Bypass cache freshness and revalidate (§8.3, T36); transports ignore this SDK-only flag.
     pub fresh: bool,
 }
 
@@ -638,7 +638,7 @@ pub struct PublisherContext {
     pub version: PublisherVersion,
 }
 
-/// Required request-level publisher/version (D18); adapters send it from T45.
+/// Required request-level publisher/version (D18); adapters send it from T44.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegisterEntitiesRequest {
     pub items: Vec<RegisterItem>,

@@ -1,12 +1,27 @@
-//! In-memory fixture for both contracts, with delayed completion and idempotency replay (`test-util`).
-//! Document hooks simulate invalid schemas, dependencies and publisher mismatch;
-//! use `x-fake-invalid`, `x-fake-depends-on`, `x-fake-publisher-mismatch`.
-//! Request hooks simulate failures, delays, missing results and concurrent writes.
-//! Equal content is unchanged; writes advance versions; dry runs use a discarded copy.
-//! Type Schema materializations are synthetic; Instances have none.
+//! In-memory fixture for both contracts (`test-util`): the test double for code that uses the
+//! types registry.
+//!
+//! **State.** [`MockTypesRegistry::seed`], [`Seed`] and [`MockTypesRegistry::seed_inventory`]
+//! store entities. Registrations and deletions change them as the real client does: equal content
+//! is unchanged, writes advance versions, dry runs decide against a discarded copy, an
+//! Idempotency-Key replays its operation.
+//!
+//! **Documents.** A Type Schema's `resolved_schema`, `effective_traits` and
+//! `effective_traits_schema` are resolved by `gts-rust` from the stored Type Schemas, as admission
+//! does. A tombstone keeps the documents it had when deleted. Instances have none. A read that
+//! selects the documents of a type that does not resolve fails with `internal`.
+//!
+//! **Behaviour.** [`Fault`] rules fail or delay calls. [`MockTypesRegistry::reject`] and
+//! [`MockTypesRegistry::depends_on`] decide admission. [`MockTypesRegistry::strict`] turns an
+//! unexpected call into a panic. [`ProtocolFault`] breaks responses for the SDK's protocol tests.
+//!
+//! **Inspection.** [`MockTypesRegistry::calls`], [`MockTypesRegistry::reads`],
+//! [`MockTypesRegistry::registered`], [`MockTypesRegistry::submissions`].
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hasher};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -23,17 +38,228 @@ use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, co
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, CandidateStatus, DeleteEntitiesRequest,
     DeletionItemResult, DeletionOperation, Entity, EntityField, EntityKey, EntityKind,
-    EntityLookup, IdempotencyKey, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
-    ListEntitiesResponse, Operation, OperationStatus, Origin, RegisterEntitiesRequest,
-    RegistrationItemResult, RegistrationOperation, Validator,
+    EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Provenance,
+    RegisterEntitiesRequest, RegisterItem, RegistrationItemResult, RegistrationOperation,
+    Validator,
 };
 use crate::reason::aborted;
+
+pub mod conformance;
+
+// ---- configuration ----------------------------------------------------------------------------
+
+/// A contract method, for [`Fault`] selectors, [`MockTypesRegistry::calls`] and strict mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Call {
+    BatchGet,
+    List,
+    Register,
+    Delete,
+    GetOperation,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum When {
+    Always,
+    Nth(u32),
+    First(u32),
+    From(u32),
+}
+
+impl When {
+    fn admits(self, seen: u32) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Nth(n) => seen == n,
+            Self::First(n) => seen <= n,
+            Self::From(n) => seen >= n,
+        }
+    }
+}
+
+/// A rule that delays and/or fails matching calls; install it with
+/// [`MockTypesRegistry::inject`]. Counts are 1-based over the calls the rule matches since it
+/// was installed. Every matching rule counts a call; the first installed one that admits it
+/// applies.
+#[derive(Debug, Clone)]
+pub struct Fault {
+    call: Option<Call>,
+    key: Option<EntityKey>,
+    when: When,
+    delay: Duration,
+    failure: Option<CanonicalError>,
+}
+
+impl Fault {
+    /// Calls of one method.
+    #[must_use]
+    pub fn on(call: Call) -> Self {
+        Self {
+            call: Some(call),
+            ..Self::any()
+        }
+    }
+
+    /// Calls of every method.
+    #[must_use]
+    pub fn any() -> Self {
+        Self {
+            call: None,
+            key: None,
+            when: When::Always,
+            delay: Duration::ZERO,
+            failure: None,
+        }
+    }
+
+    /// Only calls naming `key`: a batch read asking for it, a registration or deletion carrying
+    /// it. An identifier and its Registry Reference name the same entity.
+    #[must_use]
+    pub fn key(mut self, key: impl Into<EntityKey>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    /// Only the `n`th matching call.
+    #[must_use]
+    pub fn nth(mut self, n: u32) -> Self {
+        self.when = When::Nth(n);
+        self
+    }
+
+    /// The first `n` matching calls.
+    #[must_use]
+    pub fn first(mut self, n: u32) -> Self {
+        self.when = When::First(n);
+        self
+    }
+
+    /// The `n`th matching call and every later one.
+    #[must_use]
+    pub fn from(mut self, n: u32) -> Self {
+        self.when = When::From(n);
+        self
+    }
+
+    /// The call answers after `delay` (on the tokio clock, so a paused clock skips it).
+    #[must_use]
+    pub fn delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// The call fails with `error`, after the delay if any.
+    #[must_use]
+    pub fn fail(mut self, error: CanonicalError) -> Self {
+        self.failure = Some(error);
+        self
+    }
+
+    fn matches(&self, call: Call, keys: &[EntityKey]) -> bool {
+        self.call.is_none_or(|c| c == call)
+            && self
+                .key
+                .as_ref()
+                .is_none_or(|key| keys.iter().any(|k| same_entity(k, key)))
+    }
+}
+
+/// Defects in otherwise successful responses, for the SDK's protocol tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProtocolFault {
+    /// Batch reads answer no key at all.
+    DropAnswers,
+    /// Batch reads answer `Found` without the selected `origin`.
+    StripOrigin,
+    /// Batch reads answer `Found` with the opposite `kind` from what the identifier names.
+    MislabelKind,
+    /// A list page continued from a cursor answers that same cursor again.
+    RepeatListCursor,
+    /// Completed operations report no items.
+    DropOperationItems,
+    /// The next `n` accepted submissions fail their read back.
+    LoseReadBacks(u32),
+}
+
+#[derive(Debug, Default)]
+struct Protocol {
+    /// Every installed fault but `LoseReadBacks`, which counts down in `lose_read_backs`.
+    defects: HashSet<ProtocolFault>,
+    lose_read_backs: u32,
+}
+
+impl Protocol {
+    fn has(&self, fault: ProtocolFault) -> bool {
+        self.defects.contains(&fault)
+    }
+}
+
+/// An entity stored directly, bypassing admission. Active at version 1 unless told otherwise.
+#[derive(Debug, Clone)]
+pub struct Seed {
+    gts_id: gts::GtsId,
+    content: serde_json::Value,
+    version: u64,
+    lifecycle: LifecycleStatus,
+}
+
+impl Seed {
+    /// # Panics
+    /// If `gts_id` is not a valid GTS identifier.
+    #[must_use]
+    pub fn new(gts_id: &str, content: serde_json::Value) -> Self {
+        Self {
+            gts_id: gts::GtsId::try_new(gts_id).expect("a seed needs a valid GTS identifier"),
+            content,
+            version: 1,
+            lifecycle: LifecycleStatus::Active,
+        }
+    }
+
+    /// # Panics
+    /// If `version` is zero: stored versions start at 1.
+    #[must_use]
+    pub fn version(mut self, version: u64) -> Self {
+        assert!(version > 0, "stored versions start at 1");
+        self.version = version;
+        self
+    }
+
+    /// A tombstone. A Type Schema's documents are those it resolves to on its first read.
+    #[must_use]
+    pub fn deleted(mut self) -> Self {
+        self.lifecycle = LifecycleStatus::Deleted;
+        self
+    }
+}
+
+// ---- state ------------------------------------------------------------------------------------
+
+/// A Type Schema's resolved documents, or why it does not resolve.
+type Resolution = Result<Documents, String>;
+
+#[derive(Debug, Clone, PartialEq)]
+struct Documents {
+    resolved_schema: serde_json::Value,
+    effective_traits: serde_json::Value,
+    effective_traits_schema: serde_json::Value,
+}
 
 #[derive(Debug, Clone)]
 struct Stored {
     content: serde_json::Value,
     resource_version: u64,
     lifecycle: LifecycleStatus,
+    /// A tombstone's documents, fixed by its first successful resolution (on delete or on its
+    /// first read): refresh skips deleted entities.
+    frozen: Option<Documents>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationKind {
+    Registration,
+    Deletion,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +280,7 @@ type Outcome = (CandidateStatus, Option<u64>, Option<AdmissionFailure>);
 
 #[derive(Debug)]
 struct FakeOperation {
+    kind: OperationKind,
     candidates: Vec<Candidate>,
     /// Decided against a copy of the state, which is then discarded.
     dry_run: bool,
@@ -63,123 +290,86 @@ struct FakeOperation {
     outcomes: Option<Vec<Outcome>>,
 }
 
+/// How admission decides, besides versions: explicit refusals and dependencies.
+#[derive(Default)]
+struct Admission {
+    rejections: HashMap<String, Reason>,
+    dependencies: Vec<(String, String)>,
+}
+
+struct Strict {
+    allowed: HashSet<Call>,
+    absent: Vec<EntityKey>,
+}
+
 #[derive(Default)]
 struct State {
     entities: BTreeMap<String, Stored>,
     operations: HashMap<Uuid, FakeOperation>,
     keys: HashMap<String, (String, Uuid)>,
     submissions: Vec<(IdempotencyKey, RegisterEntitiesRequest)>,
-    /// Errors the next submissions fail with, in order, before being accepted.
-    submit_failures: Vec<CanonicalError>,
     /// Writes another publisher makes just before the next registration.
     races: Vec<(String, serde_json::Value)>,
+    admission: Admission,
+    /// Installed rules with the number of calls each has matched.
+    rules: Vec<(Fault, u32)>,
+    protocol: Protocol,
+    strict: Option<Strict>,
+    calls: HashMap<Call, u32>,
+    reads: Vec<EntityKey>,
+    resolver: Resolver,
 }
 
-pub struct FakePlatformRegistry {
+/// In-memory [`PlatformTypesRegistryApi`] and [`TypesRegistryApi`]; see the module docs.
+pub struct MockTypesRegistry {
     state: Mutex<State>,
     polls_to_complete: u32,
     max_batch: usize,
-    lose_read_backs: AtomicU32,
-    batch_reads: AtomicU32,
-    submit_delay: Mutex<std::time::Duration>,
-    poll_delay: Mutex<std::time::Duration>,
-    read_delay: Mutex<std::time::Duration>,
-    read_fault: Mutex<ReadFault>,
-    drop_operation_items: AtomicBool,
-    polls: AtomicU32,
-    repeat_list_cursor: AtomicBool,
 }
 
-/// A broken `batch_get_entities` response, for protocol-fault tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadFault {
-    /// Answers normally.
-    None,
-    /// Answers no key at all.
-    DropAnswers,
-    /// Answers `Found` without the selected `origin`.
-    StripOrigin,
-    /// Answers `Found` with the opposite `kind` from what the identifier names.
-    MislabelKind,
-    /// Fails as unavailable from the `n`th read on (1-based).
-    FailFrom(u32),
-    /// Fails as unavailable on the `n`th read only (1-based).
-    FailOnly(u32),
-}
-
-impl Default for FakePlatformRegistry {
+impl Default for MockTypesRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FakePlatformRegistry {
-    /// Operations complete on their first poll; batches up to 100 candidates.
+impl MockTypesRegistry {
+    /// Lenient: every call is answered, an unknown key is `NotFound`. Operations complete on
+    /// their first poll; batches up to 100 candidates.
     #[must_use]
     pub fn new() -> Self {
         Self {
             state: Mutex::new(State::default()),
             polls_to_complete: 1,
             max_batch: 100,
-            lose_read_backs: AtomicU32::new(0),
-            batch_reads: AtomicU32::new(0),
-            submit_delay: Mutex::new(std::time::Duration::ZERO),
-            poll_delay: Mutex::new(std::time::Duration::ZERO),
-            read_delay: Mutex::new(std::time::Duration::ZERO),
-            read_fault: Mutex::new(ReadFault::None),
-            drop_operation_items: AtomicBool::new(false),
-            polls: AtomicU32::new(0),
-            repeat_list_cursor: AtomicBool::new(false),
         }
     }
 
-    /// A list page continued from a cursor answers that same cursor again.
-    pub fn repeat_list_cursor(&self) {
-        self.repeat_list_cursor.store(true, Ordering::SeqCst);
-    }
-
-    /// Fail and record the next count submissions before acceptance ([`Self::submissions`]).
-    pub fn fail_submits(&self, count: usize, error: &CanonicalError) {
-        let mut state = self.state.lock();
-        state
-            .submit_failures
-            .extend(std::iter::repeat_n(error.clone(), count));
-    }
-
-    /// How many `get_operation` calls were made.
+    /// Strict: a call of a method not [allowed](Self::allow), or a batch read of a key that is
+    /// neither stored nor [expected absent](Self::expect_absent), panics, so a caller that
+    /// swallows errors cannot hide it.
     #[must_use]
-    pub fn polls(&self) -> u32 {
-        self.polls.load(Ordering::SeqCst)
+    pub fn strict() -> Self {
+        let fake = Self::new();
+        fake.state.lock().strict = Some(Strict {
+            allowed: HashSet::new(),
+            absent: Vec::new(),
+        });
+        fake
     }
 
-    /// Completed operations report no items.
-    pub fn drop_operation_items(&self) {
-        self.drop_operation_items.store(true, Ordering::SeqCst);
+    /// Allows `call` in strict mode; no effect on a lenient fake.
+    pub fn allow(&self, call: Call) {
+        if let Some(strict) = &mut self.state.lock().strict {
+            strict.allowed.insert(call);
+        }
     }
 
-    /// Breaks later `batch_get_entities` responses.
-    pub fn fault_reads(&self, fault: ReadFault) {
-        *self.read_fault.lock() = fault;
-    }
-
-    /// Every submission takes `delay` before it answers.
-    pub fn delay_submits(&self, delay: std::time::Duration) {
-        *self.submit_delay.lock() = delay;
-    }
-
-    /// Every `get_operation` takes `delay` before it answers.
-    pub fn delay_polls(&self, delay: std::time::Duration) {
-        *self.poll_delay.lock() = delay;
-    }
-
-    /// Every `batch_get_entities` takes `delay` before it answers.
-    pub fn delay_reads(&self, delay: std::time::Duration) {
-        *self.read_delay.lock() = delay;
-    }
-
-    /// Race the next registration with another publisher’s create/update.
-    pub fn race_next_submit(&self, gts_id: &str, content: serde_json::Value) {
-        self.state.lock().races.push((gts_id.to_owned(), content));
+    /// Lets a strict batch read ask for `key` while it is not stored; no effect on a lenient fake.
+    pub fn expect_absent(&self, key: impl Into<EntityKey>) {
+        if let Some(strict) = &mut self.state.lock().strict {
+            strict.absent.push(key.into());
+        }
     }
 
     /// Operations stay pending for `polls` polls.
@@ -196,33 +386,126 @@ impl FakePlatformRegistry {
         self
     }
 
-    /// The next `count` accepted submissions fail their read back.
-    pub fn lose_read_backs(&self, count: u32) {
-        self.lose_read_backs.store(count, Ordering::SeqCst);
+    /// Registers this fake in `hub` under both contracts.
+    pub fn install(self: &Arc<Self>, hub: &toolkit::ClientHub) {
+        hub.register::<dyn PlatformTypesRegistryApi>(
+            Arc::clone(self) as Arc<dyn PlatformTypesRegistryApi>
+        );
+        hub.register::<dyn TypesRegistryApi>(Arc::clone(self) as Arc<dyn TypesRegistryApi>);
     }
 
     /// Stores an active entity directly, at version 1.
+    ///
+    /// # Panics
+    /// If `gts_id` is not a valid GTS identifier.
     pub fn seed(&self, gts_id: &str, content: serde_json::Value) {
-        self.state.lock().entities.insert(
-            gts_id.to_owned(),
+        self.seed_entity(Seed::new(gts_id, content));
+    }
+
+    /// Stores an entity directly, replacing any stored one.
+    pub fn seed_entity(&self, seed: Seed) {
+        let mut state = self.state.lock();
+        state.resolver.invalidate();
+        state.entities.insert(
+            seed.gts_id.id().to_owned(),
             Stored {
-                content,
-                resource_version: 1,
-                lifecycle: LifecycleStatus::Active,
+                content: seed.content,
+                resource_version: seed.version,
+                lifecycle: seed.lifecycle,
+                frozen: None,
             },
         );
     }
 
-    /// Every registration submitted, accepted or replayed, in order.
+    /// Seeds every Type Schema and Instance declared in the `toolkit-gts` inventory of this
+    /// binary: what the linked gears register at startup.
+    ///
+    /// # Panics
+    /// If a declared Type Schema is not valid JSON (a macro regression).
+    pub fn seed_inventory(&self) {
+        for entry in toolkit_gts::inventory::iter::<toolkit_gts::InventoryTypeSchema> {
+            let schema = serde_json::from_str((entry.schema_fn)().as_str())
+                .expect("an inventory Type Schema is valid JSON");
+            self.seed(entry.type_id, schema);
+        }
+        for entry in toolkit_gts::inventory::iter::<toolkit_gts::InventoryInstance> {
+            self.seed(entry.instance_id, (entry.payload_fn)());
+        }
+    }
+
+    /// Admission refuses every registration of `gts_id` with `reason`.
+    pub fn reject(&self, gts_id: &str, reason: Reason) {
+        self.state
+            .lock()
+            .admission
+            .rejections
+            .insert(gts_id.to_owned(), reason);
+    }
+
+    /// Admission refuses `gts_id` as `dependency_not_found` while `dependency` is not active.
+    pub fn depends_on(&self, gts_id: &str, dependency: &str) {
+        self.state
+            .lock()
+            .admission
+            .dependencies
+            .push((gts_id.to_owned(), dependency.to_owned()));
+    }
+
+    /// Installs a rule; see [`Fault`].
+    ///
+    /// # Panics
+    /// If the rule selects a key on a method that carries none (`List`, `GetOperation`).
+    pub fn inject(&self, fault: Fault) {
+        assert!(
+            fault.key.is_none() || !matches!(fault.call, Some(Call::List | Call::GetOperation)),
+            "a key selector never matches {:?}",
+            fault.call
+        );
+        self.state.lock().rules.push((fault, 0));
+    }
+
+    /// Breaks later responses; see [`ProtocolFault`].
+    pub fn protocol_fault(&self, fault: ProtocolFault) {
+        let protocol = &mut self.state.lock().protocol;
+        if let ProtocolFault::LoseReadBacks(n) = fault {
+            protocol.lose_read_backs = n;
+        } else {
+            protocol.defects.insert(fault);
+        }
+    }
+
+    /// Race the next registration with another publisher's create/update.
+    pub fn race_next_submit(&self, gts_id: &str, content: serde_json::Value) {
+        self.state.lock().races.push((gts_id.to_owned(), content));
+    }
+
+    /// How many calls of `call` were made, counted on entry: failed and cancelled ones included.
+    #[must_use]
+    pub fn calls(&self, call: Call) -> u32 {
+        self.state.lock().calls.get(&call).copied().unwrap_or(0)
+    }
+
+    /// Every key batch reads asked for, in order.
+    #[must_use]
+    pub fn reads(&self) -> Vec<EntityKey> {
+        self.state.lock().reads.clone()
+    }
+
+    /// Every item of every registration submitted, in order: [`Self::submissions`] flattened.
+    #[must_use]
+    pub fn registered(&self) -> Vec<RegisterItem> {
+        self.state
+            .lock()
+            .submissions
+            .iter()
+            .flat_map(|(_, request)| request.items.iter().cloned())
+            .collect()
+    }
+
+    /// Every registration that got past its delay, accepted, refused or replayed, in order.
     #[must_use]
     pub fn submissions(&self) -> Vec<(IdempotencyKey, RegisterEntitiesRequest)> {
         self.state.lock().submissions.clone()
-    }
-
-    /// How many `batch_get_entities` calls were made.
-    #[must_use]
-    pub fn batch_reads(&self) -> u32 {
-        self.batch_reads.load(Ordering::SeqCst)
     }
 
     /// The stored content of `gts_id`, if active.
@@ -235,11 +518,58 @@ impl FakePlatformRegistry {
             .filter(|s| s.lifecycle == LifecycleStatus::Active)
             .map(|s| s.content.clone())
     }
+}
+
+// ---- calls ------------------------------------------------------------------------------------
+
+impl MockTypesRegistry {
+    /// Records the call, enforces strict mode, and applies the first admitting rule: its delay,
+    /// then its failure. The rule is chosen atomically, before any await.
+    async fn enter(&self, call: Call, keys: &[EntityKey]) -> Option<CanonicalError> {
+        let (delay, failure) = {
+            let mut guard = self.state.lock();
+            let state = &mut *guard;
+            *state.calls.entry(call).or_default() += 1;
+            if call == Call::BatchGet {
+                state.reads.extend(keys.iter().cloned());
+            }
+            if let Some(strict) = &state.strict {
+                assert!(
+                    strict.allowed.contains(&call),
+                    "MockTypesRegistry (strict): unexpected {call:?} call"
+                );
+                if call == Call::BatchGet {
+                    for key in keys {
+                        assert!(
+                            find(&state.entities, key).is_some()
+                                || strict.absent.iter().any(|a| same_entity(a, key)),
+                            "MockTypesRegistry (strict): unexpected read of {key}"
+                        );
+                    }
+                }
+            }
+            let mut chosen = None;
+            for (fault, seen) in &mut state.rules {
+                if fault.matches(call, keys) {
+                    *seen += 1;
+                    if chosen.is_none() && fault.when.admits(*seen) {
+                        chosen = Some((fault.delay, fault.failure.clone()));
+                    }
+                }
+            }
+            chosen.unwrap_or_default()
+        };
+        if !delay.is_zero() {
+            toolkit::tokio::time::sleep(delay).await;
+        }
+        failure
+    }
 
     fn accept(
         &self,
         key: &IdempotencyKey,
         fingerprint: String,
+        kind: OperationKind,
         candidates: Vec<Candidate>,
         dry_run: bool,
     ) -> Result<Uuid, CanonicalError> {
@@ -262,6 +592,7 @@ impl FakePlatformRegistry {
         state.operations.insert(
             operation_id,
             FakeOperation {
+                kind,
                 candidates,
                 dry_run,
                 polls_left: self.polls_to_complete,
@@ -272,15 +603,15 @@ impl FakePlatformRegistry {
     }
 
     fn read_back(&self, operation_id: Uuid) -> Result<Operation, CanonicalError> {
-        if self
-            .lose_read_backs
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
         {
-            return Err(OperationResource::aborted("lost read back")
-                .with_resource(operation_id.to_string())
-                .with_reason(aborted::OPERATION_READ_FAILED)
-                .create());
+            let protocol = &mut self.state.lock().protocol;
+            if protocol.lose_read_backs > 0 {
+                protocol.lose_read_backs -= 1;
+                return Err(OperationResource::aborted("lost read back")
+                    .with_resource(operation_id.to_string())
+                    .with_reason(aborted::OPERATION_READ_FAILED)
+                    .create());
+            }
         }
         self.operation(operation_id, false)
     }
@@ -288,8 +619,15 @@ impl FakePlatformRegistry {
     /// The operation as a read sees it; a poll counts toward completion.
     fn operation(&self, operation_id: Uuid, poll: bool) -> Result<Operation, CanonicalError> {
         let mut guard = self.state.lock();
-        let state = &mut *guard;
-        let Some(op) = state.operations.get_mut(&operation_id) else {
+        let State {
+            entities,
+            operations,
+            admission,
+            protocol,
+            resolver,
+            ..
+        } = &mut *guard;
+        let Some(op) = operations.get_mut(&operation_id) else {
             return Err(OperationResource::not_found("no such operation")
                 .with_resource(operation_id.to_string())
                 .create());
@@ -300,16 +638,21 @@ impl FakePlatformRegistry {
         if op.outcomes.is_none() && op.polls_left == 0 {
             let mut scratch;
             let entities = if op.dry_run {
-                scratch = state.entities.clone();
+                scratch = entities.clone();
                 &mut scratch
             } else {
-                &mut state.entities
+                resolver.invalidate();
+                entities
             };
-            let outcomes = op.candidates.iter().map(|c| decide(entities, c)).collect();
+            let outcomes = op
+                .candidates
+                .iter()
+                .map(|c| decide(entities, admission, c))
+                .collect();
             op.outcomes = Some(outcomes);
         }
         let mut operation = render(operation_id, op);
-        if op.outcomes.is_some() && self.drop_operation_items.load(Ordering::SeqCst) {
+        if op.outcomes.is_some() && protocol.has(ProtocolFault::DropOperationItems) {
             match &mut operation {
                 Operation::Registration(op) => op.items.clear(),
                 Operation::Deletion(op) => op.items.clear(),
@@ -319,7 +662,38 @@ impl FakePlatformRegistry {
     }
 }
 
-fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Outcome {
+fn uuid_of(key: &EntityKey) -> Uuid {
+    match key {
+        EntityKey::GtsId(id) => id.to_uuid(),
+        EntityKey::GtsUuid(uuid) => *uuid,
+    }
+}
+
+fn same_entity(a: &EntityKey, b: &EntityKey) -> bool {
+    uuid_of(a) == uuid_of(b)
+}
+
+fn find<'a>(
+    entities: &'a BTreeMap<String, Stored>,
+    key: &EntityKey,
+) -> Option<(&'a String, &'a Stored)> {
+    match key {
+        EntityKey::GtsId(id) => entities.get_key_value(id.id()),
+        EntityKey::GtsUuid(uuid) => entities
+            .iter()
+            .find(|(id, _)| gts::GtsId::try_new(id).is_ok_and(|g| g.to_uuid() == *uuid)),
+    }
+}
+
+fn is_type(gts_id: &str) -> bool {
+    gts_id.ends_with('~')
+}
+
+fn decide(
+    entities: &mut BTreeMap<String, Stored>,
+    admission: &Admission,
+    candidate: &Candidate,
+) -> Outcome {
     let failed = |reason: Reason, message: &str| {
         (
             CandidateStatus::Failed,
@@ -333,33 +707,31 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
             content,
             expected,
         } => {
-            if content.get("x-fake-publisher-mismatch") == Some(&serde_json::Value::Bool(true)) {
-                return failed(
-                    Reason::PublisherMismatch,
-                    "another publisher owns this entity",
-                );
+            if let Some(reason) = admission.rejections.get(gts_id.id()) {
+                return failed(reason.clone(), "the fake refuses this entity");
             }
-            if content.get("x-fake-invalid") == Some(&serde_json::Value::Bool(true)) {
-                return failed(Reason::InvalidSchema, "the fake refuses this document");
-            }
-            if let Some(dep) = content.get("x-fake-depends-on").and_then(|v| v.as_str())
-                && !entities
-                    .get(dep)
-                    .is_some_and(|s| s.lifecycle == LifecycleStatus::Active)
-            {
+            let missing = admission.dependencies.iter().find(|(id, dependency)| {
+                id == gts_id.id()
+                    && !entities
+                        .get(dependency)
+                        .is_some_and(|s| s.lifecycle == LifecycleStatus::Active)
+            });
+            if let Some((_, dependency)) = missing {
                 let (status, version, failure) =
                     failed(Reason::DependencyNotFound, "a dependency is not registered");
                 return (
                     status,
                     version,
-                    failure.map(|f| f.with_context(context::DEPENDENCY_ID, dep)),
+                    failure.map(|f| f.with_context(context::DEPENDENCY_ID, dependency)),
                 );
             }
-            let current = entities
-                .get(gts_id.id())
-                .filter(|s| s.lifecycle == LifecycleStatus::Active);
+            // A tombstone stays present: it is never recreated, and a revision of it is refused.
+            let current = entities.get(gts_id.id());
             match (current, expected) {
                 (Some(_), None) => failed(Reason::AlreadyExists, "already exists"),
+                (Some(s), Some(_)) if s.lifecycle == LifecycleStatus::Deleted => {
+                    failed(Reason::EntityDeleted, "the entity is deleted")
+                }
                 (Some(s), Some(v)) if s.resource_version != *v => {
                     failed(Reason::PreconditionFailed, "stale precondition")
                 }
@@ -375,6 +747,7 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
                             content: content.clone(),
                             resource_version: version,
                             lifecycle: LifecycleStatus::Active,
+                            frozen: None,
                         },
                     );
                     (CandidateStatus::Succeeded, Some(version), None)
@@ -382,24 +755,27 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
             }
         }
         Candidate::Delete { key, expected } => {
-            let EntityKey::GtsId(id) = key else {
-                return failed(
-                    Reason::from_wire("not_found"),
-                    "the fake deletes by identifier only",
-                );
+            let Some((gts_id, stored)) = find(entities, key) else {
+                return failed(Reason::from_wire("not_found"), "absent");
             };
-            match entities.get_mut(id.id()) {
-                Some(s)
-                    if s.lifecycle == LifecycleStatus::Active
-                        && s.resource_version == *expected =>
-                {
-                    s.lifecycle = LifecycleStatus::Deleted;
-                    s.resource_version += 1;
-                    (CandidateStatus::Succeeded, Some(s.resource_version), None)
-                }
-                Some(_) => failed(Reason::PreconditionFailed, "stale precondition"),
-                None => failed(Reason::from_wire("not_found"), "absent"),
+            if stored.lifecycle != LifecycleStatus::Active || stored.resource_version != *expected {
+                return failed(Reason::PreconditionFailed, "stale precondition");
             }
+            let gts_id = gts_id.clone();
+            let frozen = is_type(&gts_id)
+                .then(|| Resolver::default().resolve(entities, &gts_id).ok())
+                .flatten();
+            let Some(stored) = entities.get_mut(&gts_id) else {
+                return failed(Reason::from_wire("not_found"), "absent");
+            };
+            stored.lifecycle = LifecycleStatus::Deleted;
+            stored.resource_version += 1;
+            stored.frozen = frozen;
+            (
+                CandidateStatus::Succeeded,
+                Some(stored.resource_version),
+                None,
+            )
         }
     }
 }
@@ -415,8 +791,8 @@ fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
             .as_ref()
             .map_or((CandidateStatus::Pending, None, None), |o| o[i].clone())
     };
-    match op.candidates.first() {
-        Some(Candidate::Delete { .. }) => Operation::Deletion(DeletionOperation {
+    match op.kind {
+        OperationKind::Deletion => Operation::Deletion(DeletionOperation {
             operation_id,
             status,
             items: op
@@ -437,7 +813,7 @@ fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
                 })
                 .collect(),
         }),
-        _ => Operation::Registration(RegistrationOperation {
+        OperationKind::Registration => Operation::Registration(RegistrationOperation {
             operation_id,
             status,
             items: op
@@ -461,12 +837,96 @@ fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
     }
 }
 
-fn snapshot(gts_id: &str, stored: &Stored, fields: &crate::FieldSelection) -> Entity {
+// ---- documents and reads ----------------------------------------------------------------------
+
+/// Resolves Type Schemas with a `gts-rust` store over every stored Type Schema. The store and the
+/// resolutions are kept until a Type Schema's content changes ([`Self::invalidate`]).
+#[derive(Default)]
+struct Resolver {
+    store: Option<gts::GtsStore>,
+    resolved: HashMap<String, Resolution>,
+}
+
+impl Resolver {
+    fn invalidate(&mut self) {
+        self.store = None;
+        self.resolved.clear();
+    }
+
+    fn resolve(&mut self, entities: &BTreeMap<String, Stored>, gts_id: &str) -> Resolution {
+        if let Some(frozen) = entities.get(gts_id).and_then(|s| s.frozen.clone()) {
+            return Ok(frozen);
+        }
+        if let Some(resolution) = self.resolved.get(gts_id) {
+            return resolution.clone();
+        }
+        let store = self.store.get_or_insert_with(|| {
+            let mut store = gts::GtsStore::new();
+            for (id, stored) in entities.iter().filter(|(id, _)| is_type(id)) {
+                // An identifier that is not a type id fails only its own resolution.
+                store.register_schema(id, &stored.content).ok();
+            }
+            store
+        });
+        let resolution = store
+            .validate_schema(gts_id)
+            .map(|resolved| Documents {
+                resolved_schema: resolved.schema,
+                effective_traits: resolved.effective_traits,
+                effective_traits_schema: resolved.effective_traits_schema,
+            })
+            .map_err(|error| error.to_string());
+        self.resolved.insert(gts_id.to_owned(), resolution.clone());
+        resolution
+    }
+}
+
+/// Resolves `gts_id`; the first successful resolution of a tombstone fixes its documents.
+fn resolve_and_freeze(
+    resolver: &mut Resolver,
+    entities: &mut BTreeMap<String, Stored>,
+    gts_id: &str,
+) -> Resolution {
+    let resolution = resolver.resolve(entities, gts_id);
+    if let (Ok(documents), Some(stored)) = (&resolution, entities.get_mut(gts_id))
+        && stored.lifecycle == LifecycleStatus::Deleted
+        && stored.frozen.is_none()
+    {
+        stored.frozen = Some(documents.clone());
+    }
+    resolution
+}
+
+const DOCUMENTS: [EntityField; 3] = [
+    EntityField::ResolvedSchema,
+    EntityField::EffectiveTraits,
+    EntityField::EffectiveTraitsSchema,
+];
+
+/// `resolution` is the entity's own for a Type Schema, `None` for an Instance.
+fn snapshot(
+    gts_id: &str,
+    stored: &Stored,
+    fields: &FieldSelection,
+    resolution: Option<&Resolution>,
+) -> Result<Entity, CanonicalError> {
     let id = gts::GtsId::try_new(gts_id).expect("the fake stores valid identifiers");
     let (gts_uuid, kind) = (id.to_uuid(), EntityKind::of(&id));
-    let is_type = kind == EntityKind::TypeSchema;
     let has = |f| fields.contains(f);
-    Entity {
+    let documents = match resolution {
+        Some(Err(error)) if DOCUMENTS.into_iter().any(has) => {
+            return Err(CanonicalError::internal(format!(
+                "MockTypesRegistry: {gts_id} does not resolve: {error}"
+            ))
+            .create());
+        }
+        Some(Ok(documents)) => Some(documents),
+        _ => None,
+    };
+    let document = |field, pick: fn(&Documents) -> &serde_json::Value| {
+        documents.filter(|_| has(field)).map(|d| pick(d).clone())
+    };
+    Ok(Entity {
         gts_id: id,
         gts_uuid,
         kind,
@@ -477,20 +937,35 @@ fn snapshot(gts_id: &str, stored: &Stored, fields: &crate::FieldSelection) -> En
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }),
         content: has(EntityField::Content).then(|| stored.content.clone()),
-        resolved_schema: (is_type && has(EntityField::ResolvedSchema))
-            .then(|| serde_json::json!({ "x-fake-resolved": stored.content })),
-        effective_traits: (is_type && has(EntityField::EffectiveTraits))
-            .then(|| serde_json::json!({ "x-fake-traits-of": gts_id })),
-        effective_traits_schema: (is_type && has(EntityField::EffectiveTraitsSchema))
-            .then(|| serde_json::json!({ "x-fake-traits-schema-of": gts_id })),
-        provenance: None,
-    }
+        resolved_schema: document(EntityField::ResolvedSchema, |d| &d.resolved_schema),
+        effective_traits: document(EntityField::EffectiveTraits, |d| &d.effective_traits),
+        effective_traits_schema: document(EntityField::EffectiveTraitsSchema, |d| {
+            &d.effective_traits_schema
+        }),
+        provenance: has(EntityField::Provenance).then(|| Provenance {
+            gts_spec_version: gts::GTS_SPECIFICATION_VERSION.to_owned(),
+            gts_impl_version: gts::GTS_IMPLEMENTATION_VERSION.to_owned(),
+            compat_forced: (kind == EntityKind::TypeSchema).then_some(false),
+        }),
+    })
 }
 
 /// Scoped to the projection, as the real validators are: a token read under one selection
-/// does not condition a read under another.
-fn validator(stored: &Stored, fields: &crate::FieldSelection) -> Validator {
-    Validator::from_bytes(format!("v{}:{fields:?}", stored.resource_version).into_bytes())
+/// does not condition a read under another. A Type Schema's also covers its resolution, so a
+/// parent's change moves its children's validators.
+fn validator(
+    stored: &Stored,
+    fields: &FieldSelection,
+    resolution: Option<&Resolution>,
+) -> Validator {
+    let resolution = resolution.map(|r| {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(format!("{r:?}").as_bytes());
+        hasher.finish()
+    });
+    Validator::from_bytes(
+        format!("v{}:{fields:?}:{resolution:?}", stored.resource_version).into_bytes(),
+    )
 }
 
 /// What a discovery cursor is bound to: everything but the page size, as in the real client.
@@ -519,69 +994,61 @@ fn cursor_not_usable() -> CanonicalError {
         .create()
 }
 
-impl FakePlatformRegistry {
-    /// The batch read both contracts serve, with its delay, faults and counter.
+fn items_violation(message: impl Into<String>) -> CanonicalError {
+    TypeResource::invalid_argument()
+        .with_field_violation(field::ITEMS_FIELD, message, field::VALIDATION_FAILED)
+        .create()
+}
+
+impl MockTypesRegistry {
+    /// The batch read both contracts serve.
     async fn read_batch(
         &self,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        let call = self.batch_reads.fetch_add(1, Ordering::SeqCst) + 1;
-        let delay = *self.read_delay.lock();
-        if !delay.is_zero() {
-            toolkit::tokio::time::sleep(delay).await;
-        }
-        let fault = *self.read_fault.lock();
-        if matches!(fault, ReadFault::FailFrom(n) if call >= n)
-            || matches!(fault, ReadFault::FailOnly(n) if call == n)
-        {
-            return Err(CanonicalError::service_unavailable().create());
-        }
-        if fault == ReadFault::DropAnswers {
-            return Ok(BatchGetEntitiesResponse(HashMap::new()));
+        let keys: Vec<EntityKey> = request.items.iter().map(|i| i.key.clone()).collect();
+        if let Some(error) = self.enter(Call::BatchGet, &keys).await {
+            return Err(error);
         }
         if request.items.is_empty() || request.items.len() > crate::models::MAX_BATCH_GET_KEYS {
-            return Err(TypeResource::invalid_argument()
-                .with_field_violation(
-                    field::ITEMS_FIELD,
-                    "batch read out of range",
-                    field::VALIDATION_FAILED,
-                )
-                .create());
+            return Err(items_violation("batch read out of range"));
         }
         let fields = request.projection.normalized();
-        let state = self.state.lock();
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        if state.protocol.has(ProtocolFault::DropAnswers) {
+            return Ok(BatchGetEntitiesResponse(HashMap::new()));
+        }
         let mut out = HashMap::new();
         for item in request.items {
             // A repeated key is answered once, under its first mention's condition.
             if out.contains_key(&item.key) {
                 continue;
             }
-            let found = state.entities.iter().find(|(id, _)| match &item.key {
-                EntityKey::GtsId(g) => g.id() == id.as_str(),
-                EntityKey::GtsUuid(u) => gts::GtsId::try_new(id).is_ok_and(|g| g.to_uuid() == *u),
-            });
-            let lookup = match found {
-                None => EntityLookup::NotFound,
-                Some((id, stored)) => {
-                    let etag = validator(stored, &fields);
-                    if item.if_none_match.as_ref() == Some(&etag) {
-                        EntityLookup::Unchanged { etag }
-                    } else {
-                        let mut snapshot = snapshot(id, stored, &fields);
-                        if fault == ReadFault::MislabelKind {
-                            snapshot.kind = match snapshot.kind {
-                                EntityKind::TypeSchema => EntityKind::Instance,
-                                EntityKind::Instance => EntityKind::TypeSchema,
-                            };
-                        }
-                        if fault == ReadFault::StripOrigin {
-                            snapshot.origin = None;
-                        }
-                        EntityLookup::Found {
-                            entity: Box::new(snapshot),
-                            etag,
-                        }
-                    }
+            let Some(id) = find(&state.entities, &item.key).map(|(id, _)| id.clone()) else {
+                out.insert(item.key, EntityLookup::NotFound);
+                continue;
+            };
+            let resolution = is_type(&id)
+                .then(|| resolve_and_freeze(&mut state.resolver, &mut state.entities, &id));
+            let stored = state.entities.get(&id).expect("found above");
+            let etag = validator(stored, &fields, resolution.as_ref());
+            let lookup = if item.if_none_match.as_ref() == Some(&etag) {
+                EntityLookup::Unchanged { etag }
+            } else {
+                let mut snapshot = snapshot(&id, stored, &fields, resolution.as_ref())?;
+                if state.protocol.has(ProtocolFault::MislabelKind) {
+                    snapshot.kind = match snapshot.kind {
+                        EntityKind::TypeSchema => EntityKind::Instance,
+                        EntityKind::Instance => EntityKind::TypeSchema,
+                    };
+                }
+                if state.protocol.has(ProtocolFault::StripOrigin) {
+                    snapshot.origin = None;
+                }
+                EntityLookup::Found {
+                    entity: Box::new(snapshot),
+                    etag,
                 }
             };
             out.insert(item.key, lookup);
@@ -590,13 +1057,31 @@ impl FakePlatformRegistry {
     }
 
     /// The discovery page both contracts serve.
-    fn read_page(
+    async fn read_page(
         &self,
-        query: &ListEntitiesRequest,
+        query: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
+        if let Some(error) = self.enter(Call::List, &[]).await {
+            return Err(error);
+        }
         let fields = query.projection.normalized();
-        let limit = query.page.limit.unwrap_or(50) as usize;
-        let binding = binding(query);
+        // The real defaults: page_size_default 50, page_size_max 100.
+        let limit = match query.page.limit {
+            None => 50,
+            Some(asked @ 1..=100) => asked as usize,
+            Some(asked) => {
+                return Err(TypeResource::invalid_argument()
+                    .with_field_violation(
+                        field::LIMIT_FIELD,
+                        format!(
+                            "a page size must be between 1 and 100; this request asked for {asked}"
+                        ),
+                        field::VALIDATION_FAILED,
+                    )
+                    .create());
+            }
+        };
+        let binding = binding(&query);
         let after = match &query.page.cursor {
             None => None,
             Some(cursor) => match cursor.as_str().rsplit_once('\n') {
@@ -604,8 +1089,9 @@ impl FakePlatformRegistry {
                 _ => return Err(cursor_not_usable()),
             },
         };
-        let state = self.state.lock();
-        let matching: Vec<(&String, &Stored)> = state
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        let matching: Vec<String> = state
             .entities
             .iter()
             .filter(|(id, stored)| {
@@ -628,26 +1114,31 @@ impl FakePlatformRegistry {
                         .is_none_or(|p| gid.matches_pattern(p))
                     && after.as_ref().is_none_or(|a| id.as_str() > a.as_str())
             })
+            .map(|(id, _)| id.clone())
             .collect();
         let next = match &query.page.cursor {
-            Some(cursor) if self.repeat_list_cursor.load(Ordering::SeqCst) => Some(cursor.clone()),
-            _ => (matching.len() > limit).then(|| {
-                crate::Cursor::from_token(format!("{binding}\n{}", matching[limit - 1].0))
-            }),
+            Some(cursor) if state.protocol.has(ProtocolFault::RepeatListCursor) => {
+                Some(cursor.clone())
+            }
+            _ => (matching.len() > limit)
+                .then(|| crate::Cursor::from_token(format!("{binding}\n{}", matching[limit - 1]))),
         };
-        Ok(ListEntitiesResponse {
-            items: matching
-                .into_iter()
-                .take(limit)
-                .map(|(id, stored)| snapshot(id, stored, &fields))
-                .collect(),
-            next,
-        })
+        let items = matching
+            .into_iter()
+            .take(limit)
+            .map(|id| {
+                let resolution = is_type(&id)
+                    .then(|| resolve_and_freeze(&mut state.resolver, &mut state.entities, &id));
+                let stored = state.entities.get(&id).expect("listed above");
+                snapshot(&id, stored, &fields, resolution.as_ref())
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(ListEntitiesResponse { items, next })
     }
 }
 
 #[async_trait]
-impl PlatformTypesRegistryApi for FakePlatformRegistry {
+impl PlatformTypesRegistryApi for MockTypesRegistry {
     async fn batch_get_entities(
         &self,
         _ctx: &PlatformSecurityContext,
@@ -661,7 +1152,7 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         _ctx: &PlatformSecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        self.read_page(&request)
+        self.read_page(request).await
     }
 
     async fn register_entities(
@@ -670,15 +1161,20 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         key: IdempotencyKey,
         request: RegisterEntitiesRequest,
     ) -> Result<RegistrationOperation, CanonicalError> {
-        let delay = *self.submit_delay.lock();
-        if !delay.is_zero() {
-            toolkit::tokio::time::sleep(delay).await;
-        }
+        let keys: Vec<EntityKey> = request
+            .items
+            .iter()
+            .map(|i| EntityKey::GtsId(i.gts_id.clone()))
+            .collect();
+        let failure = self.enter(Call::Register, &keys).await;
         {
             let mut state = self.state.lock();
             state.submissions.push((key.clone(), request.clone()));
-            if !state.submit_failures.is_empty() {
-                return Err(state.submit_failures.remove(0));
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if !state.races.is_empty() {
+                state.resolver.invalidate();
             }
             for (gts_id, content) in std::mem::take(&mut state.races) {
                 let version = state
@@ -691,25 +1187,25 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
                         content,
                         resource_version: version,
                         lifecycle: LifecycleStatus::Active,
+                        frozen: None,
                     },
                 );
             }
         }
-        if request.items.len() > self.max_batch {
-            return Err(TypeResource::invalid_argument()
-                .with_field_violation(
-                    field::ITEMS_FIELD,
-                    format!(
-                        "{} entities exceeds the limit of {} per request",
-                        request.items.len(),
-                        self.max_batch
-                    ),
-                    field::VALIDATION_FAILED,
-                )
-                .create());
+        if request.items.is_empty() {
+            return Err(items_violation("a request must carry at least one entity"));
         }
-        let fingerprint = format!("{:?}", (&request.items, request.dry_run));
-        let dry_run = request.dry_run;
+        if request.items.len() > self.max_batch {
+            return Err(items_violation(format!(
+                "{} entities exceeds the limit of {} per request",
+                request.items.len(),
+                self.max_batch
+            )));
+        }
+        let fingerprint = format!(
+            "{:?}",
+            (OperationKind::Registration, &request.items, request.dry_run,)
+        );
         let candidates = request
             .items
             .into_iter()
@@ -719,10 +1215,20 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
                 expected: item.expected_resource_version,
             })
             .collect();
-        let operation_id = self.accept(&key, fingerprint, candidates, dry_run)?;
+        let operation_id = self.accept(
+            &key,
+            fingerprint,
+            OperationKind::Registration,
+            candidates,
+            request.dry_run,
+        )?;
         match self.read_back(operation_id)? {
             Operation::Registration(op) => Ok(op),
-            Operation::Deletion(_) => unreachable!("registration keys map to registrations"),
+            Operation::Deletion(_) => Err(OperationResource::already_exists(
+                "Idempotency-Key is already bound to another request",
+            )
+            .with_resource(operation_id.to_string())
+            .create()),
         }
     }
 
@@ -732,8 +1238,20 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         key: IdempotencyKey,
         request: DeleteEntitiesRequest,
     ) -> Result<DeletionOperation, CanonicalError> {
-        let fingerprint = format!("{:?}", (&request.items, request.dry_run));
-        let dry_run = request.dry_run;
+        let keys: Vec<EntityKey> = request.items.iter().map(|i| i.key.clone()).collect();
+        if let Some(error) = self.enter(Call::Delete, &keys).await {
+            return Err(error);
+        }
+        if request.items.is_empty() {
+            return Err(items_violation("a request must carry at least one entity"));
+        }
+        // As the real deletion digest: both key spellings of one entity bind the same request.
+        let targets: Vec<(Uuid, u64)> = request
+            .items
+            .iter()
+            .map(|i| (uuid_of(&i.key), i.expected_resource_version))
+            .collect();
+        let fingerprint = format!("{:?}", (OperationKind::Deletion, targets, request.dry_run));
         let candidates = request
             .items
             .into_iter()
@@ -742,10 +1260,20 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
                 expected: item.expected_resource_version,
             })
             .collect();
-        let operation_id = self.accept(&key, fingerprint, candidates, dry_run)?;
+        let operation_id = self.accept(
+            &key,
+            fingerprint,
+            OperationKind::Deletion,
+            candidates,
+            request.dry_run,
+        )?;
         match self.read_back(operation_id)? {
             Operation::Deletion(op) => Ok(op),
-            Operation::Registration(_) => unreachable!("deletion keys map to deletions"),
+            Operation::Registration(_) => Err(OperationResource::already_exists(
+                "Idempotency-Key is already bound to another request",
+            )
+            .with_resource(operation_id.to_string())
+            .create()),
         }
     }
 
@@ -754,10 +1282,8 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         _ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError> {
-        self.polls.fetch_add(1, Ordering::SeqCst);
-        let delay = *self.poll_delay.lock();
-        if !delay.is_zero() {
-            toolkit::tokio::time::sleep(delay).await;
+        if let Some(error) = self.enter(Call::GetOperation, &[]).await {
+            return Err(error);
         }
         self.operation(operation_id, true)
     }
@@ -765,7 +1291,7 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
 
 /// The tenant reads are the platform's: one store, one set of faults and counters.
 #[async_trait]
-impl TypesRegistryApi for FakePlatformRegistry {
+impl TypesRegistryApi for MockTypesRegistry {
     async fn batch_get_entities(
         &self,
         _ctx: &SecurityContext,
@@ -779,7 +1305,7 @@ impl TypesRegistryApi for FakePlatformRegistry {
         _ctx: &SecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        self.read_page(&request)
+        self.read_page(request).await
     }
 }
 

@@ -189,7 +189,7 @@ pub struct DiscoveryPage {
 /// resolved document at 1 MB, so the ceiling is what bounds a single response —
 /// 500 keys is a response this gear should never be asked to build. A
 /// reconciliation that wants to inspect more identifiers than it writes pages its
-/// reads instead, which the T23 helper owns. The upgrade path is that helper
+/// reads instead, which the T29 helper owns. The upgrade path is that helper
 /// plus a bound on response *bytes* rather than on keys; until then the key count
 /// is the only bound there is.
 ///
@@ -275,7 +275,7 @@ pub struct RegistryService {
     policy: RegistrationPolicy,
     config: TypesRegistryConfig,
     dispatch: Arc<dyn OperationDispatch>,
-    /// The admission instruments (T16).
+    /// The admission instruments (T17).
     metrics: Arc<dyn AdmissionMetrics>,
 }
 

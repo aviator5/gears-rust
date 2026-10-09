@@ -1,4 +1,4 @@
-//! Projected reads (T22b) against every backend, with the SQL recorded.
+//! Projected reads (T25) against every backend, with the SQL recorded.
 //!
 //! Properties only a real database shows:
 //!

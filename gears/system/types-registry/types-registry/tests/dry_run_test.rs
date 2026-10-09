@@ -1,4 +1,4 @@
-//! Single-candidate dry runs for registration and deletion (T20).
+//! Single-candidate dry runs for registration and deletion (T21).
 //! Check ordinary admission rules, zero entity writes and durable outcomes.
 //! Batch lifecycle and parity live in `dry_run_batch_test.rs` and
 //! `dry_run_parity_test.rs`.

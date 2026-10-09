@@ -21,8 +21,9 @@ workspace = true
 [features]
 # Default: production build, no test utilities.
 default = []
-# Exposes `pub mod testing` with a stateful `MockTypesRegistryClient` mock for
-# consumers that need a `dyn TypesRegistryClient` in their unit tests.
+# Test doubles for consumers' unit tests: `testing_platform::MockTypesRegistry`,
+# an in-memory `PlatformTypesRegistryApi` + `TypesRegistryApi`, and the legacy
+# `testing::MockTypesRegistryClient` for `dyn TypesRegistryClient` (deleted in T38).
 test-util = []
 
 [dependencies]

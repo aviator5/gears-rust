@@ -83,7 +83,7 @@ impl DeliveryOutcome {
     }
 }
 
-/// Required per-candidate labels (T20, `plan.md` P16 rule 2).
+/// Required per-candidate labels (T21, `planning-history.md` P16 rule 2).
 /// No default: callers must explicitly distinguish dry runs and operation kinds.
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

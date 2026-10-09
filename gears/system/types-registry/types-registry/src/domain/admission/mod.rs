@@ -196,7 +196,7 @@ pub enum OutboxError {
 ///
 /// A port rather than a direct `Outbox` call, because an `Outbox` only exists
 /// after `OutboxBuilder::start()` has spawned its processors — which is precisely
-/// what T21 wires and what SPEC §13's *"no test may poll"* rule forbids a test
+/// what T23 wires and what SPEC §13's *"no test may poll"* rule forbids a test
 /// from doing. The transaction shape is the same either way: the message is
 /// written by the same transaction as the operation, so a committed operation is
 /// always dispatched and a rolled-back one never is.
@@ -209,7 +209,7 @@ pub trait OperationDispatch: Send + Sync {
     /// Enqueue one operation UUID, returning the [`Wake`] for its rows.
     ///
     /// The payload carries the UUID and nothing else — candidate content must
-    /// never enter an outbox or dead-letter payload (SPEC T21).
+    /// never enter an outbox or dead-letter payload (SPEC T23).
     ///
     /// The wake must be fired only *after* the acceptance transaction commits;
     /// acceptance holds it across the commit and fires it, or drops it unfired on

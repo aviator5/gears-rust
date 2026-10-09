@@ -22,7 +22,7 @@ use super::dto::{
 use super::params::{DiscoveryParams, ExactReadSelection, NoQuery};
 use super::paths::V2;
 use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
-// Every v2 route authenticates a bearer today, so every call is a tenant's; T26 moves the
+// Every v2 route authenticates a bearer today, so every call is a tenant's; T34 moves the
 // platform routes to `.platform_authenticated()` and their calls to `CallerContext::Platform`.
 use crate::domain::caller::CallerContext;
 use crate::domain::cursor::{self, Binding};
@@ -123,10 +123,10 @@ pub async fn get_entity(
 
 // Database-backed platform handlers (T9): decode, call one domain method, encode.
 // Domain methods own policy and bounds; adapter checks only fail early.
-// T26 removes the pre-database handlers above.
+// T38 removes the pre-database handlers above.
 
 /// Advisory only: how long a client should wait before its first poll. The
-/// operation may well be terminal sooner — while admission is inline (T21) it
+/// operation may well be terminal sooner — while admission is inline (T23) it
 /// already is — so this is a hint, not a contract.
 const RETRY_AFTER_SECONDS: &str = "1";
 

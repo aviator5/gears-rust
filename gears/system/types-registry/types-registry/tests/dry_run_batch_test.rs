@@ -1,4 +1,4 @@
-//! Batch-level dry-run regression and lifecycle tests (T20 follow-up).
+//! Batch-level dry-run regression and lifecycle tests (T21 follow-up).
 //!
 //! Run identical batches against equally seeded databases and assert both expected
 //! outcomes and parity. Normalize only predicted-success revision/version fields

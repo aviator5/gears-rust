@@ -3,7 +3,7 @@
 //! No new process and no `TypesRegistryGear::init`: the database is a real file, and
 //! the `RegistryService`, `DBProvider`, pool and connections are dropped between
 //! phases; phase two reopens the file and re-runs the test migration path. Full
-//! process restart and startup seeding remain T30's e2e obligation.
+//! startup seeding is verified in T31; full process restart is verified in T41.
 //!
 //! The comparison is on whole `Model` values rather than a hand-picked column list,
 //! over all eight tables written by one Type Schema followed by one Instance

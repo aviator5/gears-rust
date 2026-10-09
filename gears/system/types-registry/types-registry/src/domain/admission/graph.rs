@@ -1,4 +1,4 @@
-//! Pure batch ordering (T19, SPEC §8.1 steps 1–2).
+//! Pure batch ordering (T20, SPEC §8.1 steps 1–2).
 //!
 //! Ordering uses `$ref`, derivation, Instance conformance and implicit minor
 //! predecessor edges. Predecessor edges are never persisted or returned by
@@ -27,7 +27,7 @@ use crate::domain::family::{VersionProbe, version_probe};
 #[derive(Clone, Debug)]
 pub struct BatchCandidate {
     pub gts_id: String,
-    /// The authored document. `None` for a deletion, which submits none (T20);
+    /// The authored document. `None` for a deletion, which submits none (T21);
     /// the identifier-derived edges still apply.
     pub content: Option<Value>,
 }

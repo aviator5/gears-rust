@@ -1,4 +1,4 @@
-//! Discovery filters (T22c) in `EntityRepo::list_page`, on every backend.
+//! Discovery filters (T26) in `EntityRepo::list_page`, on every backend.
 //!
 //! `pattern`, `depth`, `kind` and `lifecycle` are all SQL predicates applied before
 //! `LIMIT`, so a sparse match set still fills every page but the last.

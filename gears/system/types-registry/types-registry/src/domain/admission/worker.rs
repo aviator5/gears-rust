@@ -1,6 +1,6 @@
 //! Admission worker entry point: [`run_operation`] (SPEC §8.1).
 //!
-//! Returns directly for deterministic tests; T21's outbox handler maps the result
+//! Returns directly for deterministic tests; T23's outbox handler maps the result
 //! to `Ok` / `Retry` / `Reject`. Infrastructure faults return [`WorkerError`];
 //! candidate refusals are terminal [`ItemFailure`] outcomes.
 //!
@@ -79,7 +79,7 @@ async fn run_operation_inner(
     let items: Arc<[OperationItemRow]> = items.into();
     observability::record_operation_facts(&Span::current(), operation.kind, operation.dry_run);
 
-    // T21 at-least-once delivery: terminal operations return stored outcomes without writes.
+    // T23 at-least-once delivery: terminal operations return stored outcomes without writes.
     if operation.status == OperationStatus::Completed {
         return already_terminal(operation_id, &items);
     }
@@ -790,12 +790,12 @@ async fn stored_item(
 }
 
 /// Move to `running`, ignoring CAS `false`: it cannot distinguish an active pass
-/// from an interrupted one. Before T21's lease/`worker.operation_timeout`, same-key
+/// from an interrupted one. Before T23's lease/`worker.operation_timeout`, same-key
 /// `Idempotency-Key` replay was the only recovery driver. Proceeding permits duplicate
 /// evaluation but preserves outcomes: item writes use status CAS and a losing
 /// `commit_creation` rolls back with `WorkerError::ItemAlreadyTerminal`.
 ///
-/// TODO(T21): with the outbox and a lease built on `worker.operation_timeout`,
+/// TODO(T23): with the outbox and a lease built on `worker.operation_timeout`,
 /// honour `false` for an operation whose lease is live and re-take one whose lease
 /// has expired — which removes the duplicated work as well.
 async fn mark_running(

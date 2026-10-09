@@ -8,7 +8,7 @@
 //! its own `SeaORM` models at the edge — as `credstore` and `mini-chat` do.
 //! [`super::store`] therefore holds no mapping, only the `&DbTx` port signatures
 //! the domain's dyn-safe traits need. [`EntityPage`] and [`PageRequest`] are port
-//! types too since T22a made discovery a port; they are re-exported here so a
+//! types too since T24 made discovery a port; they are re-exported here so a
 //! repository caller names one module.
 //!
 //! Every method takes `runner: &impl DBRunner`, never `&SecureConn`, so one body

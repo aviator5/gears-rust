@@ -1,6 +1,6 @@
 //! Types Registry SDK
 //!
-//! Public API for `types-registry`, with a legacy surface until the T31 cutover.
+//! Public API for `types-registry`, with a legacy surface until the T38 cutover.
 //!
 //! **New surface** (SPEC §10.1, D15):
 //! - [`PlatformTypesRegistryApi`] — the platform toolkit contract; [`PlatformTypesRegistryApiExt`]
@@ -13,7 +13,7 @@
 //! - [`PlatformTypesRegistryApiExt::reconcile_entities_and_await`] — reconcile explicit
 //!   documents, returning [`Reconciliation`] and per-identifier [`ReconcileOutcome`]s
 //!
-//! **Old surface** (`legacy`, deleted in T31 with no shim; re-exported at the crate root):
+//! **Old surface** (`legacy`, deleted in T38 with no shim; re-exported at the crate root):
 //! - `TypesRegistryClient` trait for inter-gear communication. Per
 //!   [ADR 0005][adr] every fallible method (and every per-item `Result` it
 //!   returns) carries [`toolkit_canonical_errors::CanonicalError`].
@@ -58,7 +58,6 @@ pub mod reason;
 mod reconcile;
 mod submit;
 
-/// An in-memory `PlatformTypesRegistryApi` for consumer and SDK tests.
 #[cfg(any(test, feature = "test-util"))]
 #[expect(
     clippy::expect_used,
@@ -82,7 +81,7 @@ pub use models::{
 };
 pub use reconcile::{ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, Reconciliation};
 
-// The old surface, deleted in T31 (see `legacy`). Re-exported at the crate root and, for
+// The old surface, deleted in T38 (see `legacy`). Re-exported at the crate root and, for
 // its mock, at `testing`.
 mod legacy;
 

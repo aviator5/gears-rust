@@ -31,7 +31,7 @@ use crate::domain::family::FamilyKey;
 use crate::domain::key::EntityKey;
 use crate::domain::selection::FieldSelection;
 
-// The output port the admission path's instruments cross (T16).
+// The output port the admission path's instruments cross (T17).
 pub mod metrics;
 
 // ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ pub struct OperationItemRow {
 }
 
 impl OperationItemRow {
-    /// The metric labels every outcome of this item is counted under (T20).
+    /// The metric labels every outcome of this item is counted under (T21).
     ///
     /// Read from the stored row rather than from the request, so a redelivered
     /// pass labels its counts exactly as the first pass did.
@@ -730,7 +730,7 @@ pub trait EntityStore: Send + Sync {
     ) -> Result<EntityPage, ScopeError>;
 
     /// The kind of one member of a family, or `None` when the family is empty.
-    /// The input to T10's one-kind-per-family rule.
+    /// The input to T11's one-kind-per-family rule.
     async fn kind_in_family(
         &self,
         tx: &DbTx<'_>,
@@ -772,7 +772,7 @@ pub trait EntityStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Option<i64>, ScopeError>;
 
-    /// Tombstone an active entity at `expected`, advancing its version (T20).
+    /// Tombstone an active entity at `expected`, advancing its version (T21).
     /// Retain it for exact reads and compatibility until purge (ADR-0013).
     /// Both preconditions are in `WHERE`; `None` means the CAS lost.
     async fn mark_deleted(
@@ -1036,7 +1036,7 @@ pub trait DependencyStore: Send + Sync {
 
     /// Count the live **direct** registered dependants of one entity, bounded at
     /// `bound + 1`. Deletion refuses on a non-zero count and reports the number,
-    /// never the identities (T20).
+    /// never the identities (T21).
     async fn live_direct_dependents(
         &self,
         tx: &DbTx<'_>,
@@ -1078,7 +1078,7 @@ pub trait DependencyStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<i64>, ScopeError>;
 
-    /// The stored edges between the given entities, for the deletion order (T20).
+    /// The stored edges between the given entities, for the deletion order (T21).
     /// Edges leaving the set are dropped.
     async fn edges_within(
         &self,

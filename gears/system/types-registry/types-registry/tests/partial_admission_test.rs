@@ -1,4 +1,4 @@
-//! Dependency-aware partial admission (T19): dependency order, downstream-only
+//! Dependency-aware partial admission (T20): dependency order, downstream-only
 //! blocking, independent progress and cycle refusal before writes.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -587,7 +587,7 @@ async fn a_cycle_closed_by_a_revision_leaves_the_committed_entity_untouched() {
 
 /// A second pass over a batch that partially committed reports the stored
 /// outcomes and writes nothing — the property at-least-once delivery makes
-/// load-bearing (T21).
+/// load-bearing (T23).
 #[tokio::test]
 async fn a_second_pass_over_a_partially_committed_batch_is_a_no_op() {
     let db = test_db().await;

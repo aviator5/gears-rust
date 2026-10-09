@@ -2,12 +2,12 @@
 //! a mirror of its `CREATE TABLE` in `docs/database.sql`.
 //!
 //! Every table the migration creates has an entity here. `instance` and
-//! `instance_revision` arrived with Registered Instances (T10) rather than with
+//! `instance_revision` arrived with Registered Instances (T11) rather than with
 //! the migration, on the rule that an entity with no reader is code the compiler
 //! cannot check against the DDL — which is exactly the drift these mirrors exist
 //! to prevent.
 //!
-//! `dependency` is here from T4 rather than T13 as first planned: T13 *writes*
+//! `dependency` is here from T4 rather than T14 as first planned: T14 *writes*
 //! edges, but T4's dependency-closure read — what the transient `gts-rust` store
 //! of T5 is built from — already walks them.
 //!

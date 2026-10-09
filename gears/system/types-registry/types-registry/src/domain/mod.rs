@@ -1,4 +1,4 @@
-//! Domain layer: database and legacy in-memory paths coexist until T31.
+//! Domain layer: database and legacy in-memory paths coexist until T38.
 //!
 //! | Database | Legacy | Responsibility |
 //! |---|---|---|
@@ -39,11 +39,11 @@ pub mod policy;
 pub mod ports;
 // The database-backed domain surface every transport adapter calls (SPEC §8.4).
 pub mod registry_service;
-// Whether redelivering an admission can reach a different answer (T21).
+// Whether redelivering an admission can reach a different answer (T23).
 pub mod retry;
-// The normalized field set all three reads project by (T22b, SPEC §10.2).
+// The normalized field set all three reads project by (T25, SPEC §10.2).
 pub mod selection;
-// Freshness validators for conditional exact reads (T22d, SPEC §8.5).
+// Freshness validators for conditional exact reads (T27, SPEC §8.5).
 pub mod validator;
 
 // ---------------------------------------------------------------------------
@@ -54,14 +54,14 @@ pub mod validator;
 pub mod enums;
 pub mod error;
 
-// Legacy: repo, service and model retire with the old client and its cache at T31.
+// Legacy: repo, service and model retire with the old client and its cache at T38.
 // New callers use ports and registry_service.
 
 pub mod model;
 pub mod repo;
 pub mod service;
 
-// The old `TypesRegistryClient` over the in-memory path; deleted with it at T31.
+// The old `TypesRegistryClient` over the in-memory path; deleted with it at T38.
 pub mod legacy_local_client;
 
 pub use error::DomainError;

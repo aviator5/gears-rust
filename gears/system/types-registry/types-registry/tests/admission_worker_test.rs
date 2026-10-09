@@ -45,7 +45,7 @@ const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
 
 /// Enqueues nothing: T8 calls the worker directly, which is what SPEC §8.1's
-/// plain-function shape is for. T21 replaces this with the real outbox.
+/// plain-function shape is for. T23 replaces this with the real outbox.
 struct NoDispatch;
 
 #[async_trait::async_trait]
@@ -109,7 +109,7 @@ fn worker_provider(db: &Arc<DBProvider<DbError>>) -> DBProvider<WorkerError> {
 // ---------------------------------------------------------------------------
 
 /// The five affected tables, one row each. `dependency` is deliberately not among
-/// them: this candidate references nothing, and edge extraction is T13.
+/// them: this candidate references nothing, and edge extraction is T14.
 #[tokio::test]
 async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
     let db = test_db().await;
@@ -317,7 +317,7 @@ async fn the_resolution_fingerprint_is_stable_across_two_admissions_of_identical
 
 /// An item's outcome is written once and stands. Two passes over one operation can
 /// overlap — a retry under the same `Idempotency-Key` mid-flight, and at-least-once
-/// delivery from T21 — and the loser must neither overwrite the outcome nor leave an
+/// delivery from T23 — and the loser must neither overwrite the outcome nor leave an
 /// entity behind an item that says otherwise. Both halves: the item write is a CAS,
 /// and losing it rolls the whole commit back.
 #[tokio::test]
@@ -447,7 +447,7 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
 
 /// A redelivery reports the *same shape* of outcome the first pass returned, reason
 /// and message in their own fields — not `reason: "recorded"` with the payload
-/// stuffed into the message. T16 counts refusals by `reason`, and a metric that reads
+/// stuffed into the message. T17 counts refusals by `reason`, and a metric that reads
 /// `recorded` for every redelivered item counts nothing.
 #[tokio::test]
 async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
@@ -524,7 +524,7 @@ async fn a_redelivered_failure_reports_the_reason_the_first_pass_recorded() {
 /// A stored item that names a version is failed terminally and writes nothing.
 ///
 /// Acceptance no longer produces such a row — it refuses a positive
-/// `expected_resource_version` until T11 — so this manufactures one, which is also
+/// `expected_resource_version` until T12 — so this manufactures one, which is also
 /// the shape a row accepted by an earlier build has after an upgrade. What must not
 /// happen: committing it as an ordinary creation at `resource_version = 1`, with the
 /// policy gate never applied because the caller called it a revision.
@@ -753,10 +753,10 @@ async fn a_second_invocation_sees_the_first_ones_committed_revision() {
     });
     let second = submit(&db, "k2", derived, derived_body).await;
 
-    // Inverted at T10: the base is reachable through `GtsId::chain_ids()` with the
-    // edge table still empty, so the old comment blaming T13's missing rows was half
+    // Inverted at T11: the base is reachable through `GtsId::chain_ids()` with the
+    // edge table still empty, so the old comment blaming T14's missing rows was half
     // wrong. The `$ref` here points at the base, which the chain supplies;
-    // `a_ref_outside_the_chain_is_admitted` covers the half T13 owned.
+    // `a_ref_outside_the_chain_is_admitted` covers the half T14 owned.
     let outcome = run_operation(
         &stores(),
         &worker_provider(&db),
