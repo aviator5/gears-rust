@@ -126,7 +126,7 @@ fn a_typed_selection_is_the_one_its_field_names_parse_to() {
 mod item_failures {
     use sdk::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
 
-    use super::super::item_parts;
+    use super::super::{ItemState, StoredItem};
     use super::*;
     use crate::domain::admission::{StoredFailure, UnreadableFailure};
     use crate::domain::enums::OperationItemStatus;
@@ -154,9 +154,11 @@ mod item_failures {
             resource_version: None,
             error: Some(failure),
         };
-        let (_, _, _, error) = item_parts(item, Uuid::from_u128(1)).expect("representable");
-        AdmissionFailure::from_canonical(&error.expect("a failed item carries its error"))
-            .expect("an admission failure")
+        let item = StoredItem::read(item, Uuid::from_u128(1)).expect("representable");
+        let Ok(ItemState::Failed(error)) = item.decode(false) else {
+            panic!("a failed item carries its error");
+        };
+        AdmissionFailure::from_canonical(&error).expect("an admission failure")
     }
 
     #[test]
@@ -212,5 +214,193 @@ mod item_failures {
         assert_eq!(failure.reason, Reason::UnparsablePayload);
         assert_eq!(failure.message, "the recorded failure could not be read");
         assert!(failure.context.is_empty(), "{:?}", failure.context);
+    }
+}
+
+/// Stored item states decode to exactly the SDK outcome they describe; a combination the
+/// storage constraint excludes is `Internal`, never read as some outcome.
+mod item_states {
+    use toolkit_canonical_errors::CanonicalError;
+    use uuid::Uuid;
+
+    use super::super::operation_from;
+    use crate::domain::admission::StoredFailure;
+    use crate::domain::enums::{OperationItemStatus as S, OperationKind, OperationStatus};
+    use crate::domain::key::EntityKey;
+    use crate::domain::registry_service::{OperationItemRecord, OperationRecord};
+    use types_registry_sdk as sdk;
+
+    const ID: &str = "gts.cf.core.events.test.v1~";
+
+    fn failure() -> StoredFailure {
+        StoredFailure {
+            reason: "invalid_schema".to_owned(),
+            message: "refused".to_owned(),
+            dependency_id: None,
+            dependency_kind: None,
+            error_code: None,
+            operation_id: None,
+        }
+    }
+
+    fn operation(
+        kind: OperationKind,
+        dry_run: bool,
+        status: S,
+        version: Option<i64>,
+        failed: bool,
+    ) -> Result<sdk::Operation, CanonicalError> {
+        operation_from(OperationRecord {
+            operation_id: Uuid::from_u128(7),
+            kind,
+            dry_run,
+            status: OperationStatus::Completed,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            completed_at: None,
+            items: vec![OperationItemRecord {
+                key: EntityKey::GtsId(ID.to_owned()),
+                status,
+                resource_version: version,
+                error: failed.then(|| Ok(failure())),
+            }],
+        })
+    }
+
+    fn registration(
+        dry_run: bool,
+        status: S,
+        version: Option<i64>,
+        failed: bool,
+    ) -> Result<sdk::RegistrationOutcome, CanonicalError> {
+        match operation(
+            OperationKind::Registration,
+            dry_run,
+            status,
+            version,
+            failed,
+        )? {
+            sdk::Operation::Registration(mut op) => Ok(op.items.remove(0).outcome),
+            sdk::Operation::Deletion(_) => panic!("a registration reads as one"),
+        }
+    }
+
+    fn deletion(
+        dry_run: bool,
+        status: S,
+        version: Option<i64>,
+        failed: bool,
+    ) -> Result<sdk::DeletionOutcome, CanonicalError> {
+        match operation(OperationKind::Deletion, dry_run, status, version, failed)? {
+            sdk::Operation::Deletion(mut op) => Ok(op.items.remove(0).outcome),
+            sdk::Operation::Registration(_) => panic!("a deletion reads as one"),
+        }
+    }
+
+    #[test]
+    fn every_state_the_constraint_allows_decodes_to_its_outcome() {
+        use sdk::DeletionOutcome as D;
+        use sdk::RegistrationOutcome as R;
+        assert!(matches!(
+            registration(false, S::Pending, None, false),
+            Ok(R::Pending)
+        ));
+        assert!(matches!(
+            registration(false, S::Running, None, false),
+            Ok(R::Running)
+        ));
+        assert!(matches!(
+            registration(false, S::Succeeded, Some(3), false),
+            Ok(R::Succeeded {
+                resource_version: 3
+            })
+        ));
+        assert!(matches!(
+            registration(true, S::Succeeded, None, false),
+            Ok(R::WouldSucceed)
+        ));
+        for dry_run in [false, true] {
+            assert!(matches!(
+                registration(dry_run, S::Unchanged, Some(2), false),
+                Ok(R::Unchanged {
+                    resource_version: 2
+                })
+            ));
+        }
+        assert!(matches!(
+            registration(false, S::Failed, None, true),
+            Ok(R::Failed { .. })
+        ));
+
+        assert!(matches!(
+            deletion(false, S::Succeeded, Some(4), false),
+            Ok(D::Succeeded {
+                resource_version: 4
+            })
+        ));
+        assert!(matches!(
+            deletion(true, S::Succeeded, None, false),
+            Ok(D::WouldSucceed)
+        ));
+        assert!(matches!(
+            deletion(false, S::Failed, None, true),
+            Ok(D::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_state_the_constraint_excludes_is_internal() {
+        let excluded = [
+            (false, S::Pending, Some(1), false),
+            (false, S::Running, None, true),
+            (false, S::Succeeded, None, false),
+            (true, S::Succeeded, Some(1), false),
+            (false, S::Succeeded, Some(1), true),
+            (false, S::Unchanged, None, false),
+            (false, S::Failed, None, false),
+            (false, S::Failed, Some(1), true),
+        ];
+        for (dry_run, status, version, failed) in excluded {
+            assert!(
+                matches!(
+                    registration(dry_run, status, version, failed),
+                    Err(CanonicalError::Internal { .. })
+                ),
+                "{dry_run} {status:?} {version:?} {failed}"
+            );
+        }
+        assert!(
+            matches!(
+                deletion(false, S::Unchanged, Some(1), false),
+                Err(CanonicalError::Internal { .. })
+            ),
+            "a deletion is never unchanged"
+        );
+    }
+
+    #[test]
+    fn a_version_below_one_is_internal() {
+        for version in [0, -1] {
+            for (dry_run, status) in [
+                (false, S::Succeeded),
+                (false, S::Unchanged),
+                (true, S::Unchanged),
+            ] {
+                assert!(
+                    matches!(
+                        registration(dry_run, status, Some(version), false),
+                        Err(CanonicalError::Internal { .. })
+                    ),
+                    "{dry_run} {status:?} at {version}"
+                );
+            }
+            assert!(
+                matches!(
+                    deletion(false, S::Succeeded, Some(version), false),
+                    Err(CanonicalError::Internal { .. })
+                ),
+                "a deletion at {version}"
+            );
+        }
     }
 }

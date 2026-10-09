@@ -15,10 +15,11 @@ use crate::field;
 use crate::item_failure::AdmissionFailure;
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetItem, CandidateStatus, DeleteEntitiesRequest, DeleteItem,
-    Entity, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection,
-    IdempotencyKey, LifecycleFilter, LifecycleStatus, ListEntitiesRequest, Operation,
-    OperationStatus, Origin, PageRequest, Projection, Provenance, PublisherContext,
-    RegisterEntitiesRequest, RegisterItem, Validator,
+    DeletionItemResult, DeletionOutcome, Entity, EntityField, EntityFilter, EntityKey, EntityKind,
+    EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
+    ListEntitiesRequest, Operation, OperationStatus, Origin, PageRequest, Projection, Provenance,
+    PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationOperation,
+    RegistrationOutcome, Validator,
 };
 
 const DRAFT: &str = "http://json-schema.org/draft-07/schema#";
@@ -27,6 +28,8 @@ const BASE: &str = "gts.cf.core.conformance.base.v1~";
 const CHILD: &str = "gts.cf.core.conformance.base.v1~cf.core.conformance.child.v1~";
 const DOOMED: &str = "gts.cf.core.conformance.base.v1~cf.core.conformance.doomed.v1~";
 const INSTANCE: &str = "gts.cf.core.conformance.base.v1~cf.core.conformance.item.v1";
+/// Never registered.
+const ABSENT: &str = "gts.cf.core.conformance.absent.v1~";
 
 const LISTED: &str = "gts.cf.core.listing.*";
 const LISTED_A: &str = "gts.cf.core.listing.a.v1~";
@@ -59,6 +62,7 @@ pub async fn run(client: &dyn PlatformTypesRegistryApi) {
     c.a_cursor_resumes_only_the_query_that_issued_it().await;
     c.requests_out_of_range_are_refused().await;
     c.an_idempotency_key_binds_one_request().await;
+    c.dry_runs_preview_without_allocating_versions().await;
 }
 
 // fixtures.
@@ -170,7 +174,7 @@ fn assert_field_violation(error: &CanonicalError, field: &str) {
 
 /// Awaits `future` within [`COMPLETION`].
 async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
-    toolkit::tokio::time::timeout(COMPLETION, future)
+    tokio::time::timeout(COMPLETION, future)
         .await
         .unwrap_or_else(|_| panic!("{what}: no answer within {COMPLETION:?}"))
 }
@@ -240,7 +244,7 @@ impl Checker<'_> {
                 if operation.status() == OperationStatus::Completed {
                     return operation;
                 }
-                toolkit::tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -276,12 +280,11 @@ impl Checker<'_> {
             .items
             .into_iter()
             .map(|item| {
-                let failure = if item.status == CandidateStatus::Failed {
-                    reason(item.error.as_ref())
-                } else {
-                    String::new()
-                };
-                (item.status, failure)
+                let failure = item
+                    .outcome
+                    .error()
+                    .map_or_else(String::new, |e| reason(Some(e)));
+                (item.outcome.status(), failure)
             })
             .collect()
     }
@@ -297,7 +300,9 @@ impl Checker<'_> {
         );
     }
 
-    async fn delete(&self, gts_id: &str, version: u64) {
+    /// Submits and awaits one deletion of `gts_id` at `version`; answers its status and
+    /// failure reason.
+    async fn try_delete(&self, gts_id: &str, version: u64) -> (CandidateStatus, String) {
         let request = DeleteEntitiesRequest {
             items: vec![DeleteItem {
                 key: gts_key(gts_id),
@@ -316,22 +321,23 @@ impl Checker<'_> {
         let Operation::Deletion(operation) = self.completed(accepted.operation_id).await else {
             panic!("a deletion completes as a deletion");
         };
+        let [item] = operation.items.as_slice() else {
+            panic!("one result for the deleted key: {:?}", operation.items);
+        };
+        assert_eq!(item.entity_key, gts_key(gts_id), "the result names the key");
+        let failure = item
+            .outcome
+            .error()
+            .map_or_else(String::new, |e| reason(Some(e)));
+        (item.outcome.status(), failure)
+    }
+
+    async fn delete(&self, gts_id: &str, version: u64) {
+        let outcome = self.try_delete(gts_id, version).await;
         assert_eq!(
-            operation
-                .items
-                .iter()
-                .map(|i| &i.entity_key)
-                .collect::<Vec<_>>(),
-            [&gts_key(gts_id)],
-            "one result for the deleted key"
-        );
-        assert!(
-            operation
-                .items
-                .iter()
-                .all(|i| i.status == CandidateStatus::Succeeded),
-            "deleting {gts_id}: {:?}",
-            operation.items
+            outcome,
+            (CandidateStatus::Succeeded, String::new()),
+            "deleting {gts_id}"
         );
     }
 
@@ -549,6 +555,26 @@ impl Checker<'_> {
             self.try_register(vec![revise(DOOMED, doomed(), 2)]).await,
             [(CandidateStatus::Failed, "entity_deleted".to_owned())],
             "a tombstone is never revised"
+        );
+
+        let Some(Origin::Managed {
+            resource_version: tombstone_version,
+            ..
+        }) = tombstone.origin
+        else {
+            panic!("a tombstone keeps its origin: {:?}", tombstone.origin);
+        };
+        for version in [tombstone_version, 1] {
+            assert_eq!(
+                self.try_delete(DOOMED, version).await,
+                (CandidateStatus::Failed, "not_active".to_owned()),
+                "a tombstone is not deleted again, whatever version is expected ({version})"
+            );
+        }
+        assert_eq!(
+            self.try_delete(ABSENT, 1).await,
+            (CandidateStatus::Failed, "precondition_failed".to_owned()),
+            "an absent target fails its precondition"
         );
         (tombstone, tombstone_etag)
     }
@@ -893,6 +919,132 @@ impl Checker<'_> {
         assert_eq!(
             by_uuid.operation_id, by_id.operation_id,
             "both spellings of one entity bind the same deletion"
+        );
+    }
+
+    /// Submits `request` and answers its completed registration.
+    async fn registration(&self, request: RegisterEntitiesRequest) -> RegistrationOperation {
+        let accepted = bounded(
+            "the registration is answered",
+            self.client
+                .register_entities(&Self::ctx(), self.next_key(), request),
+        )
+        .await
+        .expect("the registration is accepted");
+        let Operation::Registration(operation) = self.completed(accepted.operation_id).await else {
+            panic!("a registration completes as a registration");
+        };
+        operation
+    }
+
+    async fn dry_runs_preview_without_allocating_versions(&self) {
+        const PREVIEW: &str = "gts.cf.core.conformance.preview.v1~";
+        self.a_dry_run_creation_previews(PREVIEW).await;
+        let version = self.a_creation_reports_the_stored_version(PREVIEW).await;
+        self.a_dry_run_reports_an_unchanged_update(PREVIEW, version)
+            .await;
+        self.a_dry_run_deletion_previews(PREVIEW, version).await;
+    }
+
+    /// The one outcome of a single-item registration of `item`.
+    async fn register_one(&self, item: RegisterItem, dry_run: bool) -> RegistrationOutcome {
+        let operation = self
+            .registration(RegisterEntitiesRequest {
+                items: vec![item],
+                dry_run,
+                publisher: publisher(),
+            })
+            .await;
+        let [item] = <[_; 1]>::try_from(operation.items).expect("one result");
+        item.outcome
+    }
+
+    async fn a_dry_run_creation_previews(&self, gts_id: &str) {
+        let preview = self
+            .register_one(create(gts_id, root(gts_id, None)), true)
+            .await;
+        assert!(
+            matches!(preview, RegistrationOutcome::WouldSucceed),
+            "a dry-run creation previews without a version: {preview:?}"
+        );
+        assert!(
+            matches!(
+                self.get(gts_key(gts_id), light()).await,
+                EntityLookup::NotFound
+            ),
+            "a dry run commits nothing"
+        );
+    }
+
+    async fn a_creation_reports_the_stored_version(&self, gts_id: &str) -> u64 {
+        let created = self
+            .register_one(create(gts_id, root(gts_id, None)), false)
+            .await;
+        let RegistrationOutcome::Succeeded { resource_version } = created else {
+            panic!("a committed creation carries its version: {created:?}");
+        };
+        let (stored, _) = found(self.get(gts_key(gts_id), every_field()).await);
+        assert!(
+            matches!(
+                stored.origin,
+                Some(Origin::Managed { resource_version: v, .. }) if v == resource_version
+            ),
+            "the reported version is the stored one: {:?}",
+            stored.origin
+        );
+        resource_version
+    }
+
+    async fn a_dry_run_reports_an_unchanged_update(&self, gts_id: &str, version: u64) {
+        let unchanged = self
+            .register_one(revise(gts_id, root(gts_id, None), version), true)
+            .await;
+        assert!(
+            matches!(
+                unchanged,
+                RegistrationOutcome::Unchanged { resource_version: v } if v == version
+            ),
+            "a dry run reports an unchanged update at the existing version: {unchanged:?}"
+        );
+    }
+
+    async fn a_dry_run_deletion_previews(&self, gts_id: &str, version: u64) {
+        let accepted = bounded(
+            "the deletion is answered",
+            self.client.delete_entities(
+                &Self::ctx(),
+                self.next_key(),
+                DeleteEntitiesRequest {
+                    items: vec![DeleteItem {
+                        key: gts_key(gts_id),
+                        expected_resource_version: version,
+                    }],
+                    dry_run: true,
+                    publisher: publisher(),
+                },
+            ),
+        )
+        .await
+        .expect("the deletion is accepted");
+        let Operation::Deletion(deletion) = self.completed(accepted.operation_id).await else {
+            panic!("a deletion completes as a deletion");
+        };
+        assert!(
+            matches!(
+                deletion.items.as_slice(),
+                [DeletionItemResult {
+                    outcome: DeletionOutcome::WouldSucceed,
+                    ..
+                }]
+            ),
+            "a dry-run deletion previews without a version: {:?}",
+            deletion.items
+        );
+        let (still, _) = found(self.get(gts_key(gts_id), light()).await);
+        assert_eq!(
+            still.lifecycle_status,
+            LifecycleStatus::Active,
+            "and deletes nothing"
         );
     }
 }

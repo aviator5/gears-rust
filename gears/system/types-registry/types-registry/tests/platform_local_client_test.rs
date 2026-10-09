@@ -22,10 +22,10 @@ use types_registry::domain::selection::FieldSelection as DomainSelection;
 use types_registry::infra::outbox::OutboxDispatch;
 use types_registry_sdk::{
     AdmissionFailure, BatchGetEntitiesRequest, BatchGetItem, CandidateStatus,
-    DeleteEntitiesRequest, DeleteItem, EntityField, EntityFilter, EntityKey, EntityKind,
-    EntityLookup, FieldSelection, IdempotencyKey, LifecycleStatus, ListEntitiesRequest, Operation,
-    OperationStatus, Origin, PageRequest, PlatformTypesRegistryApi, Projection, PublisherContext,
-    RegisterEntitiesRequest, RegisterItem,
+    DeleteEntitiesRequest, DeleteItem, DeletionOutcome, EntityField, EntityFilter, EntityKey,
+    EntityKind, EntityLookup, FieldSelection, IdempotencyKey, LifecycleStatus, ListEntitiesRequest,
+    Operation, OperationStatus, Origin, PageRequest, PlatformTypesRegistryApi, Projection,
+    PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationOutcome,
 };
 
 mod common;
@@ -195,8 +195,16 @@ async fn a_submit_returns_the_operation_as_read_with_its_real_items() {
     assert_eq!(submitted.items[0].gts_id, id(CF_TYPE));
 
     let items = items_of(completed(&h.client, submitted.operation_id).await);
-    assert_eq!(items[0].status, CandidateStatus::Succeeded);
-    assert_eq!(items[0].resource_version, Some(1));
+    assert!(
+        matches!(
+            items[0].outcome,
+            RegistrationOutcome::Succeeded {
+                resource_version: 1
+            }
+        ),
+        "{:?}",
+        items[0].outcome
+    );
 }
 
 #[tokio::test]
@@ -222,7 +230,7 @@ async fn a_terminal_replay_returns_the_operation_read_back_with_its_items() {
     assert_eq!(replay.operation_id, first.operation_id());
     assert_eq!(replay.status, OperationStatus::Completed);
     assert_eq!(replay.items.len(), 1);
-    assert_eq!(replay.items[0].status, CandidateStatus::Succeeded);
+    assert_eq!(replay.items[0].outcome.status(), CandidateStatus::Succeeded);
 }
 
 #[tokio::test]
@@ -244,10 +252,10 @@ async fn an_instance_document_without_an_id_registers_under_the_item_identifier(
         .await,
     );
     assert_eq!(
-        items[0].status,
+        items[0].outcome.status(),
         CandidateStatus::Succeeded,
         "{:?}",
-        items[0].error
+        items[0].outcome
     );
 
     let lookups = h
@@ -515,8 +523,8 @@ async fn deletion_round_trips_and_a_failed_item_carries_its_reason() {
     let Operation::Deletion(stale) = completed(&h.client, stale.operation_id).await else {
         panic!("deletion");
     };
-    assert_eq!(stale.items[0].status, CandidateStatus::Failed);
-    let failure = AdmissionFailure::from_canonical(stale.items[0].error.as_ref().expect("error"))
+    assert_eq!(stale.items[0].outcome.status(), CandidateStatus::Failed);
+    let failure = AdmissionFailure::from_canonical(stale.items[0].outcome.error().expect("error"))
         .expect("decodes");
     assert_eq!(
         failure.reason,
@@ -531,7 +539,11 @@ async fn deletion_round_trips_and_a_failed_item_carries_its_reason() {
     let Operation::Deletion(done) = completed(&h.client, ok.operation_id).await else {
         panic!("deletion");
     };
-    assert_eq!(done.items[0].status, CandidateStatus::Succeeded);
+    assert!(
+        matches!(done.items[0].outcome, DeletionOutcome::Succeeded { .. }),
+        "{:?}",
+        done.items[0].outcome
+    );
     assert_eq!(done.items[0].entity_key, EntityKey::from(id(CF_TYPE)));
 
     let lookups = h
@@ -605,7 +617,7 @@ async fn a_failed_read_back_names_the_accepted_operation_and_the_same_key_recove
     assert_eq!(recovered.operation_id, operation_id);
     assert_eq!(recovered.items.len(), 1);
     let items = items_of(completed(&h.client, operation_id).await);
-    assert_eq!(items[0].status, CandidateStatus::Succeeded);
+    assert_eq!(items[0].outcome.status(), CandidateStatus::Succeeded);
 }
 
 #[tokio::test]
@@ -658,7 +670,7 @@ async fn reconcile_entities_and_await_creates_then_updates_drift_through_a_dyn_c
     let h = harness().await;
     let api: Arc<dyn PlatformTypesRegistryApi> = Arc::new(LocalClient::new(Arc::clone(&h.service)));
     let cancel = tokio_util::sync::CancellationToken::new();
-    let reconcile = |desired: Vec<(String, serde_json::Value)>| {
+    let reconcile = |desired: Vec<(GtsId, serde_json::Value)>| {
         let api = Arc::clone(&api);
         let cancel = cancel.clone();
         async move {
@@ -687,14 +699,14 @@ async fn reconcile_entities_and_await_creates_then_updates_drift_through_a_dyn_c
 
     admitted(
         reconcile(vec![
-            (CF_TYPE.to_owned(), schema(CF_TYPE)),
-            (CF_INSTANCE.to_owned(), json!({ "name": "first" })),
+            (id(CF_TYPE), schema(CF_TYPE)),
+            (id(CF_INSTANCE), json!({ "name": "first" })),
         ])
         .await,
     );
 
     // The same identifier with other content is an update, not a conflict.
-    admitted(reconcile(vec![(CF_INSTANCE.to_owned(), json!({ "name": "second" }))]).await);
+    admitted(reconcile(vec![(id(CF_INSTANCE), json!({ "name": "second" }))]).await);
     let instance = api
         .get_instance(
             &ctx(),
@@ -714,8 +726,8 @@ async fn reconciliation_through_the_local_client_admits_then_reports_up_to_date(
 
     let h = harness().await;
     let desired = vec![
-        (CF_TYPE.to_owned(), schema(CF_TYPE)),
-        (CF_INSTANCE.to_owned(), json!({ "name": "first" })),
+        (id(CF_TYPE), schema(CF_TYPE)),
+        (id(CF_INSTANCE), json!({ "name": "first" })),
     ];
     let cancel = tokio_util::sync::CancellationToken::new();
 

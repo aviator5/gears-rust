@@ -14,6 +14,7 @@ pub mod aborted {
 
     /// Typed view of an `Aborted` reason.
     #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
     pub enum AbortReason {
         /// See [`OPERATION_READ_FAILED`].
         OperationReadFailed,

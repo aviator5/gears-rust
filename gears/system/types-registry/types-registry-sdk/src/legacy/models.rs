@@ -528,9 +528,9 @@ impl GtsInstance {
     }
 }
 
-/// Per-entity registration result. Success carries the canonical GTS id;
-/// read the entity through [`TypesRegistryClient::get_type_schema`] or
-/// [`TypesRegistryClient::get_instance`].
+/// Per-entity registration result. Success carries the canonical GTS id; read the entity
+/// through [`get_type_schema`](crate::TypesRegistryClient::get_type_schema) or
+/// [`get_instance`](crate::TypesRegistryClient::get_instance).
 #[derive(Debug, Clone)]
 pub enum RegisterResult {
     /// Successfully registered.

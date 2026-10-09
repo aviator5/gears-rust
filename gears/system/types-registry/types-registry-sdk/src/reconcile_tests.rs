@@ -3,6 +3,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
+use gts::GtsId;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use toolkit_canonical_errors::CanonicalError;
@@ -33,17 +34,21 @@ fn options() -> ReconcileOptions {
     ReconcileOptions::default()
 }
 
-fn doc(id: &str) -> (String, Value) {
-    (id.to_owned(), json!({ "title": id }))
+fn gid(id: &str) -> GtsId {
+    GtsId::try_new(id).expect("a valid identifier")
 }
 
-async fn run(fake: &MockTypesRegistry, desired: Vec<(String, Value)>) -> Reconciliation {
+fn doc(id: &str) -> (GtsId, Value) {
+    (gid(id), json!({ "title": id }))
+}
+
+async fn run(fake: &MockTypesRegistry, desired: Vec<(GtsId, Value)>) -> Reconciliation {
     run_with(fake, desired, &options()).await
 }
 
 async fn run_with(
     fake: &MockTypesRegistry,
-    desired: Vec<(String, Value)>,
+    desired: Vec<(GtsId, Value)>,
     options: &ReconcileOptions,
 ) -> Reconciliation {
     reconcile(
@@ -58,9 +63,13 @@ async fn run_with(
     .expect("reconciles")
 }
 
+/// The outcomes by identifier text, for indexing by the test constants.
 fn outcomes(result: Reconciliation) -> BTreeMap<String, ReconcileOutcome> {
     match result {
-        Reconciliation::Reconciled(outcomes) => outcomes,
+        Reconciliation::Reconciled(outcomes) => outcomes
+            .into_iter()
+            .map(|(id, outcome)| (id.id().to_owned(), outcome))
+            .collect(),
         Reconciliation::UpToDate => panic!("expected outcomes, got UpToDate"),
     }
 }
@@ -107,7 +116,7 @@ fn keys(submissions: &[(IdempotencyKey, RegisterEntitiesRequest)]) -> Vec<String
 async fn everything_already_matching_is_up_to_date_without_a_submission() {
     let fake = MockTypesRegistry::new();
     let (id, content) = doc(A);
-    fake.seed(&id, content.clone());
+    fake.seed(id.id(), content.clone());
 
     let result = run(&fake, vec![(id, content)]).await;
 
@@ -155,7 +164,7 @@ async fn a_dependency_published_later_is_picked_up_on_the_next_pass_under_a_new_
     // Decided at submit, so the base is seeded only after the first outcome.
     let fake = Arc::new(MockTypesRegistry::new().completing_after(0));
     fake.depends_on(A, BASE);
-    let desired = vec![(A.to_owned(), json!({}))];
+    let desired = vec![(gid(A), json!({}))];
     let task = {
         let fake = Arc::clone(&fake);
         tokio::spawn(async move { run(&fake, desired).await })
@@ -179,7 +188,7 @@ async fn a_dependency_published_later_is_picked_up_on_the_next_pass_under_a_new_
 async fn a_concurrent_publisher_of_identical_content_ends_admitted_through_a_re_read() {
     let fake = MockTypesRegistry::new();
     let (id, content) = doc(A);
-    fake.race_next_submit(&id, content.clone());
+    fake.race_next_submit(id.id(), content.clone());
 
     let outcomes = outcomes(run(&fake, vec![(id, content)]).await);
 
@@ -202,9 +211,9 @@ async fn two_publishers_of_identical_content_both_end_admitted() {
             Reconciliation::UpToDate => {}
             Reconciliation::Reconciled(outcomes) => {
                 assert!(
-                    matches!(outcomes[A], ReconcileOutcome::Admitted),
+                    matches!(outcomes[&gid(A)], ReconcileOutcome::Admitted),
                     "{:?}",
-                    outcomes[A]
+                    outcomes[&gid(A)]
                 );
             }
         }
@@ -260,7 +269,7 @@ async fn a_permanently_invalid_document_is_rejected_and_not_retried() {
     let fake = MockTypesRegistry::new();
     fake.reject(A, AdmissionFailureReason::InvalidSchema);
 
-    let outcomes = outcomes(run(&fake, vec![(A.to_owned(), json!({}))]).await);
+    let outcomes = outcomes(run(&fake, vec![(gid(A), json!({}))]).await);
 
     assert!(matches!(outcomes[A], ReconcileOutcome::Rejected(_)));
     assert_eq!(reason(&outcomes[A]), "invalid_schema");
@@ -328,8 +337,7 @@ async fn later_batches_proceed_when_an_earlier_one_waits_on_a_dependency() {
         ..options()
     };
 
-    let outcomes =
-        outcomes(run_with(&fake, vec![(A.to_owned(), json!({})), doc(B)], &options).await);
+    let outcomes = outcomes(run_with(&fake, vec![(gid(A), json!({})), doc(B)], &options).await);
 
     assert!(matches!(outcomes[B], ReconcileOutcome::Admitted));
     assert!(matches!(
@@ -340,15 +348,18 @@ async fn later_batches_proceed_when_an_earlier_one_waits_on_a_dependency() {
 }
 
 #[tokio::test]
-async fn invalid_input_alone_is_reported_not_up_to_date() {
+async fn a_conflicting_duplicate_alone_is_reported_not_up_to_date() {
     let fake = MockTypesRegistry::new();
 
-    let outcomes = outcomes(run(&fake, vec![("not-an-id".to_owned(), json!({}))]).await);
+    let outcomes = outcomes(
+        run(
+            &fake,
+            vec![(gid(C), json!({ "one": 1 })), (gid(C), json!({ "two": 2 }))],
+        )
+        .await,
+    );
 
-    assert!(matches!(
-        outcomes["not-an-id"],
-        ReconcileOutcome::Rejected(_)
-    ));
+    assert!(matches!(outcomes[C], ReconcileOutcome::Rejected(_)));
     assert!(fake.submissions().is_empty());
 }
 
@@ -356,21 +367,23 @@ async fn invalid_input_alone_is_reported_not_up_to_date() {
 async fn an_equal_document_beside_a_rejected_one_is_reported_with_it() {
     let fake = MockTypesRegistry::new();
     let (id, content) = doc(A);
-    fake.seed(&id, content.clone());
+    fake.seed(id.id(), content.clone());
 
     let outcomes = outcomes(
         run(
             &fake,
-            vec![(id, content), ("not-an-id".to_owned(), json!({}))],
+            vec![
+                (id, content),
+                (gid(C), json!({ "one": 1 })),
+                (gid(C), json!({ "two": 2 })),
+            ],
         )
         .await,
     );
 
     assert!(matches!(outcomes[A], ReconcileOutcome::Admitted));
-    assert!(matches!(
-        outcomes["not-an-id"],
-        ReconcileOutcome::Rejected(_)
-    ));
+    assert!(matches!(outcomes[C], ReconcileOutcome::Rejected(_)));
+    assert!(fake.submissions().is_empty());
 }
 
 #[tokio::test]
@@ -381,8 +394,8 @@ async fn an_identifier_declared_twice_differently_is_rejected_and_identical_twin
         run(
             &fake,
             vec![
-                (A.to_owned(), json!({ "one": 1 })),
-                (A.to_owned(), json!({ "two": 2 })),
+                (gid(A), json!({ "one": 1 })),
+                (gid(A), json!({ "two": 2 })),
                 doc(B),
                 doc(B),
             ],
@@ -450,14 +463,14 @@ async fn an_equal_identifier_settles_at_once_and_a_later_read_failure_cannot_dow
     let fake = MockTypesRegistry::new();
     fake.depends_on(B, BASE);
     let (a, content) = doc(A);
-    fake.seed(&a, content.clone());
+    fake.seed(a.id(), content.clone());
     fake.inject(
         Fault::on(Call::BatchGet)
             .from(2)
             .fail(CanonicalError::service_unavailable().create()),
     );
 
-    let outcomes = outcomes(run(&fake, vec![(a, content), (B.to_owned(), json!({}))]).await);
+    let outcomes = outcomes(run(&fake, vec![(a, content), (gid(B), json!({}))]).await);
 
     assert!(
         matches!(outcomes[A], ReconcileOutcome::Admitted),
@@ -481,8 +494,8 @@ async fn an_equal_identifier_changed_after_settling_is_not_reread_or_resubmitted
     let fake = Arc::new(MockTypesRegistry::new().completing_after(0));
     fake.depends_on(B, BASE);
     let (a, content) = doc(A);
-    fake.seed(&a, content.clone());
-    let desired = vec![(a, content), (B.to_owned(), json!({}))];
+    fake.seed(a.id(), content.clone());
+    let desired = vec![(a, content), (gid(B), json!({}))];
     let task = {
         let fake = Arc::clone(&fake);
         tokio::spawn(async move { run(&fake, desired).await })
@@ -533,7 +546,7 @@ async fn another_publishers_entity_is_rejected() {
     fake.reject(A, AdmissionFailureReason::PublisherMismatch);
     fake.seed(A, json!({ "theirs": true }));
 
-    let outcomes = outcomes(run(&fake, vec![(A.to_owned(), json!({}))]).await);
+    let outcomes = outcomes(run(&fake, vec![(gid(A), json!({}))]).await);
 
     assert!(
         matches!(outcomes[A], ReconcileOutcome::Rejected(_)),
@@ -555,7 +568,7 @@ async fn an_oversized_backoff_is_capped_by_the_deadline() {
     };
     let started = tokio::time::Instant::now();
 
-    let outcomes = outcomes(run_with(&fake, vec![(A.to_owned(), json!({}))], &options).await);
+    let outcomes = outcomes(run_with(&fake, vec![(gid(A), json!({}))], &options).await);
 
     assert!(started.elapsed() <= Duration::from_secs(5));
     assert!(
@@ -697,7 +710,7 @@ async fn a_refusal_of_the_call_is_submitted_once_and_stays_pending_as_refused() 
         ),
     );
 
-    let outcomes = outcomes(run_with(&fake, vec![doc(A)], &one_pass()).await);
+    let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
 
     assert!(
         matches!(
@@ -716,19 +729,16 @@ async fn a_refusal_of_the_call_is_submitted_once_and_stays_pending_as_refused() 
 fn every_exact_reason_maps_to_its_outcome() {
     use super::classify;
     use crate::item_failure::reason;
-    use crate::models::CandidateStatus;
+    use crate::models::RegistrationOutcome;
 
     let failed = |r: &str| {
-        classify(
-            CandidateStatus::Failed,
-            Some(
-                AdmissionFailure::new(
-                    crate::item_failure::AdmissionFailureReason::from_wire(r),
-                    "m",
-                )
-                .into_canonical(A),
-            ),
-        )
+        classify(RegistrationOutcome::Failed {
+            error: AdmissionFailure::new(
+                crate::item_failure::AdmissionFailureReason::from_wire(r),
+                "m",
+            )
+            .into_canonical(A),
+        })
     };
     for r in [
         reason::DEPENDENCY_NOT_FOUND,
@@ -768,27 +778,37 @@ fn every_exact_reason_maps_to_its_outcome() {
 }
 
 #[test]
-fn malformed_or_undecided_items_map_to_their_outcome() {
+fn undecided_or_previewed_items_stay_pending_and_written_ones_are_admitted() {
     use super::classify;
-    use crate::models::CandidateStatus;
+    use crate::models::RegistrationOutcome;
 
-    assert!(matches!(
-        classify(CandidateStatus::Failed, None),
-        ReconcileOutcome::Rejected(CanonicalError::Internal { .. })
-    ));
-    for status in [CandidateStatus::Pending, CandidateStatus::Running] {
+    // A completed committing operation never leaves these: a protocol fault, not a write.
+    for outcome in [
+        RegistrationOutcome::Pending,
+        RegistrationOutcome::Running,
+        RegistrationOutcome::WouldSucceed,
+    ] {
         assert!(
             matches!(
-                classify(status, None),
-                ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
+                classify(outcome.clone()),
+                ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(
+                    CanonicalError::Internal { .. }
+                ))
             ),
-            "{status:?}"
+            "{outcome:?}"
         );
     }
-    for status in [CandidateStatus::Succeeded, CandidateStatus::Unchanged] {
+    for outcome in [
+        RegistrationOutcome::Succeeded {
+            resource_version: 1,
+        },
+        RegistrationOutcome::Unchanged {
+            resource_version: 1,
+        },
+    ] {
         assert!(
-            matches!(classify(status, None), ReconcileOutcome::Admitted),
-            "{status:?}"
+            matches!(classify(outcome.clone()), ReconcileOutcome::Admitted),
+            "{outcome:?}"
         );
     }
 }
@@ -806,7 +826,7 @@ async fn time_pending_passes(passes: u32, backoff: Duration, max: Duration) -> (
         ..options()
     };
     let started = tokio::time::Instant::now();
-    let outcomes = outcomes(run_with(&fake, vec![(A.to_owned(), json!({}))], &options).await);
+    let outcomes = outcomes(run_with(&fake, vec![(gid(A), json!({}))], &options).await);
     assert!(matches!(
         outcomes[A],
         ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(_))
@@ -847,7 +867,7 @@ async fn the_pause_between_passes_is_capped_and_an_oversized_initial_one_clamped
 /// A reconciliation the test can cancel, with a pause between passes long enough to land in.
 fn spawn_cancellable(
     fake: &Arc<MockTypesRegistry>,
-    desired: Vec<(String, Value)>,
+    desired: Vec<(GtsId, Value)>,
 ) -> (
     CancellationToken,
     tokio::task::JoinHandle<Result<Reconciliation, CanonicalError>>,
@@ -894,7 +914,7 @@ async fn cancelling_a_blocked_read_ends_reconciliation_as_cancelled_without_subm
 async fn cancelling_the_pause_between_passes_ends_reconciliation_without_another_submission() {
     let fake = Arc::new(MockTypesRegistry::new().completing_after(0));
     fake.depends_on(A, BASE);
-    let (cancel, task) = spawn_cancellable(&fake, vec![(A.to_owned(), json!({}))]);
+    let (cancel, task) = spawn_cancellable(&fake, vec![(gid(A), json!({}))]);
     first_submission(&fake, &task).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let reads = fake.calls(Call::BatchGet);
@@ -922,7 +942,7 @@ mod cover {
     use gts::GtsId;
 
     use super::*;
-    use crate::models::{CandidateStatus, RegisterItem, RegistrationItemResult};
+    use crate::models::{RegisterItem, RegistrationItemResult, RegistrationOutcome};
     use crate::reconcile::cover;
 
     fn candidate(id: &str) -> RegisterItem {
@@ -937,9 +957,9 @@ mod cover {
     fn succeeded(id: &str) -> RegistrationItemResult {
         RegistrationItemResult {
             gts_id: GtsId::try_new(id).expect("valid identifier"),
-            status: CandidateStatus::Succeeded,
-            resource_version: Some(1),
-            error: None,
+            outcome: RegistrationOutcome::Succeeded {
+                resource_version: 1,
+            },
         }
     }
 
@@ -998,7 +1018,7 @@ mod cover {
 #[test]
 fn revalidation_exhaustion_is_a_conflict_the_next_pass_retries() {
     use crate::item_failure::AdmissionFailureReason;
-    use crate::models::CandidateStatus;
+    use crate::models::RegistrationOutcome;
 
     let error = AdmissionFailure::new(
         AdmissionFailureReason::RevalidationExhausted,
@@ -1006,7 +1026,7 @@ fn revalidation_exhaustion_is_a_conflict_the_next_pass_retries() {
     )
     .into_canonical(A);
 
-    let outcome = super::classify(CandidateStatus::Failed, Some(error));
+    let outcome = super::classify(RegistrationOutcome::Failed { error });
 
     assert!(
         matches!(
@@ -1014,5 +1034,440 @@ fn revalidation_exhaustion_is_a_conflict_the_next_pass_retries() {
             ReconcileOutcome::Pending(ReconcilePendingCause::Conflict(_))
         ),
         "{outcome:?}"
+    );
+}
+
+/// A `Cancelled` answered by the registry, not raised by the caller's token.
+fn remote_cancelled() -> CanonicalError {
+    crate::gts::OperationResource::cancelled().create()
+}
+
+fn refused_as_cancelled(outcome: &ReconcileOutcome) -> bool {
+    matches!(
+        outcome,
+        ReconcileOutcome::Pending(ReconcilePendingCause::Refused(
+            CanonicalError::Cancelled { .. }
+        ))
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_read_answer_leaves_the_identifiers_pending_and_the_call_ok() {
+    let fake = MockTypesRegistry::new();
+    fake.inject(Fault::on(Call::BatchGet).fail(remote_cancelled()));
+
+    let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
+
+    assert!(refused_as_cancelled(&outcomes[A]), "{:?}", outcomes[A]);
+    assert_eq!(
+        fake.calls(Call::BatchGet),
+        1,
+        "the call ends at the refused read"
+    );
+    assert!(fake.submissions().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_submit_answer_is_not_retried_and_keeps_the_other_outcomes() {
+    let fake = MockTypesRegistry::new();
+    fake.inject(
+        Fault::on(Call::Register)
+            .key(gts::GtsId::try_new(B).expect("valid"))
+            .fail(remote_cancelled()),
+    );
+    let options = ReconcileOptions {
+        batch_size: NonZeroUsize::MIN,
+        ..options()
+    };
+
+    let outcomes = outcomes(run_with(&fake, vec![doc(A), doc(B)], &options).await);
+
+    assert!(
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
+        "{:?}",
+        outcomes[A]
+    );
+    assert!(refused_as_cancelled(&outcomes[B]), "{:?}", outcomes[B]);
+    let b_submissions = fake
+        .submissions()
+        .iter()
+        .filter(|(_, request)| request.items.iter().any(|i| i.gts_id.id() == B))
+        .count();
+    assert_eq!(b_submissions, 1, "a registry's cancellation is not retried");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_poll_answer_leaves_the_identifier_pending_and_the_call_ok() {
+    let fake = MockTypesRegistry::new().completing_after(1);
+    fake.inject(Fault::on(Call::GetOperation).fail(remote_cancelled()));
+
+    let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
+
+    assert!(refused_as_cancelled(&outcomes[A]), "{:?}", outcomes[A]);
+    assert_eq!(
+        fake.calls(Call::Register),
+        1,
+        "a registry's cancellation is not retried, by transport or by another pass"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_while_polling_ends_reconciliation_as_cancelled() {
+    let fake = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
+    let (cancel, task) = spawn_cancellable(&fake, vec![doc(A)]);
+    first_submission(&fake, &task).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        fake.calls(Call::GetOperation) > 0,
+        "the operation is being polled"
+    );
+
+    cancel.cancel();
+
+    let result = task.await.expect("joins");
+    assert!(
+        matches!(result, Err(CanonicalError::Cancelled { .. })),
+        "{result:?}"
+    );
+    assert_eq!(fake.submissions().len(), 1, "nothing is resubmitted");
+}
+
+fn invalid(field: &str, resource: Option<&str>) -> CanonicalError {
+    let builder = crate::gts::TypeResource::invalid_argument();
+    match resource {
+        Some(name) => builder
+            .with_resource(name.to_owned())
+            .with_field_violation(field, "refused", crate::field::VALIDATION_FAILED)
+            .create(),
+        None => builder
+            .with_field_violation(field, "refused", crate::field::VALIDATION_FAILED)
+            .create(),
+    }
+}
+
+fn refused_pending(outcome: &ReconcileOutcome) -> bool {
+    matches!(
+        outcome,
+        ReconcileOutcome::Pending(ReconcilePendingCause::Refused(
+            CanonicalError::InvalidArgument { .. }
+        ))
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_of_the_whole_request_is_submitted_once_and_stays_pending() {
+    for (what, error) in [
+        ("the publisher", invalid("publisher", None)),
+        (
+            "a foreign resource",
+            invalid(crate::field::GTS_ID_FIELD, Some(BASE)),
+        ),
+        (
+            "mixed violations",
+            crate::gts::TypeResource::invalid_argument()
+                .with_field_violation(crate::field::ITEMS_FIELD, "too many", "VALIDATION_FAILED")
+                .with_field_violation("publisher", "missing", "VALIDATION_FAILED")
+                .create(),
+        ),
+        (
+            "a named candidate mixed with the publisher",
+            crate::gts::TypeResource::invalid_argument()
+                .with_resource(B.to_owned())
+                .with_field_violation(crate::field::ENTITY_FIELD, "bad", "VALIDATION_FAILED")
+                .with_field_violation("publisher", "missing", "VALIDATION_FAILED")
+                .create(),
+        ),
+        (
+            "a named candidate under an unknown field",
+            invalid("publisher", Some(B)),
+        ),
+        (
+            "a named candidate's format refusal",
+            crate::gts::TypeResource::invalid_argument()
+                .with_resource(B.to_owned())
+                .with_format("malformed body")
+                .create(),
+        ),
+        (
+            "a named candidate's constraint refusal",
+            crate::gts::TypeResource::invalid_argument()
+                .with_resource(B.to_owned())
+                .with_constraint("violates a constraint")
+                .create(),
+        ),
+    ] {
+        let fake = MockTypesRegistry::new();
+        fake.inject(Fault::on(Call::Register).fail(error));
+
+        // Every pass is allowed: a refused request is still submitted only once.
+        let outcomes = outcomes(run(&fake, vec![doc(A), doc(B), doc(C)]).await);
+
+        assert!(
+            outcomes.values().all(refused_pending),
+            "{what}: {outcomes:?}"
+        );
+        assert_eq!(
+            fake.calls(Call::Register),
+            1,
+            "{what}: neither splitting nor another pass cures it"
+        );
+    }
+}
+
+const D: &str = "gts.cf.test.pkg.d.v1~";
+const E: &str = "gts.cf.test.pkg.e.v1~";
+
+/// Refuse every registration that carries `id`, naming it as a candidate refusal does.
+fn refuse_candidate(fake: &MockTypesRegistry, id: &str) {
+    fake.inject(
+        Fault::on(Call::Register)
+            .key(gid(id))
+            .fail(invalid(crate::field::ENTITY_FIELD, Some(id))),
+    );
+}
+
+/// Every submission's key and candidate identifiers, in order.
+fn submitted(fake: &MockTypesRegistry) -> Vec<(String, Vec<String>)> {
+    fake.submissions()
+        .into_iter()
+        .map(|(key, request)| {
+            (
+                key.as_str().to_owned(),
+                request
+                    .items
+                    .iter()
+                    .map(|i| i.gts_id.id().to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn assert_one_outcome_each(outcomes: &BTreeMap<String, ReconcileOutcome>, ids: &[&str]) {
+    let mut expected: Vec<&str> = ids.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        outcomes.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected,
+        "every desired identifier has exactly one outcome"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_candidate_is_rejected_and_the_rest_resubmitted_in_order_under_a_new_key() {
+    let fake = MockTypesRegistry::new();
+    refuse_candidate(&fake, B);
+
+    let outcomes = outcomes(run(&fake, vec![doc(A), doc(B), doc(C), doc(D)]).await);
+
+    assert_one_outcome_each(&outcomes, &[A, B, C, D]);
+    assert!(
+        matches!(
+            outcomes[B],
+            ReconcileOutcome::Rejected(CanonicalError::InvalidArgument { .. })
+        ),
+        "{:?}",
+        outcomes[B]
+    );
+    for id in [A, C, D] {
+        assert!(
+            matches!(outcomes[id], ReconcileOutcome::Admitted),
+            "{id}: {:?}",
+            outcomes[id]
+        );
+    }
+    let submissions = submitted(&fake);
+    assert_eq!(
+        submissions
+            .iter()
+            .map(|(_, ids)| ids.clone())
+            .collect::<Vec<_>>(),
+        [vec![A, B, C, D], vec![A, C, D]],
+        "two calls, where bisection would take five"
+    );
+    assert_ne!(
+        submissions[0].0, submissions[1].0,
+        "a new payload takes a new key"
+    );
+    assert_eq!(fake.calls(Call::Register), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refused_candidates_are_peeled_one_call_each() {
+    let fake = MockTypesRegistry::new();
+    refuse_candidate(&fake, B);
+    refuse_candidate(&fake, D);
+
+    let outcomes = outcomes(run(&fake, vec![doc(A), doc(B), doc(C), doc(D), doc(E)]).await);
+
+    assert_one_outcome_each(&outcomes, &[A, B, C, D, E]);
+    for id in [B, D] {
+        assert!(
+            matches!(outcomes[id], ReconcileOutcome::Rejected(_)),
+            "{id}: {:?}",
+            outcomes[id]
+        );
+    }
+    for id in [A, C, E] {
+        assert!(
+            matches!(outcomes[id], ReconcileOutcome::Admitted),
+            "{id}: {:?}",
+            outcomes[id]
+        );
+    }
+    let submissions = submitted(&fake);
+    assert_eq!(
+        submissions
+            .iter()
+            .map(|(_, ids)| ids.clone())
+            .collect::<Vec<_>>(),
+        [vec![A, B, C, D, E], vec![A, C, D, E], vec![A, C, E]]
+    );
+    let keys: std::collections::HashSet<_> = submissions.iter().map(|(k, _)| k).collect();
+    assert_eq!(keys.len(), 3, "every payload has its own key");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_single_candidate_is_rejected_and_nothing_is_resubmitted() {
+    let fake = MockTypesRegistry::new();
+    refuse_candidate(&fake, A);
+
+    let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
+
+    assert!(
+        matches!(outcomes[A], ReconcileOutcome::Rejected(_)),
+        "{:?}",
+        outcomes[A]
+    );
+    assert_eq!(fake.calls(Call::Register), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_resubmitted_rest_keeps_its_key_across_transport_retries() {
+    let fake = MockTypesRegistry::new();
+    refuse_candidate(&fake, B);
+    // The second submission — the rest — fails once in transport.
+    fake.inject(
+        Fault::on(Call::Register)
+            .nth(2)
+            .fail(CanonicalError::service_unavailable().create()),
+    );
+
+    let outcomes = outcomes(run(&fake, vec![doc(A), doc(B), doc(C)]).await);
+
+    assert_one_outcome_each(&outcomes, &[A, B, C]);
+    assert!(
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
+        "{:?}",
+        outcomes[A]
+    );
+    assert!(
+        matches!(outcomes[C], ReconcileOutcome::Admitted),
+        "{:?}",
+        outcomes[C]
+    );
+    let submissions = submitted(&fake);
+    assert_eq!(
+        submissions
+            .iter()
+            .map(|(_, ids)| ids.clone())
+            .collect::<Vec<_>>(),
+        [vec![A, B, C], vec![A, C], vec![A, C]]
+    );
+    assert_ne!(submissions[0].0, submissions[1].0);
+    assert_eq!(
+        submissions[1].0, submissions[2].0,
+        "a transport retry reuses the key"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deadline_while_resubmitting_the_rest_keeps_the_rejection_and_leaves_the_rest_pending() {
+    let fake = MockTypesRegistry::new();
+    refuse_candidate(&fake, B);
+    fake.inject(
+        Fault::on(Call::Register)
+            .nth(2)
+            .delay(Duration::from_secs(3600)),
+    );
+    let options = ReconcileOptions {
+        deadline: Duration::from_secs(10),
+        ..options()
+    };
+
+    let outcomes = outcomes(run_with(&fake, vec![doc(A), doc(B), doc(C)], &options).await);
+
+    assert_one_outcome_each(&outcomes, &[A, B, C]);
+    assert!(
+        matches!(outcomes[B], ReconcileOutcome::Rejected(_)),
+        "{:?}",
+        outcomes[B]
+    );
+    for id in [A, C] {
+        assert!(
+            matches!(
+                outcomes[id],
+                ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(
+                    CanonicalError::DeadlineExceeded { .. }
+                ))
+            ),
+            "{id}: {:?}",
+            outcomes[id]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_while_resubmitting_the_rest_ends_the_call_as_cancelled() {
+    let fake = Arc::new(MockTypesRegistry::new());
+    refuse_candidate(&fake, B);
+    fake.inject(
+        Fault::on(Call::Register)
+            .nth(2)
+            .delay(Duration::from_secs(3600)),
+    );
+    let (cancel, task) = spawn_cancellable(&fake, vec![doc(A), doc(B), doc(C)]);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(fake.calls(Call::Register), 2, "the rest is being submitted");
+
+    cancel.cancel();
+
+    let result = task.await.expect("joins");
+    assert!(
+        matches!(result, Err(CanonicalError::Cancelled { .. })),
+        "{result:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dry_run_preview_answering_a_committing_registration_is_not_admitted() {
+    let fake = MockTypesRegistry::new();
+    fake.protocol_fault(ProtocolFault::PreviewSuccesses);
+
+    let outcomes = outcomes(run_with(&fake, vec![doc(A)], &one_pass()).await);
+
+    assert!(
+        matches!(
+            outcomes[A],
+            ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(
+                CanonicalError::Internal { .. }
+            ))
+        ),
+        "a preview is not a write: {:?}",
+        outcomes[A]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_size_refusal_of_one_candidate_stays_pending() {
+    let fake = MockTypesRegistry::new().with_max_batch(0);
+
+    let outcomes = outcomes(run(&fake, vec![doc(A), doc(B)]).await);
+
+    assert!(outcomes.values().all(refused_pending), "{outcomes:?}");
+    assert_eq!(
+        fake.submissions().len(),
+        3,
+        "the pair is split once, then each single candidate is submitted once"
     );
 }

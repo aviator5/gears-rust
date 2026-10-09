@@ -40,14 +40,14 @@ pub mod reason {
     pub const MISSING_PREDECESSOR: &str = "missing_predecessor";
     pub const NOT_ACTIVE: &str = "not_active";
     pub const PRECONDITION_FAILED: &str = "precondition_failed";
-    /// Another publisher owns the entity (D18, Phase 9).
+    /// Another publisher owns the entity.
     pub const PUBLISHER_MISMATCH: &str = "publisher_mismatch";
     pub const RESOLUTION_CLOSURE_EXCEEDED: &str = "resolution_closure_exceeded";
     pub const RESOLVED_DOCUMENT_TOO_LARGE: &str = "resolved_document_too_large";
     pub const REVALIDATION_EXHAUSTED: &str = "revalidation_exhausted";
     pub const STABLE_DERIVES_FROM_MAJOR_ZERO: &str = "stable_derives_from_major_zero";
     pub const STABLE_REFS_MAJOR_ZERO: &str = "stable_refs_major_zero";
-    /// Newer release of the same publisher (D18, Phase 9).
+    /// A newer release of the same publisher owns the entity.
     pub const SUPERSEDED: &str = "superseded";
     pub const SYSTEM_FAILURE: &str = "system_failure";
     pub const UNPARSABLE_PAYLOAD: &str = "unparsable_payload";
@@ -76,8 +76,9 @@ pub mod dependency_kind {
     pub const REF: &str = "ref";
 }
 
-/// Typed view of [`context::DEPENDENCY_KIND`] (DESIGN §3.3: an open set).
+/// Typed view of [`context::DEPENDENCY_KIND`], an open set.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DependencyKind {
     /// See [`dependency_kind::BASE`].
     Base,
@@ -121,6 +122,7 @@ impl std::fmt::Display for DependencyKind {
 
 /// Typed view of [`reason`]; [`Self::Unknown`] preserves unrecognized codes.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdmissionFailureReason {
     ActivationWriteSetExceeded,
     AlreadyExists,

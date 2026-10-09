@@ -23,8 +23,9 @@ workspace = true
 default = []
 # Test doubles for consumers' unit tests: `testing_platform::MockTypesRegistry`,
 # an in-memory `PlatformTypesRegistryApi` + `TypesRegistryApi`, and the legacy
-# `testing::MockTypesRegistryClient` for `dyn TypesRegistryClient` (deleted in T38).
-test-util = []
+# `testing::MockTypesRegistryClient` for `dyn TypesRegistryClient`. Only the test
+# doubles need `toolkit` (`ClientHub`) and `parking_lot`.
+test-util = ["dep:toolkit", "dep:parking_lot"]
 
 [dependencies]
 # Per ADR 0005 the `TypesRegistryClient` trait boundary is `CanonicalError`;
@@ -46,22 +47,31 @@ serde_json = { workspace = true }
 gts = { workspace = true }
 toolkit-gts = { workspace = true }
 
-# `PlatformTypesRegistryApi` is a `#[toolkit::contract]` (D15): the macro, its IR
-# and descriptor types, and the platform-plane security context.
-toolkit = { workspace = true }
+# `PlatformTypesRegistryApi` is a `#[toolkit_contract::contract]`: the macro, its IR
+# and descriptor types, and the platform-plane security context. The SDK does not
+# depend on the `toolkit` runtime (its default `db`/`otel` features) outside tests.
 toolkit-contract = { workspace = true }
 toolkit-security = { workspace = true }
 time = { workspace = true }
-parking_lot = { workspace = true }
 tracing = { workspace = true }
+# Deadlines, pacing and cancellation of submit/poll and reconciliation. The
+# workspace pins Tokio with `full`; `time` and `macros` are what the SDK uses.
+tokio = { workspace = true, features = ["time", "macros"] }
 # `PublisherVersion`: SemVer parsing and precedence.
 semver = { workspace = true }
 tokio-util = { workspace = true }
 # Jittered backoff of reconciliation passes and transport retries.
 rand = { workspace = true }
 
+# Test doubles only (`test-util`).
+toolkit = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+
 [dev-dependencies]
 # Paused-clock tests of the submit/poll deadline and polling.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # Round-trip and consistency properties of the SDK's codecs and orderings.
 proptest = { workspace = true }
+# The test doubles also compile under `cfg(test)` without `test-util`.
+toolkit = { workspace = true }
+parking_lot = { workspace = true }

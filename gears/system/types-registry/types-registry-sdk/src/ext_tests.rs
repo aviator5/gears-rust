@@ -78,7 +78,9 @@ async fn submit_and_await<A: PlatformTypesRegistryApi + ?Sized>(
     cancel: &CancellationToken,
 ) -> Result<RegistrationOperation, CanonicalError> {
     let deadline = crate::submit::deadline_from_now(budget)?;
-    crate::submit::await_registration(api, &ctx(), key, request, deadline, cancel).await
+    crate::submit::await_registration(api, &ctx(), key, request, deadline, cancel)
+        .await
+        .unwrap_or_else(|stop| Err(stop.into_error()))
 }
 
 #[tokio::test(start_paused = true)]
@@ -97,7 +99,10 @@ async fn a_consumer_round_trips_submit_poll_and_read_through_the_trait() {
     .expect("completes");
 
     assert_eq!(operation.status, OperationStatus::Completed);
-    assert_eq!(operation.items[0].status, CandidateStatus::Succeeded);
+    assert_eq!(
+        operation.items[0].outcome.status(),
+        CandidateStatus::Succeeded
+    );
     let snapshot = api
         .get_type_schema(
             &ctx(),
@@ -437,6 +442,34 @@ async fn list_helpers_select_their_documents_by_default_and_follow_every_page() 
 }
 
 #[tokio::test]
+async fn a_list_helper_reads_documents_only_for_the_default_projection() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(TYPE, schema(TYPE));
+    let explicit_default = Projection::Select(Projection::Default.normalized());
+
+    let by_default = fake
+        .list_type_schemas(&ctx(), ListEntitiesRequest::default())
+        .await
+        .expect("lists");
+    let by_explicit = fake
+        .list_type_schemas(
+            &ctx(),
+            ListEntitiesRequest {
+                projection: explicit_default,
+                ..ListEntitiesRequest::default()
+            },
+        )
+        .await
+        .expect("lists");
+
+    assert!(by_default[0].resolved_schema.is_some());
+    assert!(
+        by_explicit[0].content.is_none() && by_explicit[0].resolved_schema.is_none(),
+        "an explicit selection of the default fields stays document-free"
+    );
+}
+
+#[tokio::test]
 async fn a_list_helper_refuses_a_page_that_repeats_its_cursor() {
     let fake = MockTypesRegistry::new();
     for n in 0..3 {
@@ -484,8 +517,8 @@ async fn a_list_helper_stops_after_its_page_bound() {
         .expect_err("more pages than the bound fail");
 
     assert!(
-        matches!(error, CanonicalError::InvalidArgument { .. }),
-        "{error:?}"
+        matches!(error, CanonicalError::ResourceExhausted { .. }),
+        "the query was valid; the traversal outgrew its bound: {error:?}"
     );
 }
 
@@ -860,4 +893,54 @@ mod tenant {
 
         assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
     }
+}
+
+#[tokio::test]
+async fn spellings_of_one_entity_are_read_once_and_each_answered() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(TYPE, json!({}));
+    // Unchecked: parsing trims it to `TYPE`, so both name one entity key.
+    let padded = GtsTypeId::new(&format!(" {TYPE}"));
+    assert_ne!(padded, type_id(TYPE));
+
+    let answers = fake
+        .batch_get_type_schemas(
+            &ctx(),
+            &[type_id(TYPE), padded.clone(), type_id(TYPE)],
+            Projection::Default,
+        )
+        .await
+        .expect("the read succeeds");
+
+    assert_eq!(
+        answers.len(),
+        2,
+        "each distinct spelling is a key of the answer"
+    );
+    assert!(answers[&type_id(TYPE)].is_some());
+    assert_eq!(answers[&padded], answers[&type_id(TYPE)]);
+    assert_eq!(
+        fake.reads(),
+        [crate::models::EntityKey::GtsId(id(TYPE))],
+        "the entity is read once"
+    );
+}
+
+#[tokio::test]
+async fn distinct_keys_beyond_one_batch_are_read_in_full_batches() {
+    let fake = MockTypesRegistry::new();
+    let ids: Vec<GtsTypeId> = (0..super::MAX_BATCH_GET_KEYS)
+        .map(|n| type_id(&format!("gts.cf.test.pkg.t{n:03}.v1~")))
+        .collect();
+    // Every key twice: duplicates no longer spill into a second batch.
+    let asked: Vec<GtsTypeId> = ids.iter().chain(ids.iter()).cloned().collect();
+
+    let answers = fake
+        .batch_get_type_schemas(&ctx(), &asked, Projection::Default)
+        .await
+        .expect("the reads succeed");
+
+    assert_eq!(answers.len(), ids.len());
+    assert!(answers.values().all(Option::is_none));
+    assert_eq!(fake.calls(Call::BatchGet), 1);
 }

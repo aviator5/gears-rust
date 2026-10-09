@@ -279,7 +279,7 @@ async fn a_rule_delays_then_fails_and_the_attempt_is_still_recorded() {
             .delay(Duration::from_secs(10))
             .fail(unavailable()),
     );
-    let started = toolkit::tokio::time::Instant::now();
+    let started = tokio::time::Instant::now();
 
     register(&fake, "k", vec![create(TOY, json!({}))])
         .await
@@ -344,7 +344,7 @@ async fn admission_rejects_and_waits_on_dependencies_as_told() {
     .await
     .expect("accepted");
     let failure = |i: usize| {
-        AdmissionFailure::from_canonical(items[i].error.as_ref().expect("failed"))
+        AdmissionFailure::from_canonical(items[i].outcome.error().expect("failed"))
             .expect("an admission failure")
     };
     assert_eq!(failure(0).reason, AdmissionFailureReason::InvalidSchema);
@@ -358,7 +358,7 @@ async fn admission_rejects_and_waits_on_dependencies_as_told() {
     let items = register(&fake, "second", vec![create(OTHER, json!({}))])
         .await
         .expect("accepted");
-    assert_eq!(items[0].status, CandidateStatus::Succeeded);
+    assert_eq!(items[0].outcome.status(), CandidateStatus::Succeeded);
 }
 
 // strict mode.

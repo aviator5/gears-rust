@@ -8,12 +8,15 @@ fn id(s: &str) -> GtsId {
 }
 
 #[test]
-fn default_and_an_explicit_default_selection_are_one_projection() {
+fn default_and_an_explicit_default_selection_differ_but_normalize_alike() {
     let explicit = Projection::Select(FieldSelection::with(&EntityField::DEFAULT));
-    assert_eq!(Projection::Default, explicit);
+    // Different requests: the kind-narrowed list helpers give `Default` documents.
+    assert_ne!(Projection::Default, explicit);
+    assert_eq!(Projection::Default.normalized(), explicit.normalized());
     assert_ne!(
-        Projection::Default,
-        Projection::Select(FieldSelection::full())
+        Projection::Default.normalized(),
+        FieldSelection::full(),
+        "the default selection is document-free"
     );
 }
 

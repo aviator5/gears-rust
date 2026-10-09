@@ -19,7 +19,7 @@ use crate::models::{
 /// Every method fails with `CanonicalError`. For typed dispatch, project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError); an operation item's failure
 /// decodes with [`AdmissionFailure::from_canonical`](crate::AdmissionFailure::from_canonical).
-#[toolkit::contract(gear = "types-registry", version = "v1")]
+#[toolkit_contract::contract(gear = "types-registry", version = "v1")]
 pub trait PlatformTypesRegistryApi: Send + Sync {
     /// Read bounded keys under one projection.
     ///
@@ -85,7 +85,7 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
 ///
 /// Every method fails with `CanonicalError`; project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError) for typed dispatch.
-#[toolkit::contract(gear = "types-registry", version = "v1")]
+#[toolkit_contract::contract(gear = "types-registry", version = "v1")]
 pub trait TypesRegistryApi: Send + Sync {
     /// Read bounded keys under one projection. The single exact read is an extension
     /// helper over it, as on the platform contract.

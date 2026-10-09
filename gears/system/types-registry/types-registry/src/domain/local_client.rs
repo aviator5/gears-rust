@@ -471,16 +471,6 @@ const fn sdk_operation_status(status: OperationStatus) -> sdk::OperationStatus {
     }
 }
 
-const fn sdk_candidate_status(status: OperationItemStatus) -> sdk::CandidateStatus {
-    match status {
-        OperationItemStatus::Pending => sdk::CandidateStatus::Pending,
-        OperationItemStatus::Running => sdk::CandidateStatus::Running,
-        OperationItemStatus::Succeeded => sdk::CandidateStatus::Succeeded,
-        OperationItemStatus::Unchanged => sdk::CandidateStatus::Unchanged,
-        OperationItemStatus::Failed => sdk::CandidateStatus::Failed,
-    }
-}
-
 // ---- reads ------------------------------------------------------------------
 
 /// The domain's validator token (§8.5). RFC 9110 quoting is REST's representation only.
@@ -556,6 +546,7 @@ fn snapshot_from(record: EntityRecord) -> Result<sdk::Entity, CanonicalError> {
 
 fn operation_from(record: OperationRecord) -> Result<sdk::Operation, CanonicalError> {
     let operation_id = record.operation_id;
+    let dry_run = record.dry_run;
     let status = sdk_operation_status(record.status);
     Ok(match record.kind {
         OperationKind::Registration => sdk::Operation::Registration(sdk::RegistrationOperation {
@@ -565,20 +556,27 @@ fn operation_from(record: OperationRecord) -> Result<sdk::Operation, CanonicalEr
                 .items
                 .into_iter()
                 .map(|item| {
-                    let (key, status, resource_version, error) = item_parts(item, operation_id)?;
-                    let sdk::EntityKey::GtsId(gts_id) = key else {
+                    let item = StoredItem::read(item, operation_id)?;
+                    let sdk::EntityKey::GtsId(gts_id) = item.key.clone() else {
                         return Err(corrupt(
                             "registration item keyed by reference",
                             &operation_id,
                             &"a registration names its candidates by identifier",
                         ));
                     };
-                    Ok(sdk::RegistrationItemResult {
-                        gts_id,
-                        status,
-                        resource_version,
-                        error,
-                    })
+                    let outcome = match item.decode(dry_run)? {
+                        ItemState::Pending => sdk::RegistrationOutcome::Pending,
+                        ItemState::Running => sdk::RegistrationOutcome::Running,
+                        ItemState::Succeeded(resource_version) => {
+                            sdk::RegistrationOutcome::Succeeded { resource_version }
+                        }
+                        ItemState::WouldSucceed => sdk::RegistrationOutcome::WouldSucceed,
+                        ItemState::Unchanged(resource_version) => {
+                            sdk::RegistrationOutcome::Unchanged { resource_version }
+                        }
+                        ItemState::Failed(error) => sdk::RegistrationOutcome::Failed { error },
+                    };
+                    Ok(sdk::RegistrationItemResult { gts_id, outcome })
                 })
                 .collect::<Result<_, CanonicalError>>()?,
         }),
@@ -589,13 +587,28 @@ fn operation_from(record: OperationRecord) -> Result<sdk::Operation, CanonicalEr
                 .items
                 .into_iter()
                 .map(|item| {
-                    let (entity_key, status, resource_version, error) =
-                        item_parts(item, operation_id)?;
+                    let item = StoredItem::read(item, operation_id)?;
+                    let entity_key = item.key.clone();
+                    let subject = item.subject();
+                    let outcome = match item.decode(dry_run)? {
+                        ItemState::Pending => sdk::DeletionOutcome::Pending,
+                        ItemState::Running => sdk::DeletionOutcome::Running,
+                        ItemState::Succeeded(resource_version) => {
+                            sdk::DeletionOutcome::Succeeded { resource_version }
+                        }
+                        ItemState::WouldSucceed => sdk::DeletionOutcome::WouldSucceed,
+                        ItemState::Unchanged(_) => {
+                            return Err(corrupt(
+                                "inconsistent operation item",
+                                &subject,
+                                &"a deletion is never unchanged",
+                            ));
+                        }
+                        ItemState::Failed(error) => sdk::DeletionOutcome::Failed { error },
+                    };
                     Ok(sdk::DeletionItemResult {
                         entity_key,
-                        status,
-                        resource_version,
-                        error,
+                        outcome,
                     })
                 })
                 .collect::<Result<_, CanonicalError>>()?,
@@ -603,26 +616,74 @@ fn operation_from(record: OperationRecord) -> Result<sdk::Operation, CanonicalEr
     })
 }
 
-type ItemParts = (
-    sdk::EntityKey,
-    sdk::CandidateStatus,
-    Option<u64>,
-    Option<CanonicalError>,
-);
+/// One stored operation item, its fields converted but not yet checked against each other.
+struct StoredItem {
+    operation_id: Uuid,
+    key: sdk::EntityKey,
+    canonical: String,
+    status: OperationItemStatus,
+    resource_version: Option<u64>,
+    error: Option<CanonicalError>,
+}
 
-fn item_parts(item: OperationItemRecord, operation_id: Uuid) -> Result<ItemParts, CanonicalError> {
-    let canonical = item.key.to_string();
-    let error = item
-        .error
-        .map(|stored| item_failure(&item.key, stored, operation_id).into_canonical(&canonical));
-    Ok((
-        sdk_key(item.key)?,
-        sdk_candidate_status(item.status),
-        item.resource_version
+/// An item state with exactly the data `ck_tr_operation_item_state` gives it.
+enum ItemState {
+    Pending,
+    Running,
+    Succeeded(u64),
+    WouldSucceed,
+    Unchanged(u64),
+    Failed(CanonicalError),
+}
+
+impl StoredItem {
+    fn read(item: OperationItemRecord, operation_id: Uuid) -> Result<Self, CanonicalError> {
+        let canonical = item.key.to_string();
+        let error = item
+            .error
+            .map(|stored| item_failure(&item.key, stored, operation_id).into_canonical(&canonical));
+        let resource_version = item
+            .resource_version
             .map(|v| sdk_version(v, &format_args!("{operation_id} {canonical}")))
-            .transpose()?,
-        error,
-    ))
+            .transpose()?;
+        Ok(Self {
+            operation_id,
+            key: sdk_key(item.key)?,
+            canonical,
+            status: item.status,
+            resource_version,
+            error,
+        })
+    }
+
+    fn subject(&self) -> String {
+        format!("{} {}", self.operation_id, self.canonical)
+    }
+
+    /// The state the stored fields describe. A combination the storage constraints exclude is
+    /// corruption, reported as `Internal`, never read as some outcome: a committed success has
+    /// a version and a dry run's has none; unchanged always has one; every version is at least
+    /// 1; only a failure has an error, and it has no version.
+    fn decode(self, dry_run: bool) -> Result<ItemState, CanonicalError> {
+        use OperationItemStatus as S;
+        let subject = self.subject();
+        let shape = format!(
+            "{:?} with version {:?} and {} error in a {} operation",
+            self.status,
+            self.resource_version,
+            if self.error.is_some() { "an" } else { "no" },
+            if dry_run { "dry-run" } else { "committing" },
+        );
+        Ok(match (self.status, self.resource_version, self.error) {
+            (S::Pending, None, None) => ItemState::Pending,
+            (S::Running, None, None) => ItemState::Running,
+            (S::Succeeded, Some(version @ 1..), None) if !dry_run => ItemState::Succeeded(version),
+            (S::Succeeded, None, None) if dry_run => ItemState::WouldSucceed,
+            (S::Unchanged, Some(version @ 1..), None) => ItemState::Unchanged(version),
+            (S::Failed, None, Some(error)) => ItemState::Failed(error),
+            _ => return Err(corrupt("inconsistent operation item", &subject, &shape)),
+        })
+    }
 }
 
 /// Reversible SDK item failure; expose only the reason of unreadable records, matching REST.

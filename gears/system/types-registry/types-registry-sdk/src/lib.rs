@@ -37,15 +37,16 @@ pub use contract::{PlatformTypesRegistryApi, TypesRegistryApi};
 pub use error::{FieldIssue, TypesRegistryError};
 pub use ext::{PlatformTypesRegistryApiExt, TypesRegistryApiExt};
 pub use gts::{OPERATION_RESOURCE_TYPE, TYPE_RESOURCE_TYPE};
-pub use item_failure::AdmissionFailure;
+pub use item_failure::{AdmissionFailure, AdmissionFailureReason, DependencyKind};
 pub use models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, CandidateStatus, Cursor,
-    DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, Entity, EntityField,
-    EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection, IdempotencyKey, Instance,
-    JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest, ListEntitiesResponse,
-    Operation, OperationStatus, Origin, PageRequest, Projection, Provenance, PublisherContext,
-    PublisherVersion, PublisherVersionError, RegisterEntitiesRequest, RegisterItem,
-    RegistrationItemResult, RegistrationOperation, TypeSchema, Validator,
+    DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, DeletionOutcome,
+    Entity, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection,
+    IdempotencyKey, Instance, JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
+    ListEntitiesResponse, Operation, OperationStatus, Origin, PageRequest, Projection, Provenance,
+    PublisherContext, PublisherVersion, PublisherVersionError, RegisterEntitiesRequest,
+    RegisterItem, RegistrationItemResult, RegistrationOperation, RegistrationOutcome, TypeSchema,
+    Validator,
 };
 pub use reconcile::{ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, Reconciliation};
 
@@ -57,9 +58,10 @@ pub use legacy::testing;
 
 pub use legacy::api::TypesRegistryClient;
 pub use legacy::models::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, RegisterSummary, TypeSchemaQuery,
-    is_type_schema_id,
+    AncestorIter, GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, RegisterSummary,
+    TypeSchemaQuery, is_type_schema_id,
 };
 
-// Leading `::` selects the external crate over this crate's `gts` module.
-pub use ::gts::{GtsInstanceId, GtsTypeId};
+// GTS types the SDK's models name, so a consumer builds requests without its own `gts`
+// dependency. Leading `::` selects the external crate over this crate's `gts` module.
+pub use ::gts::{GtsId, GtsIdPattern, GtsIdSegment, GtsInstanceId, GtsTypeId};

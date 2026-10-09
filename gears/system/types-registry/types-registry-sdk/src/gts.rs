@@ -15,6 +15,7 @@ pub const OPERATION_RESOURCE_TYPE: &str = gts_id!("cf.core.types_registry.operat
 
 /// Typed view of a types-registry `resource_type`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Resource {
     /// [`TYPE_RESOURCE_TYPE`]: `resource_name` is an entity key.
     Entity,

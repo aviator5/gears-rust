@@ -110,7 +110,10 @@ pub const MAX_BATCH_GET_KEYS: usize = 100;
 pub struct BatchGetEntitiesRequest {
     pub items: Vec<BatchGetItem>,
     pub projection: Projection,
-    /// Bypass cache freshness and revalidate; transports ignore this SDK-only flag.
+    /// Ask a caching client for an authoritative read, bypassing its freshness window.
+    /// SDK-only: never sent on the wire. Today's clients do not cache, so every read is
+    /// already authoritative and they ignore it; it takes effect with the SDK's caching
+    /// client.
     pub fresh: bool,
 }
 
@@ -151,7 +154,7 @@ impl EntityField {
         Self::LifecycleStatus,
     ];
 
-    /// What [`Projection::Default`] selects: document-free (§10.2).
+    /// What [`Projection::Default`] selects on single, batch and discovery reads: no documents.
     pub const DEFAULT: [Self; 5] = [
         Self::GtsId,
         Self::GtsUuid,
@@ -212,16 +215,25 @@ impl FieldSelection {
     }
 }
 
-/// Default and an explicit default selection compare equal via [`Self::normalized`].
-#[derive(Debug, Clone, Default)]
+/// Which fields a read asks for.
+///
+/// Equality is structural: `Default` and an explicit selection of the same fields are
+/// different requests, because kind-narrowed list helpers give `Default` their own
+/// document selection. On the wire, and for validators and cursors, compare
+/// [`Self::normalized`] instead: there `Default` is the explicit default selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Projection {
+    /// The read's default: the document-free [`EntityField::DEFAULT`] fields on
+    /// `batch_get_entities` and `list_entities`; documents on the kind-narrowed list
+    /// helpers.
     #[default]
     Default,
+    /// Exactly these fields, the mandatory ones included.
     Select(FieldSelection),
 }
 
 impl Projection {
-    /// The selection this projection asks for.
+    /// The field set the registry answers: [`EntityField::DEFAULT`] for `Default`.
     #[must_use]
     pub fn normalized(&self) -> FieldSelection {
         match self {
@@ -230,14 +242,6 @@ impl Projection {
         }
     }
 }
-
-impl PartialEq for Projection {
-    fn eq(&self, other: &Self) -> bool {
-        self.normalized() == other.normalized()
-    }
-}
-
-impl Eq for Projection {}
 
 // results.
 
@@ -261,7 +265,7 @@ pub enum EntityLookup {
 }
 
 /// Projected entity with mandatory identity, kind and lifecycle. Documents are stored
-/// materializations (D3): `None` is unselected/inapplicable; `Some(Null)` is selected null.
+/// materializations: `None` is unselected/inapplicable; `Some(Null)` is selected null.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     pub gts_id: GtsId,
@@ -290,7 +294,7 @@ impl Entity {
 
 /// A Type Schema as a kind-narrowed read returns it: [`Entity`] with the kind in the
 /// type. Documents follow the read's projection — `None` is unselected, `Some(Null)` a
-/// selected null — and are the server's materializations (D3); nothing is computed here.
+/// selected null — and are the server's materializations; nothing is computed here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeSchema {
     pub type_id: GtsTypeId,
@@ -705,14 +709,11 @@ pub struct RegistrationOperation {
     pub items: Vec<RegistrationItemResult>,
 }
 
+/// One registration candidate's state in an operation.
 #[derive(Debug, Clone)]
 pub struct RegistrationItemResult {
     pub gts_id: GtsId,
-    pub status: CandidateStatus,
-    pub resource_version: Option<u64>,
-    /// Decode reason/context with
-    /// [`AdmissionFailure::from_canonical`](`crate::AdmissionFailure::from_canonical`).
-    pub error: Option<CanonicalError>,
+    pub outcome: RegistrationOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -722,15 +723,12 @@ pub struct DeletionOperation {
     pub items: Vec<DeletionItemResult>,
 }
 
+/// One deletion target's state in an operation.
 #[derive(Debug, Clone)]
 pub struct DeletionItemResult {
     /// The target's key, in canonical form.
     pub entity_key: EntityKey,
-    pub status: CandidateStatus,
-    pub resource_version: Option<u64>,
-    /// Decode reason/context with
-    /// [`AdmissionFailure::from_canonical`](`crate::AdmissionFailure::from_canonical`).
-    pub error: Option<CanonicalError>,
+    pub outcome: DeletionOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -740,6 +738,121 @@ pub enum OperationStatus {
     Completed,
 }
 
+/// Where one registration candidate stands, with exactly the data that state has.
+#[derive(Debug, Clone)]
+pub enum RegistrationOutcome {
+    /// Not yet evaluated.
+    Pending,
+    /// Being evaluated.
+    Running,
+    /// Committed at `resource_version`.
+    Succeeded { resource_version: u64 },
+    /// A dry run would have committed it; a dry run allocates no version.
+    WouldSucceed,
+    /// An update whose content equals the current revision's: nothing was written, and
+    /// `resource_version` is the existing one. Dry runs report it too.
+    Unchanged { resource_version: u64 },
+    /// Refused. Decode reason and context with
+    /// [`AdmissionFailure::from_canonical`](crate::AdmissionFailure::from_canonical).
+    Failed { error: CanonicalError },
+}
+
+/// Where one deletion target stands, with exactly the data that state has. A deletion is
+/// never unchanged.
+#[derive(Debug, Clone)]
+pub enum DeletionOutcome {
+    /// Not yet evaluated.
+    Pending,
+    /// Being evaluated.
+    Running,
+    /// Deleted; the tombstone is at `resource_version`.
+    Succeeded { resource_version: u64 },
+    /// A dry run would have deleted it; a dry run allocates no version.
+    WouldSucceed,
+    /// Refused. Decode reason and context with
+    /// [`AdmissionFailure::from_canonical`](crate::AdmissionFailure::from_canonical).
+    Failed { error: CanonicalError },
+}
+
+impl RegistrationOutcome {
+    /// The state without its data.
+    #[must_use]
+    pub fn status(&self) -> CandidateStatus {
+        match self {
+            Self::Pending => CandidateStatus::Pending,
+            Self::Running => CandidateStatus::Running,
+            Self::Succeeded { .. } | Self::WouldSucceed => CandidateStatus::Succeeded,
+            Self::Unchanged { .. } => CandidateStatus::Unchanged,
+            Self::Failed { .. } => CandidateStatus::Failed,
+        }
+    }
+
+    /// The candidate will not change again.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.status().is_terminal()
+    }
+
+    /// The version the entity stands at: committed, or found unchanged.
+    #[must_use]
+    pub fn resource_version(&self) -> Option<u64> {
+        match self {
+            Self::Succeeded { resource_version } | Self::Unchanged { resource_version } => {
+                Some(*resource_version)
+            }
+            _ => None,
+        }
+    }
+
+    /// The refusal, when the candidate failed.
+    #[must_use]
+    pub fn error(&self) -> Option<&CanonicalError> {
+        match self {
+            Self::Failed { error } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl DeletionOutcome {
+    /// The state without its data.
+    #[must_use]
+    pub fn status(&self) -> CandidateStatus {
+        match self {
+            Self::Pending => CandidateStatus::Pending,
+            Self::Running => CandidateStatus::Running,
+            Self::Succeeded { .. } | Self::WouldSucceed => CandidateStatus::Succeeded,
+            Self::Failed { .. } => CandidateStatus::Failed,
+        }
+    }
+
+    /// The target will not change again.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.status().is_terminal()
+    }
+
+    /// The tombstone's version, once deleted.
+    #[must_use]
+    pub fn resource_version(&self) -> Option<u64> {
+        match self {
+            Self::Succeeded { resource_version } => Some(*resource_version),
+            _ => None,
+        }
+    }
+
+    /// The refusal, when the target failed.
+    #[must_use]
+    pub fn error(&self) -> Option<&CanonicalError> {
+        match self {
+            Self::Failed { error } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// An item outcome without its data, for matching and logging. A dry run's `WouldSucceed`
+/// is `Succeeded` here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateStatus {
     Pending,

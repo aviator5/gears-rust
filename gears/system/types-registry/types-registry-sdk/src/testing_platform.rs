@@ -28,12 +28,11 @@ use crate::field;
 use crate::gts::{OperationResource, TypeResource};
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
 use crate::models::{
-    BatchGetEntitiesRequest, BatchGetEntitiesResponse, CandidateStatus, DeleteEntitiesRequest,
-    DeletionItemResult, DeletionOperation, Entity, EntityField, EntityKey, EntityKind,
-    EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
-    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Provenance,
-    RegisterEntitiesRequest, RegisterItem, RegistrationItemResult, RegistrationOperation,
-    Validator,
+    BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionItemResult,
+    DeletionOperation, DeletionOutcome, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
+    FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
+    ListEntitiesResponse, Operation, OperationStatus, Origin, Provenance, RegisterEntitiesRequest,
+    RegisterItem, RegistrationItemResult, RegistrationOperation, RegistrationOutcome, Validator,
 };
 use crate::reason::aborted;
 
@@ -170,6 +169,8 @@ pub enum ProtocolFault {
     RepeatListCursor,
     /// Completed operations report no items.
     DropOperationItems,
+    /// Committing registrations report their successes as dry-run previews.
+    PreviewSuccesses,
     /// The next `n` accepted submissions fail their read back.
     LoseReadBacks(u32),
 }
@@ -267,8 +268,13 @@ enum Candidate {
     },
 }
 
-/// A decided candidate: its status, resulting version and failure.
-type Outcome = (CandidateStatus, Option<u64>, Option<AdmissionFailure>);
+/// A decided candidate, as if committed; a dry run renders `Succeeded` without its version.
+#[derive(Debug, Clone)]
+enum Decided {
+    Succeeded(u64),
+    Unchanged(u64),
+    Failed(AdmissionFailure),
+}
 
 #[derive(Debug)]
 struct FakeOperation {
@@ -278,8 +284,8 @@ struct FakeOperation {
     dry_run: bool,
     /// Polls left before the operation completes.
     polls_left: u32,
-    /// Decided outcomes, once completed: status, version, failure.
-    outcomes: Option<Vec<Outcome>>,
+    /// Decided outcomes, once completed.
+    outcomes: Option<Vec<Decided>>,
 }
 
 /// How admission decides, besides versions: explicit refusals and dependencies.
@@ -552,7 +558,7 @@ impl MockTypesRegistry {
             chosen.unwrap_or_default()
         };
         if !delay.is_zero() {
-            toolkit::tokio::time::sleep(delay).await;
+            tokio::time::sleep(delay).await;
         }
         failure
     }
@@ -643,7 +649,11 @@ impl MockTypesRegistry {
                 .collect();
             op.outcomes = Some(outcomes);
         }
-        let mut operation = render(operation_id, op);
+        let mut operation = render(
+            operation_id,
+            op,
+            protocol.has(ProtocolFault::PreviewSuccesses),
+        );
         if op.outcomes.is_some() && protocol.has(ProtocolFault::DropOperationItems) {
             match &mut operation {
                 Operation::Registration(op) => op.items.clear(),
@@ -685,14 +695,9 @@ fn decide(
     entities: &mut BTreeMap<String, Stored>,
     admission: &Admission,
     candidate: &Candidate,
-) -> Outcome {
-    let failed = |reason: Reason, message: &str| {
-        (
-            CandidateStatus::Failed,
-            None,
-            Some(AdmissionFailure::new(reason, message)),
-        )
-    };
+) -> Decided {
+    let failed =
+        |reason: Reason, message: &str| Decided::Failed(AdmissionFailure::new(reason, message));
     match candidate {
         Candidate::Register {
             gts_id,
@@ -709,12 +714,12 @@ fn decide(
                         .is_some_and(|s| s.lifecycle == LifecycleStatus::Active)
             });
             if let Some((_, dependency)) = missing {
-                let (status, version, failure) =
-                    failed(Reason::DependencyNotFound, "a dependency is not registered");
-                return (
-                    status,
-                    version,
-                    failure.map(|f| f.with_context(context::DEPENDENCY_ID, dependency)),
+                return Decided::Failed(
+                    AdmissionFailure::new(
+                        Reason::DependencyNotFound,
+                        "a dependency is not registered",
+                    )
+                    .with_context(context::DEPENDENCY_ID, dependency),
                 );
             }
             // A tombstone stays present: it is never recreated, and a revision of it is refused.
@@ -729,7 +734,7 @@ fn decide(
                 }
                 (None, Some(_)) => failed(Reason::PreconditionFailed, "nothing to update"),
                 (Some(s), Some(_)) if s.content == *content => {
-                    (CandidateStatus::Unchanged, Some(s.resource_version), None)
+                    Decided::Unchanged(s.resource_version)
                 }
                 (current, _) => {
                     let version = current.map_or(1, |s| s.resource_version + 1);
@@ -742,15 +747,20 @@ fn decide(
                             frozen: None,
                         },
                     );
-                    (CandidateStatus::Succeeded, Some(version), None)
+                    Decided::Succeeded(version)
                 }
             }
         }
         Candidate::Delete { key, expected } => {
+            // As the registry: an absent target fails its precondition, and lifecycle is asked
+            // before the version, so a tombstone never invites a retry with a newer one.
             let Some((gts_id, stored)) = find(entities, key) else {
-                return failed(Reason::from_wire("not_found"), "absent");
+                return failed(Reason::PreconditionFailed, "names no entity");
             };
-            if stored.lifecycle != LifecycleStatus::Active || stored.resource_version != *expected {
+            if stored.lifecycle != LifecycleStatus::Active {
+                return failed(Reason::NotActive, "already deleted");
+            }
+            if stored.resource_version != *expected {
                 return failed(Reason::PreconditionFailed, "stale precondition");
             }
             let gts_id = gts_id.clone();
@@ -758,30 +768,47 @@ fn decide(
                 .then(|| Resolver::default().resolve(entities, &gts_id).ok())
                 .flatten();
             let Some(stored) = entities.get_mut(&gts_id) else {
-                return failed(Reason::from_wire("not_found"), "absent");
+                return failed(Reason::PreconditionFailed, "names no entity");
             };
             stored.lifecycle = LifecycleStatus::Deleted;
             stored.resource_version += 1;
             stored.frozen = frozen;
-            (
-                CandidateStatus::Succeeded,
-                Some(stored.resource_version),
-                None,
-            )
+            Decided::Succeeded(stored.resource_version)
         }
     }
 }
 
-fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
+fn render(operation_id: Uuid, op: &FakeOperation, preview: bool) -> Operation {
     let status = if op.outcomes.is_some() {
         OperationStatus::Completed
     } else {
         OperationStatus::Pending
     };
-    let outcome = |i: usize| {
-        op.outcomes
-            .as_ref()
-            .map_or((CandidateStatus::Pending, None, None), |o| o[i].clone())
+    let decided = |i: usize| op.outcomes.as_ref().map(|o| &o[i]);
+    let registration = |i: usize, key: &str| match decided(i) {
+        None => RegistrationOutcome::Pending,
+        Some(Decided::Succeeded(_)) if op.dry_run || preview => RegistrationOutcome::WouldSucceed,
+        Some(Decided::Succeeded(resource_version)) => RegistrationOutcome::Succeeded {
+            resource_version: *resource_version,
+        },
+        Some(Decided::Unchanged(resource_version)) => RegistrationOutcome::Unchanged {
+            resource_version: *resource_version,
+        },
+        Some(Decided::Failed(failure)) => RegistrationOutcome::Failed {
+            error: failure.clone().into_canonical(key),
+        },
+    };
+    let deletion = |i: usize, key: &str| match decided(i) {
+        None => DeletionOutcome::Pending,
+        Some(Decided::Succeeded(_)) if op.dry_run => DeletionOutcome::WouldSucceed,
+        Some(Decided::Succeeded(resource_version)) => DeletionOutcome::Succeeded {
+            resource_version: *resource_version,
+        },
+        // `decide` never answers a deletion unchanged.
+        Some(Decided::Unchanged(_)) => unreachable!("a deletion is never unchanged"),
+        Some(Decided::Failed(failure)) => DeletionOutcome::Failed {
+            error: failure.clone().into_canonical(key),
+        },
     };
     match op.kind {
         OperationKind::Deletion => Operation::Deletion(DeletionOperation {
@@ -792,15 +819,10 @@ fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, c)| match c {
-                    Candidate::Delete { key, .. } => {
-                        let (status, resource_version, failure) = outcome(i);
-                        Some(DeletionItemResult {
-                            entity_key: key.clone(),
-                            status,
-                            resource_version,
-                            error: failure.map(|f| f.into_canonical(&key.to_string())),
-                        })
-                    }
+                    Candidate::Delete { key, .. } => Some(DeletionItemResult {
+                        entity_key: key.clone(),
+                        outcome: deletion(i, &key.to_string()),
+                    }),
                     Candidate::Register { .. } => None,
                 })
                 .collect(),
@@ -813,15 +835,10 @@ fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, c)| match c {
-                    Candidate::Register { gts_id, .. } => {
-                        let (status, resource_version, failure) = outcome(i);
-                        Some(RegistrationItemResult {
-                            gts_id: gts_id.clone(),
-                            status,
-                            resource_version,
-                            error: failure.map(|f| f.into_canonical(gts_id.id())),
-                        })
-                    }
+                    Candidate::Register { gts_id, .. } => Some(RegistrationItemResult {
+                        gts_id: gts_id.clone(),
+                        outcome: registration(i, gts_id.id()),
+                    }),
                     Candidate::Delete { .. } => None,
                 })
                 .collect(),

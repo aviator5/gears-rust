@@ -60,21 +60,24 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// update differing content. Safe on every start; omitted identifiers are never deleted.
     ///
     /// [`Reconciliation::UpToDate`] means all documents matched without submission.
-    /// `Ok(Reconciled(..))` may include `Rejected` (e.g. incompatible changes) or `Pending`
-    /// outcomes, including those left by deadline or pass exhaustion.
+    /// `Ok(Reconciled(..))` answers every desired identifier and may include `Rejected` (e.g.
+    /// incompatible changes) or `Pending` outcomes, including those left by deadline or pass
+    /// exhaustion: `Ok` alone does not mean admitted. An identifier listed twice with the same
+    /// document counts once; with different documents it is `Rejected` unsubmitted.
     ///
     /// Cancellation or dropping loses in-flight keys; accepted writes continue. A later
     /// call recovers through reads and preconditions. Prefer the token and `options.deadline`
     /// over an outer timeout.
     ///
     /// # Errors
-    /// `InvalidArgument` for an unrepresentable deadline, `Cancelled` on cancellation. Registry failures are per-identifier
-    /// [`ReconcileOutcome`](crate::ReconcileOutcome)s.
+    /// `InvalidArgument` for an unrepresentable deadline, `Cancelled` when `cancel` fires.
+    /// Registry failures, a `Cancelled` answered by the registry included, are
+    /// per-identifier [`ReconcileOutcome`](crate::ReconcileOutcome)s.
     async fn reconcile_entities_and_await(
         &self,
         ctx: &PlatformSecurityContext,
         publisher: &PublisherContext,
-        desired: &[(String, JsonDocument)],
+        desired: &[(GtsId, JsonDocument)],
         options: &ReconcileOptions,
         cancel: &CancellationToken,
     ) -> Result<Reconciliation, CanonicalError> {
@@ -212,11 +215,16 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     }
 
     /// Traverse Type Schemas from `query.page.cursor`, preserving filters and page size.
-    /// Default projection includes content and all materializations; explicit selections are preserved.
+    /// [`Projection::Default`] selects content and all materializations here; an explicit
+    /// selection, even of the default fields, is kept as given.
     /// Traversal is complete but provides no point-in-time snapshot.
     ///
+    /// Each page is read with `kind` set to Type Schema and the effective selection, and a
+    /// cursor binds both: only a cursor issued for that same query resumes.
+    ///
     /// # Errors
-    /// `InvalidArgument` for an Instance filter; page or traversal-limit errors.
+    /// `InvalidArgument` for an Instance filter; a page's error; `ResourceExhausted` past
+    /// [`MAX_LIST_PAGES`].
     async fn list_type_schemas(
         &self,
         ctx: &PlatformSecurityContext,
@@ -225,10 +233,12 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         list_kind(&PlatformReads { api: self, ctx }, query).await
     }
 
-    /// Traverse Instances as [`Self::list_type_schemas`], selecting content by default.
+    /// Traverse Instances as [`Self::list_type_schemas`]; [`Projection::Default`] selects
+    /// content.
     ///
     /// # Errors
-    /// `InvalidArgument` for a Type Schema filter; page or traversal-limit errors.
+    /// `InvalidArgument` for a Type Schema filter; a page's error; `ResourceExhausted` past
+    /// [`MAX_LIST_PAGES`].
     async fn list_instances(
         &self,
         ctx: &PlatformSecurityContext,
@@ -361,7 +371,8 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     /// As [`PlatformTypesRegistryApiExt::list_type_schemas`].
     ///
     /// # Errors
-    /// `InvalidArgument` for an Instance filter; page or traversal-limit errors.
+    /// `InvalidArgument` for an Instance filter; a page's error; `ResourceExhausted` past
+    /// [`MAX_LIST_PAGES`].
     async fn list_type_schemas(
         &self,
         ctx: &SecurityContext,
@@ -373,7 +384,8 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     /// As [`PlatformTypesRegistryApiExt::list_instances`].
     ///
     /// # Errors
-    /// `InvalidArgument` for a Type Schema filter; page or traversal-limit errors.
+    /// `InvalidArgument` for a Type Schema filter; a page's error; `ResourceExhausted` past
+    /// [`MAX_LIST_PAGES`].
     async fn list_instances(
         &self,
         ctx: &SecurityContext,
@@ -496,45 +508,42 @@ async fn get_many_by_uuid<R: EntityReads + ?Sized, T: Kinded>(
         .collect())
 }
 
-/// Reads `keys` in bounded batches. A failed batch fails the call: no later batch is
-/// read, and no partial answer is returned beside the error.
+/// Reads `keys` in bounded batches of distinct entity keys. Every asked key is answered,
+/// including different spellings that name one entity. A failed batch fails the call: no
+/// later batch is read, and no partial answer is returned beside the error.
 async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
     reads: &R,
     keys: Vec<(K, EntityKey)>,
     projection: Projection,
 ) -> Result<Vec<(K, Option<T>)>, CanonicalError> {
     let mut out = Vec::with_capacity(keys.len());
-    let mut keys = keys.into_iter().peekable();
-    while keys.peek().is_some() {
-        let chunk: Vec<(K, EntityKey)> = keys.by_ref().take(MAX_BATCH_GET_KEYS).collect();
+    // Who asked for each distinct key, in first-asked order.
+    let mut askers: HashMap<EntityKey, Vec<K>> = HashMap::with_capacity(keys.len());
+    let mut distinct = Vec::with_capacity(keys.len());
+    for (asked, key) in keys {
+        askers
+            .entry(key)
+            .or_insert_with_key(|key| {
+                distinct.push(key.clone());
+                Vec::new()
+            })
+            .push(asked);
+    }
+    for chunk in distinct.chunks(MAX_BATCH_GET_KEYS) {
         let request = BatchGetEntitiesRequest {
-            items: chunk
-                .iter()
-                .map(|(_, key)| BatchGetItem::from(key.clone()))
-                .collect(),
+            items: chunk.iter().cloned().map(BatchGetItem::from).collect(),
             projection: projection.clone(),
             fresh: false,
         };
         let mut lookups = reads.batch_get(request).await?;
-        // Move the lookup on its last use; earlier duplicate keys need clones.
-        let mut left: HashMap<EntityKey, usize> = HashMap::with_capacity(chunk.len());
-        for (_, key) in &chunk {
-            *left.entry(key.clone()).or_default() += 1;
-        }
-        for (asked, key) in chunk {
-            let last = left.get_mut(&key).is_none_or(|n| {
-                *n -= 1;
-                *n == 0
-            });
-            let lookup = if last {
-                lookups.0.remove(&key)
-            } else {
-                lookups.0.get(&key).cloned()
-            };
-            out.push((
-                asked,
-                found(&key, T::KIND, lookup)?.map(narrow).transpose()?,
-            ));
+        for key in chunk {
+            let answer = found(key, T::KIND, lookups.0.remove(key))?
+                .map(narrow::<T>)
+                .transpose()?;
+            let mut asked = askers.remove(key).unwrap_or_default();
+            let last = asked.pop();
+            out.extend(asked.into_iter().map(|k| (k, answer.clone())));
+            out.extend(last.map(|k| (k, answer)));
         }
     }
     Ok(out)
@@ -575,20 +584,21 @@ async fn list_kind<R: EntityReads + ?Sized, T: Kinded>(
             None => return Ok(items),
         }
     }
-    Err(TypeResource::invalid_argument()
-        .with_field_violation(
-            field::PAGE_FIELD,
-            format!(
-                "the listing did not end within {MAX_LIST_PAGES} pages; narrow the \
-                 query or raise its page limit"
-            ),
-            field::INVALID_QUERY,
-        )
-        .create())
+    // The query is valid; the traversal outgrew the helper's bound.
+    Err(TypeResource::resource_exhausted(format!(
+        "the listing did not end within {MAX_LIST_PAGES} pages; narrow the query or raise its \
+         page limit"
+    ))
+    .with_quota_violation(
+        field::PAGE_FIELD,
+        format!("at most {MAX_LIST_PAGES} pages per listing helper call"),
+    )
+    .create())
 }
 
-/// Default list documents: Instance content; Type Schema content and three materializations.
-/// Explicit selections stay unchanged.
+/// What [`Projection::Default`] selects on a list helper: Instance content; Type Schema
+/// content and three materializations. Explicit selections, including one equal to the
+/// default fields, stay unchanged.
 fn list_default(kind: EntityKind) -> FieldSelection {
     match kind {
         EntityKind::Instance => FieldSelection::with(&[EntityField::Content]),
@@ -643,7 +653,7 @@ fn found(
 }
 
 /// A kind-narrowed read's result type and the kind it carries.
-trait Kinded: TryFrom<Entity, Error = Entity> + Send {
+trait Kinded: TryFrom<Entity, Error = Entity> + Clone + Send {
     const KIND: EntityKind;
 }
 

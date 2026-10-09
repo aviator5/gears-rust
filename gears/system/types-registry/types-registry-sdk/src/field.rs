@@ -57,7 +57,8 @@ pub const SELECT_FIELD: &str = "$select";
 
 /// An [`IdempotencyKey`](crate::IdempotencyKey) refused by its constructor.
 pub const IDEMPOTENCY_KEY_FIELD: &str = "idempotency_key";
-/// A listing helper that did not finish within its page budget.
+/// The quota subject of a listing helper's `ResourceExhausted`: it did not finish within
+/// its page budget.
 pub const PAGE_FIELD: &str = "page";
 /// A deadline the SDK cannot represent.
 pub const DEADLINE_FIELD: &str = "deadline";
@@ -100,6 +101,7 @@ pub const CONSTRAINT_SHAPE: &str = "CONSTRAINT";
 /// [`Self::Format`] and [`Self::Constraint`] are synthetic reasons produced by the
 /// projection, never by [`Self::from_wire`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ValidationReason {
     /// See [`INVALID_GTS_ID`].
     InvalidGtsId,

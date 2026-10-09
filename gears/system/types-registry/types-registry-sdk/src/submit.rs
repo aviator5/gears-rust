@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
+use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
-use toolkit::tokio::time::{Instant, sleep_until};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
@@ -23,6 +23,10 @@ pub const POLL_INTERVAL_INITIAL: Duration = Duration::from_millis(50);
 pub const POLL_INTERVAL_MAX: Duration = Duration::from_secs(1);
 
 /// Submit and poll under one deadline; reconciliation's submit step.
+///
+/// The outer `Err` is this call's own stop — the caller's cancellation or the deadline —
+/// and the inner one the registry's answer, so a `Cancelled` from the registry is never
+/// mistaken for the caller's.
 pub async fn await_registration<A: PlatformTypesRegistryApi + ?Sized>(
     api: &A,
     ctx: &PlatformSecurityContext,
@@ -30,14 +34,18 @@ pub async fn await_registration<A: PlatformTypesRegistryApi + ?Sized>(
     request: RegisterEntitiesRequest,
     deadline: Instant,
     cancel: &CancellationToken,
-) -> Result<RegistrationOperation, CanonicalError> {
-    let mut operation = bounded(
+) -> Result<Result<RegistrationOperation, CanonicalError>, Stop> {
+    let mut operation = match bounded(
         deadline,
         cancel,
         None,
         api.register_entities(ctx, key, request),
     )
-    .await??;
+    .await?
+    {
+        Ok(operation) => operation,
+        Err(error) => return Ok(Err(error)),
+    };
     let operation_id = operation.operation_id;
     let mut interval = POLL_INTERVAL_INITIAL;
     while operation.status != OperationStatus::Completed {
@@ -49,24 +57,28 @@ pub async fn await_registration<A: PlatformTypesRegistryApi + ?Sized>(
         )
         .await?;
         interval = (interval * 2).min(POLL_INTERVAL_MAX);
-        let polled = bounded(
+        let polled = match bounded(
             deadline,
             cancel,
             Some(operation_id),
             api.get_operation(ctx, operation_id),
         )
-        .await??;
+        .await?
+        {
+            Ok(polled) => polled,
+            Err(error) => return Ok(Err(error)),
+        };
         let crate::models::Operation::Registration(polled) = polled else {
-            return Err(OperationResource::unknown(format!(
+            return Ok(Err(OperationResource::unknown(format!(
                 "the registry answered a poll of registration operation {operation_id} \
                  with a deletion"
             ))
             .with_resource(operation_id.to_string())
-            .create());
+            .create()));
         };
         operation = polled;
     }
-    Ok(operation)
+    Ok(Ok(operation))
 }
 
 /// Equal jitter in [backoff/2, backoff] spreads concurrent retries.
@@ -97,41 +109,47 @@ pub async fn bounded<F: std::future::Future>(
     cancel: &CancellationToken,
     operation_id: Option<Uuid>,
     future: F,
-) -> Result<F::Output, CanonicalError> {
+) -> Result<F::Output, Stop> {
     if cancel.is_cancelled() {
-        return Err(stopped(operation_id, StopCause::Cancelled));
+        return Err(Stop::Cancelled);
     }
     if Instant::now() >= deadline {
-        return Err(stopped(operation_id, StopCause::Deadline));
+        return Err(Stop::Deadline(operation_id));
     }
-    toolkit::tokio::select! {
+    tokio::select! {
         biased;
-        () = cancel.cancelled() => Err(stopped(operation_id, StopCause::Cancelled)),
-        () = sleep_until(deadline) => Err(stopped(operation_id, StopCause::Deadline)),
+        () = cancel.cancelled() => Err(Stop::Cancelled),
+        () = sleep_until(deadline) => Err(Stop::Deadline(operation_id)),
         outcome = future => Ok(outcome),
     }
 }
 
-enum StopCause {
+/// Why a call stopped waiting, as opposed to what the registry answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// The caller's cancellation token fired.
     Cancelled,
-    Deadline,
+    /// The deadline passed, while the named operation was running if it was accepted.
+    Deadline(Option<Uuid>),
 }
 
-/// Stop waiting while accepted writes continue; timeout names the operation, cancellation
-/// requires replay with the caller’s key.
-fn stopped(operation_id: Option<Uuid>, cause: StopCause) -> CanonicalError {
-    match (cause, operation_id) {
-        (StopCause::Cancelled, _) => OperationResource::cancelled().create(),
-        (StopCause::Deadline, Some(id)) => OperationResource::deadline_exceeded(format!(
-            "the deadline passed while operation {id} was still running; it was not \
-             cancelled, and retrying with the same idempotency key replays it"
-        ))
-        .with_resource(id.to_string())
-        .create(),
-        (StopCause::Deadline, None) => OperationResource::deadline_exceeded(
-            "the deadline passed before the registry acknowledged the submission; retry \
-             with the same idempotency key to learn its outcome",
-        )
-        .create(),
+impl Stop {
+    /// The canonical error reporting the stop: accepted writes continue; a timeout names
+    /// the operation, and cancellation requires replay with the caller's key.
+    pub fn into_error(self) -> CanonicalError {
+        match self {
+            Self::Cancelled => OperationResource::cancelled().create(),
+            Self::Deadline(Some(id)) => OperationResource::deadline_exceeded(format!(
+                "the deadline passed while operation {id} was still running; it was not \
+                 cancelled, and retrying with the same idempotency key replays it"
+            ))
+            .with_resource(id.to_string())
+            .create(),
+            Self::Deadline(None) => OperationResource::deadline_exceeded(
+                "the deadline passed before the registry acknowledged the submission; retry \
+                 with the same idempotency key to learn its outcome",
+            )
+            .create(),
+        }
     }
 }
