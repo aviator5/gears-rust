@@ -10,8 +10,6 @@ full local Account Management adoption. The current plan contains **45 sequentia
 tasks**: T1–T30 complete and T31–T45 open. It retains all CI/backend gates; real
 local AM is verified at Checkpoint 7A, and the complete process proof is verified
 on real AM at Checkpoint 8A. There is no separate pilot application.
-Rationale and the historical P1–P31 decisions are in
-[planning-history.md](./planning-history.md), with the P32 numbering conversion.
 The live execution artifacts are [plan.md](./plan.md) and [todo.md](./todo.md).
 Their task references, and all task references below, use the current numbering.
 The plan supersedes §15's ordering (P1); conflicting decisions must be reported as spec bugs.
@@ -113,7 +111,7 @@ correctness core, not scope.
 | D3 | **Materialize effective artifacts** | `type_schema` current-state row is populated at admission. Read path shape identical to P1, no later backfill of `resolution_fingerprint` |
 | D4 | **Multi-pod** | Commit transaction re-reads `resource_version` of the candidate and the revision vector of everything consumed, and re-derives the reverse-impact set from the database; a difference rolls back and revalidates within `worker.max_revalidation_attempts`. The comparison is **not** taken under locks on the compared rows — §8.1 step 4.2 argues why locking the vector is the wrong tool and what serializes those rows instead. Ordering is provided by the **`entity_write_order` row** of `types_registry__coordination_state`, advanced as each commit transaction's first statement: one commit at a time per installation, which is what lets the in-transaction scan and guard see each other's work. A row rather than an advisory lock because advisory keys live on a separate session that can be lost while the transaction carries on. Every writer of entity state must claim it — deletion at T21, the purge job under ADR-0013 |
 | D5 | **Reverse impact by one scoped recursive CTE, refresh by an iterative loop** | `DependencyRepo::reverse_impact` is a single `WITH RECURSIVE` over `dependency` through `SecureCteSelect` (ADR-0001, `toolkit-db`) — no raw SQL — depth-capped at `limits.activation_write_set`, which is also the refusal threshold for the set it returns. The refresh stays a domain loop because the fingerprint-stability stop decides the write set by recomputation, which no closure query can express. See [§D5](#d5-splits-the-traversal-from-the-refresh) |
-| D6 | **The old `TypesRegistryClient` is removed in P0**; every consumer migrates inside this effort | ~50 call sites across 20+ gears move. Forced by two facts: async admission makes the old synchronous `register()` a lie in its own signature, and the old models' `Arc`-linked object graphs cannot cross a wire, so keeping them keeps an out-of-process blocker. Migration is split by gear group — see `planning-history.md` P5. P28 exposes the new local APIs to new gears at T31 while legacy consumers retain their independent store, with no shim or synchronization (§8.4). P29 migrates the complete AM/IdP/TR group locally at T32 with one new client inside AM. Other consumers move together and legacy is deleted at T38; the behavioural startup move remains T41/T42 |
+| D6 | **The old `TypesRegistryClient` is removed in P0**; every consumer migrates inside this effort | ~50 call sites across 20+ gears move. Forced by two facts: async admission makes the old synchronous `register()` a lie in its own signature, and the old models' `Arc`-linked object graphs cannot cross a wire, so keeping them keeps an out-of-process blocker. Migration is split by gear group — see P5. P28 exposes the new local APIs to new gears at T31 while legacy consumers retain their independent store, with no shim or synchronization (§8.4). P29 migrates the complete AM/IdP/TR group locally at T32 with one new client inside AM. Other consumers move together and legacy is deleted at T38; the behavioural startup move remains T41/T42 |
 | D7 | `operation.plane = 1` (platform), `tenant_id = NULL`, `principal_id` a hardcoded constant with a `TODO` | Idempotency scope becomes global — see §9 ceiling C2 |
 | D8 | **`gts`, `gts-id` and `gts-macros` are pinned at 0.12.0 and move together** | A split pin puts the identifier crate and the semantics crate on different specifications. `gts-dylint` / `gts-macros-cli` must not lag either — see §7 |
 | D9 | **Use `toolkit-db/preview-outbox`** | Closes DESIGN §4's outbox sign-off for this gear |
@@ -1698,7 +1696,7 @@ stability is `unstable`, the change is called out in the changelog, and any REST
 must move to submit-then-poll. `GET /entities/{entity_key}` keeps its route and `200`/`404`
 semantics, but T25 changes its default representation as described below.
 
-**The break is withdrawn for the T10–T38 window** (`planning-history.md` P12). T9 took it early by
+**The break is withdrawn for the T10–T38 window** (P12). T9 took it early by
 repointing the existing v1 routes at the database, which changed `POST /v1/entities`'s
 *request* body and so refused its existing callers with `400` rather than handing them a
 `202` they could adapt to. Worse, it left
@@ -2436,7 +2434,7 @@ references.
 
 **Superseded by [`plan.md`](./plan.md).** This section originally ordered the work
 horizontally — schema, then repositories, then a synchronous admission path a later slice
-would have rewritten. `planning-history.md` P1 replaces it with vertical slices and [`todo.md`](./todo.md)
+would have rewritten. P1 replaces it with vertical slices and [`todo.md`](./todo.md)
 is the executable task list. The current queue (P32) has 15 remaining tasks:
 T31–T38 (local AM, SDK contracts and the remaining-fleet/REST cutover);
 T39–T43 (collectors, real remote AM, end-of-pull and HA); then T44–T45
@@ -2524,7 +2522,7 @@ other documents cite it.
 ## 17. Open questions
 
 The P22 questions — rolling-update authority, publisher coverage, wire serialization, header
-binding, the trait name and the local client's context — are resolved in `planning-history.md` P22 and
+binding, the trait name and the local client's context — are resolved in P22 and
 recorded as D15–D17, C11 and the DESIGN amendments of §3. P23 resolves publication ordering,
 the receipt, platform-only mutations, availability, startup and schema authority (D18–D22).
 **One remains open for P0**, and one is deferred: O5 is closed by T40 before T41; O6 is
@@ -2577,10 +2575,10 @@ constant is digested.
 - **Toolkit ADRs relied on (P22)**: toolkit-oop 0001 (deployment profiles), 0002 (REST-first
   OoP), 0005 (eventual readiness), 0006 (platform-plane auth); toolkit-contract-binding PRD
   (header injection deferred to a manual `impl`)
-- **P22 decision and rationale**: [`planning-history.md`](./planning-history.md) P22
-- **Historical P26 scheduling and task-ID mapping** (the separate pilot is removed by P31): [`planning-history.md`](./planning-history.md) P26
+- **P22 decision and rationale**: P22
+- **Historical P26 scheduling and task-ID mapping** (the separate pilot is removed by P31): P26
 - **P23 decision and rationale** (publication ordering, receipt, platform-only mutations,
-  availability, startup, schema authority — D18–D22, C12–C13): [`planning-history.md`](./planning-history.md) P23
+  availability, startup, schema authority — D18–D22, C12–C13): P23
 - **ADRs out of P0 scope**: 0002, 0007, 0009, 0010, 0011, 0013
 - **`gts-rust`**: 0.12.0 from crates.io, declaring `GTS_SPECIFICATION_VERSION = "0.13"`
 - **Prerequisites closed here**: activation write set (§4), `sea-query` recursive CTE

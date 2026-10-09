@@ -1,4 +1,4 @@
-//! Compatibility and provenance through direct admission-worker calls (T18, ADR-0003).
+//! Compatibility and provenance through direct admission-worker calls (T17, ADR-0003).
 //! Baseline selection is covered in `src/domain/compat/baseline_tests.rs`.
 //!
 //! The matrix adds the same optional property at three object levels: closed

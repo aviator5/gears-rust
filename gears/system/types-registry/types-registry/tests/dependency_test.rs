@@ -1,4 +1,4 @@
-//! Dependency edges written by a real admission (T14).
+//! Dependency edges written by a real admission (T13).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 

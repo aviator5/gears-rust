@@ -126,7 +126,7 @@ pub async fn get_entity(
 // T38 removes the pre-database handlers above.
 
 /// Advisory only: how long a client should wait before its first poll. The
-/// operation may well be terminal sooner — while admission is inline (T23) it
+/// operation may well be terminal sooner — while admission is inline (T21) it
 /// already is — so this is a hint, not a contract.
 const RETRY_AFTER_SECONDS: &str = "1";
 

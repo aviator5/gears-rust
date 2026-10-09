@@ -82,7 +82,7 @@ fn etag_header() -> ResponseHeaderSpec {
     )
 }
 
-/// The pre-database v1 contract, verbatim from `main` (T10).
+/// The pre-database v1 contract, verbatim from `main` (T9a).
 fn register_v1(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // Legacy v1 uses only the in-memory TypesRegistryService. Until T38, consumers must read
     // and write the same store; routing v1 writes to RegistryService would break that invariant.
@@ -302,7 +302,7 @@ fn register_reads(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router
 }
 
-/// `POST {V2}/entities:batchGet` (T24).
+/// `POST {V2}/entities:batchGet` (T22a).
 fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // A read-only custom action, and a `POST` for two reasons that are about the
     // transport rather than the semantics: an identifier runs to 1024 characters,
@@ -350,7 +350,7 @@ fn register_batch_get(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rout
     router
 }
 
-/// `GET {V2}/entities` — the bounded, projected discovery page (D12, T24, T25).
+/// `GET {V2}/entities` — the bounded, projected discovery page (D12, T22a, T22b).
 fn register_discovery(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
@@ -449,7 +449,7 @@ fn register_discovery(
     router
 }
 
-/// `POST {V2}/entities:batchDelete` (T22).
+/// `POST {V2}/entities:batchDelete` (T20a).
 fn register_batch_delete(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router = OperationBuilder::post(format!("{V2}/entities:batchDelete"))
         .operation_id("types_registry.batch_delete_entities")
@@ -521,7 +521,7 @@ fn register_batch_delete(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
     router
 }
 
-/// `DELETE {V2}/entities/{{entity_key}}` (T22).
+/// `DELETE {V2}/entities/{{entity_key}}` (T20a).
 fn register_delete_entity(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router = OperationBuilder::delete(format!("{V2}/entities/{{entity_key}}"))
         .operation_id("types_registry.delete_entity")

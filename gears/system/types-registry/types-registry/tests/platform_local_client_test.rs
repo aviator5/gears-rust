@@ -324,7 +324,7 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
         })
     ));
 
-    // T27's token itself: the RFC 9110 quotes are REST's representation, not the validator.
+    // T22d's token itself: the RFC 9110 quotes are REST's representation, not the validator.
     let selection = DomainSelection::parse(&["content", "origin"]).expect("selection");
     let DomainLookup::Found { etag: domain, .. } = h
         .service

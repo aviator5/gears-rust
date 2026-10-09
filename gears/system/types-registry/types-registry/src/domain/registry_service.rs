@@ -275,7 +275,7 @@ pub struct RegistryService {
     policy: RegistrationPolicy,
     config: TypesRegistryConfig,
     dispatch: Arc<dyn OperationDispatch>,
-    /// The admission instruments (T17).
+    /// The admission instruments (T16).
     metrics: Arc<dyn AdmissionMetrics>,
 }
 

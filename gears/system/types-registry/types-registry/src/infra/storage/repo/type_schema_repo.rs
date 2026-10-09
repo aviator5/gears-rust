@@ -111,7 +111,7 @@ impl TypeSchemaRepo {
     ///
     /// An entity with no `type_schema` row is simply **absent** from the result
     /// rather than an error: a registered Instance has no row in this table by
-    /// construction (its current pointer lives in `instance`, T11), and only the
+    /// construction (its current pointer lives in `instance`, T10), and only the
     /// caller knows whether an absence is a fault.
     ///
     /// # Errors

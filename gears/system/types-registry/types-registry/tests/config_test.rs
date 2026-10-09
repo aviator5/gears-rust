@@ -321,11 +321,11 @@ fn configured_limits_are_kept() {
     assert_eq!(cfg.limits.resolution_closure, 128);
     assert_eq!(
         cfg.limits.activation_write_set, 8,
-        "T15 enforces this one: the reverse-impact refusal and the CTE's depth cap"
+        "T14 enforces this one: the reverse-impact refusal and the CTE's depth cap"
     );
     assert_eq!(
         cfg.worker.max_revalidation_attempts, 3,
-        "T16 enforces this one: the bound on the revalidation loop"
+        "T15 enforces this one: the bound on the revalidation loop"
     );
 }
 

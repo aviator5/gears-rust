@@ -107,11 +107,11 @@ pub struct EvaluatedUnit {
     /// Remains true for a compatible candidate if the waiver is still authorized;
     /// ADR-0003 withdraws the whole-history guarantee for any forced step.
     pub compat_forced: bool,
-    /// The candidate's outgoing edges, by target **identifier** (T14).
+    /// The candidate's outgoing edges, by target **identifier** (T13).
     pub edges: Vec<DependencyEdge>,
     /// The database state on which this evaluation's verdict rests.
     pub vector: RevisionVector,
-    /// Which pass produced this unit, for the series its commit emits (T21).
+    /// Which pass produced this unit, for the series its commit emits (T20).
     /// Carried on the unit rather than threaded through every commit signature:
     /// each commit already takes the unit, and a separate argument would be one
     /// more place the two could disagree.
@@ -314,7 +314,7 @@ pub struct EvaluationTarget<'a> {
     pub precondition: Precondition,
     /// Accepted waiver request, subject to worker and baseline re-authorization.
     pub force: bool,
-    /// Which pass this evaluation belongs to, for the series it emits (T21).
+    /// Which pass this evaluation belongs to, for the series it emits (T20).
     pub labels: PassLabels,
 }
 

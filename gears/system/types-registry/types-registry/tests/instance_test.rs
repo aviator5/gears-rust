@@ -1,4 +1,4 @@
-//! Registered Instances end to end through the admission worker (T11).
+//! Registered Instances end to end through the admission worker (T10).
 //!
 //! Every test calls the worker directly, as `admission_worker_test.rs` does: no
 //! `sleep`, no timer, no polling (SPEC §13).

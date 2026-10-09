@@ -390,7 +390,7 @@ fn an_instance_identifier_must_name_a_stable_major_without_a_minor() {
     }
 
     // The same shapes as Type Schemas: a minor is admissible under any prefix,
-    // and a major-0 Type Schema is quarantined by references (T19), not by the
+    // and a major-0 Type Schema is quarantined by references (T18), not by the
     // profile.
     for id in [
         gts_id!("cf.core.example.type.v1.2~"),
@@ -735,7 +735,7 @@ fn force_on_a_later_minor_is_accepted_and_travels_on_the_item() {
     let validated = run(&pair, &req).expect("a later minor has a cross-minor check to waive");
     assert!(
         validated.items[0].compat_forced,
-        "the flag is durable state: the worker reads the item, and after T23 that is \
+        "the flag is durable state: the worker reads the item, and after T21 that is \
          all it reads",
     );
 }
@@ -757,7 +757,7 @@ fn force_cannot_waive_the_intra_entity_edge_of_a_revision() {
     }
 }
 
-/// T21 made Dry Run acceptable, so the force gate is now what refuses this
+/// T20 made Dry Run acceptable, so the force gate is now what refuses this
 /// request — and it refuses it for the deployment setting, not for the mode. A
 /// dry run is a mode of the ordinary path and waives no check of its own.
 #[test]
@@ -825,7 +825,7 @@ fn a_minor_bearing_type_schema_cannot_be_content_revised() {
 }
 
 // ---------------------------------------------------------------------------
-// Deletion (T21)
+// Deletion (T20)
 // ---------------------------------------------------------------------------
 
 // A deletion is a `DeleteRequest`, so a document or `force` on one cannot be

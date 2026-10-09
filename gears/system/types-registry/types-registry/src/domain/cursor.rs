@@ -181,7 +181,7 @@ pub fn resume(cursor: &CursorV1, binding: &Binding<'_>) -> Result<String, Servic
     validate_cursor_against(cursor, &page_order(), expected.as_deref())
         .map_err(|e| not_usable(&e.to_string()))?;
     // `validate_cursor_against` skips the comparison when the token has no filter,
-    // which only a pre-T25 cursor lacks.
+    // which only a pre-T22b cursor lacks.
     if cursor.f != expected {
         return Err(not_usable(
             "it was issued for a different pattern, depth, kind, lifecycle_status or \
@@ -412,7 +412,7 @@ mod tests {
         Ok(())
     }
 
-    /// A T25 default-selection token (its canonical spelling is unchanged)
+    /// A T22b default-selection token (its canonical spelling is unchanged)
     /// resumes while no `depth`, `kind` or non-default `lifecycle_status` is named.
     #[test]
     fn a_t22b_cursor_resumes_under_the_same_absent_filters() -> Result<(), serde_json::Error> {
@@ -478,7 +478,7 @@ mod tests {
         Ok(())
     }
 
-    /// A T24 token carries no selection binding, so it cannot resume a T25 page.
+    /// A T22a token carries no selection binding, so it cannot resume a T22b page.
     #[test]
     fn a_cursor_without_a_selection_binding_is_refused() -> Result<(), serde_json::Error> {
         let token = CursorV1 {

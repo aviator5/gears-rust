@@ -61,7 +61,7 @@ pub fn unit_span(
         baseline_gts_id = field::Empty,
         baseline_revision = field::Empty,
         compat_verdict = field::Empty,
-        // T21: how many live direct dependants blocked a deletion. A count,
+        // T20: how many live direct dependants blocked a deletion. A count,
         // and on the span rather than in a label: identities are unbounded and
         // the caller may not be entitled to read them.
         blocked_dependents = field::Empty,
@@ -77,7 +77,7 @@ pub fn record_resolved_gts_id(span: &Span, gts_id: &str) {
     span.record("gts_id", gts_id);
 }
 
-/// Record how many live direct dependants refused a deletion (T21).
+/// Record how many live direct dependants refused a deletion (T20).
 pub fn record_blocked_dependents(span: &Span, blocked: usize) {
     span.record("blocked_dependents", blocked);
 }

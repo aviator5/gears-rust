@@ -105,7 +105,7 @@ fn a_repeated_identifier_is_refused_rather_than_silently_overwritten() {
     }
 }
 
-/// **Inverted at T11.** This case used to assert that an Instance identifier was
+/// **Inverted at T10.** This case used to assert that an Instance identifier was
 /// refused as out of scope; the store now carries both kinds, so it asserts the
 /// opposite — the Instance registers, alongside the Type Schema it conforms to.
 ///
@@ -163,7 +163,7 @@ fn a_single_segment_instance_is_refused_by_the_library() {
     }
 }
 
-/// The dialect gate is asked of Type Schemas only (T11). An Instance has no
+/// The dialect gate is asked of Type Schemas only (T10). An Instance has no
 /// `$schema` by definition — that absence is what makes it an Instance — so
 /// applying the gate to both kinds would refuse every Instance ever registered.
 #[test]

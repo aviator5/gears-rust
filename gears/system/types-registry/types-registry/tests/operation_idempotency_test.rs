@@ -563,7 +563,7 @@ async fn a_different_fingerprint_under_one_key_is_a_conflict() {
 }
 
 /// A dry run and a commit are different requests under one key: the mode is a
-/// fingerprint input (T21), so the second is a conflict rather than a replay of
+/// fingerprint input (T20), so the second is a conflict rather than a replay of
 /// the first.
 #[tokio::test]
 async fn a_dry_run_and_a_commit_cannot_share_one_idempotency_key() {

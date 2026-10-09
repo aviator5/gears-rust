@@ -15,7 +15,7 @@ use crate::domain::enums::OperationKind;
 use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage, TerminalStatus};
 use gts::CompatibilityVerdict;
 
-/// The labels the pre-T21 tests are not about: a committing registration.
+/// The labels the pre-T20 tests are not about: a committing registration.
 /// Named rather than inlined so those tests keep reading as assertions about
 /// `status`, `stage` and `reason`.
 fn commit() -> PassLabels {
@@ -440,7 +440,7 @@ fn recorded_names(exporter: &InMemoryMetricExporter) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// `types_registry_compat_verdicts_total{verdict,forced}` (T18, P16)
+// `types_registry_compat_verdicts_total{verdict,forced}` (T17, P16)
 // ---------------------------------------------------------------------------
 
 /// The instrument's **rendered name**, which no other test in this repository
@@ -511,7 +511,7 @@ fn a_waived_verdict_is_its_own_series_under_forced_true() {
 
 /// Every label **key** is present on every data point, and each vocabulary is
 /// closed. A dropped key silently merges series; a stray value silently splits
-/// one. T21 added `dry_run` here, and this count is the deliberation it forced.
+/// one. T20 added `dry_run` here, and this count is the deliberation it forced.
 #[test]
 fn the_verdict_counter_carries_exactly_three_closed_label_keys() {
     let (provider, exporter, metrics) = recorder();
@@ -586,7 +586,7 @@ fn the_verdict_counter_carries_exactly_three_closed_label_keys() {
 }
 
 // ---------------------------------------------------------------------------
-// T21's label sweep: mode and kind on the per-candidate series (P16 rule 2)
+// T20's label sweep: mode and kind on the per-candidate series (P16 rule 2)
 // ---------------------------------------------------------------------------
 
 /// Sorted distinct values a label key took, for vocabulary assertions that do

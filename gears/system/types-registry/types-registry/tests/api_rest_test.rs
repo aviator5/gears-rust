@@ -816,7 +816,7 @@ async fn a_missing_idempotency_key_is_a_synchronous_refusal() {
     assert_eq!(entity.status, StatusCode::NOT_FOUND);
 }
 
-/// Dry Run is an ordinary accepted operation (T21): it gets a receipt and a
+/// Dry Run is an ordinary accepted operation (T20): it gets a receipt and a
 /// terminal outcome like any other, and it leaves nothing readable behind.
 #[tokio::test]
 async fn a_dry_run_is_accepted_and_writes_nothing() {
@@ -2690,7 +2690,7 @@ async fn the_operation_polling_response_refuses_to_be_cached() {
     );
 }
 // ---------------------------------------------------------------------------
-// The two read routes: `:batchGet` and discovery (T24)
+// The two read routes: `:batchGet` and discovery (T22a)
 // ---------------------------------------------------------------------------
 //
 // Both are driven through `register_routes` like every other case here, so the
@@ -3750,7 +3750,7 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
 }
 
 // ---------------------------------------------------------------------------
-// `$select` on the exact read and `:batchGet` (T25)
+// `$select` on the exact read and `:batchGet` (T22b)
 // ---------------------------------------------------------------------------
 
 const DEFAULT_FIELDS: [&str; 5] = ["gts_id", "gts_uuid", "kind", "lifecycle_status", "origin"];
@@ -4118,7 +4118,7 @@ fn router_for_openapi(openapi: &TestOpenApi) -> Router {
 }
 
 // ---------------------------------------------------------------------------
-// `$select` on discovery and its cursor binding (T25)
+// `$select` on discovery and its cursor binding (T22b)
 // ---------------------------------------------------------------------------
 
 /// Walk every page under `query`, returning the pages' items in order.
@@ -4433,7 +4433,7 @@ async fn echoed_caller_input_is_cut_to_64_characters() {
 }
 
 // ---------------------------------------------------------------------------
-// Discovery by `kind` (T26)
+// Discovery by `kind` (T22c)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -4718,7 +4718,7 @@ fn every_entity_read_requires_identity_kind_and_lifecycle_in_the_generated_docum
 }
 
 // ---------------------------------------------------------------------------
-// Discovery by `depth` (T26)
+// Discovery by `depth` (T22c)
 // ---------------------------------------------------------------------------
 
 /// A Type Schema derived from [`CF_TYPE`], two segments deep.
@@ -4976,7 +4976,7 @@ fn discovery_declares_the_page_size_as_positive_on_request_and_page() {
 }
 
 // ---------------------------------------------------------------------------
-// Conditional reads (T27)
+// Conditional reads (T22d)
 // ---------------------------------------------------------------------------
 
 fn get_if_none_match(uri: &str, value: &str) -> Request<Body> {

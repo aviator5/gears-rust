@@ -269,7 +269,7 @@ async fn reverse_impact_refuses_rather_than_truncating_a_chain_deeper_than_the_b
 }
 
 // ---------------------------------------------------------------------------
-// `edges_within`: the edges a deletion batch orders by (T21)
+// `edges_within`: the edges a deletion batch orders by (T20)
 // ---------------------------------------------------------------------------
 
 const A: &str = gts_id!("acme.rev.thing.type.v1~acme.rev.edges.a.v1~");

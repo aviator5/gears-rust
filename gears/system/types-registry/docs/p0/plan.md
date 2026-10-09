@@ -44,8 +44,7 @@ T32 (full local Account Management/IdP/TR migration).
 
 ## Decisions and task numbering
 
-The rationale for P1–P31 and the P32 old-to-new mapping are in
-[planning-history.md](./planning-history.md). References to P1–P31 in this plan,
+References to P1–P31 in this plan,
 the spec and the task list name those historical decisions; their task numbers
 are local to the journal. The graph, index, checkpoints, risks and execution
 queue below use only current task IDs. There are no separate merged or removed

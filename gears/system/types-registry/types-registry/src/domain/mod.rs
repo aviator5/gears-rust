@@ -39,11 +39,11 @@ pub mod policy;
 pub mod ports;
 // The database-backed domain surface every transport adapter calls (SPEC §8.4).
 pub mod registry_service;
-// Whether redelivering an admission can reach a different answer (T23).
+// Whether redelivering an admission can reach a different answer (T21).
 pub mod retry;
-// The normalized field set all three reads project by (T25, SPEC §10.2).
+// The normalized field set all three reads project by (T22b, SPEC §10.2).
 pub mod selection;
-// Freshness validators for conditional exact reads (T27, SPEC §8.5).
+// Freshness validators for conditional exact reads (T22d, SPEC §8.5).
 pub mod validator;
 
 // ---------------------------------------------------------------------------
