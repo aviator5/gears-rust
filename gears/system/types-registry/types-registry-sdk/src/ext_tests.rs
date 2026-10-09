@@ -678,7 +678,7 @@ async fn a_spent_budget_submits_nothing_even_to_an_instant_registry() {
     assert!(fake.submissions().is_empty());
 }
 
-// ---- TypesRegistryApiExt: the same helpers over the tenant contract ---------
+// TypesRegistryApiExt: the same helpers over the tenant contract.
 //
 // Called through `&dyn TypesRegistryApi`: the fake implements both contracts, and the
 // trait object leaves only the tenant helpers in reach.

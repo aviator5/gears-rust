@@ -80,11 +80,7 @@ impl From<DomainError> for CanonicalError {
             ))
             .with_resource(id)
             .create(),
-            // Adapter-only (in-process) batch-register disposition — never
-            // reaches a REST handler. Carries `parent_type_id` / `dependent_id`
-            // losslessly so the SDK projects it back to
-            // `TypesRegistryError::ParentNotRegistered`: dependent → resource,
-            // parent → violation subject, message → violation description.
+            // Legacy parent refusal: dependent → resource, parent → violation subject.
             DomainError::ParentTypeSchemaNotRegistered {
                 parent_type_id,
                 dependent_id,
@@ -132,42 +128,14 @@ impl From<DomainError> for CanonicalError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The database-backed path (T7–T9)
-// ---------------------------------------------------------------------------
-//
-// Every refusal below becomes an RFC-9457 problem through the canonical-error
-// ladder — never a raw status tuple. One arm per `AcceptanceError` variant, so a
-// new refusal reason cannot reach the wire as an opaque 500 by omission.
-//
-// # The wire detail is written here, not taken from `Display`
-//
-// Each wire `detail` is composed from the variant's own fields rather than from its
-// `Display` — the pattern every other gear here follows, and what DE1302 enforces.
-// `CanonicalError` is a terminal RFC-9457 document with no `source()` slot, so
-// piping `Display` into it would fuse two messages with different audiences: the
-// `#[error(...)]` text is for operators reading logs and names internals
-// (`limits.batch_candidates`, `allow_compatibility_force`), while `detail` is a
-// public API string. Fused, a reworded log line silently changes the wire contract.
-// Infrastructure failures likewise log the cause and answer with a generic detail,
-// because a rendered `DbErr` can carry a table name, a constraint name or SQL.
-//
-// **One arm renders, on purpose.** `PolicyRefused` calls `refusal.to_string()`:
-// `PolicyRefusal` is not an error being converted but a value whose whole content
-// is the region and the parameter an operator has to edit, and the
-// `failed_precondition` constructor locks the wire `detail`, so that content
-// survives only in the violation's description. It carries no internals to leak.
-// The reasoning is repeated at that arm.
+// Construct public error details from variant fields. Error `Display` messages
+// target operator logs and may contain internal configuration or database details.
+// Infrastructure failures are logged and returned with an opaque detail.
 
 /// What the caller is told when the failure is ours.
 const OPAQUE_INTERNAL: &str = "An internal error occurred. Please retry later.";
 
-/// Log the cause where it happened, answer with [`OPAQUE_INTERNAL`].
-///
-/// A function rather than a `tracing::error!` inline in each arm: every macro
-/// expansion adds branches, and three matches full of them trip
-/// `clippy::cognitive_complexity` without making anything clearer. `at` names the
-/// step, which is what an operator greps for.
+/// Log the cause with its processing step and return [`OPAQUE_INTERNAL`].
 fn opaque_internal(cause: &dyn std::fmt::Display, at: &'static str) -> CanonicalError {
     tracing::error!(error = %cause, at, "types_registry could not complete a request");
     CanonicalError::internal(OPAQUE_INTERNAL).create()
@@ -195,10 +163,7 @@ impl From<ServiceError> for CanonicalError {
             ServiceError::CorruptDocument(detail) => {
                 opaque_internal(&detail, "stored document parse")
             }
-            // The three read-surface envelope refusals (T22a). Each names the
-            // request field the caller has to change, and each states the bound
-            // rather than the configuration key holding it — as
-            // `AcceptanceError::BatchTooLarge` does, and for the same reason.
+            // Report the request field and its bound without exposing configuration keys.
             ServiceError::BatchReadOutOfRange { count } => invalid_field(
                 field::ITEMS_FIELD,
                 format!(

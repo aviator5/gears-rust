@@ -1,22 +1,14 @@
-//! In-memory fixture for both contracts (`test-util`): the test double for code that uses the
-//! types registry.
+//! In-memory test client for both registry contracts (`test-util`).
 //!
-//! **State.** [`MockTypesRegistry::seed`], [`Seed`] and [`MockTypesRegistry::seed_inventory`]
-//! store entities. Registrations and deletions change them as the real client does: equal content
-//! is unchanged, writes advance versions, dry runs decide against a discarded copy, an
-//! Idempotency-Key replays its operation.
+//! Seed entities with [`MockTypesRegistry::seed`], [`Seed`] or
+//! [`MockTypesRegistry::seed_inventory`]. Mutations advance versions, dry runs discard
+//! changes, and idempotency keys replay operations. Type Schema materializations are
+//! resolved by `gts-rust`; tombstones retain them, and unresolvable document reads fail.
 //!
-//! **Documents.** A Type Schema's `resolved_schema`, `effective_traits` and
-//! `effective_traits_schema` are resolved by `gts-rust` from the stored Type Schemas, as admission
-//! does. A tombstone keeps the documents it had when deleted. Instances have none. A read that
-//! selects the documents of a type that does not resolve fails with `internal`.
-//!
-//! **Behaviour.** [`Fault`] rules fail or delay calls. [`MockTypesRegistry::reject`] and
-//! [`MockTypesRegistry::depends_on`] decide admission. [`MockTypesRegistry::strict`] turns an
-//! unexpected call into a panic. [`ProtocolFault`] breaks responses for the SDK's protocol tests.
-//!
-//! **Inspection.** [`MockTypesRegistry::calls`], [`MockTypesRegistry::reads`],
-//! [`MockTypesRegistry::registered`], [`MockTypesRegistry::submissions`].
+//! Use [`Fault`] for delays and errors, [`MockTypesRegistry::reject`] and
+//! [`MockTypesRegistry::depends_on`] for admission rules, and [`ProtocolFault`] for
+//! malformed responses. [`MockTypesRegistry::strict`] panics on unexpected calls.
+//! Inspect calls and writes through the client's recording methods.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hasher};
@@ -47,7 +39,7 @@ use crate::reason::aborted;
 
 pub mod conformance;
 
-// ---- configuration ----------------------------------------------------------------------------
+// configuration.
 
 /// A contract method, for [`Fault`] selectors, [`MockTypesRegistry::calls`] and strict mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -234,7 +226,7 @@ impl Seed {
     }
 }
 
-// ---- state ------------------------------------------------------------------------------------
+// state.
 
 /// A Type Schema's resolved documents, or why it does not resolve.
 type Resolution = Result<Documents, String>;
@@ -520,7 +512,7 @@ impl MockTypesRegistry {
     }
 }
 
-// ---- calls ------------------------------------------------------------------------------------
+// calls.
 
 impl MockTypesRegistry {
     /// Records the call, enforces strict mode, and applies the first admitting rule: its delay,
@@ -837,7 +829,7 @@ fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
     }
 }
 
-// ---- documents and reads ----------------------------------------------------------------------
+// documents and reads.
 
 /// Resolves Type Schemas with a `gts-rust` store over every stored Type Schema. The store and the
 /// resolutions are kept until a Type Schema's content changes ([`Self::invalidate`]).

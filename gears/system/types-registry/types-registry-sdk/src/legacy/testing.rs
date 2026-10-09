@@ -1,16 +1,8 @@
-//! Test utilities for [`TypesRegistryClient`] consumers.
+//! Legacy [`TypesRegistryClient`] test support (`test-util`).
 //!
-//! [`MockTypesRegistryClient`] is a hand-rolled, stateful mock backend: pre-populate
-//! it with [`with_type_schemas`](MockTypesRegistryClient::with_type_schemas) /
-//! [`with_instances`](MockTypesRegistryClient::with_instances), hand it to the code
-//! under test as `Arc<dyn TypesRegistryClient>`, and let it answer `get_*` /
-//! `list_*` calls against the in-memory data.
-//!
-//! Helper builders [`make_test_type_schema`] and [`make_test_instance`]
-//! produce minimal valid values for tests where the schema / instance content
-//! is not the focus of the assertion.
-//!
-//! Available with the `test-util` cargo feature.
+//! Seed [`MockTypesRegistryClient`] with its builders and pass it as
+//! `Arc<dyn TypesRegistryClient>`. [`make_test_type_schema`] and [`make_test_instance`]
+//! build fixtures with synthetic Type Schema chains.
 
 // Test infrastructure: `expect`/`unwrap` are appropriate for synthetic-data
 // builders and lock-poisoning paths inside a mock that is only used in tests.
@@ -33,12 +25,7 @@ use crate::field;
 use crate::gts::TypeResource;
 use gts::{GtsId, GtsInstanceId};
 
-/// Builds the `InvalidArgument` canonical error the registry returns for a
-/// malformed / kind-mismatched GTS id (reason [`field::INVALID_GTS_ID`]),
-/// matching the real client's classification.
-///
-/// Exposed so consumer test fakes that implement [`TypesRegistryClient`] can
-/// synthesize the same canonical envelopes the real client emits.
+/// Canonical identifier validation error for consumer test clients.
 #[must_use]
 pub fn invalid_gts_id(message: impl Into<String>) -> CanonicalError {
     TypeResource::invalid_argument()
@@ -46,10 +33,7 @@ pub fn invalid_gts_id(message: impl Into<String>) -> CanonicalError {
         .create()
 }
 
-/// Builds the `NotFound` canonical error the registry returns for an
-/// unregistered id / UUID, tagged with the types-registry resource type.
-///
-/// Exposed for consumer test fakes (see [`invalid_gts_id`]).
+/// Canonical entity `NotFound` error for consumer test clients.
 #[must_use]
 pub fn not_found(id: impl Into<String>) -> CanonicalError {
     let id = id.into();
@@ -58,29 +42,15 @@ pub fn not_found(id: impl Into<String>) -> CanonicalError {
         .create()
 }
 
-/// Builds the opaque `Internal` canonical error the registry returns for an
-/// infrastructure failure.
-///
-/// Exposed for consumer test fakes (see [`invalid_gts_id`]).
+/// Opaque canonical `Internal` error for consumer test clients.
 #[must_use]
 pub fn internal(message: impl Into<String>) -> CanonicalError {
     CanonicalError::internal(message).create()
 }
 
-/// Stateful in-memory implementation of [`TypesRegistryClient`] for tests.
-///
-/// The mock is read-mostly: build it with the builder methods, then hand to
-/// the code under test. `register_*` methods are **not implemented** —
-/// calling any of them with a non-empty input panics. Pre-populate via
-/// [`with_type_schemas`](Self::with_type_schemas) /
-/// [`with_instances`](Self::with_instances) builders instead. Empty-input
-/// `register_*` calls return an empty result vector to keep the trait
-/// shape consistent for tests that pass `vec![]` defensively.
-///
-/// `list_*` methods return all stored entries verbatim and ignore the
-/// query (callers wanting filtered results should pre-filter what they
-/// put in); the query passed in is captured for assertions via
-/// [`received_instance_queries`](Self::received_instance_queries).
+/// In-memory legacy client seeded with [`Self::with_type_schemas`] and
+/// [`Self::with_instances`]. Non-empty registration calls panic; empty ones return
+/// an empty result. List calls ignore filters and record queries for assertions.
 #[derive(Default)]
 pub struct MockTypesRegistryClient {
     type_schemas: Vec<GtsTypeSchema>,
@@ -316,22 +286,12 @@ impl TypesRegistryClient for MockTypesRegistryClient {
     }
 }
 
-/// Builds a synthetic [`GtsTypeSchema`] with the given `type_id` and an empty
-/// JSON Schema body. Convenient for tests that need a `GtsTypeSchema` value
-/// but don't care about the schema content.
-///
-/// For derived ids, the parent chain is built recursively by emitting one
-/// synthetic schema per chain hop (root → ... → leaf). Chain-aware methods
-/// like [`GtsTypeSchema::ancestors`] / [`GtsTypeSchema::effective_schema`]
-/// therefore observe a complete chain matching `type_id`. Each synthetic
-/// schema along the chain carries an empty body, so semantic content from
-/// real schemas is not modelled — tests that rely on parent-body details
-/// must construct the chain manually.
+/// Builds a Type Schema with empty bodies throughout its synthetic parent chain.
+/// Construct the chain manually when tests depend on parent content.
 ///
 /// # Panics
 ///
-/// Panics if `type_id` is not a valid GTS type-schema identifier (must end
-/// with `~` and parse as a full GTS id).
+/// If `type_id` is not a valid GTS Type Schema identifier.
 #[must_use]
 pub fn make_test_type_schema(type_id: &str) -> GtsTypeSchema {
     let parent = GtsTypeSchema::derive_parent_type_id(type_id)
@@ -340,18 +300,11 @@ pub fn make_test_type_schema(type_id: &str) -> GtsTypeSchema {
         .expect("synthetic type-schema is valid")
 }
 
-/// Builds a synthetic [`GtsInstance`] with the given content body, attached
-/// to a synthetic type-schema chain matching the instance id's prefix.
-///
-/// The instance's `id` must contain at least one `~`. The prefix (everything
-/// up to and including the last `~`) is used as the parent type-schema's
-/// `type_id`, and the full chain leading up to it is built via
-/// [`make_test_type_schema`].
+/// Builds an Instance with the given content and a synthetic Type Schema chain.
 ///
 /// # Panics
 ///
-/// Panics if `gts_id` doesn't contain a `~` (no chain prefix) or doesn't
-/// parse as a valid GTS identifier.
+/// If `gts_id` is invalid or lacks a Type Schema prefix.
 #[must_use]
 pub fn make_test_instance(gts_id: &str, content: Value) -> GtsInstance {
     let type_id = GtsInstance::derive_type_id(gts_id)

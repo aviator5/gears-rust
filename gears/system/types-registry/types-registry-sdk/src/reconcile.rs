@@ -1,8 +1,7 @@
-//! Reconcile explicit desired documents; no inventory discovery or deletion (SPEC §10.1).
-//! Read unsettled content, settle active matches, submit differences with observed preconditions.
-//! Transport retries reuse key/request; new passes re-read and use new keys (ADR-0012).
+//! Reconcile explicit documents by reading current content and submitting differences.
+//! Transport retries reuse the key and request; new passes re-read and use new keys.
 //! Dependencies, conflicts and call refusals stay pending; item refusals are terminal.
-//! Until T45, equal content cannot confirm a newer publisher version (D18).
+//! Matching content does not confirm the stored publisher version.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -286,7 +285,7 @@ fn validate<'d>(
     let mut outcomes = BTreeMap::new();
     let mut conflicting = Vec::new();
     for (raw, content) in desired {
-        // Require canonical spelling (SPEC §8.1): try_new trims, which would change response keys.
+        // Require canonical spelling: try_new trims, which would change response keys.
         let parsed = GtsId::try_new(raw)
             .map_err(|e| e.to_string())
             .and_then(|id| {
@@ -587,7 +586,7 @@ fn retryable(error: &CanonicalError) -> bool {
     )
 }
 
-/// The outcome policy, keyed by the exact reason (SPEC §10.1).
+/// Classify candidate outcomes by admission-failure reason.
 fn classify(status: CandidateStatus, error: Option<CanonicalError>) -> ReconcileOutcome {
     match status {
         CandidateStatus::Succeeded | CandidateStatus::Unchanged => ReconcileOutcome::Admitted,
@@ -611,8 +610,7 @@ fn classify(status: CandidateStatus, error: Option<CanonicalError>) -> Reconcile
                 | Reason::MissingPredecessor => {
                     ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(error))
                 }
-                // Revalidation exhaustion is contention with concurrent writers, not a verdict
-                // on the document (SPEC §8.4): the next pass re-reads and resubmits.
+                // Contention with concurrent writers: re-read and resubmit next pass.
                 Reason::AlreadyExists | Reason::PreconditionFailed | Reason::RevalidationExhausted => {
                     ReconcileOutcome::Pending(ReconcilePendingCause::Conflict(error))
                 }

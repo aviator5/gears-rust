@@ -1,21 +1,8 @@
-//! Tests for the [`TypesRegistryError`](super::TypesRegistryError) projection.
-//!
-//! Two suites:
-//!
-//! * `wire_vocabulary_round_trip` — pins every wire-string constant the
-//!   projection introduces ([`crate::field`], [`crate::precondition`],
-//!   [`crate::reason`], [`crate::gts`], [`crate::item_failure`]) to its `Problem`
-//!   JSON path. A drift between an SDK constant
-//!   and the wire trips here.
-//! * `projection_tests` — exercises `From<CanonicalError>`, verifying each
-//!   canonical category lands on the expected typed variant and that unmodeled
-//!   categories preserve the canonical in `Other`.
+//! Tests for typed error projection and canonical wire vocabulary.
 
 use super::TypesRegistryError;
 
-// ─────────────────────────────────────────────────────────────────────
 // Wire-vocabulary round-trip
-// ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod wire_vocabulary_round_trip {
@@ -33,7 +20,6 @@ mod wire_vocabulary_round_trip {
 
     #[test]
     fn gts_resource_type_round_trips_to_context_resource_type() {
-        // Also pins the SDK `TypeResource` marker literal == the const.
         let err = TypeResource::not_found("x").with_resource("x").create();
         let json = problem(err);
         assert_eq!(
@@ -308,9 +294,7 @@ mod wire_vocabulary_round_trip {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
 // Projection: From<CanonicalError> for TypesRegistryError
-// ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod projection_tests {

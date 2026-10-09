@@ -138,7 +138,7 @@ async fn the_fake_conforms_to_the_contract() {
     super::conformance::run(&MockTypesRegistry::new()).await;
 }
 
-// ---- seeds and documents ----------------------------------------------------------------------
+// seeds and documents.
 
 #[tokio::test]
 async fn seeded_types_resolve_their_documents_in_any_order() {
@@ -241,7 +241,7 @@ async fn seed_inventory_stores_the_linked_declarations() {
     assert!(matches!(lookup, EntityLookup::Found { .. }), "{lookup:?}");
 }
 
-// ---- faults -----------------------------------------------------------------------------------
+// faults.
 
 #[tokio::test]
 async fn every_matching_rule_counts_a_call_and_the_first_admitting_one_applies() {
@@ -328,7 +328,7 @@ fn a_key_rule_on_a_method_without_keys_is_refused() {
     MockTypesRegistry::new().inject(Fault::on(Call::List).key(key(TOY)));
 }
 
-// ---- admission --------------------------------------------------------------------------------
+// admission.
 
 #[tokio::test]
 async fn admission_rejects_and_waits_on_dependencies_as_told() {
@@ -361,7 +361,7 @@ async fn admission_rejects_and_waits_on_dependencies_as_told() {
     assert_eq!(items[0].status, CandidateStatus::Succeeded);
 }
 
-// ---- strict mode ------------------------------------------------------------------------------
+// strict mode.
 
 #[tokio::test]
 #[should_panic(expected = "unexpected BatchGet call")]
@@ -393,7 +393,7 @@ async fn strict_mode_answers_stored_and_expected_absent_keys() {
     assert!(matches!(answers[1], EntityLookup::NotFound));
 }
 
-// ---- inspection and wiring --------------------------------------------------------------------
+// inspection and wiring.
 
 #[tokio::test]
 async fn reads_and_registrations_are_recorded_in_order() {

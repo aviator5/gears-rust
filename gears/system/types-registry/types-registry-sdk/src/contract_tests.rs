@@ -94,7 +94,7 @@ async fn an_implementation_registered_in_the_client_hub_answers_through_the_trai
     ));
 }
 
-// ---- the tenant contract ------------------------------------------------------
+// the tenant contract.
 
 #[test]
 fn the_tenant_contract_descriptor_names_the_types_registry_v1_api() {

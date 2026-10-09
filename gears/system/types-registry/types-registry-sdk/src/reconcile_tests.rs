@@ -842,7 +842,7 @@ async fn the_pause_between_passes_is_capped_and_an_oversized_initial_one_clamped
     assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
 }
 
-// ---- cancellation -----------------------------------------------------------
+// cancellation.
 
 /// A reconciliation the test can cancel, with a pause between passes long enough to land in.
 fn spawn_cancellable(
@@ -916,7 +916,7 @@ async fn cancelling_the_pause_between_passes_ends_reconciliation_without_another
     assert_eq!(fake.calls(Call::BatchGet), reads, "nor its read");
 }
 
-// ---- exactly one outcome per candidate --------------------------------------
+// exactly one outcome per candidate.
 
 mod cover {
     use gts::GtsId;

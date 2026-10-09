@@ -1,11 +1,4 @@
-//! Unit tests for the public model types in `models.rs`
-//! ([`GtsTypeSchema`], [`GtsInstance`], [`RegisterResult`], etc.).
-//!
-//! Kept in a sibling `_tests.rs` file per the `de1101_tests_in_separate_files`
-//! repo lint. Linked into `models.rs` via
-//! `#[path = "models_tests.rs"] mod tests;`, so `super::*` pulls every
-//! item declared at the top of `models.rs` (`GtsTypeSchema`, `GtsInstance`,
-//! `RegisterResult`, etc.) into scope.
+//! Tests for legacy entity models and registration results.
 
 #![allow(clippy::needless_pass_by_value)]
 
@@ -14,10 +7,7 @@ use serde_json::json;
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
 
-/// `try_new` now returns `CanonicalError`; the legacy `is_invalid_gts_*`
-/// predicates are gone. The kind distinction collapsed at the canonical
-/// boundary (ADR 0005), so both former variants are one `InvalidArgument`
-/// with reason `INVALID_GTS_ID`.
+/// Matches canonical identifier validation errors for either entity kind.
 fn is_invalid_gts_id(err: &CanonicalError) -> bool {
     matches!(
         err,

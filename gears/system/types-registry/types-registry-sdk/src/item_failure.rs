@@ -1,9 +1,9 @@
-//! Reversible `CanonicalError` item failures (DESIGN §3.3).
+//! Reversible `CanonicalError` item failures.
 //! `FailedPrecondition` violation 0 carries reason/key/message; later violations carry
 //! `context.<name>`/value/empty description. Unknown reasons and context round-trip unchanged.
 //!
 //! [`reason`] defines codes used in storage, errors and metrics;
-//! [`AdmissionFailureReason`] provides typed dispatch (ADR 0005 rule 4).
+//! [`AdmissionFailureReason`] provides typed dispatch.
 
 use std::collections::BTreeMap;
 
@@ -119,10 +119,7 @@ impl std::fmt::Display for DependencyKind {
     }
 }
 
-/// A candidate refusal, or a code preserved from another service version.
-///
-/// Typed view of [`reason`]. Exhaustive on purpose: [`Self::Unknown`] carries any code this
-/// build does not know, so a newer registry never breaks an older consumer.
+/// Typed view of [`reason`]; [`Self::Unknown`] preserves unrecognized codes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmissionFailureReason {
     ActivationWriteSetExceeded,
@@ -139,12 +136,12 @@ pub enum AdmissionFailureReason {
     /// `compare_documents` returned `Unknown`, distinct from an incompatible verdict.
     CompatibilityUndecidable,
     /// A new base, conforming type or schema reference names a tombstone;
-    /// deletion removes an entity from the valid targets (PRD §5).
+    /// deletion removes an entity from the valid targets.
     DependencyDeleted,
     /// A required base, conforming type or schema reference is absent.
     DependencyNotFound,
     DependentInvalid,
-    /// The declared dialect differs from the major's pinned dialect (ADR-0014).
+    /// The declared dialect differs from the major's pinned dialect.
     DialectChanged,
     EntityDeleted,
     FamilyKindConflict,
@@ -152,32 +149,30 @@ pub enum AdmissionFailureReason {
     /// The refusal reports how many; never which ones.
     HasRegisteredDependents,
     FamilyShapeConflict,
-    /// `Valid(baseline) ⊆ Valid(candidate)` does not hold (ADR-0003).
+    /// `Valid(baseline) ⊆ Valid(candidate)` does not hold.
     IncompatibleWithBaseline,
-    /// ADR-0015: a registered Instance cannot conform to a major-0 Type Schema.
+    /// A registered Instance cannot conform to a major-0 Type Schema.
     InstanceOfMajorZero,
     InvalidDocument,
     InvalidIdentifier,
     InvalidSchema,
     InvalidValue,
     MissingPredecessor,
-    /// The deletion target is not `ACTIVE`. Distinct from
-    /// [`Self::EntityDeleted`], which says the entity a *revision* wanted is
-    /// gone: this one says the deletion has nothing left to do, and a second
-    /// attempt must never read as "retry with a newer version".
+    /// The deletion target is not active. [`Self::EntityDeleted`] instead means a
+    /// revision targeted a deleted entity.
     NotActive,
     PreconditionFailed,
-    /// Another publisher owns the entity (D18); emitted from Phase 9.
+    /// Another publisher owns the entity.
     PublisherMismatch,
     ResolutionClosureExceeded,
     ResolvedDocumentTooLarge,
     RevalidationExhausted,
-    /// ADR-0015 quarantine: a stable candidate's immediate derivation base names
+    /// A stable candidate's immediate derivation base names
     /// a major-0 entity.
     StableDerivesFromMajorZero,
-    /// ADR-0015: a stable candidate `$ref`s a major-0 entity.
+    /// A stable candidate `$ref`s a major-0 entity.
     StableRefsMajorZero,
-    /// A newer release of the same publisher owns the entity (D18); emitted from Phase 9.
+    /// A newer release of the same publisher owns the entity.
     Superseded,
     /// The system failed, not the candidate; `error_code` names the cause.
     SystemFailure,

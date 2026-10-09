@@ -1,5 +1,5 @@
 //! Wire `reason` vocabulary of types-registry canonical errors, grouped by the canonical
-//! category whose `ctx.reason` carries it (ADR 0005 rule 4).
+//! category whose `ctx.reason` carries it.
 //!
 //! Field-violation reasons live in [`crate::field`], precondition `type`s in
 //! [`crate::precondition`], and an item's admission reason in [`crate::item_failure`].
@@ -9,7 +9,7 @@ pub mod aborted {
     use core::fmt;
 
     /// A mutation was accepted, but reading its operation back failed. `resource_name` is the
-    /// operation UUID; retrying with the same idempotency key replays it (SPEC D19).
+    /// operation UUID; retrying with the same idempotency key replays it.
     pub const OPERATION_READ_FAILED: &str = "OPERATION_READ_FAILED";
 
     /// Typed view of an `Aborted` reason.

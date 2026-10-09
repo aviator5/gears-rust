@@ -1,5 +1,5 @@
-//! Serde-free P0 models (SPEC §10.1, DESIGN §3.3); REST DTOs are separate.
-//! Flat documents avoid parent graphs (P5); ownership, availability and federation are P1.
+//! Transport-independent requests, operations and entity snapshots.
+//! REST DTOs are defined separately.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -16,7 +16,7 @@ use uuid::Uuid;
 /// One authored or materialized JSON document.
 pub type JsonDocument = serde_json::Value;
 
-// ---- keys and selection -----------------------------------------------------
+// keys and selection.
 
 /// How a caller names one entity: its GTS identifier or its Registry Reference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -58,7 +58,7 @@ impl fmt::Display for EntityKey {
     }
 }
 
-/// Opaque freshness token (SPEC §8.5), compared by equality and never recomputed here.
+/// Opaque freshness token, compared by equality and never recomputed here.
 /// REST strips RFC 9110 entity-tag quotes on receipt and restores them on send;
 /// all clients expose the same token bytes.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -102,7 +102,7 @@ impl From<EntityKey> for BatchGetItem {
     }
 }
 
-/// Batch-read key ceiling (SPEC C10); larger reads are split.
+/// Batch-read key ceiling; larger reads are split.
 pub const MAX_BATCH_GET_KEYS: usize = 100;
 
 /// A batch read: every key answered under one projection.
@@ -110,11 +110,11 @@ pub const MAX_BATCH_GET_KEYS: usize = 100;
 pub struct BatchGetEntitiesRequest {
     pub items: Vec<BatchGetItem>,
     pub projection: Projection,
-    /// Bypass cache freshness and revalidate (§8.3, T36); transports ignore this SDK-only flag.
+    /// Bypass cache freshness and revalidate; transports ignore this SDK-only flag.
     pub fresh: bool,
 }
 
-/// A selectable or mandatory entity field (SPEC §10.2).
+/// A selectable or mandatory entity field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntityField {
     GtsId,
@@ -239,13 +239,13 @@ impl PartialEq for Projection {
 
 impl Eq for Projection {}
 
-// ---- results ----------------------------------------------------------------
+// results.
 
 /// Every key's answer, keyed by the key as asked.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
-/// Per-key answer; P0 has no federation failure. Future variants require a fallback arm.
+/// Per-key read result; match future variants with a fallback arm.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum EntityLookup {
@@ -400,7 +400,7 @@ impl EntityKind {
     }
 }
 
-/// Entity origin; P0 supports Managed only. External origins will require fallback matches.
+/// Entity origin; match future variants with a fallback arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Origin {
@@ -418,7 +418,7 @@ pub enum LifecycleStatus {
     Deleted,
 }
 
-/// How the current revision was admitted; the sole selectable group (SPEC §10.2).
+/// How the current revision was admitted; selected as one group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
     pub gts_spec_version: String,
@@ -427,7 +427,7 @@ pub struct Provenance {
     pub compat_forced: Option<bool>,
 }
 
-// ---- discovery --------------------------------------------------------------
+// discovery.
 
 /// Discovery restrictions; absent fields are unrestricted, except lifecycle defaults to Active.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -479,16 +479,16 @@ pub struct ListEntitiesRequest {
     pub page: PageRequest,
 }
 
-/// One bounded page; `next` is absent on the last one (D12).
+/// One bounded page; `next` is absent on the last one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListEntitiesResponse {
     pub items: Vec<Entity>,
     pub next: Option<Cursor>,
 }
 
-// ---- write path -------------------------------------------------------------
+// write path.
 
-/// Mutation replay key for one identical request (ADR-0012); changed requests need a new key.
+/// Mutation replay key for one identical request; changed requests need a new key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(String);
 
@@ -542,7 +542,7 @@ impl IdempotencyKey {
 }
 
 /// Publisher `SemVer` precedence: prereleases count; build metadata affects display only.
-/// Length is bounded by [`Self::MAX_LEN`]. Use the publishing crate’s `CARGO_PKG_VERSION` (D18).
+/// Length is bounded by [`Self::MAX_LEN`]. Use the publishing crate’s `CARGO_PKG_VERSION`.
 #[derive(Debug, Clone)]
 pub struct PublisherVersion(semver::Version);
 
@@ -631,14 +631,14 @@ impl Hash for PublisherVersion {
     }
 }
 
-/// Publishing gear and its own `CARGO_PKG_VERSION` (SPEC D18); shared helpers only forward it.
+/// Publishing gear and its own `CARGO_PKG_VERSION`; shared helpers only forward it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PublisherContext {
     pub name: String,
     pub version: PublisherVersion,
 }
 
-/// Required request-level publisher/version (D18); adapters send it from T44.
+/// Required publisher identity and version for a mutation request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegisterEntitiesRequest {
     pub items: Vec<RegisterItem>,
@@ -650,12 +650,12 @@ pub struct RegisterEntitiesRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegisterItem {
     /// Instance identity may be absent from its document; Type Schema `$id` must be
-    /// `gts://<gts_id>` (SPEC §8.1 step 5).
+    /// `gts://<gts_id>`.
     pub gts_id: GtsId,
     pub content: JsonDocument,
     /// `Some(v)`: must still be at `v`. `None`: must not exist.
     pub expected_resource_version: Option<u64>,
-    /// Per-item ADR-0004 cross-minor waiver.
+    /// Skip the cross-minor compatibility check for this item.
     pub force: bool,
 }
 
@@ -673,7 +673,7 @@ pub struct DeleteItem {
     pub expected_resource_version: u64,
 }
 
-/// An operation as read back from the registry, never as built from a receipt (D19).
+/// Operation state read back from the registry after acceptance.
 #[derive(Debug, Clone)]
 pub enum Operation {
     Registration(RegistrationOperation),

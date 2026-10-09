@@ -135,7 +135,7 @@ fn generated_keys_are_valid_and_distinct() {
     assert!(IdempotencyKey::new(a.as_str()).is_ok());
 }
 
-// ---- kind-narrowed read models -------------------------------------------------
+// kind-narrowed read models.
 
 mod narrowed {
     use gts::{GtsId, GtsInstanceId, GtsTypeId};
@@ -218,9 +218,9 @@ mod narrowed {
     }
 }
 
-// ---- publisher version ----------------------------------------------------------
+// publisher version.
 
-/// Publisher version precedence (SPEC D18).
+/// Publisher version precedence.
 mod publisher_version {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

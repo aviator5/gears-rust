@@ -1,5 +1,4 @@
-//! Helpers over both contracts (SPEC §10.1), outside contract IR. Blanket
-//! implementations make the methods available by importing the extension trait.
+//! Read and reconciliation helpers, available by importing the extension trait.
 //!
 //! # Which one a client uses
 //!
@@ -57,7 +56,7 @@ pub const MAX_LIST_PAGES: usize = 1_000;
 /// them, including this trait's own `DeadlineExceeded` and `Cancelled`.
 #[async_trait]
 pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
-    /// Reconcile `desired` under `options` (SPEC §10.1): create absent identifiers and
+    /// Reconcile `desired` under `options`: create absent identifiers and
     /// update differing content. Safe on every start; omitted identifiers are never deleted.
     ///
     /// [`Reconciliation::UpToDate`] means all documents matched without submission.
@@ -241,10 +240,8 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
 
 impl<T: PlatformTypesRegistryApi + ?Sized> PlatformTypesRegistryApiExt for T {}
 
-/// Blanket-implemented read helpers over [`TypesRegistryApi`]: the read helpers of
-/// [`PlatformTypesRegistryApiExt`], with the same local kind narrowing, batching and
-/// document selection, under a tenant's [`SecurityContext`]. Both traits run one
-/// implementation; a tenant has no mutation helper.
+/// Read helpers over [`TypesRegistryApi`], with the same batching, projection and
+/// kind checks as [`PlatformTypesRegistryApiExt`], under a tenant's [`SecurityContext`].
 #[async_trait]
 pub trait TypesRegistryApiExt: TypesRegistryApi {
     /// As [`PlatformTypesRegistryApiExt::get_type_schema`].
@@ -388,8 +385,7 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
 
 impl<T: TypesRegistryApi + ?Sized> TypesRegistryApiExt for T {}
 
-/// The two reads every helper composes, bound to one contract and its context, so one
-/// implementation of the helpers serves both extension traits.
+/// Shared read interface bound to a contract and security context.
 #[async_trait]
 trait EntityReads: Sync {
     async fn batch_get(
@@ -469,8 +465,7 @@ async fn get_many_by_id<R: EntityReads + ?Sized, K: AsRef<str> + Clone + Eq + Ha
     ids: &[K],
     projection: Projection,
 ) -> Result<HashMap<K, Option<T>>, CanonicalError> {
-    // Checked before any read: a typed id built unchecked is the caller's bug, and the
-    // whole call is refused rather than answered around it.
+    // Validate all identifiers before issuing any read.
     let keys = ids
         .iter()
         .map(|id| {
@@ -660,9 +655,7 @@ impl Kinded for Instance {
     const KIND: EntityKind = EntityKind::Instance;
 }
 
-/// A snapshot the registry answered for a kind-narrowed read, as that kind. One that does
-/// not convert — the other kind, or inconsistent kind data — is a protocol fault, and fails
-/// the whole call.
+/// Narrow a snapshot to the requested kind; inconsistent data fails the call.
 fn narrow<T: Kinded>(snapshot: Entity) -> Result<T, CanonicalError> {
     T::try_from(snapshot).map_err(|snapshot| {
         CanonicalError::internal(format!(

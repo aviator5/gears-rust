@@ -3,52 +3,26 @@
 Spec: [`SPEC.md`](./SPEC.md)
 Task list: [`todo.md`](./todo.md)
 
-> **Location note.** These planning artifacts live with the gear they describe, in
-> `gears/system/types-registry/docs/p0/`, not in a repository-root `tasks/`. This is
-> deliberate: the monorepo holds many gears, and a shared root `tasks/` would collide
-> across concurrent work. Downstream commands that default to `tasks/todo.md` — including
-> `/agent-skills:build` — must be pointed at `gears/system/types-registry/docs/p0/todo.md`.
+> **Location note.** These planning artifacts live with the gear they describe, in `gears/system/types-registry/docs/p0/`, not in a repository-root `tasks/`. This is deliberate: the monorepo holds many gears, and a shared root `tasks/` would collide across concurrent work. Downstream commands that default to `tasks/todo.md` — including `/agent-skills:build` — must be pointed at `gears/system/types-registry/docs/p0/todo.md`.
 
 ## Overview
 
-Make Types Registry durable: entities move from a process-local `gts-rust` store into the
-platform database, admission becomes an asynchronous operation-based protocol, effective
-artifacts are materialized, and a new SDK trait replaces the old one outright. Types Registry
-runs in its own process in production, so the new trait is a toolkit contract served in
-process and over a hand-written REST client, and each gear publishes its own GTS declarations
-after wiring. Registry-side inventory pull ends once every gear does (P22, superseding P18's
-deferral).
+Make Types Registry durable: entities move from a process-local `gts-rust` store into the platform database, admission becomes an asynchronous operation-based protocol, effective artifacts are materialized, and a new SDK trait replaces the old one outright. Types Registry runs in its own process in production, so the new trait is a toolkit contract served in process and over a hand-written REST client, and each gear publishes its own GTS declarations after wiring. Registry-side inventory pull ends once every gear does (P22, superseding P18's deferral).
 
-Global entities only — no tenant ownership, no PDP, no federation. `PlatformSecurityContext`
-is in the contract and every route authenticates its caller; authorization and a platform
-listener remain P1 (P22).
+Global entities only — no tenant ownership, no PDP, no federation. `PlatformSecurityContext` is in the contract and every route authenticates its caller; authorization and a platform listener remain P1 (P22).
 
-**Coordination state, stated once for the whole plan.** `types_registry__coordination_state`
-exists — it is created and seeded by this P0's second migration. Only its
-`entity_write_order` row is seeded and used in P0: the serialization point every commit
-that writes entity state advances as its first statement (historical decision P15). `source_claim` is
-not created in P0. The `routing` state row — the future routing generation — arrives with
-federation, seeded by that phase's own migration alongside `source_claim`. A standalone
-`routing_config` table is never created, in P0 or any later phase.
+**Coordination state, stated once for the whole plan.** `types_registry__coordination_state` exists — it is created and seeded by this P0's second migration. Only its `entity_write_order` row is seeded and used in P0: the serialization point every commit that writes entity state advances as its first statement (historical decision P15). `source_claim` is not created in P0. The `routing` state row — the future routing generation — arrives with federation, seeded by that phase's own migration alongside `source_claim`. A standalone `routing_config` table is never created, in P0 or any later phase.
 
 `limits.resolved_document` and `limits.resolution_closure` are enforced during admission
 and dependent refresh. Both must be positive. Closure accounting is per document over the
 candidate overlay; the resolved-size budget applies to the canonical bytes of each effective
 artifact. Exceeding either refuses the candidate without committing partial state.
 
-The executable list uses sequential task IDs **T1–T45**. T1–T30 are complete;
-**T31–T45 are the 15 remaining tasks**. Task status, acceptance criteria and
-recorded evidence are preserved; task references are synchronized with this numbering.
-The next task is T31 (database seeding and local ClientHub handoff), followed by
-T32 (full local Account Management/IdP/TR migration).
+The executable list uses sequential task IDs **T1–T45**. T1–T30 are complete; **T31–T45 are the 15 remaining tasks**. Task status, acceptance criteria and recorded evidence are preserved; task references are synchronized with this numbering. The next task is T31 (database seeding and local ClientHub handoff), followed by T32 (full local Account Management/IdP/TR migration).
 
 ## Decisions and task numbering
 
-References to P1–P31 in this plan,
-the spec and the task list name those historical decisions; their task numbers
-are local to the journal. The graph, index, checkpoints, risks and execution
-queue below use only current task IDs. There are no separate merged or removed
-tasks in the executable list. Checkpoint IDs (0–9, 7A and 8A) stay unchanged.
+References to P1–P31 in this plan, the spec and the task list name those historical decisions; their task numbers are local to the journal. The graph, index, checkpoints, risks and execution queue below use only current task IDs. There are no separate merged or removed tasks in the executable list. Checkpoint IDs (0–9, 7A and 8A) stay unchanged.
 
 ## Dependency graph
 
@@ -258,26 +232,13 @@ exists. From T7 onward the graph is vertical.
 
 ## Checkpoints
 
-Each phase/handoff checkpoint is a human review gate. Do not proceed past a failing
-one. Checkpoints 0–9, 7A and 8A retain the full applicable phase gate, including
-workspace `make dylint` (P13) and, from T41/Checkpoint 8A on, `make e2e-am-remote`
-inside `make ci`; Checkpoint 0 keeps T1's documented exception.
+Each phase/handoff checkpoint is a human review gate. Do not proceed past a failing one. Checkpoints 0–9, 7A and 8A retain the full applicable phase gate, including workspace `make dylint` (P13) and, from T41/Checkpoint 8A on, `make e2e-am-remote` inside `make ci`; Checkpoint 0 keeps T1's documented exception.
 
 **Checkpoint 0** — `make ci` green; every declared GTS identifier still admits under
 0.12.0; every difference in generated schema documents accounted for. This gate protects
 other gears, so it is reviewed before any registry code is written.
 
-**Checkpoint 1** — a fixture Type Schema registers over REST, the operation reaches
-`completed`, the entity and its resolved artifacts are readable, and both survive a process
-restart. **The new surface is additive (T10, P12): v1 is intact, `make e2e-local` is green and no
-e2e file was edited.** An Instance registers against a Type Schema committed by an earlier
-operation, and a derived Type Schema admits against a committed base with the `dependency` table
-empty (T11, P13). Consumers are untouched: the old trait is still served from its existing in-memory
-repository, while the new path reads from the database and holds no store between admissions
-(P6). The plain gear tests are green on SQLite,
-`make test-types-registry-db` is green on PostgreSQL and MySQL, and `make dylint` is re-run
-after T10 and T11 — the recorded run covers T1–T9 only (P13). This checkpoint proves the
-architecture.
+**Checkpoint 1** — a fixture Type Schema registers over REST, the operation reaches `completed`, the entity and its resolved artifacts are readable, and both survive a process restart. **The new surface is additive (T10, P12): v1 is intact, `make e2e-local` is green and no e2e file was edited.** An Instance registers against a Type Schema committed by an earlier operation, and a derived Type Schema admits against a committed base with the `dependency` table empty (T11, P13). Consumers are untouched: the old trait is still served from its existing in-memory repository, while the new path reads from the database and holds no store between admissions (P6). The plain gear tests are green on SQLite, `make test-types-registry-db` is green on PostgreSQL and MySQL, and `make dylint` is re-run after T10 and T11 — the recorded run covers T1–T9 only (P13). This checkpoint proves the architecture.
 
 **Checkpoint 2** — equal content reports `unchanged` without a revision;
 a stale `expected_resource_version` fails `precondition_failed`; family shape and contiguity
@@ -293,75 +254,19 @@ and a forced waiver are each distinguishable in the metrics, and admission reaso
 compile-enforced vocabulary** (P16) — quarantine and dialect refusals included, none of them
 collapsed into `invalid_schema`.
 
-**Checkpoint 5** — a batch with a failing dependency commits independent branches and
-blocks everything downstream of it; a circular `$ref` is refused; deletion safety holds.
-**No series blends a dry run with a commit or a deletion with a registration, and blocked
-candidates are counted per reason** (P16). Registration and both deletion routes support
-dry run on `/v2/`, with mutation OpenAPI and quickstart examples (T22). All three routes,
-in committed and dry-run mode, reach terminal outcomes through the outbox without a direct
-worker call (T23): operation/outcome records persist, while a dry run changes no entity state,
-revision or resource version. `make e2e-local` stays green with no e2e file edited.
+**Checkpoint 5** — a batch with a failing dependency commits independent branches and blocks everything downstream of it; a circular `$ref` is refused; deletion safety holds. **No series blends a dry run with a commit or a deletion with a registration, and blocked candidates are counted per reason** (P16). Registration and both deletion routes support dry run on `/v2/`, with mutation OpenAPI and quickstart examples (T22). All three routes, in committed and dry-run mode, reach terminal outcomes through the outbox without a direct worker call (T23): operation/outcome records persist, while a dry run changes no entity state, revision or resource version. `make e2e-local` stays green with no e2e file edited.
 
-**Checkpoint 6** — the P0 REST contract is complete on `/v2/` (P21). **All seven v2 routes are complete** (T22, T24, T25, T26, P17/P19/P20):
-`batchGet` returns explicit per-key results; discovery is bounded and content-free by default, filters in SQL before the page limit, and its cursor
-traverses an unchanged matching set exactly once under one `pattern`/`depth`/`kind` filter and
-normalized `$select`, and all three reads
-project the requested fields. **Conditional reads work** (T27): an exact read carries a
-per-request validator and honours `If-None-Match` with a `304` that carries its `ETag`, and
-`batchGet` reports `unchanged` per key with its `etag`. OpenAPI covers every route and
-`QUICKSTART.md` covers reads and mutations. Gear tests, `make lychee` and unchanged
-`make e2e-local` pass; nothing has been cut over yet, and the new SDK trait is not written yet.
+**Checkpoint 6** — the P0 REST contract is complete on `/v2/` (P21). **All seven v2 routes are complete** (T22, T24, T25, T26, P17/P19/P20): `batchGet` returns explicit per-key results; discovery is bounded and content-free by default, filters in SQL before the page limit, and its cursor traverses an unchanged matching set exactly once under one `pattern`/`depth`/`kind` filter and normalized `$select`, and all three reads project the requested fields. **Conditional reads work** (T27): an exact read carries a per-request validator and honours `If-None-Match` with a `304` that carries its `ETag`, and `batchGet` reports `unchanged` per key with its `etag`. OpenAPI covers every route and `QUICKSTART.md` covers reads and mutations. Gear tests, `make lychee` and unchanged `make e2e-local` pass; nothing has been cut over yet, and the new SDK trait is not written yet.
 
-**Checkpoint 7A** — T31's seed/local ClientHub path and T32's complete real
-AM application pass, and both SDKs pass real TCP/resolving/auth contracts.
-T36's cache and T37's generic lifecycle/supervision/readiness contracts hold.
-The handoff promises local AM and those SDK contracts, not complete process-level
-cold-start/recovery behavior. That application proof belongs to T41/Checkpoint
-8A. Full CI/backend/local e2e gates and human review remain; no pilot target exists.
+**Checkpoint 7A** — T31's seed/local ClientHub path and T32's complete real AM application pass, and both SDKs pass real TCP/resolving/auth contracts. T36's cache and T37's generic lifecycle/supervision/readiness contracts hold. The handoff promises local AM and those SDK contracts, not complete process-level cold-start/recovery behavior. That application proof belongs to T41/Checkpoint 8A. Full CI/backend/local e2e gates and human review remain; no pilot target exists.
 
-**Checkpoint 7** — every gear is on the new SDK and the database (P23, C′, P26).
-`PlatformTypesRegistryApi` and its helpers work through the real local client, carrying T27's
-validators; both adapters return operations read through `get_operation`, never a synthesized
-receipt (T29, D19). The platform REST client passes its contract test on
-`/types-registry/platform/v1/` and the tenant client on `/types-registry/v1/`; platform routes
-serve a validated internal token only, tenant reads a validated bearer only (T34, T35, T38,
-P25). Linked inventory and `cfg.entities` seed through the outbox, a second start reports
-`unchanged`, and no registration T38's audit listed is refused by immediate validation.
-`TypesRegistryClient`, ready mode, the in-memory repository and the old v1 routes are gone;
-reads are cached with the late-fill guard by T36 and throughout T38; T32's
-earlier local handoff is explicitly uncached. One REST
-version remains, and the e2e suites pass on the `202` contract (T38). Gear tests on three
-backends, `make ci`, `make e2e-local`, `make e2e-docker`, `make dylint`.
+**Checkpoint 7** — every gear is on the new SDK and the database (P23, C′, P26). `PlatformTypesRegistryApi` and its helpers work through the real local client, carrying T27's validators; both adapters return operations read through `get_operation`, never a synthesized receipt (T29, D19). The platform REST client passes its contract test on `/types-registry/platform/v1/` and the tenant client on `/types-registry/v1/`; platform routes serve a validated internal token only, tenant reads a validated bearer only (T34, T35, T38, P25). Linked inventory and `cfg.entities` seed through the outbox, a second start reports `unchanged`, and no registration T38's audit listed is refused by immediate validation. `TypesRegistryClient`, ready mode, the in-memory repository and the old v1 routes are gone; reads are cached with the late-fill guard by T36 and throughout T38; T32's earlier local handoff is explicitly uncached. One REST version remains, and the e2e suites pass on the `202` contract (T38). Gear tests on three backends, `make ci`, `make e2e-local`, `make e2e-docker`, `make dylint`.
 
-**Checkpoint 8A** — real Account Management and static-idp-plugin publish after wiring,
-bootstrap an Active root and pass authenticated child-tenant create/read, in the embedded host
-and with the registry in another process, using the production authenticator (T41). Both
-start orders, delayed prerequisites, configuration changes and restarts converge. Root-binding
-drift is fatal; a refused root type or a type-invalid request is refused without failing boot;
-readiness covers publication plus bootstrap; RG's init-only, no-REST boundary stays intact.
-Embedded AM e2e is green before the remaining fleet migrates in T42.
+**Checkpoint 8A** — real Account Management and static-idp-plugin publish after wiring, bootstrap an Active root and pass authenticated child-tenant create/read, in the embedded host and with the registry in another process, using the production authenticator (T41). Both start orders, delayed prerequisites, configuration changes and restarts converge. Root-binding drift is fatal; a refused root type or a type-invalid request is refused without failing boot; readiness covers publication plus bootstrap; RG's init-only, no-REST boundary stays intact. Embedded AM e2e is green before the remaining fleet migrates in T42.
 
-**Checkpoint 8** — out-of-process operation (P23). Per-crate collectors, the `gts(…)`
-attribute, `post_wiring`, `Required` readiness and supervised publication are in toolkit; the
-plugin selector caches no incomplete selection (T37, T39, T40). Every declaring gear publishes
-its own crates after wiring and gates its readiness on them; no registry call remains in any
-`init()`, and no startup phase fails on an unpublished or unreachable registry (T41/T42). No
-process-global GTS inventory remains; the registry seeds inline only its own types, the base
-types and the `cfg.entities` whose dependencies lie within that set, and the rest publish after
-wiring; the coverage test is green (T40, T42). With types-registry in its own process and two
-replicas, a gear in another process publishes, becomes ready and reads through the same trait
-(T43). Ceiling C11 still applies.
+**Checkpoint 8** — out-of-process operation (P23). Per-crate collectors, the `gts(…)` attribute, `post_wiring`, `Required` readiness and supervised publication are in toolkit; the plugin selector caches no incomplete selection (T37, T39, T40). Every declaring gear publishes its own crates after wiring and gates its readiness on them; no registry call remains in any `init()`, and no startup phase fails on an unpublished or unreachable registry (T41/T42). No process-global GTS inventory remains; the registry seeds inline only its own types, the base types and the `cfg.entities` whose dependencies lie within that set, and the rest publish after wiring; the coverage test is green (T40, T42). With types-registry in its own process and two replicas, a gear in another process publishes, becomes ready and reads through the same trait (T43). Ceiling C11 still applies.
 
-**Checkpoint 9** — the publisher-version guard is active (P23). Lower versions are
-`superseded` before the precondition and before any pre-commit refusal, delayed old operations
-do not overwrite newer commits, partial admission converges per entity, a higher version with
-identical content moves no `resource_version`, validator or `updated_at`, and another
-publisher name is `publisher_mismatch` (T44, SPEC §13). Every writer submits with the actual
-publisher's context and a mutation without one is refused (T45); rows written before the
-migration were claimed by their first publication; 0.1 → 0.2 → restart 0.1 keeps the newer
-content and stamp and 0.1 is ready with a warning (T45). **One REST version: no `/v2/` path
-survives (T38, P12).** All 20 success criteria of SPEC §16; `make ci`,
-`make test-types-registry-db`, `make e2e-local`, the out-of-process run and `make dylint` green.
+**Checkpoint 9** — the publisher-version guard is active (P23). Lower versions are `superseded` before the precondition and before any pre-commit refusal, delayed old operations do not overwrite newer commits, partial admission converges per entity, a higher version with identical content moves no `resource_version`, validator or `updated_at`, and another publisher name is `publisher_mismatch` (T44, SPEC §13). Every writer submits with the actual publisher's context and a mutation without one is refused (T45); rows written before the migration were claimed by their first publication; 0.1 → 0.2 → restart 0.1 keeps the newer content and stamp and 0.1 is ready with a warning (T45). **One REST version: no `/v2/` path survives (T38, P12).** All 20 success criteria of SPEC §16; `make ci`, `make test-types-registry-db`, `make e2e-local`, the out-of-process run and `make dylint` green.
 
 ## Risks and mitigations
 
@@ -409,17 +314,10 @@ survives (T38, P12).** All 20 success criteria of SPEC §16; `make ci`,
 
 ## Sequence
 
-**Accepted queue (P32): sequential, in numeric order.** Completed phases retain
-their status and evidence; the next implementation task is **T31**.
+**Accepted queue (P32): sequential, in numeric order.** Completed phases retain their status and evidence; the next implementation task is **T31**.
 
-1. Phase 7: T31 → T32 → T33 → T34 → T35 → T36 → T37 (Checkpoint 7A) → T38
-   (Checkpoint 7). T29/T30 are complete; T33 remains its own toolkit pull request.
+1. Phase 7: T31 → T32 → T33 → T34 → T35 → T36 → T37 (Checkpoint 7A) → T38 (Checkpoint 7). T29/T30 are complete; T33 remains its own toolkit pull request.
 2. Phase 8: T39 → T40 → T41 (Checkpoint 8A) → T42 → T43 (Checkpoint 8).
 3. Phase 9: T44 → T45 (Checkpoint 9).
 
-Each task lands as the commits it lists; every commit clears the standing bar, and each
-checkpoint runs the full gate including the real AM remote target from T41 onward. T34 and T35 move routes and e2e callers
-together, so e2e stays green through Checkpoint 7A. T38's audit commit precedes its cutover
-commits, and the cutover merges as one change: the legacy trait is deleted in it. Legacy removal, tenant path promotion and caller migration now merge together in T38; no red window is accepted. T41/T42 follow T38's audited prerequisite
-order; T42's final commit ends the pull. T41, T43 and T45 reuse the real AM process venue rather than
-creating parallel pilot applications or cold-start harnesses.
+Each task lands as the commits it lists; every commit clears the standing bar, and each checkpoint runs the full gate including the real AM remote target from T41 onward. T34 and T35 move routes and e2e callers together, so e2e stays green through Checkpoint 7A. T38's audit commit precedes its cutover commits, and the cutover merges as one change: the legacy trait is deleted in it. Legacy removal, tenant path promotion and caller migration now merge together in T38; no red window is accepted. T41/T42 follow T38's audited prerequisite order; T42's final commit ends the pull. T41, T43 and T45 reuse the real AM process venue rather than creating parallel pilot applications or cold-start harnesses.

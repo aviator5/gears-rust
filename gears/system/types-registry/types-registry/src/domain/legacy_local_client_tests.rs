@@ -1,9 +1,4 @@
 //! Unit tests for [`TypesRegistryLocalClient`](super::TypesRegistryLocalClient).
-//!
-//! Kept in a sibling `_tests.rs` file per the `de1101_tests_in_separate_files`
-//! repo lint. Linked into `legacy_local_client.rs` via
-//! `#[path = "legacy_local_client_tests.rs"] mod tests;`, so the module sees
-//! `legacy_local_client.rs` as `super`.
 
 use super::*;
 use crate::infra::InMemoryGtsRepository;

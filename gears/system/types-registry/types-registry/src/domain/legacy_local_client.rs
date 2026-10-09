@@ -27,12 +27,7 @@ use crate::domain::model::{GtsEntity, ListQuery};
 use crate::domain::service::TypesRegistryService;
 use crate::infra::cache::{CacheConfig, InMemoryCache, InstanceCache, TypeSchemaCache};
 
-/// Build the canonical `InvalidArgument` error this adapter emits for a
-/// malformed / kind-mismatched GTS id, routed through the single
-/// `From<DomainError> for CanonicalError` ladder (field `gts_id`, reason
-/// `INVALID_GTS_ID`). The type-schema-vs-instance distinction the legacy SDK
-/// error carried collapses here per ADR 0005 — the canonical boundary
-/// classifies both kinds identically.
+/// Canonical identifier validation error for either entity kind.
 fn invalid_gts_id_err(message: impl Into<String>) -> CanonicalError {
     CanonicalError::from(DomainError::invalid_gts_id(message))
 }

@@ -1,8 +1,4 @@
-//! `TypesRegistryClient` trait definition.
-//!
-//! This trait defines the public API for the `types-registry` gear.
-//! GTS type-schemas and instances are global resources, so no security context
-//! is required.
+//! Legacy registry client for global GTS entities; calls require no security context.
 
 use std::collections::HashMap;
 
@@ -12,35 +8,13 @@ use uuid::Uuid;
 
 use super::models::{GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery};
 
-/// Public API trait for the `types-registry` gear.
+/// Legacy registry client, resolved through `ClientHub` as `dyn TypesRegistryClient`.
 ///
-/// This trait can be consumed by other gears via `ClientHub`:
-/// ```ignore
-/// let client = hub.get::<dyn TypesRegistryClient>()?;
-/// let schema = client.get_type_schema(gts_id!("acme.core.events.user.v1~")).await?;
-/// ```
-///
-/// GTS type-schemas and instances are global resources (not tenant-scoped),
-/// so no security context is required for these operations.
-///
-/// # Error envelope
-///
-/// Per [ADR 0005][adr] every fallible method returns
-/// `Result<_, CanonicalError>`, and every per-item `Result` returned inside a
-/// map or [`RegisterResult`] carries `CanonicalError` too. The single
-/// authoritative AIP-193 ladder (`From<DomainError> for CanonicalError`) lives
-/// in the impl crate's `api::rest::error`; this trait surfaces that envelope
-/// unchanged. Consumers may propagate it, or opt into the typed
-/// [`TypesRegistryError`](crate::TypesRegistryError) projection
-/// (`From<CanonicalError>`) for flat dispatch — see its gear docs for the
-/// dispatch table and the three integration patterns.
-///
-/// [adr]: https://github.com/constructorfabric/gears-rust/blob/main/docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md
+/// Calls require no security context. Method and item failures carry [`CanonicalError`];
+/// convert to [`crate::TypesRegistryError`] for typed matching.
 #[async_trait]
 pub trait TypesRegistryClient: Send + Sync {
-    // ------------------------------------------------------------------
     // Generic batch register (kind detected from gts_id suffix per item).
-    // ------------------------------------------------------------------
 
     /// Register GTS entities (type-schemas or instances) in batch.
     ///
@@ -62,9 +36,7 @@ pub trait TypesRegistryClient: Send + Sync {
         entities: Vec<serde_json::Value>,
     ) -> Result<Vec<RegisterResult>, CanonicalError>;
 
-    // ------------------------------------------------------------------
     // Type-schema operations (internal — no tenant scoping).
-    // ------------------------------------------------------------------
 
     /// Register GTS type-schemas in batch.
     ///
@@ -134,9 +106,7 @@ pub trait TypesRegistryClient: Send + Sync {
         query: TypeSchemaQuery,
     ) -> Result<Vec<GtsTypeSchema>, CanonicalError>;
 
-    // ------------------------------------------------------------------
     // Instance operations (internal — no tenant scoping).
-    // ------------------------------------------------------------------
 
     /// Register GTS instances in batch.
     ///

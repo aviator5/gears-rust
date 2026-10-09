@@ -1,8 +1,5 @@
-//! Contract checks every [`PlatformTypesRegistryApi`] passes (`test-util`). The SDK runs them
-//! against [`super::MockTypesRegistry`] and the registry against its local client, so the fake
-//! cannot drift from the real contract unnoticed.
-//!
-//! [`run`] takes a fresh, empty client and seeds it through the contract only.
+//! Shared contract checks for [`super::MockTypesRegistry`] and the registry's local client.
+//! [`run`] requires a fresh, empty client and seeds it through the contract.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU8;
@@ -64,7 +61,7 @@ pub async fn run(client: &dyn PlatformTypesRegistryApi) {
     c.an_idempotency_key_binds_one_request().await;
 }
 
-// ---- fixtures ---------------------------------------------------------------------------------
+// fixtures.
 
 fn uri(gts_id: &str) -> String {
     format!("gts://{gts_id}")
@@ -215,7 +212,7 @@ fn found(lookup: EntityLookup) -> (Entity, Validator) {
     }
 }
 
-// ---- the client -------------------------------------------------------------------------------
+// the client.
 
 struct Checker<'a> {
     client: &'a dyn PlatformTypesRegistryApi,
@@ -395,7 +392,7 @@ impl Checker<'_> {
             .collect()
     }
 
-    // ---- checks -------------------------------------------------------------------------------
+    // checks.
 
     async fn documents_resolve_through_the_chain(&self) {
         self.register(vec![create(BASE, root(BASE, Some(base_traits())))])

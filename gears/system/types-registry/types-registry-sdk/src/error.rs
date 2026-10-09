@@ -1,111 +1,14 @@
-//! Types Registry SDK error surface — typed projection of [`CanonicalError`].
+//! Typed view of [`CanonicalError`] for Types Registry consumers.
 //!
-//! # Opt-in convenience, not the contract
+//! API contracts and operation-item failures return `CanonicalError`. Convert with
+//! [`TypesRegistryError::from`] for typed matching; unrecognized categories and shapes
+//! remain intact in [`TypesRegistryError::Other`]. Item failures decode through
+//! [`AdmissionFailure::from_canonical`].
 //!
-//! [ADR 0005][adr] requires [`CanonicalError`] at API trait boundaries (including
-//! [`PlatformTypesRegistryApi`]) and in item failures. [`TypesRegistryError`] is an
-//! opt-in typed view; adding a variant does not change the contract.
-//! The implementation's `api::error` ladder owns
-//! AIP-193 classification; this projection only decodes its result.
-//!
-//! The conversion is infallible (`From<CanonicalError>`). Anything types-registry does
-//! not emit, or emits in a shape this build does not recognize, falls through to
-//! [`TypesRegistryError::Other`], which preserves the full [`CanonicalError`].
-//!
-//! # What types-registry emits — consumer dispatch reference
-//!
-//! | Disposition | Match arm | HTTP |
-//! |---|---|---|
-//! | invalid GTS id / query / `$select` / request field (inspect [`FieldIssue::reason`]) | [`TypesRegistryError::Validation`] | 400 |
-//! | entity missing (`resource_type` = [`crate::gts::TYPE_RESOURCE_TYPE`]) | [`TypesRegistryError::NotFound`] | 404 |
-//! | operation missing (`resource_type` = [`crate::gts::OPERATION_RESOURCE_TYPE`]) | [`TypesRegistryError::NotFound`] | 404 |
-//! | `Idempotency-Key` bound to another request (operation resource type) | [`TypesRegistryError::AlreadyExists`] | 409 |
-//! | one item of an operation refused (inspect [`AdmissionFailure::reason`]) | [`TypesRegistryError::Admission`] | — (operation item) |
-//! | a registration policy refused the candidate | [`TypesRegistryError::PolicyRefused`] | 400 |
-//! | accepted, but the operation could not be read back — replay the same key (SPEC D19) | [`TypesRegistryError::ReadBackFailed`] | — (client) |
-//! | a reconciliation submit or poll ran out of time | [`TypesRegistryError::DeadlineExceeded`] | — (client) |
-//! | the caller cancelled | [`TypesRegistryError::Cancelled`] | — (client) |
-//! | registry not available | [`TypesRegistryError::Unavailable`] | 503 |
-//! | internal failure | [`TypesRegistryError::Internal`] | 500 |
-//! | legacy: entity already registered | [`TypesRegistryError::AlreadyExists`] | 409 |
-//! | legacy: batch register, required parent type-schema absent | [`TypesRegistryError::ParentNotRegistered`] | — (in-process) |
-//! | anything else (forward-compat) | [`TypesRegistryError::Other`] | — |
-//!
-//! Legacy rows belong to [`TypesRegistryClient`], which T38 deletes together with them.
-//!
-//! Resource-scoped variants ([`TypesRegistryError::NotFound`] /
-//! [`TypesRegistryError::AlreadyExists`]) carry `resource_type`; decode it with
-//! [`crate::gts::Resource::from_wire`]. Type Schemas and Instances share the same
-//! error classification; the called method and identifier suffix distinguish them.
-//!
-//! `FailedPrecondition` carries three distinct shapes, each with its own decoder:
-//! [`TypesRegistryError::ParentNotRegistered`] (legacy,
-//! [`precondition::PARENT_NOT_REGISTERED`](crate::precondition::PARENT_NOT_REGISTERED)),
-//! [`TypesRegistryError::PolicyRefused`]
-//! ([`precondition::REGISTRATION_POLICY_PREFIX`](crate::precondition::REGISTRATION_POLICY_PREFIX))
-//! and [`TypesRegistryError::Admission`] ([`AdmissionFailure::from_canonical`]). None
-//! accepts another's shape; a malformed one lands in `Other`.
-//!
-//! # Refusals from the `ToolKit` layer
-//!
-//! `ToolKit` extractors can refuse a request before registry dispatch. Their codes
-//! become [`TypesRegistryError::Validation`] with [`ValidationReason::Unknown`].
-//! Match on `field` and `reason`: this projection omits HTTP status and resource type.
-//!
-//! | `field` | `reason` | HTTP | when |
-//! |---|---|---|---|
-//! | `body` | `json_syntax_error` | 400 | the body is not JSON |
-//! | `body` | `invalid_json_body` | 422 | the JSON does not fit the request type, e.g. an `expected_resource_version` above `i64::MAX` |
-//! | `body` | `missing_json_content_type` | 415 | no JSON `Content-Type` |
-//! | `body` | `json_body_read_error` | 413 and others | the body could not be read, e.g. over the size limit |
-//! | `query` | `INVALID_QUERY_PARAMS` | 400 | a discovery parameter of the wrong type, e.g. `limit=abc` |
-//! | `query` | `invalid_query_string` | 400 | a deletion parameter of the wrong type |
-//! | `path` | `invalid_path_params` | 400 | a path segment that is not UTF-8, or an operation id that is not a UUID |
-//!
-//! `INVALID_SELECT` comes from either layer and is typed. A missing or rejected
-//! credential is `Unauthenticated` and lands in [`TypesRegistryError::Other`]. A response
-//! the router makes itself, such as `405` for a wrong method, is a `Problem` with no
-//! canonical type: `TryFrom<Problem> for CanonicalError` refuses it, so it never reaches
-//! this projection.
-//!
-//! # Consumer integration — three patterns
-//!
-//! **Pattern 1 — pure propagation (no projection):**
-//!
-//! ```ignore
-//! let page = registry.list_entities(&ctx, request).await?; // ? propagates CanonicalError
-//! ```
-//!
-//! **Pattern 2 — explicit projection at the call site:**
-//!
-//! ```ignore
-//! use types_registry_sdk::TypesRegistryError;
-//!
-//! match registry.register_entities(&ctx, key.clone(), request).await.map_err(TypesRegistryError::from) {
-//!     Err(TypesRegistryError::ReadBackFailed { .. }) => /* replay with the same key */,
-//!     Err(TypesRegistryError::Unavailable { .. }) => /* retry later */,
-//!     _ => /* … */,
-//! }
-//! ```
-//!
-//! **Pattern 3 — transparent chaining via `From<CanonicalError> for OwnError`:**
-//!
-//! ```ignore
-//! impl From<CanonicalError> for OwnConsumerError {
-//!     fn from(err: CanonicalError) -> Self {
-//!         TypesRegistryError::from(err).into() // route through the typed view
-//!     }
-//! }
-//! // then every call site stays plain `?`.
-//! ```
-//!
-//! Out-of-process consumers reconstruct the canonical error from the wire via
-//! `TryFrom<Problem> for CanonicalError` first, then project:
-//! `Problem JSON → Problem → CanonicalError → TypesRegistryError`.
-//!
-//! [`PlatformTypesRegistryApi`]: crate::PlatformTypesRegistryApi
-//! [`TypesRegistryClient`]: crate::TypesRegistryClient
-//! [adr]: https://github.com/constructorfabric/gears-rust/blob/main/docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md
+//! Resource-scoped errors carry `resource_type`; decode it with [`Resource::from_wire`].
+//! Extractor validation codes that the registry does not model become
+//! [`ValidationReason::Unknown`]. Out-of-process callers first reconstruct
+//! `CanonicalError` from `Problem`, then apply this projection.
 
 use thiserror::Error;
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
@@ -117,12 +20,7 @@ use crate::item_failure::AdmissionFailure;
 use crate::precondition::{PARENT_NOT_REGISTERED, PolicyParameter};
 use crate::reason::aborted::AbortReason;
 
-/// A single field-violation projected from a canonical
-/// `InvalidArgument.field_violations[]` entry.
-///
-/// `reason` is the typed [`ValidationReason`] discriminator consumers dispatch
-/// on; `field` is the raw attribution identifier (not a discriminator);
-/// `description` is the human-readable message.
+/// A canonical `InvalidArgument.field_violations[]` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldIssue {
     /// The request field the violation is attributed to (e.g.
@@ -134,32 +32,19 @@ pub struct FieldIssue {
     pub description: String,
 }
 
-/// Typed projection of [`CanonicalError`] for Types Registry consumers.
-///
-/// The impl crate's `From<DomainError> for CanonicalError` is the single
-/// authoritative AIP-193 mapping; this enum is a forward-compatible, flat view
-/// over the categories types-registry emits, plus the mandatory catch-all
-/// [`Self::Other`]. See the [gear docs](self) for the dispatch table and
-/// consumer patterns.
+/// Typed projection of [`CanonicalError`]; [`Self::Other`] preserves unrecognized errors.
 #[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum TypesRegistryError {
-    /// Request-shape validation failure (invalid GTS id, query, or entity
-    /// content). Each [`FieldIssue`] carries a typed
-    /// [`ValidationReason`]; types-registry
-    /// emits exactly one issue per error today, but the `Vec` mirrors the
-    /// canonical `field_violations` carrier.
+    /// Request validation failure with typed field-violation reasons.
     #[error("validation failed: {} issue(s)", issues.len())]
     Validation {
         /// The projected field violations.
         issues: Vec<FieldIssue>,
     },
 
-    /// No type-schema or instance is registered under the requested id / UUID,
-    /// or no admission operation has the requested id. `resource_type` is the
-    /// canonical GTS type — [`crate::gts::TYPE_RESOURCE_TYPE`] for an entity,
-    /// [`crate::gts::OPERATION_RESOURCE_TYPE`] for an operation; `name` is the
-    /// raw identifier the caller supplied.
+    /// The entity or operation does not exist. `resource_type` identifies its kind;
+    /// `name` is the requested identifier or UUID.
     #[error("not found [{resource_type}]: {name}")]
     NotFound {
         resource_type: String,
@@ -167,10 +52,9 @@ pub enum TypesRegistryError {
         detail: String,
     },
 
-    /// An entity with the same GTS id already exists (duplicate-on-register,
-    /// [`crate::gts::TYPE_RESOURCE_TYPE`]), or an `Idempotency-Key` is already
-    /// bound to another request ([`crate::gts::OPERATION_RESOURCE_TYPE`], `name`
-    /// is that operation's UUID).
+    /// An entity already exists, or an `Idempotency-Key` is bound to another request.
+    /// For key conflicts, `resource_type` is [`crate::gts::OPERATION_RESOURCE_TYPE`]
+    /// and `name` is the operation UUID.
     #[error("already exists [{resource_type}]: {name}")]
     AlreadyExists {
         resource_type: String,
@@ -178,11 +62,8 @@ pub enum TypesRegistryError {
         detail: String,
     },
 
-    /// Batch register: an entity could not be registered because its required
-    /// parent type-schema is not yet registered. Register `parent_type_id`
-    /// first, then retry `dependent_id`. Reconstructed losslessly from a
-    /// `FailedPrecondition` whose `violations[].type` is
-    /// [`precondition::PARENT_NOT_REGISTERED`](crate::precondition::PARENT_NOT_REGISTERED).
+    /// Legacy batch registration failed because its required parent Type Schema is absent.
+    /// Register `parent_type_id`, then retry `dependent_id`.
     #[error(
         "cannot register {dependent_id}: required type-schema {parent_type_id} is not registered"
     )]
@@ -211,7 +92,7 @@ pub enum TypesRegistryError {
     },
 
     /// The mutation was accepted as `operation_id`, but reading it back failed.
-    /// Retrying with the same idempotency key replays it (SPEC D19).
+    /// Retrying with the same idempotency key replays it.
     #[error("operation {operation_id} was accepted but not read back: {detail}")]
     ReadBackFailed { operation_id: Uuid, detail: String },
 
@@ -236,21 +117,10 @@ pub enum TypesRegistryError {
     #[error("internal error: {detail}")]
     Internal { detail: String },
 
-    /// Catch-all for canonical categories types-registry does not model —
-    /// preserves the full [`CanonicalError`] so consumers stay
-    /// forward-compatible if the impl crate ever emits a new category.
+    /// Unrecognized category or shape, preserving the full [`CanonicalError`].
     #[error("[{}] {}", canonical.gts_type(), canonical.detail())]
     Other { canonical: CanonicalError },
 }
-
-// ─────────────────────────────────────────────────────────────────────
-// CanonicalError → TypesRegistryError projection.
-//
-// The typed sub-enum (`field::ValidationReason`) lives next to its wire-string
-// constants in `crate::field`; the precondition `type` discriminator stays a
-// plain const in `crate::precondition`. This file owns only the top-level enum
-// and the dispatch from `CanonicalError`.
-// ─────────────────────────────────────────────────────────────────────
 
 impl From<CanonicalError> for TypesRegistryError {
     fn from(err: CanonicalError) -> Self {
@@ -261,20 +131,13 @@ impl From<CanonicalError> for TypesRegistryError {
         {
             return projected;
         }
-        // Borrow the canonical detail before consuming `err`; the borrow ends
-        // here so each arm below can move its fields out (no clones).
         let detail = err.detail().to_owned();
         match err {
             CanonicalError::InvalidArgument { ctx, .. } => Self::Validation {
                 issues: project_field_issues(ctx),
             },
 
-            // A modeled `NotFound`/`AlreadyExists` always carries its
-            // `resource_type` (callers dispatch on it via `TYPE_RESOURCE_TYPE`).
-            // A canonical envelope missing that metadata is malformed for our
-            // purposes — fall through to `Other` (the `_` arm) so the empty
-            // string never masquerades as a typed resource type, and the full
-            // `CanonicalError` is preserved for inspection.
+            // Missing resource metadata falls through to `Other`.
             CanonicalError::NotFound {
                 resource_type: Some(resource_type),
                 resource_name,
@@ -295,12 +158,8 @@ impl From<CanonicalError> for TypesRegistryError {
                 detail,
             },
 
-            // The only `FailedPrecondition` types-registry emits is
-            // parent-type-schema-not-registered, discriminated by the
-            // `PARENT_NOT_REGISTERED` violation type. The dependent id rides in
-            // `resource_name`; the parent id and message ride in that violation
-            // (`subject` / `description`). Any other precondition shape is
-            // unmodeled and falls through to `Other` (the `_` arm below).
+            // Parent refusals use the dependent id as `resource_name` and the parent id
+            // as the violation subject. Other shapes fall through to `Other`.
             CanonicalError::FailedPrecondition {
                 ctx, resource_name, ..
             } if ctx
@@ -319,8 +178,7 @@ impl From<CanonicalError> for TypesRegistryError {
                         dependent_id,
                         detail: v.description,
                     },
-                    // Unreachable: the guard guaranteed a matching violation.
-                    // Kept total rather than panicking.
+                    // The guard guarantees a match; retain a total, non-panicking fallback.
                     None => Self::ParentNotRegistered {
                         parent_type_id: String::new(),
                         dependent_id,
@@ -419,13 +277,8 @@ fn deadline_exceeded(err: &CanonicalError) -> Option<TypesRegistryError> {
     })
 }
 
-/// Project a canonical `InvalidArgument` context into the typed field issues.
-///
-/// Types-registry only ever emits the `FieldViolations` shape; the `Format` /
-/// `Constraint` shapes are mapped into a single field-less issue tagged with a
-/// distinct synthetic sentinel ([`ValidationReason::Format`] /
-/// [`ValidationReason::Constraint`]) so the discriminator is unambiguous and
-/// the message is preserved, even though the impl never produces them today.
+/// Project field violations; format and constraint errors become field-less issues
+/// with distinct synthetic reasons.
 fn project_field_issues(ctx: InvalidArgument) -> Vec<FieldIssue> {
     match ctx {
         InvalidArgument::FieldViolations { field_violations } => field_violations

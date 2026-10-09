@@ -1,7 +1,4 @@
-//! Public models for the `types-registry` gear.
-//!
-//! These are transport-agnostic data structures that define the contract
-//! between the `types-registry` gear and its consumers.
+//! Legacy entity models with linked Type Schema inheritance chains.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,52 +18,22 @@ use uuid::Uuid;
 use crate::field;
 use crate::gts::TypeResource;
 
-/// Build the in-process `InvalidArgument` canonical error the client-side
-/// `try_new` constructors emit for a malformed / kind-mismatched GTS id.
-///
-/// Mirrors the impl crate's `From<DomainError> for CanonicalError` mapping of
-/// `InvalidGtsId` (field [`field::GTS_ID_FIELD`], reason
-/// [`field::INVALID_GTS_ID`]) so the in-process and REST classifications match.
-/// These constructors never cross a wire boundary (ADR 0005 "Non-Canonical
-/// Methods"); emitting `CanonicalError` keeps the SDK on a single error type
-/// end-to-end (it projects to
-/// [`TypesRegistryError::Validation`](crate::TypesRegistryError::Validation)).
+/// Validation error for a malformed or kind-mismatched GTS identifier.
 fn invalid_gts_id_error(message: impl Into<String>) -> CanonicalError {
     TypeResource::invalid_argument()
         .with_field_violation(field::GTS_ID_FIELD, message, field::INVALID_GTS_ID)
         .create()
 }
 
-/// Returns `true` if `s` is shaped like a type-schema GTS id (ends with `~`).
-///
-/// Type-schema ids and instance ids are lexically distinct in GTS: type-schema
-/// ids end with `~`, instance ids do not. Centralizing the predicate here so
-/// that callers don't sprinkle raw `ends_with('~')` checks across kind-aware
-/// code (`local_client`, mocks, etc.). Pure string predicate — does not parse
-/// or otherwise validate the id.
-///
-// TODO(#1752): drop this helper once `GtsTypeId::try_new` /
-// `GtsInstanceId::try_new` land upstream in `gts-rust`. Callers should
-// consume `&GtsTypeId` / `&GtsInstanceId` directly and the kind invariant
-// becomes a type-system property instead of a runtime predicate.
+/// Checks the Type Schema suffix (`~`) without parsing or validating the identifier.
+// TODO(#1752): replace with checked `GtsTypeId` / `GtsInstanceId` constructors upstream.
 #[must_use]
 pub fn is_type_schema_id(s: &str) -> bool {
     s.ends_with('~')
 }
 
-/// A registered GTS type-schema (type definition).
-///
-/// In addition to the common fields, the schema-specific extensions
-/// `x-gts-traits-schema` and `x-gts-traits` are extracted into top-level
-/// fields, and the GTS chain parent is pre-resolved into [`Self::parent`]
-/// (Arc-shared, deduplicated by the registry's local-client cache).
-///
-/// Use [`Self::effective_schema`], [`Self::effective_properties`],
-/// [`Self::effective_required`], [`Self::effective_traits`] to inspect the schema
-/// across the inheritance chain without manual walking.
-///
-/// `x-gts-final` / `x-gts-abstract` modifiers are intentionally not surfaced
-/// here yet — support will be added later.
+/// Registered Type Schema with extracted trait values, trait schema and a shared parent.
+/// Use the `effective_*` methods to inspect inherited schema and traits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GtsTypeSchema {
     /// Deterministic UUID v5 derived from the type id.
@@ -104,31 +71,14 @@ pub struct GtsTypeSchema {
 }
 
 impl GtsTypeSchema {
-    /// Constructs a `GtsTypeSchema` from its canonical inputs.
-    ///
-    /// `type_uuid` and `segments` are derived from `type_id` via gts-rust's
-    /// canonical parser — there is only one source of truth (the id string).
-    /// `traits` / `traits_schema` / `title` are extracted from `raw_schema`.
-    /// `parent` is pre-resolved by the caller (typically the local client
-    /// via its type-schema cache); presence/absence of `parent` is enforced
-    /// against the chain shape of `type_id` — a derived id MUST carry its
-    /// parent, a root id MUST NOT — so that
-    /// [`ancestors`](Self::ancestors) / [`effective_schema`](Self::effective_schema)
-    /// always observe a complete chain. A mismatched parent (chain-prefix
-    /// disagreement) is also rejected.
+    /// Constructs a Type Schema, deriving its UUID and segments from `type_id` and
+    /// extracting traits and title from `raw_schema`. Derived types require the matching
+    /// chain parent; root types require `None`.
     ///
     /// # Errors
     ///
-    /// Returns an `InvalidArgument` [`CanonicalError`] (reason
-    /// [`field::INVALID_GTS_ID`]) in any of these cases:
-    /// - `type_id` does not end with `~` (looks like an instance id);
-    /// - `type_id` does not parse as a valid GTS identifier;
-    /// - `parent` is `Some(_)` but its `type_id` does not match the chain
-    ///   prefix derived from this `type_id`;
-    /// - `parent` is `Some(_)` but this `type_id` is a root (no chain prefix
-    ///   exists, so the schema cannot have a parent);
-    /// - `parent` is `None` but this `type_id` is derived (its chain prefix
-    ///   is non-empty, so the schema requires its parent to be passed in).
+    /// `InvalidArgument` with reason [`field::INVALID_GTS_ID`] if the identifier is
+    /// invalid, names an Instance, or disagrees with the supplied parent.
     pub fn try_new(
         type_id: GtsTypeId,
         raw_schema: Value,
@@ -505,24 +455,13 @@ pub struct GtsInstance {
 }
 
 impl GtsInstance {
-    /// Constructs a `GtsInstance` from its canonical inputs plus a
-    /// pre-resolved type-schema reference.
-    ///
-    /// `uuid` and `segments` are derived from `id` via gts-rust's canonical
-    /// parser — there is only one source of truth (the id string). `id` must
-    /// NOT end with `~` and must contain at least one `~`. The passed
-    /// `type_schema.type_id` is verified to match the chain prefix derived
-    /// from `id` (everything up to and including the last `~`) so a
-    /// mismatched type-schema can't silently mislabel the instance.
+    /// Constructs an Instance, deriving its UUID and segments from `id`.
+    /// `type_schema` must match the identifier's chain prefix.
     ///
     /// # Errors
     ///
-    /// Returns an `InvalidArgument` [`CanonicalError`] (reason
-    /// [`field::INVALID_GTS_ID`]) in any of these cases:
-    /// - `id` ends with `~` (looks like a type-schema id);
-    /// - `id` contains no `~` at all (no type-schema chain prefix);
-    /// - `id` does not parse as a valid GTS identifier;
-    /// - `type_schema.type_id` does not match the chain prefix derived from `id`.
+    /// `InvalidArgument` with reason [`field::INVALID_GTS_ID`] if `id` is invalid,
+    /// lacks a Type Schema prefix, names a Type Schema, or disagrees with `type_schema`.
     pub fn try_new(
         id: GtsInstanceId,
         object: Value,
@@ -589,14 +528,9 @@ impl GtsInstance {
     }
 }
 
-/// Result of registering a single GTS entity in a batch operation.
-///
-/// Successful registration carries only the canonical (server-normalized)
-/// GTS id of the persisted entity. Callers that need a typed view of the
-/// registered entity should follow up with [`TypesRegistryClient::get_type_schema`]
-/// / [`TypesRegistryClient::get_instance`] — keeping registration's
-/// responsibility narrow ("did it persist?") and reads' responsibility narrow
-/// ("give me the resolved typed value").
+/// Per-entity registration result. Success carries the canonical GTS id;
+/// read the entity through [`TypesRegistryClient::get_type_schema`] or
+/// [`TypesRegistryClient::get_instance`].
 #[derive(Debug, Clone)]
 pub enum RegisterResult {
     /// Successfully registered.

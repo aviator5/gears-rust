@@ -1,25 +1,8 @@
-//! The wire form of a discovery page's position (D12).
+//! Versioned discovery cursors binding a position to its query.
 //!
-//! `toolkit-odata`'s [`CursorV1`] rather than a bespoke token, because the property
-//! the page contract needs is already there: the encoding is versioned base64url and
-//! decoding **refuses** an unknown version instead of reading it as a position this
-//! build understands. A cursor that outlives a protocol change is then a `400`
-//! rather than a silently wrong page.
-//!
-//! # Domain, not transport
-//!
-//! Tokens bind the stored `gts_id` position ([`DiscoveryQuery::after`]) to its query.
-//! Adapters pass them through unchanged; the API ladder maps [`ServiceError`] refusals
-//! to canonical errors.
-//!
-//! # What the cursor binds
-//!
-//! The query it was issued for: the pattern, `depth`, `kind`, `lifecycle_status`
-//! and the canonical [`FieldSelection`]. Replaying a position under any of them
-//! changed is refused rather than spliced; an absent `$select` or
-//! `lifecycle_status` and its explicit default share one binding.
-//!
-//! [`DiscoveryQuery::after`]: crate::domain::registry_service::DiscoveryQuery::after
+//! [`CursorV1`] rejects unknown versions. The binding includes pattern, depth, kind,
+//! lifecycle status and canonical field selection; changed queries cannot resume it.
+//! Omitted filters and their explicit defaults share a binding.
 
 use std::num::NonZeroU8;
 

@@ -1,36 +1,14 @@
-//! Wire `type` vocabulary for precondition violations under
-//! [`CanonicalError::FailedPrecondition`].
+//! Canonical `FailedPrecondition` violation types.
 //!
-//! The legacy `FailedPrecondition` shape is produced by the legacy
-//! local client's batch-registration parent pre-check: an entity cannot be
-//! registered because its required parent type-schema is not yet registered.
-//! That disposition has **no `DomainError` / REST-ladder arm** — it is an
-//! adapter-only, in-process concept — so it is constructed directly on the
-//! in-process boundary and carried losslessly in canonical's typed slots:
+//! Legacy parent refusals use [`PARENT_NOT_REGISTERED`] as the violation type,
+//! the parent Type Schema id as its subject, and the dependent id as `resource_name`.
+//! The violation description carries the message.
 //!
-//! * `violations[].type` = [`PARENT_NOT_REGISTERED`] (the discriminator),
-//! * `violations[].subject` = the missing **parent** type-schema id,
-//! * `resource_name` = the **dependent** entity id that failed,
-//! * `violations[].description` = the human message.
-//!
-//! The projection ([`crate::error::TypesRegistryError::ParentNotRegistered`])
-//! reconstructs `{ parent_type_id, dependent_id }` from exactly those slots, so
-//! the structured batch-registration outcome survives the canonical round-trip.
-//! The round-trip tests in [`crate::error`] pin the constant to its `Problem`
-//! JSON path.
-//!
-//! Two other `FailedPrecondition` shapes share this envelope: a registration-policy
-//! refusal ([`REGISTRATION_POLICY_PREFIX`], typed by [`PolicyParameter`]) and an item
-//! failure ([`crate::item_failure::AdmissionFailure`]). Their decoders refuse each
-//! other's shapes.
-//!
-//! [`CanonicalError::FailedPrecondition`]: toolkit_canonical_errors::CanonicalError::FailedPrecondition
+//! Policy refusals use [`REGISTRATION_POLICY_PREFIX`] and [`PolicyParameter`];
+//! item failures use [`crate::item_failure::AdmissionFailure`]. Each decoder
+//! accepts only its own shape.
 
-/// The `violations[].type` token types-registry emits for a
-/// parent-type-schema-not-registered precondition failure.
-///
-/// It is the discriminator the projection keys on to reconstruct
-/// [`crate::error::TypesRegistryError::ParentNotRegistered`].
+/// Violation type for [`crate::TypesRegistryError::ParentNotRegistered`].
 pub const PARENT_NOT_REGISTERED: &str = "PARENT_NOT_REGISTERED";
 
 /// Prefix of the `violations[].type` of a registration-policy refusal; the rest is the

@@ -157,7 +157,7 @@ proptest::proptest! {
     }
 }
 
-// ---- the reason vocabulary (P16 rule 3) ---------------------------------------
+// Reason vocabulary.
 //
 // Exhaustive production matches require codes and labels. These tests check
 // uniqueness, round-trips, and bounded labels. [`known`] is checked against
@@ -416,7 +416,7 @@ fn t18s_quarantine_and_dialect_reasons_are_four_distinct_codes() {
     }
 }
 
-// ---- dependency_kind ----------------------------------------------------------
+// dependency_kind.
 
 const DEPENDENCY_KINDS: [(&str, DependencyKind); 3] = [
     (dependency_kind::BASE, DependencyKind::Base),

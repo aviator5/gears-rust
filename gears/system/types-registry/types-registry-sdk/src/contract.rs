@@ -1,8 +1,8 @@
-//! The two planes' contracts (SPEC §10.1, D15, D17): the platform contract with every
-//! operation, and the tenant contract with its entity reads only. Helpers live in
-//! `PlatformTypesRegistryApiExt` and `TypesRegistryApiExt`.
-//! REST attaches the process token; local contexts stay unvalidated with no principal (C2).
-//! Mutations read back accepted operations; failures name `operation_id` for same-key replay (D19).
+//! Platform and tenant Types Registry contracts.
+//!
+//! The platform contract supports all operations; the tenant contract supports entity reads.
+//! REST authenticates the process token; local contexts carry no validated principal.
+//! Mutation calls read back accepted operations; failures name the operation for same-key replay.
 
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
