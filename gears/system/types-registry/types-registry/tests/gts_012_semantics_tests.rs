@@ -180,6 +180,6 @@ fn candidate_object_levels_classify_every_level_including_partial() {
 /// Pin the release and specification whose behavior the registry tests cover.
 #[test]
 fn workspace_uses_expected_gts_release() {
-    assert_eq!(GTS_SPECIFICATION_VERSION, "0.15");
-    assert_eq!(GTS_IMPLEMENTATION_VERSION, "0.14.0");
+    assert_eq!(GTS_SPECIFICATION_VERSION, "0.16");
+    assert_eq!(GTS_IMPLEMENTATION_VERSION, "0.15.0");
 }
