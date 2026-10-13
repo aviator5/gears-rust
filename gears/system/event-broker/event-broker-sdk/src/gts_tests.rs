@@ -136,7 +136,7 @@ fn admit_event_with_subject_pattern(pattern: &str) -> Result<gts::ResolvedType, 
 }
 
 #[test]
-fn event_type_admission_accepts_concrete_and_wildcard_subject_patterns() {
+fn event_type_admission_accepts_concrete_wildcard_and_instance_subject_patterns() {
     for pattern in [
         "gts.*",
         "gts.fabrikam.shop.orders.*",
@@ -146,6 +146,7 @@ fn event_type_admission_accepts_concrete_and_wildcard_subject_patterns() {
         "gts.fabrikam.shop.orders.order.v1.2~*",
         "gts.fabrikam.shop.orders.order.v1~fabrikam.shop.orders.*",
         "gts.fabrikam.shop.orders.order.v1~fabrikam.shop.orders.special.v1~",
+        "gts.fabrikam.shop.orders.order.v1~fabrikam.shop.orders.named.v1",
     ] {
         gts::GtsIdPattern::try_new(pattern).expect("valid GTS pattern fixture");
         admit_event_with_subject_pattern(pattern)
@@ -154,14 +155,15 @@ fn event_type_admission_accepts_concrete_and_wildcard_subject_patterns() {
 }
 
 #[test]
-fn event_type_admission_rejects_malformed_or_instance_subject_patterns() {
+fn event_type_admission_rejects_malformed_subject_patterns() {
+    let too_long = format!("gts.fabrikam.shop.orders.{}.v1~", "a".repeat(1024));
     for pattern in [
         "not-gts.*",
         "gts.fabrikam.*.orders.order.v1~",
         "gts.fabrikam.shop.orders.*~*",
         "gts.fabrikam.shop.orders.ord*",
         "gts.fabrikam.shop.orders.order.v01~",
-        "gts.fabrikam.shop.orders.order.v1~fabrikam.shop.orders.named.v1",
+        &too_long,
     ] {
         assert!(
             admit_event_with_subject_pattern(pattern).is_err(),
@@ -170,12 +172,30 @@ fn event_type_admission_rejects_malformed_or_instance_subject_patterns() {
     }
 }
 
+/// Validates a subscription whose single interest selects `selector` against the
+/// committed subscription schema. Goes through `GtsStore` rather than a plain
+/// JSON Schema validator, which would ignore `x-gts-pattern-ref`.
+fn subscribe_with_selector(selector: &str) -> Result<(), gts::StoreError> {
+    let type_id = "gts.cf.core.events.subscription.v1~";
+    let mut store = gts::GtsStore::new();
+    store.register_schema(
+        type_id,
+        &committed("gts.cf.core.events.subscription.v1~.schema.json"),
+    )?;
+    let subscription = serde_json::json!({
+        "consumer_group": "gts.cf.core.events.consumer_group.v1~fabrikam.shop.orders.billing.v1",
+        "client_agent": "test/1.0",
+        "interests": [{
+            "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "types": [selector],
+        }],
+    });
+    store.validate_payload_with(type_id, &subscription, gts::GtsRefValidation::None)
+}
+
 #[test]
-fn subscription_schema_accepts_concrete_and_wildcard_event_type_selectors() {
-    let schema = committed("gts.cf.core.events.subscription.v1~.schema.json");
-    let items = &schema["definitions"]["Interest"]["properties"]["types"]["items"];
-    let standard = jsonschema::validator_for(items).expect("selector schema compiles");
-    let gts = gts::XGtsRefValidator::new();
+fn subscription_schema_accepts_concrete_wildcard_and_instance_event_type_selectors() {
     for pattern in [
         "gts.cf.core.events.event.v1~",
         "gts.cf.core.events.event.v1~*",
@@ -184,20 +204,20 @@ fn subscription_schema_accepts_concrete_and_wildcard_event_type_selectors() {
         "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v*",
         "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v1.*",
         "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v1~",
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.named.v1",
     ] {
         gts::GtsIdPattern::try_new(pattern).expect("valid GTS pattern fixture");
-        let value = serde_json::json!(pattern);
-        assert!(standard.is_valid(&value), "selector {pattern}");
-        let errors = gts.validate_instance(&value, items, "");
-        assert!(errors.is_empty(), "selector {pattern}: {errors:?}");
+        subscribe_with_selector(pattern)
+            .unwrap_or_else(|error| panic!("selector {pattern} must be accepted: {error}"));
     }
 }
 
 #[test]
 fn subscription_schema_rejects_malformed_and_non_event_type_selectors() {
-    let schema = committed("gts.cf.core.events.subscription.v1~.schema.json");
-    let items = &schema["definitions"]["Interest"]["properties"]["types"]["items"];
-    let standard = jsonschema::validator_for(items).expect("selector schema compiles");
+    let too_long = format!(
+        "gts.cf.core.events.event.v1~fabrikam.shop.orders.{}.v1~",
+        "a".repeat(1024)
+    );
     for pattern in [
         "not-gts.*",
         "gts.*",
@@ -207,10 +227,10 @@ fn subscription_schema_rejects_malformed_and_non_event_type_selectors() {
         "gts.cf.core.events.event.v1~fabrikam.shop.orders.*~*",
         "gts.cf.core.events.event.v1~fabrikam.shop.orders.plac*",
         "gts.cf.core.events.event.v1~fabrikam.shop.orders.placed.v01~",
-        "gts.cf.core.events.event.v1~fabrikam.shop.orders.named.v1",
+        &too_long,
     ] {
         assert!(
-            !standard.is_valid(&serde_json::json!(pattern)),
+            subscribe_with_selector(pattern).is_err(),
             "invalid event type selector {pattern} must be rejected"
         );
     }

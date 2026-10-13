@@ -29,25 +29,13 @@ const ASCII_PRINTABLE: &str = r"^[\x20-\x7E]+$";
 /// same either way, and an empty string is a legitimate way to say "none".
 const ASCII_PRINTABLE_OR_EMPTY: &str = r"^[\x20-\x7E]*$";
 
-// Type patterns per GTS spec §§2.3, 10: complete type segments followed by
-// either another complete type or a wildcard at a name/version/chain boundary.
-// Runtime GtsIdPattern validation remains authoritative for numeric bounds.
-const GTS_TYPE_PATTERN: &str = concat!(
-    r"^gts\.",
-    r"(([a-z_][a-z0-9_]*\.){4}v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?~)*",
-    r"(([a-z_][a-z0-9_]*\.){4}v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?~|",
-    r"([a-z_][a-z0-9_]*\.){0,4}\*|([a-z_][a-z0-9_]*\.){4}v((0|[1-9][0-9]*)\.)?\*)$",
-);
-
 // One `allowed_subject_types` entry: a GTS Type-id pattern naming an entity kind
-// whose events may declare it in `subject_type`. `x-gts-ref` cannot constrain
-// this field: its values must be concrete IDs, not wildcard patterns.
+// whose events may declare it in `subject_type`. `x-gts-pattern-ref` checks its
+// syntax and length (GTS spec §10); `gts.*` places no coverage limit on it.
 #[derive(Serialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct SubjectTypeRef(
-    #[schemars(regex(pattern = GTS_TYPE_PATTERN), length(max = 1024))] pub String,
-);
+pub struct SubjectTypeRef(#[schemars(extend("x-gts-pattern-ref" = gts_id!("*")))] pub String);
 
 /// The default the base declares for [`EventTraits::partition_key`]: the event's
 /// tenant. Every event carries one, so the default always resolves.

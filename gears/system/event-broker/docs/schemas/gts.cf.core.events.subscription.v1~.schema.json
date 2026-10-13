@@ -102,8 +102,7 @@
           "maxItems": 32,
           "items": {
             "type": "string",
-            "maxLength": 1024,
-            "pattern": "^gts\\.cf\\.core\\.events\\.event\\.v1(\\.(0|[1-9][0-9]*))?~(([a-z_][a-z0-9_]*\\.){4}v(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*))?~)*(([a-z_][a-z0-9_]*\\.){0,4}\\*|([a-z_][a-z0-9_]*\\.){4}v((0|[1-9][0-9]*)\\.)?\\*)?$"
+            "x-gts-pattern-ref": "gts.cf.core.events.event.v1~"
           }
         },
         "filter": {
