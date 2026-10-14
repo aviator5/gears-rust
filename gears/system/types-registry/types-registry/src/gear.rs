@@ -22,6 +22,7 @@ use crate::domain::policy::RegistrationPolicy;
 use crate::domain::ports::Stores;
 use crate::domain::ports::metrics::AdmissionMetrics;
 use crate::domain::registry_service::RegistryService;
+use crate::domain::seeding::{SeedSet, seed};
 use crate::domain::service::TypesRegistryService;
 use crate::infra::InMemoryGtsRepository;
 use crate::infra::outbox::{OutboxDispatch, TABLE_PREFIX as OUTBOX_TABLE_PREFIX};
@@ -56,14 +57,18 @@ impl Default for TypesRegistryGear {
 }
 
 impl TypesRegistryGear {
-    /// Start the optional database-backed admission pipeline.
+    /// Start the optional database-backed admission pipeline and admit `seeds`
+    /// through it. A seed failure stops the pipeline and fails boot.
     async fn wire_admission(
         &self,
         db: &DBProvider<DbError>,
         registration_policy: RegistrationPolicy,
         cfg: TypesRegistryConfig,
         metrics: Arc<dyn AdmissionMetrics>,
+        seeds: &SeedSet,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
+        let seed_budget = cfg.worker.operation_timeout;
         let dispatch = Arc::new(OutboxDispatch::new());
         // Choose database adapters at the composition root.
         let stores: Arc<dyn Stores> = Arc::new(Repos);
@@ -79,16 +84,34 @@ impl TypesRegistryGear {
         // The dispatch must be bound before anything submits: acceptance enqueues
         // inside its own transaction and refuses if there is nowhere to enqueue.
         let admission = crate::infra::outbox::start(db.db(), &registry, &dispatch).await?;
+        info!(
+            queue = crate::infra::outbox::QUEUE,
+            table_prefix = OUTBOX_TABLE_PREFIX,
+            "types_registry admission outbox running"
+        );
+
+        // The seed barrier: nothing database-backed is published before every
+        // seed is stored. A failed startup keeps no worker running.
+        match seed(&registry, seeds, seed_budget, cancel).await {
+            Ok(summary) => info!(
+                documents = summary.documents,
+                unchanged = summary.unchanged,
+                admitted = summary.admitted,
+                passes = summary.passes,
+                "types_registry seeded the database"
+            ),
+            Err(error) => {
+                admission.stop().await;
+                return Err(anyhow::anyhow!(
+                    "types-registry database seeding failed: {error}"
+                ));
+            }
+        }
         *self.outbox.lock() = Some(admission);
 
         self.registry
             .set(registry)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-        info!(
-            queue = crate::infra::outbox::QUEUE,
-            table_prefix = OUTBOX_TABLE_PREFIX,
-            "types_registry database-backed admission path wired; outbox worker running"
-        );
         Ok(())
     }
 
@@ -161,10 +184,19 @@ impl Gear for TypesRegistryGear {
         let instance_count = inventory_instances.len();
         let mut inventory_entries = inventory_type_schemas;
         inventory_entries.extend(inventory_instances);
-        debug!(
+        info!(
             schema_count,
-            instance_count, "Seeding GTS inventory into types-registry"
+            instance_count,
+            configured_count = static_entities.len(),
+            "types_registry seed set"
         );
+        // The same declarations seed the database path; until T38 the two catalogues
+        // are independent and nothing mirrors later writes between them.
+        let seed_documents: Vec<serde_json::Value> = inventory_entries
+            .iter()
+            .chain(&static_entities)
+            .cloned()
+            .collect();
         let seed_results = service.register(inventory_entries);
         RegisterResult::ensure_all_ok(&seed_results)
             .map_err(|e| anyhow::anyhow!("Failed to register GTS inventory: {e}"))?;
@@ -205,8 +237,16 @@ impl Gear for TypesRegistryGear {
         // T7–T9's database path is optional for `no-db.yaml` / `--mock` deployments.
         // Without a DB, routes return canonical `503 Service Unavailable`; warn why.
         if let Some(db) = ctx.db() {
-            self.wire_admission(&db, registration_policy, cfg_for_registry, metrics)
-                .await?;
+            let seeds = SeedSet::collect(seed_documents, &cfg_for_registry.entity_id_fields)?;
+            self.wire_admission(
+                &db,
+                registration_policy,
+                cfg_for_registry,
+                metrics,
+                &seeds,
+                ctx.cancellation_token(),
+            )
+            .await?;
         } else {
             tracing::warn!(
                 "types_registry has no database bound: POST /entities, GET /operations/{{id}} and \
