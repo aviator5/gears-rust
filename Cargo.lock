@@ -3642,6 +3642,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -3830,7 +3831,9 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "inventory",
  "serde",
+ "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -3991,7 +3994,9 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "inventory",
  "serde",
+ "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
