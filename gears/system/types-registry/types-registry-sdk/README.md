@@ -24,37 +24,194 @@ The GTS identifier types the models use (`GtsId`, `GtsTypeId`, `GtsInstanceId`,
 `GtsIdPattern`, `GtsIdSegment`) are re-exported, so building a request needs no direct
 `gts` dependency.
 
-## Reading
+## Publishing from a gear
 
-```rust
+A gear publishes the documents it owns from its own `init()` through the in-process
+platform API, then reads them back. Its `Cargo.toml` depends on this SDK and on the
+registry gear crate, `cf-gears-types-registry`: `deps = [types_registry]` re-exports that
+crate to keep its registration linked, and orders the two `init()` calls.
+
+```rust,no_run
+# // This doctest cannot depend on the registry gear; stand the SDK in for it.
+# pub extern crate types_registry_sdk as types_registry;
+use std::time::Duration;
+
+use toolkit::{Gear, GearCtx};
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
-    GtsTypeId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection, ReadOptions,
+    EntityField, FieldSelection, GtsId, GtsTypeId, Origin, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection, PublisherContext, ReadOptions, ReconcileOptions,
+    ReconcileOutcome, ReconcileReport, Reconciliation,
 };
 
-let registry = hub.get::<dyn PlatformTypesRegistryApi>()?;
-let ctx = PlatformSecurityContext::outbound_marker();
-let type_id = GtsTypeId::try_new("gts.acme.core.events.user_created.v1~")?;
+// `deps` makes this gear's `init()` run after the registry's.
+#[toolkit::gear(name = "example-events", deps = [types_registry])]
+#[derive(Default)]
+pub struct ExampleEvents;
 
-// Document-free by default: identity, kind, lifecycle and origin.
-let light = registry.get_type_schema(&ctx, &type_id, ReadOptions::default()).await?;
+#[async_trait::async_trait]
+impl Gear for ExampleEvents {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        // Fails when the registry has no database bound: there is no fallback.
+        let registry = ctx.client_hub().get::<dyn PlatformTypesRegistryApi>()?;
+        let platform = PlatformSecurityContext::outbound_marker();
+        let publisher = PublisherContext {
+            name: "example-events".to_owned(),
+            version: env!("CARGO_PKG_VERSION").parse()?,
+        };
+        let desired = vec![(
+            GtsId::try_new("gts.cf.example.events.user_created.v1~")?,
+            serde_json::json!({
+                "$id": "gts://gts.cf.example.events.user_created.v1~",
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object"
+            }),
+        )];
+        let mut options = ReconcileOptions::default();
+        options.deadline = Duration::from_secs(120);
 
-// Select documents explicitly.
-use types_registry_sdk::{EntityField, FieldSelection};
-let with_schema = ReadOptions {
-    projection: Projection::Select(FieldSelection::with(&[
-        EntityField::Content,
-        EntityField::ResolvedSchema,
-    ])),
-    ..ReadOptions::default()
+        // The startup gate: up to date, or every desired identifier admitted.
+        match registry
+            .reconcile_entities_and_await(
+                &platform,
+                &publisher,
+                &desired,
+                &options,
+                ctx.cancellation_token(),
+            )
+            .await
+        {
+            // Every document already matched; nothing was submitted.
+            Ok(Reconciliation::UpToDate) => {}
+            Ok(Reconciliation::Reconciled(outcomes)) => {
+                for (id, _) in &desired {
+                    match outcomes.get(id) {
+                        Some(ReconcileOutcome::Admitted) => {}
+                        Some(ReconcileOutcome::Rejected(cause)) => {
+                            anyhow::bail!("{id} was rejected: {cause}");
+                        }
+                        Some(ReconcileOutcome::Pending(cause)) => {
+                            anyhow::bail!("{id} did not settle: {cause:?}");
+                        }
+                        None => anyhow::bail!("{id} has no outcome"),
+                    }
+                }
+            }
+            Err(error) => {
+                // Name what did not settle, then fail this gear's boot.
+                if let Some(report) = ReconcileReport::from_canonical(&error) {
+                    for (id, outcome) in &report.outcomes {
+                        match outcome {
+                            ReconcileOutcome::Admitted => {}
+                            ReconcileOutcome::Rejected(cause) => {
+                                tracing::error!(%id, %cause, "registration rejected");
+                            }
+                            ReconcileOutcome::Pending(cause) => {
+                                tracing::error!(%id, ?cause, "registration not settled");
+                            }
+                        }
+                    }
+                }
+                return Err(error.into());
+            }
+        }
+
+        let type_id = GtsTypeId::try_new("gts.cf.example.events.user_created.v1~")?;
+        let read = registry
+            .get_type_schema(
+                &platform,
+                &type_id,
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[
+                        EntityField::Content,
+                        EntityField::Origin,
+                    ])),
+                    ..ReadOptions::default()
+                },
+            )
+            .await?;
+        if let Some(Origin::Managed { resource_version, .. }) = read.origin {
+            tracing::info!(resource_version, "user_created is published");
+        }
+        Ok(())
+    }
+}
+```
+
+Success is `UpToDate`, or `Reconciled` with every desired identifier `Admitted`. An accepted
+operation, or an `Ok` from a single `register_entities`, is not: an item can still fail in
+admission.
+
+The examples use vendor `cf`, the only one a registry admits without configuration. Another
+vendor needs a `registration_policy` entry for its region in the registry's configuration:
+
+```yaml
+gears:
+  types-registry:
+    config:
+      registration_policy:
+        "gts.acme.core.*":
+          allowed_vendors: [acme]
+```
+
+**What the local API is today.** The registry publishes both contracts in `ClientHub` from
+its own `init()`, after it has admitted every linked inventory declaration (Type Schemas
+from `#[toolkit_gts::gts_type_schema(..)]`, Instances from `gts_instance!` and
+`gts_instance_raw!`) and every configured `entities` document into its database. Without a
+database bound to `types-registry`, or when that seeding fails, neither contract is
+registered and `ClientHub::get` fails; nothing falls back to the legacy client.
+
+- `deps` orders `init()` only. Remote clients are wired after every `init()`, so a remote
+  registry is not reachable from `init()`; calling the local API there is a transitional
+  exception that ends with T41/T42, after which publication moves to a post-wiring hook.
+- `PublisherContext` is required, but P0 neither forwards nor enforces it; that arrives
+  with T44/T45, without an earlier guarantee for mixed-version publishers.
+- The local client passes `SecurityContext` and `PlatformSecurityContext` through without
+  validating them and applies no tenant scope (P0 ceilings C2/C6).
+- Reads are uncached until T36: each call reads the database.
+- The new API and the legacy client are independent catalogues until T38: the same linked
+  declarations seed both, nothing written through one is visible through the other, and a
+  document depending on an entity registered only through the legacy client cannot be
+  published here.
+- With several registry instances on one database, an admission accepted by one instance can
+  wait for another instance's outbox poll, up to a minute. Keep reconciliation deadlines and
+  the registry's `worker.operation_timeout` above that.
+
+## Reading
+
+```rust,no_run
+use toolkit::client_hub::ClientHub;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, GtsTypeId, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions,
 };
-let schema = registry.get_type_schema(&ctx, &type_id, with_schema).await?;
 
-// Bypass a client cache for this read.
-let fresh = registry.get_type_schema(&ctx, &type_id, ReadOptions {
-    fresh: true,
-    ..ReadOptions::default()
-}).await?;
+async fn read(hub: &ClientHub) -> anyhow::Result<()> {
+    let registry = hub.get::<dyn PlatformTypesRegistryApi>()?;
+    let ctx = PlatformSecurityContext::outbound_marker();
+    let type_id = GtsTypeId::try_new("gts.cf.example.events.user_created.v1~")?;
+
+    // Document-free by default: identity, kind, lifecycle and origin.
+    let light = registry.get_type_schema(&ctx, &type_id, ReadOptions::default()).await?;
+
+    // Select documents explicitly.
+    let with_schema = ReadOptions {
+        projection: Projection::Select(FieldSelection::with(&[
+            EntityField::Content,
+            EntityField::ResolvedSchema,
+        ])),
+        ..ReadOptions::default()
+    };
+    let schema = registry.get_type_schema(&ctx, &type_id, with_schema).await?;
+
+    // Bypass a client cache for this read.
+    let fresh = registry.get_type_schema(&ctx, &type_id, ReadOptions {
+        fresh: true,
+        ..ReadOptions::default()
+    }).await?;
+    Ok(())
+}
 ```
 
 `Projection::Default` is the document-free field set on single and batch reads, while the
@@ -75,17 +232,25 @@ it did not — not a claim that a check ran. `Instance` has no `provenance`.
 
 ## Listing
 
-```rust
-use types_registry_sdk::{EntityFilter, GtsIdPattern, ListEntitiesRequest};
-
-let query = ListEntitiesRequest {
-    filter: EntityFilter {
-        pattern: Some(GtsIdPattern::try_new("gts.acme.core.*")?),
-        ..EntityFilter::default()
-    },
-    ..ListEntitiesRequest::default()
+```rust,no_run
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    EntityFilter, GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt,
 };
-let schemas = registry.list_type_schemas(&ctx, query).await?;
+
+async fn list(registry: &dyn PlatformTypesRegistryApi) -> anyhow::Result<()> {
+    let ctx = PlatformSecurityContext::outbound_marker();
+    let query = ListEntitiesRequest {
+        filter: EntityFilter {
+            pattern: Some(GtsIdPattern::try_new("gts.cf.example.*")?),
+            ..EntityFilter::default()
+        },
+        ..ListEntitiesRequest::default()
+    };
+    let schemas = registry.list_type_schemas(&ctx, query).await?;
+    Ok(())
+}
 ```
 
 A listing helper follows every page; past `MAX_LIST_PAGES` it fails with
@@ -93,31 +258,7 @@ A listing helper follows every page; past `MAX_LIST_PAGES` it fails with
 
 ## Reconciling
 
-```rust
-use serde_json::json;
-use tokio_util::sync::CancellationToken;
-use types_registry_sdk::{GtsId, PublisherContext, ReconcileOptions};
-
-let publisher = PublisherContext {
-    name: "acme-events".to_owned(),
-    version: env!("CARGO_PKG_VERSION").parse()?,
-};
-let desired = vec![(
-    GtsId::try_new("gts.acme.core.events.user_created.v1~")?,
-    json!({
-        "$id": "gts://gts.acme.core.events.user_created.v1~",
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object"
-    }),
-)];
-let options = ReconcileOptions::default();
-
-let reconciliation = registry
-    .reconcile_entities_and_await(&ctx, &publisher, &desired, &options, &CancellationToken::new())
-    .await?;
-// Every desired identifier is admitted.
-```
-
+[Publishing from a gear](#publishing-from-a-gear) shows a complete call and its outcomes.
 Reconciliation creates absent identifiers and updates differing ones; it never deletes. An
 identifier listed twice with different documents is `Rejected` without being submitted.
 `Ok` means every identifier is admitted. Otherwise `FailedPrecondition` carries a report;
@@ -142,19 +283,27 @@ earlier outcomes or become `Pending(Skipped)`; accepted writes continue.
 `get_operation` until `OperationStatus::Completed`. Each item carries an outcome with exactly
 its state's data:
 
-```rust
-use types_registry_sdk::{Operation, RegistrationOutcome};
+```rust,no_run
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{Operation, PlatformTypesRegistryApi, RegistrationOutcome};
 
-if let Operation::Registration(operation) = registry.get_operation(&ctx, operation_id).await? {
-    for item in operation.items {
-        match item.outcome {
-            RegistrationOutcome::Succeeded { resource_version } => {}
-            RegistrationOutcome::Unchanged { resource_version } => {}
-            RegistrationOutcome::WouldSucceed => {} // a dry run: nothing committed
-            RegistrationOutcome::Failed { error } => {}
-            RegistrationOutcome::Pending | RegistrationOutcome::Running => {}
+async fn outcomes(
+    registry: &dyn PlatformTypesRegistryApi,
+    operation_id: uuid::Uuid,
+) -> anyhow::Result<()> {
+    let ctx = PlatformSecurityContext::outbound_marker();
+    if let Operation::Registration(operation) = registry.get_operation(&ctx, operation_id).await? {
+        for item in operation.items {
+            match item.outcome {
+                RegistrationOutcome::Succeeded { resource_version } => {}
+                RegistrationOutcome::Unchanged { resource_version } => {}
+                RegistrationOutcome::WouldSucceed => {} // a dry run: nothing committed
+                RegistrationOutcome::Failed { error } => {}
+                RegistrationOutcome::Pending | RegistrationOutcome::Running => {}
+            }
         }
     }
+    Ok(())
 }
 ```
 
@@ -162,16 +311,27 @@ A deletion item's `DeletionOutcome` has the same states except `Unchanged`.
 
 ## Errors
 
-```rust
-use types_registry_sdk::{ReadOptions, TypesRegistryError};
+```rust,no_run
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsTypeId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions,
+    TypesRegistryError,
+};
 
-match registry.get_type_schema(&ctx, &type_id, ReadOptions::default()).await {
-    Ok(schema) => {}
-    Err(error) => match TypesRegistryError::from(error) {
-        TypesRegistryError::NotFound { name, .. } => {}
-        TypesRegistryError::Validation { issues } => {}
-        other => return Err(other.into()),
-    },
+async fn classify(
+    registry: &dyn PlatformTypesRegistryApi,
+    type_id: &GtsTypeId,
+) -> anyhow::Result<()> {
+    let ctx = PlatformSecurityContext::outbound_marker();
+    match registry.get_type_schema(&ctx, type_id, ReadOptions::default()).await {
+        Ok(schema) => {}
+        Err(error) => match TypesRegistryError::from(error) {
+            TypesRegistryError::NotFound { .. } => {}
+            TypesRegistryError::Validation { issues } => {}
+            other => return Err(other.into()),
+        },
+    }
+    Ok(())
 }
 ```
 
@@ -237,11 +397,26 @@ event carries `reconcile_id` directly.
 - `testing_platform::conformance::run` holds the contract checks that the mock and the
   registry's local client both pass.
 
-## Legacy client
+## Legacy API
 
-`TypesRegistryClient`, its models (`GtsTypeSchema`, `GtsInstance`, `AncestorIter`, …) and
-`testing::MockTypesRegistryClient` remain at the crate root while consumers migrate. New
-code should use the contracts above.
+**Removed at T38.** Existing consumers still use it until they migrate; new code uses the
+contracts above. `TypesRegistryClient` reads and registers through the registry's in-memory
+catalogue, which is independent of the database the new contracts serve. Its models
+(`GtsTypeSchema`, `GtsInstance`, `AncestorIter`, `RegisterResult`, `RegisterSummary`, …) and
+`testing::MockTypesRegistryClient` remain at the crate root until then.
+
+```rust,no_run
+use toolkit::client_hub::ClientHub;
+use types_registry_sdk::TypesRegistryClient;
+
+async fn legacy(hub: &ClientHub) -> anyhow::Result<()> {
+    let client = hub.get::<dyn TypesRegistryClient>()?;
+    let schema = client
+        .get_type_schema("gts.cf.example.events.user_created.v1~")
+        .await?;
+    Ok(())
+}
+```
 
 ## License
 

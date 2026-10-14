@@ -65,3 +65,5 @@ tracing-subscriber = { workspace = true }
 # The test doubles also compile under `cfg(test)` without `test-util`.
 toolkit = { workspace = true }
 parking_lot = { workspace = true }
+# The README's examples compile as doctests.
+anyhow = { workspace = true }

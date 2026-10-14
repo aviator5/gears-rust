@@ -1,17 +1,4 @@
-//! Public API for Types Registry.
-//!
-//! - [`PlatformTypesRegistryApi`] provides reads, mutations and operation polling;
-//!   [`PlatformTypesRegistryApiExt`] adds typed reads, pagination and reconciliation.
-//! - [`TypesRegistryApi`] and [`TypesRegistryApiExt`] provide tenant-context reads.
-//! - [`models`] defines requests, operations and projected entity snapshots.
-//! - [`TypesRegistryError`] provides a typed view of canonical errors;
-//!   [`AdmissionFailure`] decodes operation-item failures.
-//! - [`ReconcileReport`] decodes incomplete reconciliation errors.
-//! - [`GtsTypeId`] and [`GtsInstanceId`] are typed GTS identifiers.
-//!
-//! The legacy [`TypesRegistryClient`], its models and its `testing` mock remain
-//! available at the crate root. New consumers should use the API contracts above.
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
