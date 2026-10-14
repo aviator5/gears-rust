@@ -674,6 +674,11 @@ impl Gear for AccountManagementGear {
             .client_hub()
             .get::<dyn types_registry_sdk::TypesRegistryClient>()
             .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryClient: {e}"))?;
+        // The database-backed platform API serves the readers migrated so far (T32).
+        let platform_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = ctx
+            .client_hub()
+            .get::<dyn types_registry_sdk::PlatformTypesRegistryApi>()
+            .map_err(|e| anyhow::anyhow!("failed to get PlatformTypesRegistryApi: {e}"))?;
 
         // The root-type contract is registered independently from the optional
         // bootstrap saga and its `strict` policy. At this point Types Registry
@@ -731,7 +736,7 @@ impl Gear for AccountManagementGear {
 
         info!("types-registry client resolved from client hub; enabling GTS tenant-type checker");
         let tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync> =
-            Arc::new(GtsTenantTypeChecker::new(types_registry.clone()));
+            Arc::new(GtsTenantTypeChecker::new(Arc::clone(&platform_registry)));
 
         // IdP provider plugin — lazy vendor-based selection.
         //

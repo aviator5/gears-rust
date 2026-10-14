@@ -3610,18 +3610,17 @@ async fn delete_tenant_propagates_rg_timeout_as_service_unavailable() {
 #[tokio::test(start_paused = true)]
 async fn create_tenant_propagates_gts_timeout_as_service_unavailable() {
     use crate::infra::types_registry::GtsTenantTypeChecker;
-    use crate::infra::types_registry::test_helpers::SlowRegistry;
-    use std::sync::Arc as StdArc;
+    use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 
     let root = Uuid::from_u128(0x100);
     let child = Uuid::from_u128(0x912);
     let repo = Arc::new(FakeTenantRepo::with_root(root));
     let closure_before = repo.snapshot_closure().len();
 
-    // Wire the production GTS checker around a registry whose
-    // `get_type_schemas_by_uuid` sleeps for 50 ms; checker
-    // timeout is 10 ms.
-    let slow = StdArc::new(SlowRegistry::new(StdDuration::from_millis(50)));
+    // Wire the production GTS checker around a registry whose batch
+    // reads take 50 ms; checker timeout is 10 ms.
+    let slow = Arc::new(MockTypesRegistry::new());
+    slow.inject(Fault::on(Call::BatchGet).delay(StdDuration::from_millis(50)));
     let checker = Arc::new(GtsTenantTypeChecker::with_timeout(slow, 10));
 
     let svc = TenantService::new(
