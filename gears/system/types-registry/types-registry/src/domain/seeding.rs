@@ -19,6 +19,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
 
+use crate::domain::admission::fingerprint::canonical_text;
 use crate::domain::admission::{AdmissionFailureReason, Candidate, SubmitRequest};
 use crate::domain::caller::CallerContext;
 use crate::domain::enums::{LifecycleStatus, OperationItemStatus, OperationStatus};
@@ -39,7 +40,16 @@ const BACKOFF_MAX: Duration = Duration::from_secs(1);
 #[domain_model]
 #[derive(Clone, Debug, Default)]
 pub struct SeedSet {
-    documents: BTreeMap<String, Value>,
+    documents: BTreeMap<String, Seed>,
+}
+
+/// One seed and its canonical text, the form acceptance stores and compares: it
+/// keeps every byte-level distinction, `-0.0` against `0.0` included.
+#[domain_model]
+#[derive(Clone, Debug)]
+struct Seed {
+    document: Value,
+    canonical: String,
 }
 
 impl SeedSet {
@@ -59,13 +69,23 @@ impl SeedSet {
                     index,
                     fields: id_fields.to_vec(),
                 })?;
+            let canonical = canonical_text(&document);
             match set.get(&gts_id) {
-                Some(existing) if *existing != document => {
+                Some(Seed {
+                    canonical: existing,
+                    ..
+                }) if *existing != canonical => {
                     return Err(SeedError::ConflictingDeclarations { gts_id });
                 }
                 Some(_) => {}
                 None => {
-                    set.insert(gts_id, document);
+                    set.insert(
+                        gts_id,
+                        Seed {
+                            document,
+                            canonical,
+                        },
+                    );
                 }
             }
         }
@@ -189,6 +209,18 @@ impl Budget<'_> {
         }
     }
 
+    /// Whether the budget still holds: checked before every success, because the
+    /// synchronous work after the last await is not bounded by `select!`.
+    fn check(&self) -> Result<(), Stop> {
+        if self.cancel.is_cancelled() {
+            Err(Stop::Cancelled)
+        } else if Instant::now() >= self.deadline {
+            Err(Stop::Deadline)
+        } else {
+            Ok(())
+        }
+    }
+
     async fn pause(&self, backoff: Duration) -> Result<(), Stop> {
         let wake = Instant::now()
             .checked_add(backoff)
@@ -199,7 +231,8 @@ impl Budget<'_> {
 
 /// The current state of one stored seed.
 struct Current {
-    content: Value,
+    /// Canonical text of the stored authored document.
+    content: String,
     resource_version: i64,
     lifecycle: LifecycleStatus,
 }
@@ -250,7 +283,10 @@ pub async fn seed(
         passes: 0,
     };
     if set.is_empty() {
-        return Ok(summary);
+        return window
+            .check()
+            .map(|()| summary)
+            .map_err(|stop| stopped(stop, budget, set, Vec::new()));
     }
     let ctx = PlatformSecurityContext::outbound_marker();
     let seeder = Seeder {
@@ -268,6 +304,9 @@ pub async fn seed(
         };
         match end {
             PassEnd::UpToDate | PassEnd::Admitted => {
+                if let Err(stop) = window.check() {
+                    return Err(stopped(stop, budget, set, contention));
+                }
                 summary.admitted = summary.documents - summary.unchanged;
                 return Ok(summary);
             }
@@ -391,9 +430,10 @@ impl Seeder<'_> {
                         let (Some(origin), Some(content)) = (record.origin, record.content) else {
                             return Ok(Err(read_fault(&gts_id, "lacks a selected field")));
                         };
-                        let Ok(content) = serde_json::from_str(content.get()) else {
+                        let Ok(content) = serde_json::from_str::<Value>(content.get()) else {
                             return Ok(Err(read_fault(&gts_id, "stored content is not JSON")));
                         };
+                        let content = canonical_text(&content);
                         current.insert(
                             gts_id,
                             Current {
@@ -456,17 +496,17 @@ fn read_fault(gts_id: &str, why: &str) -> SeedError {
 fn compare(set: &SeedSet, current: &BTreeMap<String, Current>) -> Vec<Candidate> {
     set.documents
         .iter()
-        .filter_map(|(gts_id, document)| {
+        .filter_map(|(gts_id, seed)| {
             let found = current.get(gts_id);
             if let Some(found) = found
                 && found.lifecycle == LifecycleStatus::Active
-                && found.content == *document
+                && found.content == seed.canonical
             {
                 return None;
             }
             Some(Candidate {
                 gts_id: gts_id.clone(),
-                content: Some(document.clone()),
+                content: Some(seed.document.clone()),
                 expected_resource_version: found.map(|f| f.resource_version),
                 force: false,
             })

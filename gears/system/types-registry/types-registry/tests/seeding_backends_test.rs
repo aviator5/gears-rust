@@ -25,7 +25,10 @@ use types_registry::domain::seeding::{SeedSet, seed};
 use types_registry::domain::selection::FieldSelection;
 use types_registry::infra::outbox::OutboxDispatch;
 
-const BUDGET: Duration = Duration::from_secs(60);
+/// Two registry instances race: a message one sequences into a partition the
+/// other's processor leases waits for that processor's idle poll (one minute under
+/// the `low_latency` outbox profile), so the budget covers more than one poll.
+const BUDGET: Duration = Duration::from_mins(3);
 const BASE: &str = "gts.cf.core.seedback.base.v1~";
 const CHILD: &str = "gts.cf.core.seedback.base.v1~cf.core.seedback.child.v1~";
 const INSTANCE: &str =
