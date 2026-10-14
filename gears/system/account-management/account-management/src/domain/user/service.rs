@@ -59,7 +59,7 @@ use toolkit_odata::filter::{FilterNode, FilterOp, ODataValue};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use toolkit_security::AccessScope;
 use toolkit_security::{SecurityContext, pep_properties};
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -159,7 +159,7 @@ pub struct UserService {
     /// GTS schema source for the user JSON-Schema contract — keeps
     /// structural rules (length, format) authoritative in the
     /// catalogue rather than duplicated in code.
-    types_registry: Arc<dyn TypesRegistryClient>,
+    types_registry: Arc<dyn PlatformTypesRegistryApi>,
     /// PEP gate run before any `IdP` / RG round trip.
     enforcer: PolicyEnforcer,
     /// RG client for `delete_user` membership cleanup. `None` in
@@ -223,7 +223,7 @@ impl UserService {
     pub fn new(
         tenant_repo: Arc<dyn TenantRepo>,
         idp_user: Arc<dyn IdpPluginClient>,
-        types_registry: Arc<dyn TypesRegistryClient>,
+        types_registry: Arc<dyn PlatformTypesRegistryApi>,
         enforcer: PolicyEnforcer,
     ) -> Self {
         Self {

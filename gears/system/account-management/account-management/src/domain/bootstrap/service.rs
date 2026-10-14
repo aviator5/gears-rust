@@ -61,7 +61,11 @@ use crate::domain::tenant::closure::build_activation_rows;
 use crate::domain::tenant::model::{NewTenant, TenantModel, TenantStatus};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::util::backoff::compute_next_backoff;
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, LifecycleStatus, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection,
+};
 
 /// Internal classification produced by `BootstrapService::classify`.
 #[allow(clippy::large_enum_variant)]
@@ -234,7 +238,7 @@ struct RunCtx {
 pub struct BootstrapService<R: TenantRepo> {
     repo: Arc<R>,
     idp: Arc<dyn IdpPluginClient>,
-    types_registry: Option<Arc<dyn TypesRegistryClient>>,
+    types_registry: Option<Arc<dyn PlatformTypesRegistryApi>>,
     cfg: BootstrapConfig,
     root_type: RootTypeConfig,
     /// Mirrors `cfg.idp.required` from the parent
@@ -320,7 +324,10 @@ impl<R: TenantRepo> BootstrapService<R> {
     /// preflight. Tests that exercise non-GTS paths may omit this; gear
     /// wiring supplies it when `ClientHub` resolves the registry client.
     #[must_use]
-    pub fn with_types_registry(mut self, types_registry: Arc<dyn TypesRegistryClient>) -> Self {
+    pub fn with_types_registry(
+        mut self,
+        types_registry: Arc<dyn PlatformTypesRegistryApi>,
+    ) -> Self {
         self.types_registry = Some(types_registry);
         self
     }
@@ -838,10 +845,28 @@ impl<R: TenantRepo> BootstrapService<R> {
         // and can correlate with the deadline.
         let entity = match tokio::time::timeout_at(
             deadline,
-            registry.get_type_schema(self.root_type.gts_id.as_ref()),
+            registry.get_type_schema(
+                &PlatformSecurityContext::outbound_marker(),
+                &self.root_type.gts_id,
+                Projection::Select(FieldSelection::with(&[EntityField::EffectiveTraits])),
+            ),
         )
         .await
         {
+            Ok(Ok(entity)) if entity.lifecycle_status != LifecycleStatus::Active => {
+                emit_metric(
+                    AM_BOOTSTRAP_LIFECYCLE,
+                    MetricKind::Counter,
+                    &[
+                        ("phase", "gts_preflight"),
+                        ("classification", "invalid_tenant_type"),
+                        ("outcome", "failure"),
+                    ],
+                );
+                return Err(DomainError::InvalidTenantType {
+                    detail: format!("{} is deleted in GTS", self.root_type.gts_id),
+                });
+            }
             Ok(Ok(entity)) => entity,
             Ok(Err(err)) => {
                 if matches!(
@@ -914,15 +939,21 @@ impl<R: TenantRepo> BootstrapService<R> {
             });
         }
 
-        // `effective_traits` resolves the GTS chain (own + ancestors)
-        // so a root type that inherits a non-empty
+        // The registry-materialized `effective_traits` merges the GTS
+        // chain (own + ancestors) so a root type that inherits a non-empty
         // `allowed_parent_types` from a base schema is correctly
-        // rejected. Reading `entity.raw_schema` directly only sees the
+        // rejected. Reading the authored content directly only sees the
         // type's own declarations and would silently accept an
         // inherited rule, breaking the root-eligibility contract —
         // the same effective-trait resolution that
         // `GtsTenantTypeChecker` already uses for child create.
-        let allowed = extract_allowed_parent_types_from_effective(&entity.effective_traits())?;
+        let effective = entity.effective_traits.as_ref().ok_or_else(|| {
+            DomainError::internal(format!(
+                "types-registry answered root tenant type {} without the selected effective_traits",
+                self.root_type.gts_id
+            ))
+        })?;
+        let allowed = extract_allowed_parent_types_from_effective(effective)?;
         if !allowed.is_empty() {
             emit_metric(
                 AM_BOOTSTRAP_LIFECYCLE,

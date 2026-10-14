@@ -4,7 +4,7 @@
 //! published under `gears/system/account-management/docs/schemas/`
 //! and registered in the GTS Types Registry at deployment time. This
 //! gear is the single AM-side seam that fetches a resolved schema
-//! from `TypesRegistryClient` and runs `jsonschema::validator_for`
+//! from `PlatformTypesRegistryApi` and runs `jsonschema::validator_for`
 //! against the supplied field values — adapting the
 //! `cf-resource-group::domain::validation::validate_metadata_via_gts`
 //! pattern to AM's needs with one deliberate divergence: AM maps a
@@ -77,11 +77,17 @@
 //! call. The plugin owns the shape (input and output) end-to-end;
 //! AM does not interpret it.
 
+use std::collections::BTreeMap;
+
 use account_management_sdk::{IdpNewUser, IdpUserPatch};
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, GtsTypeId, LifecycleStatus, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection,
+};
 
 use crate::domain::error::DomainError;
 
@@ -121,7 +127,7 @@ pub(crate) const TENANT_TYPE_ID: &str = gts_id!("cf.core.am.tenant.v1~");
 /// See gear-level docs.
 pub async fn validate_new_user_payload_via_gts(
     payload: &IdpNewUser,
-    types_registry: &dyn TypesRegistryClient,
+    types_registry: &dyn PlatformTypesRegistryApi,
 ) -> Result<(), DomainError> {
     let Some(properties) = lookup_effective_properties(USER_TYPE_ID, types_registry).await? else {
         // Fail-closed: the user schema MUST be registered before
@@ -191,7 +197,7 @@ pub async fn validate_new_user_payload_via_gts(
 /// See gear-level docs.
 pub async fn validate_user_patch_via_gts(
     patch: &IdpUserPatch,
-    types_registry: &dyn TypesRegistryClient,
+    types_registry: &dyn PlatformTypesRegistryApi,
 ) -> Result<(), DomainError> {
     let Some(properties) = lookup_effective_properties(USER_TYPE_ID, types_registry).await? else {
         return Err(DomainError::service_unavailable(format!(
@@ -236,7 +242,7 @@ pub async fn validate_user_patch_via_gts(
 /// See gear-level docs.
 pub async fn validate_tenant_name_via_gts(
     name: &str,
-    types_registry: &dyn TypesRegistryClient,
+    types_registry: &dyn PlatformTypesRegistryApi,
 ) -> Result<(), DomainError> {
     let Some(properties) = lookup_effective_properties(TENANT_TYPE_ID, types_registry).await?
     else {
@@ -256,15 +262,49 @@ pub async fn validate_tenant_name_via_gts(
 /// contract on other registry errors.
 async fn lookup_effective_properties(
     type_id: &'static str,
-    types_registry: &dyn TypesRegistryClient,
-) -> Result<Option<std::collections::BTreeMap<String, Value>>, DomainError> {
-    match types_registry.get_type_schema(type_id).await {
-        Ok(schema) => Ok(Some(schema.effective_properties())),
+    types_registry: &dyn PlatformTypesRegistryApi,
+) -> Result<Option<BTreeMap<String, Value>>, DomainError> {
+    let projection = Projection::Select(FieldSelection::with(&[EntityField::ResolvedSchema]));
+    match types_registry
+        .get_type_schema(
+            &PlatformSecurityContext::outbound_marker(),
+            &GtsTypeId::new(type_id),
+            projection,
+        )
+        .await
+    {
+        // A deleted schema is no longer registered for new payloads.
+        Ok(schema) if schema.lifecycle_status != LifecycleStatus::Active => Ok(None),
+        Ok(schema) => {
+            let resolved = schema.resolved_schema.ok_or_else(|| {
+                DomainError::internal(format!(
+                    "types-registry answered `{type_id}` without the selected resolved_schema"
+                ))
+            })?;
+            Ok(Some(effective_properties(&resolved)))
+        }
         Err(CanonicalError::NotFound { .. }) => Ok(None),
         Err(err) => Err(DomainError::service_unavailable(format!(
             "GTS type schema lookup failed for `{type_id}`: {err}"
         ))),
     }
+}
+
+/// The properties a registry-resolved schema declares. References are
+/// inlined at admission, so the `allOf` members carry the inherited
+/// declarations: they are collected first and the schema's own
+/// `properties` win on a key collision.
+fn effective_properties(schema: &Value) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
+        for member in members {
+            out.extend(effective_properties(member));
+        }
+    }
+    if let Some(own) = schema.get("properties").and_then(Value::as_object) {
+        out.extend(own.iter().map(|(key, value)| (key.clone(), value.clone())));
+    }
+    out
 }
 
 /// Compile the property sub-schema for `field_name` and validate
@@ -283,7 +323,7 @@ fn validate_property_value(
     type_id: &'static str,
     field_name: &str,
     field_value: &Value,
-    properties: &std::collections::BTreeMap<String, Value>,
+    properties: &BTreeMap<String, Value>,
 ) -> Result<(), DomainError> {
     let Some(field_schema) = properties.get(field_name) else {
         return Err(DomainError::Internal {

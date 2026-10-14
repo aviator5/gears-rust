@@ -37,8 +37,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 use crate::domain::error::{DomainError, UnsupportedResource};
@@ -67,14 +66,10 @@ fn test_tenant_type_uuid() -> Uuid {
         .to_uuid()
 }
 
-fn test_tenant_type_schema() -> GtsTypeSchema {
-    fn build(type_id: &str) -> GtsTypeSchema {
-        let parent = GtsTypeSchema::derive_parent_type_id(type_id)
-            .map(|p| std::sync::Arc::new(build(p.as_ref())));
-        GtsTypeSchema::try_new(GtsTypeId::new(type_id), json!({}), None, parent)
-            .expect("synthetic tenant_type schema is valid")
-    }
-    build(TEST_TENANT_TYPE_ID)
+fn registry_with_test_tenant_type() -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.seed(TEST_TENANT_TYPE_ID, json!({ "type": "object" }));
+    registry
 }
 
 fn fixed_now() -> OffsetDateTime {
@@ -108,8 +103,7 @@ fn make_service(
     tenants: Arc<FakeTenantRepo>,
     idp: Arc<FakeServiceAccountProvider>,
 ) -> ServiceAccountService {
-    let types_registry =
-        Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
+    let types_registry = Arc::new(registry_with_test_tenant_type());
     ServiceAccountService::new(tenants, idp, types_registry, mock_enforcer())
 }
 
@@ -119,8 +113,7 @@ fn make_denied_service(
     tenants: Arc<FakeTenantRepo>,
     idp: Arc<FakeServiceAccountProvider>,
 ) -> ServiceAccountService {
-    let types_registry =
-        Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
+    let types_registry = Arc::new(registry_with_test_tenant_type());
     ServiceAccountService::new(tenants, idp, types_registry, deny_all_enforcer())
 }
 
@@ -312,7 +305,7 @@ async fn tenant_type_resolution_failure_uses_fixed_public_detail() {
     let idp = Arc::new(FakeServiceAccountProvider::new());
     // An empty registry returns a canonical NotFound carrying the requested
     // UUID. The shared guard must retain that text only in its operator log.
-    let types_registry = Arc::new(MockTypesRegistryClient::new());
+    let types_registry = Arc::new(MockTypesRegistry::new());
     let idp_client: Arc<dyn account_management_sdk::IdpPluginClient> = idp.clone();
     let svc = ServiceAccountService::new(tenants, idp_client, types_registry, mock_enforcer());
 

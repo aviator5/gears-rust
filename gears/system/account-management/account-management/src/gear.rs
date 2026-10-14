@@ -78,7 +78,7 @@ struct BootstrapParams {
     idp_required: bool,
     repo: Arc<TenantRepoImpl>,
     idp: Arc<dyn IdpPluginClient>,
-    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    types_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>,
 }
 
 // Conversion lifecycle knobs (`approval_ttl`, `resolved_retention`,
@@ -927,7 +927,7 @@ impl Gear for AccountManagementGear {
                     idp_required: cfg.idp.required,
                     repo: Arc::clone(&repo),
                     idp: Arc::clone(&idp),
-                    types_registry: Arc::clone(&types_registry),
+                    types_registry: Arc::clone(&platform_registry),
                 });
             }
         }
@@ -966,7 +966,7 @@ impl Gear for AccountManagementGear {
             enforcer,
             cfg,
         );
-        service = service.with_types_registry(Arc::clone(&types_registry));
+        service = service.with_types_registry(Arc::clone(&platform_registry));
 
         // Tenant Resolver Plugin (in-process, AM-co-located).
         //
@@ -1153,7 +1153,7 @@ impl Gear for AccountManagementGear {
             UserService::new(
                 Arc::clone(&repo) as Arc<dyn TenantRepo>,
                 Arc::clone(&idp),
-                Arc::clone(&types_registry),
+                Arc::clone(&platform_registry),
                 user_enforcer,
             )
             // Wire RG-membership cleanup so `delete_user` removes
@@ -1171,7 +1171,7 @@ impl Gear for AccountManagementGear {
         );
 
         // Build the service-account domain service. Shares the same
-        // `TenantRepoImpl` + `TypesRegistryClient` the user service uses
+        // `TenantRepoImpl` + platform registry client the user service uses
         // for the tenant guard, and the same resolved `IdpPluginClient`
         // — machine identities are a separate PEP resource type, not a
         // separate provider. Holds no storage handles: like the user
@@ -1180,7 +1180,7 @@ impl Gear for AccountManagementGear {
         let service_account_service = Arc::new(ServiceAccountService::new(
             Arc::clone(&repo) as Arc<dyn TenantRepo>,
             Arc::clone(&idp),
-            Arc::clone(&types_registry),
+            Arc::clone(&platform_registry),
             service_account_enforcer,
         ));
 
