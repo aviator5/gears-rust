@@ -1,109 +1,97 @@
-//! Test helpers shared across crate-internal integration tests for the
-//! GTS Types Registry SDK adapter. Promoted to `pub(crate)` (compiled
-//! under `#[cfg(test)]` only) so service-level tests in
-//! `domain/tenant/service/service_tests.rs` can wire the production
-//! [`super::GtsTenantTypeChecker`] against a slow / failing fake
-//! without re-stubbing the full ~13-method `TypesRegistryClient`
-//! trait at every call site.
+//! Test helpers shared across crate-internal tests of the GTS Types
+//! Registry adapters. Compiled under `#[cfg(test)]` only.
 
 #![cfg(test)]
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
-};
 use uuid::Uuid;
 
-/// Minimal `TypesRegistryClient` fake whose `get_type_schemas_by_uuid`
-/// sleeps for `delay` before returning an empty map. Any other trait
-/// method is `unreachable!()` — service-level integration tests
-/// exercise only the type-checker barrier path. Use with
-/// `#[tokio::test(start_paused = true)]` to verify the production
-/// timeout boundary fires deterministically.
-pub struct SlowRegistry {
-    pub delay: Duration,
+/// A platform registry whose batch reads answer snapshots edited after the
+/// read: what admission never stores (a trait value its traits schema
+/// refuses) or what a broken client might answer (a selected document
+/// missing), to exercise adapters' defensive branches.
+pub struct Tampered {
+    inner: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
+    edit: Box<SnapshotEdit>,
 }
 
-impl SlowRegistry {
-    pub fn new(delay: Duration) -> Self {
-        Self { delay }
+type SnapshotEdit = dyn Fn(&mut types_registry_sdk::Entity) + Send + Sync;
+
+impl Tampered {
+    pub fn new(
+        inner: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
+        edit: impl Fn(&mut types_registry_sdk::Entity) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner,
+            edit: Box::new(edit),
+        }
+    }
+
+    /// Answers without the documents the caller selected — content and every
+    /// materialization.
+    pub fn without_documents(
+        inner: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
+    ) -> Self {
+        Self::new(inner, |entity| {
+            entity.content = None;
+            entity.resolved_schema = None;
+            entity.effective_traits = None;
+            entity.effective_traits_schema = None;
+        })
     }
 }
 
 #[async_trait]
-impl TypesRegistryClient for SlowRegistry {
-    async fn register(
+impl types_registry_sdk::PlatformTypesRegistryApi for Tampered {
+    async fn batch_get_entities(
         &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
+        ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        let mut response = self.inner.batch_get_entities(ctx, request).await?;
+        for lookup in response.0.values_mut() {
+            if let types_registry_sdk::EntityLookup::Found { entity, .. } = lookup {
+                (self.edit)(entity);
+            }
+        }
+        Ok(response)
     }
-    async fn register_type_schemas(
+
+    async fn list_entities(
         &self,
-        _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
+        ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        self.inner.list_entities(ctx, request).await
     }
-    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type_schema_by_uuid(
+
+    async fn register_entities(
         &self,
-        _type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        unreachable!()
+        ctx: &toolkit_security::PlatformSecurityContext,
+        key: types_registry_sdk::IdempotencyKey,
+        request: types_registry_sdk::RegisterEntitiesRequest,
+    ) -> Result<types_registry_sdk::RegistrationOperation, CanonicalError> {
+        self.inner.register_entities(ctx, key, request).await
     }
-    async fn get_type_schemas(
+
+    async fn delete_entities(
         &self,
-        _type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        unreachable!()
+        ctx: &toolkit_security::PlatformSecurityContext,
+        key: types_registry_sdk::IdempotencyKey,
+        request: types_registry_sdk::DeleteEntitiesRequest,
+    ) -> Result<types_registry_sdk::DeletionOperation, CanonicalError> {
+        self.inner.delete_entities(ctx, key, request).await
     }
-    async fn get_type_schemas_by_uuid(
+
+    async fn get_operation(
         &self,
-        _type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        tokio::time::sleep(self.delay).await;
-        HashMap::new()
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        unreachable!()
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        unreachable!()
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        unreachable!()
-    }
-    async fn list_instances(
-        &self,
-        _query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        unreachable!()
+        ctx: &toolkit_security::PlatformSecurityContext,
+        operation_id: Uuid,
+    ) -> Result<types_registry_sdk::Operation, CanonicalError> {
+        self.inner.get_operation(ctx, operation_id).await
     }
 }
