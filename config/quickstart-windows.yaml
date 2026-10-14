@@ -166,6 +166,17 @@ gears:
       default_page_size: 5
       max_page_size: 100
 
+  types-registry:
+    # The tenant-resolver plugins publish through the database-backed registry API.
+    database:
+      server: "sqlite_users"
+      file: "types_registry.db"
+    config:
+      limits:
+        # The startup seed admits all linked inventory in one operation; with every
+        # example feature that is 146 documents (T31 seed audit), above the default 100.
+        batch_candidates: 256
+
   tenant-resolver:
     config:
       vendor: "constructorfabric"
