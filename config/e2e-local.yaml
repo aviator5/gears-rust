@@ -170,6 +170,11 @@ gears:
       registration_policy:
         "gts.acme.e2e.*":
           allowed_vendors: [acme]
+      limits:
+        # The startup seed admits all linked inventory and `entities` in one
+        # operation: 144 documents with `config/e2e-features.txt` (T31 seed
+        # audit). The default of 100 does not fit.
+        batch_candidates: 256
 
   static-tr-plugin:
     config:
