@@ -42,8 +42,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
-    EntityField, FieldSelection, GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
-    Projection, TypeSchema,
+    EntityField, FieldSelection, GtsId, LifecycleStatus, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection, TypeSchema,
 };
 use uuid::Uuid;
 
@@ -242,7 +242,8 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
 
 /// Look up one requested UUID: an unanswered key is a contract break of
 /// the registry client (service unavailable), `None` is an unregistered
-/// tenant type.
+/// tenant type, and a deleted one admits no new pairing either — exact
+/// reads answer tombstones, which the legacy catalogue never held.
 fn resolve_schema<'a>(
     map: &'a HashMap<Uuid, Option<TypeSchema>>,
     uuid: Uuid,
@@ -255,6 +256,14 @@ fn resolve_schema<'a>(
         Some(None) => Err(DomainError::InvalidTenantType {
             detail: format!("{role} tenant type {uuid} not registered in GTS"),
         }),
+        Some(Some(schema)) if schema.lifecycle_status != LifecycleStatus::Active => {
+            Err(DomainError::InvalidTenantType {
+                detail: format!(
+                    "{role} tenant type {} ({uuid}) is deleted in GTS",
+                    schema.type_id.as_ref()
+                ),
+            })
+        }
         Some(Some(schema)) => Ok(schema),
     }
 }
