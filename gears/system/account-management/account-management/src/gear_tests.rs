@@ -970,6 +970,33 @@ mod restart_tests {
         }
     }
 
+    /// The stored AM tenant-resolver plugin instance's revision, if any.
+    async fn tr_instance_revision(booted: &Booted) -> Option<u64> {
+        let id = tenant_resolver_sdk::TenantResolverPluginSpecV1::gts_make_instance_id(
+            "cf.builtin.account_management_tenant_resolver.plugin.v1",
+        );
+        let read = booted
+            .hub
+            .get::<dyn PlatformTypesRegistryApi>()
+            .expect("platform API")
+            .get_instance(
+                &PlatformSecurityContext::outbound_marker(),
+                &id,
+                Projection::Select(FieldSelection::with(&[EntityField::Origin])),
+            )
+            .await;
+        match read {
+            Ok(instance) => match instance.origin {
+                Some(Origin::Managed {
+                    resource_version, ..
+                }) => Some(resource_version),
+                other => panic!("a managed origin, got {other:?}"),
+            },
+            Err(CanonicalError::NotFound { .. }) => None,
+            Err(error) => panic!("instance read failed: {error:?}"),
+        }
+    }
+
     fn resource_version(schema: &TypeSchema) -> u64 {
         match schema.origin {
             Some(Origin::Managed {
@@ -1116,6 +1143,9 @@ mod restart_tests {
             .await
             .expect("AM serves the tenant query");
         assert_eq!(info.tenant_type.as_deref(), Some(ROOT_TENANT_TYPE));
+        let published = tr_instance_revision(&enabled)
+            .await
+            .expect("the enabled plugin published its instance");
         enabled.shutdown().await;
 
         // The instance published by the first boot is still stored; the
@@ -1128,6 +1158,11 @@ mod restart_tests {
             .await
             .expect_err("no running plugin");
         assert!(error.contains("PluginNotFound"), "{error}");
+        assert_eq!(
+            tr_instance_revision(&disabled).await,
+            Some(published),
+            "disabling neither deletes nor rewrites the stored instance"
+        );
         disabled.shutdown().await;
 
         let again = data
@@ -1138,6 +1173,11 @@ mod restart_tests {
             .await
             .expect("re-enabled AM serves again");
         assert_eq!(info.id.0, Uuid::parse_str(ROOT_ID).expect("uuid"));
+        assert_eq!(
+            tr_instance_revision(&again).await,
+            Some(published),
+            "re-enabling with the same instance writes nothing"
+        );
         again.shutdown().await;
     }
 }
