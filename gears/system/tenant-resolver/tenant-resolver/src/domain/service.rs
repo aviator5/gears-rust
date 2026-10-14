@@ -15,9 +15,12 @@ use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use toolkit::telemetry::ThrottledLog;
 use toolkit_macros::domain_model;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tracing::info;
-use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use types_registry_sdk::{
+    EntityFilter, EntityKind, GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt,
+};
 
 use super::error::DomainError;
 
@@ -89,18 +92,50 @@ impl Service {
 
         let registry = self
             .hub
-            .get::<dyn TypesRegistryClient>()
+            .get::<dyn PlatformTypesRegistryApi>()
             .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
 
-        let plugin_type_id = TenantResolverPluginSpecV1::gts_type_id().clone();
-
+        let plugin_type_id = TenantResolverPluginSpecV1::gts_type_id();
+        let pattern = GtsIdPattern::try_new(&format!("{plugin_type_id}*"))
+            .map_err(|e| DomainError::Internal(format!("plugin discovery pattern: {e}")))?;
+        let query = ListEntitiesRequest {
+            filter: EntityFilter {
+                pattern: Some(pattern),
+                kind: Some(EntityKind::Instance),
+                ..EntityFilter::default()
+            },
+            ..ListEntitiesRequest::default()
+        };
+        // The helper follows every page and fails on any page's error, so selection never
+        // runs over a truncated listing.
         let instances = registry
-            .list_instances(InstanceQuery::new().with_pattern(format!("{plugin_type_id}*")))
+            .list_instances(&PlatformSecurityContext::outbound_marker(), query)
             .await?;
 
+        // The database keeps the instances of plugins that earlier boots published, also after
+        // a plugin is disabled; choose among those whose plugin runs in this process.
         let gts_id = choose_plugin_instance::<TenantResolverPluginSpecV1>(
             &self.vendor,
-            instances.iter().map(|e| (e.id.as_ref(), &e.object)),
+            instances
+                .iter()
+                .filter(|instance| {
+                    self.hub
+                        .try_get_scoped::<dyn TenantResolverPluginClient>(&ClientScope::gts_id(
+                            instance.id.as_ref(),
+                        ))
+                        .is_some()
+                })
+                .map(|instance| {
+                    instance
+                        .content
+                        .as_ref()
+                        .map(|content| (instance.id.as_ref(), content))
+                        .ok_or_else(|| DomainError::InvalidPluginInstance {
+                            gts_id: instance.id.to_string(),
+                            reason: "the listing returned no content".to_owned(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         )?;
         info!(plugin_gts_id = %gts_id, "Selected tenant resolver plugin instance");
 
@@ -224,3 +259,8 @@ impl Service {
             .map_err(DomainError::from)
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_tests.rs"]
+mod service_tests;

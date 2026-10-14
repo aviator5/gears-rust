@@ -47,3 +47,7 @@ inventory = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
