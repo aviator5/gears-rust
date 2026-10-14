@@ -1,72 +1,80 @@
 //! Registration of Account Management's configured platform-root tenant type.
 //!
-//! This intentionally uses the existing process-local [`TypesRegistryClient`].
-//! During gear initialization the client stages the schema in Types Registry's
-//! configuration catalogue. Types Registry's existing `post_init` ready
-//! transition then performs full GTS semantic validation before any stateful
-//! gear starts.
+//! AM reconciles the root type into the database-backed Types Registry
+//! through the in-process platform API during its own `init()`, and waits
+//! for admission before bootstrap reads it. An equal document submits
+//! nothing; a permitted content change (`idp_provisioning`) is an update
+//! under the registry's ordinary compatibility rules, and a refused one
+//! fails startup naming the identifier.
 //!
-//! This path does not provide persistence or cross-replica coordination. Those
-//! guarantees belong to the Types Registry P0 consumer migration tracked by
-//! #4627.
+//! The caller validates the stored root binding before calling this, so a
+//! configured-type mismatch never reaches the registry.
+
+use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use toolkit_gts::GTS_ID_URI_PREFIX;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
+    ReconcileOptions, ReconcileReport,
+};
 
-use crate::domain::root_type::RootTypeConfig;
+use crate::domain::root_type::{RootTypeConfig, TENANT_TYPE_BASE};
 
 const JSON_SCHEMA_DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
 
-/// Register the configured root-type definition in the process-local registry.
+/// Budget for registering the root type from `init()`. With several registry
+/// instances on one database an admission can wait up to a minute for another
+/// instance's outbox.
+const REGISTRATION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Reconcile the configured root-type definition and wait for its admission.
 ///
-/// Registration is create-if-absent and idempotent for an identical document.
-/// The existing client rejects a second document under the same identifier, so
-/// definition drift is startup-fatal. Full semantic validation is completed by
-/// Types Registry's ready transition after every gear has finished `init()`.
+/// # Errors
+/// An invalid configuration, a refused or unsettled admission (the error
+/// names the identifier and its outcome), the deadline or cancellation.
 pub async fn register_root_type(
-    registry: &dyn TypesRegistryClient,
+    registry: &dyn PlatformTypesRegistryApi,
     cfg: &RootTypeConfig,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let expected_id = cfg.validated_id().map_err(anyhow::Error::msg)?;
+    let id = GtsId::try_new(cfg.validated_id().map_err(anyhow::Error::msg)?)?;
     let desired = desired_root_schema(cfg)?;
-    let mut results = registry
-        .register_type_schemas(vec![desired])
+    let publisher = PublisherContext {
+        name: "account-management".to_owned(),
+        version: env!("CARGO_PKG_VERSION").parse()?,
+    };
+    let mut options = ReconcileOptions::default();
+    options.deadline = REGISTRATION_DEADLINE;
+    registry
+        .reconcile_entities_and_await(
+            &PlatformSecurityContext::outbound_marker(),
+            &publisher,
+            &[(id.clone(), desired)],
+            &options,
+            cancel,
+        )
         .await
-        .map_err(|error| anyhow::anyhow!("root tenant type registration failed: {error}"))?;
-
-    if results.len() != 1 {
-        anyhow::bail!(
-            "root tenant type registration returned {} results for one schema",
-            results.len()
-        );
-    }
-
-    match results.remove(0) {
-        RegisterResult::Ok { gts_id } if gts_id == expected_id => Ok(()),
-        RegisterResult::Ok { gts_id } => anyhow::bail!(
-            "root tenant type registration returned unexpected id {gts_id}; expected {expected_id}"
-        ),
-        RegisterResult::Err { gts_id, error } => {
-            let attempted = gts_id.as_deref().unwrap_or(expected_id);
-            anyhow::bail!(
-                "root tenant type {attempted} conflicts with the Account Management-owned definition or is invalid: {error}"
-            )
-        }
-    }
+        .map_err(|error| {
+            let outcome = ReconcileReport::from_canonical(&error)
+                .and_then(|report| report.outcomes.get(&id).cloned());
+            anyhow::anyhow!("root tenant type {id} was not admitted: {error}; outcome: {outcome:?}")
+        })?;
+    Ok(())
 }
 
 /// Build the single AM-owned concrete root schema.
 pub fn desired_root_schema(cfg: &RootTypeConfig) -> anyhow::Result<Value> {
+    // The configuration guarantees a type directly derived from the envelope.
     let type_id = cfg.validated_id().map_err(anyhow::Error::msg)?;
-    let parent = types_registry_sdk::GtsTypeSchema::derive_parent_type_id(type_id)
-        .ok_or_else(|| anyhow::anyhow!("root tenant type {type_id} has no concrete parent"))?;
     Ok(json!({
         "$id": format!("{GTS_ID_URI_PREFIX}{type_id}"),
         "$schema": JSON_SCHEMA_DRAFT_07,
         "description": "Platform-root tenant type (no parents).",
         "type": "object",
-        "allOf": [{ "$ref": format!("{GTS_ID_URI_PREFIX}{parent}") }],
+        "allOf": [{ "$ref": format!("{GTS_ID_URI_PREFIX}{TENANT_TYPE_BASE}") }],
         "x-gts-traits": {
             "allowed_parent_types": [],
             "idp_provisioning": cfg.idp_provisioning,

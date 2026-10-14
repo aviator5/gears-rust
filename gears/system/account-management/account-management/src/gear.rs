@@ -62,11 +62,16 @@ use crate::tr_plugin::PluginImpl as TrPluginImpl;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
-use types_registry_sdk::RegisterResult;
+use types_registry_sdk::PlatformTypesRegistryApiExt;
 
 type ConcreteService = TenantService<TenantRepoImpl>;
 
 const ROOT_BINDING_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Budget for publishing the opt-in tenant-resolver plugin instance from
+/// `init()`. With several registry instances on one database an admission
+/// can wait up to a minute for another instance's outbox.
+const TR_PLUGIN_PUBLICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Bootstrap dependencies captured in `init()` and consumed by
 /// `serve()`. Separating validation (fast, in `init`) from execution
@@ -681,15 +686,14 @@ impl Gear for AccountManagementGear {
             .map_err(|e| anyhow::anyhow!("failed to get PlatformTypesRegistryApi: {e}"))?;
 
         // The root-type contract is registered independently from the optional
-        // bootstrap saga and its `strict` policy. At this point Types Registry
-        // is still in configuration mode: registration stages the AM-owned
-        // document, and its system `post_init` validates the complete catalogue
-        // before stateful gears (including AM bootstrap) start.
+        // bootstrap saga and its `strict` policy: AM reconciles it into the
+        // database-backed registry and waits for its admission, so bootstrap
+        // reads an admitted root.
         if let Some(root_cfg) = root_type.as_ref() {
             // `tenant_type_uuid` is the durable create-once binding between an
             // existing root row and its configured GTS contract. Reject drift
-            // before mutating the process-local catalogue and before non-strict
-            // bootstrap policy can suppress it.
+            // before any registry write and before non-strict bootstrap policy
+            // can suppress it.
             let root_scope = toolkit_db::secure::AccessScope::allow_all();
             let existing_root = tokio::select! {
                 () = ctx.cancellation_token().cancelled() => {
@@ -719,18 +723,20 @@ impl Gear for AccountManagementGear {
                 )?;
             }
 
-            register_root_type(types_registry.as_ref(), root_cfg)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "account-management root tenant type registration failed: {error}"
-                    )
-                })?;
+            register_root_type(
+                platform_registry.as_ref(),
+                root_cfg,
+                ctx.cancellation_token(),
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("account-management root tenant type registration failed: {error}")
+            })?;
 
             info!(
                 target: "am.root_tenant_type",
                 root_tenant_type = %root_cfg.gts_id,
-                "root tenant type registered for Types Registry startup validation"
+                "root tenant type admitted by Types Registry"
             );
         }
 
@@ -1060,37 +1066,31 @@ impl Gear for AccountManagementGear {
             };
             let tr_instance_json = serde_json::to_value(&tr_instance)
                 .map_err(|e| anyhow::anyhow!("tr-plugin: serialize instance failed: {e}"))?;
-            let tr_results = types_registry
-                .register(vec![tr_instance_json.clone()])
-                .await?;
-            // Idempotent restart: treat `AlreadyExists` as success only
-            // when the stored spec matches our current serialized
-            // instance; fail otherwise so a stale registration under
-            // the same ID surfaces immediately.
-            for result in &tr_results {
-                if let RegisterResult::Err { error, .. } = result {
-                    if matches!(
-                        error,
-                        toolkit_canonical_errors::CanonicalError::AlreadyExists { .. }
-                    ) {
-                        let existing = types_registry
-                            .get_instance(tr_instance_id.as_ref())
-                            .await
-                            .map_err(|e| {
-                            anyhow::anyhow!("tr-plugin: verify existing instance: {e}")
-                        })?;
-                        if existing.object != tr_instance_json {
-                            return Err(anyhow::anyhow!(
-                                "tr-plugin: instance already registered with a different spec"
-                            ));
-                        }
-                    } else {
-                        return Err(anyhow::anyhow!("tr-plugin: registration failed: {error}"));
-                    }
-                }
-            }
-            // Only after types-registry has accepted the instance
-            // (or confirmed an idempotent restart) do we publish the
+            let tr_gts_id = types_registry_sdk::GtsId::try_new(tr_instance_id.as_ref())?;
+            let mut tr_options = types_registry_sdk::ReconcileOptions::default();
+            tr_options.deadline = TR_PLUGIN_PUBLICATION_DEADLINE;
+            platform_registry
+                .reconcile_entities_and_await(
+                    &toolkit_security::PlatformSecurityContext::outbound_marker(),
+                    &types_registry_sdk::PublisherContext {
+                        name: Self::MODULE_NAME.to_owned(),
+                        version: env!("CARGO_PKG_VERSION").parse()?,
+                    },
+                    &[(tr_gts_id.clone(), tr_instance_json)],
+                    &tr_options,
+                    ctx.cancellation_token(),
+                )
+                .await
+                .map_err(|error| {
+                    let outcome = types_registry_sdk::ReconcileReport::from_canonical(&error)
+                        .and_then(|report| report.outcomes.get(&tr_gts_id).cloned());
+                    anyhow::anyhow!(
+                        "tr-plugin: publishing instance {tr_instance_id} failed: {error}; \
+                         outcome: {outcome:?}"
+                    )
+                })?;
+            // Only after types-registry has admitted the instance
+            // (or found it up to date) do we publish the
             // scoped client to the hub. A failure above returns Err
             // before we reach this point, leaving `ClientHub`
             // untouched.

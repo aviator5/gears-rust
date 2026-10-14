@@ -470,14 +470,15 @@ mod no_seed_startup_tests {
     };
     use sea_orm_migration::{MigrationTrait, MigratorTrait};
     use serde_json::{Value, json};
-    use toolkit::contracts::SystemCapability;
-    use toolkit::runtime::{GearManager, GrpcInstallerStore, SystemContext};
     use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
     use toolkit_canonical_errors::CanonicalError;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
     use toolkit_security::PlatformSecurityContext;
-    use types_registry_sdk::TypesRegistryClient;
+    use types_registry_sdk::{
+        EntityField, FieldSelection, GtsTypeId, PlatformTypesRegistryApi,
+        PlatformTypesRegistryApiExt, Projection,
+    };
 
     use crate::gear::AccountManagementGear;
 
@@ -563,9 +564,9 @@ mod no_seed_startup_tests {
         let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
         hub.register::<dyn AuthZResolverApi>(authz);
 
-        // Initialize the actual Types Registry gear with its default, seedless
-        // configuration. This publishes the process-local client in
-        // configuration mode, before its ready transition.
+        // Initialize the actual Types Registry gear on its own database with no
+        // configured entities: it seeds the linked inventory and publishes the
+        // platform API.
         let types_registry_gear = types_registry::gear::TypesRegistryGear::default();
         let types_registry_ctx = context(
             "types-registry",
@@ -582,10 +583,15 @@ mod no_seed_startup_tests {
             .expect("Types Registry init");
 
         let registry = hub
-            .get::<dyn TypesRegistryClient>()
-            .expect("Types Registry client");
+            .get::<dyn PlatformTypesRegistryApi>()
+            .expect("Types Registry platform API");
+        let platform = PlatformSecurityContext::outbound_marker();
+        let root_type = GtsTypeId::new(ROOT_TENANT_TYPE);
         assert!(
-            registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err(),
+            registry
+                .get_type_schema(&platform, &root_type, Projection::Default)
+                .await
+                .is_err(),
             "the test must not accidentally provide a YAML root seed"
         );
 
@@ -626,35 +632,146 @@ mod no_seed_startup_tests {
             .await
             .expect("AM init without a YAML root seed");
 
-        // AM registration happens while the registry is in configuration mode,
-        // so the staged definition is intentionally not readable yet.
-        assert!(registry.get_type_schema(ROOT_TENANT_TYPE).await.is_err());
-
-        let sys = SystemContext::new(
-            uuid::Uuid::new_v4(),
-            Arc::new(GearManager::new()),
-            Arc::new(GrpcInstallerStore::new()),
-        );
-        types_registry_gear
-            .post_init(&sys)
-            .await
-            .expect("Types Registry semantic validation and ready transition");
-
+        // AM init waits for the root's admission: it is readable at once,
+        // with its materialized traits.
         let runtime_root = registry
-            .get_type_schema(ROOT_TENANT_TYPE)
+            .get_type_schema(
+                &platform,
+                &root_type,
+                Projection::Select(FieldSelection::with(&[
+                    EntityField::EffectiveTraits,
+                    EntityField::ResolvedSchema,
+                ])),
+            )
             .await
-            .expect("validated in-memory root type");
+            .expect("admitted root type");
         assert_eq!(runtime_root.type_id.as_ref(), ROOT_TENANT_TYPE);
         assert_eq!(
-            runtime_root.effective_traits(),
-            json!({"allowed_parent_types": [], "idp_provisioning": false})
+            runtime_root.effective_traits,
+            Some(json!({"allowed_parent_types": [], "idp_provisioning": false}))
         );
-        assert_eq!(
-            runtime_root
-                .parent
-                .as_ref()
-                .map(|parent| parent.type_id.as_ref()),
-            Some("gts.cf.core.am.tenant_type.v1~")
+        assert!(
+            runtime_root.resolved_schema.is_some(),
+            "the root resolves against the seeded envelope"
         );
+    }
+
+    /// AM's init over a real registry and a real AM database holding a
+    /// platform root bound to another tenant type.
+    async fn init_over_a_mismatched_root(strict: bool) -> (anyhow::Error, Arc<ClientHub>) {
+        use sea_orm::ActiveValue;
+        use toolkit_db::secure::secure_insert;
+
+        use crate::infra::storage::entity::tenants;
+
+        let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {
+            account_management: json!({
+                "config": {
+                    "root_tenant_type": {
+                        "gts_id": ROOT_TENANT_TYPE,
+                        "idp_provisioning": false
+                    },
+                    "bootstrap": {
+                        "root_id": "00000000-df51-5b42-9538-d2b56b7ee953",
+                        "root_name": "platform-root",
+                        "strict": strict
+                    }
+                }
+            }),
+        });
+        let hub = Arc::new(ClientHub::new());
+        let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
+        hub.register::<dyn AuthZResolverApi>(authz);
+        let types_registry_gear = types_registry::gear::TypesRegistryGear::default();
+        types_registry_gear
+            .init(&context(
+                "types-registry",
+                Arc::clone(&config),
+                Arc::clone(&hub),
+                migrated_sqlite(toolkit::contracts::DatabaseCapability::migrations(
+                    &types_registry_gear,
+                ))
+                .await,
+            ))
+            .await
+            .expect("Types Registry init");
+        let resource_group_gear = resource_group::gear::ResourceGroup::default();
+        resource_group_gear
+            .init(&context(
+                "resource-group",
+                Arc::clone(&config),
+                Arc::clone(&hub),
+                migrated_sqlite(resource_group::infra::storage::migrations::Migrator::migrations())
+                    .await,
+            ))
+            .await
+            .expect("Resource Group init");
+
+        let am_db = migrated_sqlite(crate::Migrator::migrations()).await;
+        let provider = crate::infra::storage::repo_impl::AmDbProvider::new(am_db.clone());
+        let now = time::OffsetDateTime::now_utc();
+        secure_insert::<tenants::Entity>(
+            tenants::ActiveModel {
+                id: ActiveValue::Set(
+                    uuid::Uuid::parse_str("00000000-df51-5b42-9538-d2b56b7ee953").expect("uuid"),
+                ),
+                parent_id: ActiveValue::Set(None),
+                name: ActiveValue::Set("platform-root".to_owned()),
+                status: ActiveValue::Set(
+                    crate::domain::tenant::model::TenantStatus::Active.as_smallint(),
+                ),
+                self_managed: ActiveValue::Set(false),
+                tenant_type_uuid: ActiveValue::Set(uuid::Uuid::nil()),
+                depth: ActiveValue::Set(0),
+                created_at: ActiveValue::Set(now),
+                updated_at: ActiveValue::Set(now),
+                deleted_at: ActiveValue::Set(None),
+                retention_window_secs: ActiveValue::Set(None),
+                claimed_by: ActiveValue::Set(None),
+                claimed_at: ActiveValue::Set(None),
+                terminal_failure_at: ActiveValue::Set(None),
+            },
+            &toolkit_db::secure::AccessScope::allow_all(),
+            &provider.conn().expect("conn"),
+        )
+        .await
+        .expect("seed a root bound to another tenant type");
+
+        let error = AccountManagementGear::default()
+            .init(&context(
+                "account-management",
+                config,
+                Arc::clone(&hub),
+                am_db,
+            ))
+            .await
+            .expect_err("a root binding mismatch fails init");
+        (error, hub)
+    }
+
+    #[tokio::test]
+    async fn a_root_binding_mismatch_fails_before_any_registry_write() {
+        for strict in [true, false] {
+            let (error, hub) = init_over_a_mismatched_root(strict).await;
+
+            assert!(
+                format!("{error:#}").contains("root binding mismatch"),
+                "strict={strict}: {error:#}"
+            );
+            let registry = hub
+                .get::<dyn PlatformTypesRegistryApi>()
+                .expect("Types Registry platform API");
+            let read = registry
+                .get_type_schema(
+                    &PlatformSecurityContext::outbound_marker(),
+                    &GtsTypeId::new(ROOT_TENANT_TYPE),
+                    Projection::Default,
+                )
+                .await;
+            assert!(
+                matches!(read, Err(CanonicalError::NotFound { .. })),
+                "strict={strict}: no root schema was written, got {read:?}"
+            );
+        }
     }
 }
