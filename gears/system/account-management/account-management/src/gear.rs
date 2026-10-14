@@ -1035,7 +1035,7 @@ impl Gear for AccountManagementGear {
             let hierarchy_read_adapter = Arc::new(TenantHierarchyReadAdapter::new(Arc::clone(&db)));
             let tr_plugin = Arc::new(TrPluginImpl::new(
                 hierarchy_read_adapter,
-                Arc::clone(&types_registry),
+                Arc::clone(&platform_registry),
             ));
             let tr_instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
                 "cf.builtin.account_management_tenant_resolver.plugin.v1",

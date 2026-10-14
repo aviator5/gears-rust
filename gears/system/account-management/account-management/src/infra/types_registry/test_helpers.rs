@@ -131,3 +131,91 @@ impl types_registry_sdk::PlatformTypesRegistryApi for Tampered {
         self.inner.get_operation(ctx, operation_id).await
     }
 }
+
+/// A platform registry that answers every read by UUID with the same
+/// Type Schema, carrying the requested UUID, and every read by
+/// identifier with `NotFound`. For fixtures whose seeded rows carry
+/// opaque tenant-type UUIDs no real registry would know: only the
+/// typed identifier on the answer is load-bearing. Reads by identifier
+/// miss, so AM-owned resource schemas (`gts.cf.core.am.tenant.v1~` /
+/// `.user.v1~`) are absent and payload validation short-circuits.
+pub struct ConstantTypeRegistry(pub &'static str);
+
+fn not_implemented() -> CanonicalError {
+    CanonicalError::internal("not implemented for the constant test registry").create()
+}
+
+#[async_trait]
+impl types_registry_sdk::PlatformTypesRegistryApi for ConstantTypeRegistry {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        let gts_id = types_registry_sdk::GtsId::try_new(self.0).expect("valid id");
+        let answers = request
+            .items
+            .into_iter()
+            .map(|item| {
+                let lookup = match item.key {
+                    types_registry_sdk::EntityKey::GtsUuid(uuid) => {
+                        types_registry_sdk::EntityLookup::Found {
+                            entity: Box::new(types_registry_sdk::Entity {
+                                gts_id: gts_id.clone(),
+                                gts_uuid: uuid,
+                                kind: types_registry_sdk::EntityKind::TypeSchema,
+                                lifecycle_status: types_registry_sdk::LifecycleStatus::Active,
+                                origin: None,
+                                content: None,
+                                resolved_schema: None,
+                                effective_traits: None,
+                                effective_traits_schema: None,
+                                provenance: None,
+                            }),
+                            etag: types_registry_sdk::Validator::from_bytes("constant"),
+                        }
+                    }
+                    types_registry_sdk::EntityKey::GtsId(_) => {
+                        types_registry_sdk::EntityLookup::NotFound
+                    }
+                };
+                (item.key, lookup)
+            })
+            .collect();
+        Ok(types_registry_sdk::BatchGetEntitiesResponse(answers))
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        Err(not_implemented())
+    }
+
+    async fn register_entities(
+        &self,
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _key: types_registry_sdk::IdempotencyKey,
+        _request: types_registry_sdk::RegisterEntitiesRequest,
+    ) -> Result<types_registry_sdk::RegistrationOperation, CanonicalError> {
+        Err(not_implemented())
+    }
+
+    async fn delete_entities(
+        &self,
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _key: types_registry_sdk::IdempotencyKey,
+        _request: types_registry_sdk::DeleteEntitiesRequest,
+    ) -> Result<types_registry_sdk::DeletionOperation, CanonicalError> {
+        Err(not_implemented())
+    }
+
+    async fn get_operation(
+        &self,
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _operation_id: Uuid,
+    ) -> Result<types_registry_sdk::Operation, CanonicalError> {
+        Err(not_implemented())
+    }
+}

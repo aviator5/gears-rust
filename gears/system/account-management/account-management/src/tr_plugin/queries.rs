@@ -47,7 +47,8 @@ use tenant_resolver_sdk::{
     BarrierMode as SdkBarrierMode, GetAncestorsResponse, GetDescendantsResponse, TenantId,
     TenantInfo, TenantRef, TenantResolverError, TenantStatus as SdkTenantStatus,
 };
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection};
 
 use crate::domain::tenant::hierarchy_read_port::{
     BarrierMode, StatusFilter, TenantHierarchyReadPort,
@@ -148,17 +149,24 @@ fn sdk_statuses_to_filter(statuses: &[SdkTenantStatus]) -> StatusFilter {
 }
 
 /// Resolve a single `tenant_type_uuid` to its chained GTS identifier
-/// via [`TypesRegistryClient::get_type_schema_by_uuid`].
+/// via the registry's read by UUID.
 ///
 /// Per DESIGN §3.4 / §5: registry unavailable -> fail with
 /// [`TenantResolverError::Internal`]; must not return raw UUIDs in
 /// place of public `tenant_type`. The detailed cause is logged
 /// server-side.
 async fn resolve_tenant_type_one(
-    registry: &Arc<dyn TypesRegistryClient>,
+    registry: &Arc<dyn PlatformTypesRegistryApi>,
     type_uuid: Uuid,
 ) -> Result<String, TenantResolverError> {
-    match registry.get_type_schema_by_uuid(type_uuid).await {
+    match registry
+        .get_type_schema_by_uuid(
+            &PlatformSecurityContext::outbound_marker(),
+            type_uuid,
+            Projection::Default,
+        )
+        .await
+    {
         Ok(schema) => Ok(schema.type_id.as_ref().to_owned()),
         Err(err) => {
             tracing::warn!(
@@ -175,13 +183,13 @@ async fn resolve_tenant_type_one(
 }
 
 /// Batched companion to [`resolve_tenant_type_one`]. Issues one
-/// `get_type_schemas_by_uuid` round-trip for the *distinct* uuids
+/// batch read by UUID for the *distinct* uuids
 /// supplied so latency scales with pages, not rows.
 ///
 /// Per DESIGN §3.4 / §5: any per-UUID resolution failure fails the
 /// entire call with `TenantResolverError::Internal`.
 async fn resolve_tenant_types_for_uuids(
-    registry: &Arc<dyn TypesRegistryClient>,
+    registry: &Arc<dyn PlatformTypesRegistryApi>,
     uuids: impl IntoIterator<Item = Uuid>,
 ) -> Result<HashMap<Uuid, String>, TenantResolverError> {
     let mut distinct: Vec<Uuid> = uuids.into_iter().collect();
@@ -190,25 +198,34 @@ async fn resolve_tenant_types_for_uuids(
     if distinct.is_empty() {
         return Ok(HashMap::new());
     }
-    let resolved = registry.get_type_schemas_by_uuid(distinct).await;
+    let resolved = registry
+        .batch_get_type_schemas_by_uuid(
+            &PlatformSecurityContext::outbound_marker(),
+            &distinct,
+            Projection::Default,
+        )
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                target: "tr_plugin",
+                error = %err,
+                "tenant_type uuid -> chained-id batch resolution failed"
+            );
+            TenantResolverError::Internal("tenant resolver tenant_type hydration failed".to_owned())
+        })?;
     let mut out: HashMap<Uuid, String> = HashMap::with_capacity(resolved.len());
-    for (uuid, res) in resolved {
-        match res {
-            Ok(schema) => {
-                out.insert(uuid, schema.type_id.as_ref().to_owned());
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "tr_plugin",
-                    tenant_type_uuid = %uuid,
-                    error = %err,
-                    "tenant_type uuid -> chained-id resolution failed"
-                );
-                return Err(TenantResolverError::Internal(
-                    "tenant resolver tenant_type hydration failed".to_owned(),
-                ));
-            }
-        }
+    for (uuid, schema) in resolved {
+        let Some(schema) = schema else {
+            tracing::warn!(
+                target: "tr_plugin",
+                tenant_type_uuid = %uuid,
+                "tenant_type uuid is not registered; chained-id resolution failed"
+            );
+            return Err(TenantResolverError::Internal(
+                "tenant resolver tenant_type hydration failed".to_owned(),
+            ));
+        };
+        out.insert(uuid, schema.type_id.as_ref().to_owned());
     }
     Ok(out)
 }
@@ -216,7 +233,7 @@ async fn resolve_tenant_types_for_uuids(
 /// `get_tenant`.
 pub(super) async fn get_tenant(
     port: &Arc<dyn TenantHierarchyReadPort>,
-    registry: &Arc<dyn TypesRegistryClient>,
+    registry: &Arc<dyn PlatformTypesRegistryApi>,
     id: TenantId,
 ) -> Result<TenantInfo, TenantResolverError> {
     let row = port
@@ -231,7 +248,7 @@ pub(super) async fn get_tenant(
 /// `get_root_tenant`.
 pub(super) async fn get_root_tenant(
     port: &Arc<dyn TenantHierarchyReadPort>,
-    registry: &Arc<dyn TypesRegistryClient>,
+    registry: &Arc<dyn PlatformTypesRegistryApi>,
 ) -> Result<TenantInfo, TenantResolverError> {
     // Port returns AT MOST 2 rows so the plugin can distinguish
     // 0 / 1 / many without an unbounded scan.
@@ -273,7 +290,7 @@ pub(super) async fn get_root_tenant(
 /// `get_tenants`.
 pub(super) async fn get_tenants(
     port: &Arc<dyn TenantHierarchyReadPort>,
-    registry: &Arc<dyn TypesRegistryClient>,
+    registry: &Arc<dyn PlatformTypesRegistryApi>,
     ids: &[TenantId],
     status_filter: &[SdkTenantStatus],
 ) -> Result<Vec<TenantInfo>, TenantResolverError> {
@@ -382,7 +399,7 @@ pub(super) async fn is_ancestor(
 /// `get_ancestors`.
 pub(super) async fn get_ancestors(
     port: &Arc<dyn TenantHierarchyReadPort>,
-    registry: &Arc<dyn TypesRegistryClient>,
+    registry: &Arc<dyn PlatformTypesRegistryApi>,
     id: TenantId,
     barrier_mode: SdkBarrierMode,
 ) -> Result<GetAncestorsResponse, TenantResolverError> {
@@ -479,7 +496,7 @@ pub(super) async fn get_ancestors(
 )]
 pub(super) async fn get_descendants(
     port: &Arc<dyn TenantHierarchyReadPort>,
-    registry: &Arc<dyn TypesRegistryClient>,
+    registry: &Arc<dyn PlatformTypesRegistryApi>,
     id: TenantId,
     barrier_mode: SdkBarrierMode,
     status_filter: &[SdkTenantStatus],
