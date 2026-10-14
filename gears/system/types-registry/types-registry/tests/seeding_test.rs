@@ -25,6 +25,12 @@ mod common;
 
 const BUDGET: Duration = Duration::from_secs(30);
 
+/// Two registry instances: one may sequence a message into a partition whose lease
+/// the other's processor holds, and that processor finds it only on its idle poll
+/// (one minute under the `low_latency` outbox profile). The production seed budget
+/// is five minutes; the races get more than one poll.
+const RACE_BUDGET: Duration = Duration::from_mins(3);
+
 const AM_BASE: &str = "gts.cf.core.am.tenant_type.v1~";
 const CUSTOMER: &str = "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~";
 const PLUGIN_SPEC: &str = "gts.cf.toolkit.plugins.plugin.v1~cf.core.seed_test.plugin.v1~";
@@ -354,8 +360,8 @@ async fn concurrent_seeders_converge_on_an_empty_database() {
     let cancel = CancellationToken::new();
 
     let (left, right) = tokio::join!(
-        seed(&a.service, &set, BUDGET, &cancel),
-        seed(&b.service, &set, BUDGET, &cancel),
+        seed(&a.service, &set, RACE_BUDGET, &cancel),
+        seed(&b.service, &set, RACE_BUDGET, &cancel),
     );
 
     left.expect("left seeder");
@@ -375,14 +381,14 @@ async fn concurrent_seeders_converge_on_one_permitted_update() {
     let a = registry(&db, TypesRegistryConfig::default()).await;
     let b = registry(&db, TypesRegistryConfig::default()).await;
     let cancel = CancellationToken::new();
-    seed(&a.service, &seeds("first"), BUDGET, &cancel)
+    seed(&a.service, &seeds("first"), RACE_BUDGET, &cancel)
         .await
         .expect("first boot");
     let set = seeds("second");
 
     let (left, right) = tokio::join!(
-        seed(&a.service, &set, BUDGET, &cancel),
-        seed(&b.service, &set, BUDGET, &cancel),
+        seed(&a.service, &set, RACE_BUDGET, &cancel),
+        seed(&b.service, &set, RACE_BUDGET, &cancel),
     );
 
     left.expect("left seeder");
@@ -392,5 +398,78 @@ async fn concurrent_seeders_converge_on_one_permitted_update() {
         read[0],
         Some((2, customer("second"))),
         "exactly one revision"
+    );
+}
+
+#[tokio::test]
+async fn a_change_only_in_a_signed_zero_is_revised() {
+    let dir = common::TestDir::new("tr-seed-signed-zero");
+    let db = database(&dir).await;
+    let r = registry(&db, TypesRegistryConfig::default()).await;
+    let id = "gts.cf.core.seed_test.zero.v1~";
+    let with_default = |default: Value| {
+        SeedSet::collect(
+            [json!({
+                "$id": format!("gts://{id}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {"v": {"type": "number", "default": default}}
+            })],
+            &TypesRegistryConfig::default().entity_id_fields,
+        )
+        .unwrap()
+    };
+    seed(
+        &r.service,
+        &with_default(json!(0.0)),
+        BUDGET,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("first boot");
+
+    let summary = seed(
+        &r.service,
+        &with_default(json!(-0.0)),
+        BUDGET,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("the change converges");
+
+    assert_eq!(
+        summary.admitted, 1,
+        "-0.0 is a change, not an equal restart"
+    );
+    let (rv, content) = stored(&r.service, &[id]).await.remove(0).expect("stored");
+    assert_eq!(rv, 2);
+    assert_eq!(content["properties"]["v"]["default"].to_string(), "-0.0");
+}
+
+#[tokio::test]
+async fn an_empty_set_still_honours_the_budget_and_cancellation() {
+    let dir = common::TestDir::new("tr-seed-empty");
+    let db = database(&dir).await;
+    let r = registry(&db, TypesRegistryConfig::default()).await;
+    let empty = SeedSet::default();
+
+    let expired = seed(
+        &r.service,
+        &empty,
+        Duration::ZERO,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        matches!(expired, Err(SeedError::Deadline { .. })),
+        "{expired:?}"
+    );
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let cancelled = seed(&r.service, &empty, BUDGET, &cancel).await;
+    assert!(
+        matches!(cancelled, Err(SeedError::Cancelled)),
+        "{cancelled:?}"
     );
 }
