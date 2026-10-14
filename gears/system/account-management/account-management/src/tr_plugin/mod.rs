@@ -13,7 +13,7 @@
 //! and registers a scoped binding in `ClientHub` from
 //! [`crate::AccountManagementGear::init`]. Every SDK call resolves
 //! to one or two indexed reads against AM-owned storage; tenant-type
-//! reverse-hydration is delegated to `TypesRegistryClient` (which owns
+//! reverse-hydration is delegated to the platform registry client (which owns
 //! the cache for that mapping).
 
 mod error_map;

@@ -3,7 +3,7 @@
 //!
 //! Each trait method delegates to the matching free function in
 //! [`super::queries`], threading the port handle and the
-//! `TypesRegistryClient` used for `tenant_type` reverse-resolution.
+//! platform registry client used for `tenant_type` reverse-resolution.
 //! Wiring to AM's `init()` is in the gear's init function.
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use tenant_resolver_sdk::{
     TenantResolverPluginClient,
 };
 use toolkit_security::SecurityContext;
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
 
 use crate::domain::tenant::hierarchy_read_port::TenantHierarchyReadPort;
 
@@ -23,7 +23,7 @@ use crate::domain::tenant::hierarchy_read_port::TenantHierarchyReadPort;
 ///
 /// Holds an `Arc<dyn TenantHierarchyReadPort>` (the seam -- see
 /// `crate::domain::tenant::hierarchy_read_port`) and a
-/// `TypesRegistryClient` used by `super::queries` to reverse-resolve
+/// platform registry client used by `super::queries` to reverse-resolve
 /// `tenant_type_uuid -> tenant_type` on every result.
 ///
 /// # `SecurityContext` parameter
@@ -36,19 +36,19 @@ use crate::domain::tenant::hierarchy_read_port::TenantHierarchyReadPort;
 /// single named call site in the adapter).
 pub struct PluginImpl {
     port: Arc<dyn TenantHierarchyReadPort>,
-    types_registry: Arc<dyn TypesRegistryClient>,
+    types_registry: Arc<dyn PlatformTypesRegistryApi>,
 }
 
 impl PluginImpl {
     /// Build the plugin from AM's already-resolved dependencies.
     ///
     /// Called from `AccountManagementGear::init` after the
-    /// `TenantHierarchyReadAdapter` and `TypesRegistryClient` have
+    /// `TenantHierarchyReadAdapter` and platform registry client have
     /// been constructed.
     #[must_use]
     pub fn new(
         port: Arc<dyn TenantHierarchyReadPort>,
-        types_registry: Arc<dyn TypesRegistryClient>,
+        types_registry: Arc<dyn PlatformTypesRegistryApi>,
     ) -> Self {
         Self {
             port,
