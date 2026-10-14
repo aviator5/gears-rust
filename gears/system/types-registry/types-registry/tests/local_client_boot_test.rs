@@ -20,17 +20,18 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use toolkit::GearCtx;
 use toolkit::client_hub::ClientHub;
-use toolkit::lifecycle::Status;
 use toolkit::config::ConfigProvider;
 use toolkit::contracts::{DatabaseCapability, Gear, RunnableCapability, SystemCapability};
+use toolkit::lifecycle::Status;
 use toolkit::registry::RegistryBuilder;
 use toolkit::runtime::{DbOptions, HostRuntime};
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use types_registry::gear::TypesRegistryGear;
 use types_registry_sdk::{
     EntityField, FieldSelection, GtsId, GtsTypeId, Origin, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection, PublisherContext, ReconcileOptions, ReconcileOutcome,
-    ReconcileReport, Reconciliation, TypesRegistryApi, TypesRegistryApiExt, TypesRegistryClient,
+    PlatformTypesRegistryApiExt, Projection, PublisherContext, ReadOptions, ReconcileOptions,
+    ReconcileOutcome, ReconcileReport, Reconciliation, TypesRegistryApi, TypesRegistryApiExt,
+    TypesRegistryClient,
 };
 
 mod common;
@@ -66,7 +67,10 @@ fn derived(gts_id: &str, parent: &str, description: &str) -> Value {
 
 /// What the fixture consumer saw in its `init()`.
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools, reason = "independent observations of one boot")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent observations of one boot"
+)]
 struct Report {
     up_to_date: bool,
     /// The platform read of the first declaration after reconciling.
@@ -160,15 +164,18 @@ async fn publish(
 
         let (first, content) = &declarations[0];
         let type_id = GtsTypeId::try_new(first.id()).expect("a Type Schema identifier");
-        let projection = Projection::Select(FieldSelection::with(&[
-            EntityField::Content,
-            EntityField::Origin,
-        ]));
+        let read_options = ReadOptions {
+            projection: Projection::Select(FieldSelection::with(&[
+                EntityField::Content,
+                EntityField::Origin,
+            ])),
+            ..ReadOptions::default()
+        };
         let read = platform
             .get_type_schema(
                 &PlatformSecurityContext::outbound_marker(),
                 &type_id,
-                projection.clone(),
+                read_options.clone(),
             )
             .await
             .map_err(|e| format!("platform read: {e}"))?;
@@ -182,7 +189,7 @@ async fn publish(
             .get::<dyn TypesRegistryApi>()
             .map_err(|e| format!("resolve the tenant API: {e}"))?;
         let tenant_read = tenant
-            .get_type_schema(&SecurityContext::anonymous(), &type_id, projection)
+            .get_type_schema(&SecurityContext::anonymous(), &type_id, read_options)
             .await
             .map_err(|e| format!("tenant read: {e}"))?;
         let legacy = hub
@@ -568,4 +575,36 @@ async fn a_cancelled_startup_publishes_no_api() {
             .is_none()
     );
     assert!(outcome.hub.try_get::<dyn TypesRegistryApi>().is_none());
+}
+
+/// The SDK README's gear example, run against the ordinary registry: its document
+/// needs no configured base and no registration policy, and a restart is a no-op.
+#[tokio::test]
+async fn the_documented_example_publishes_and_restarts() {
+    const EXAMPLE: &str = "gts.cf.example.events.user_created.v1~";
+    let documented = || {
+        vec![(
+            GtsId::try_new(EXAMPLE).unwrap(),
+            json!({
+                "$id": format!("gts://{EXAMPLE}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object"
+            }),
+        )]
+    };
+    let dir = common::TestDir::new("tr-boot-readme");
+
+    let mut cold = Host::new(&dir);
+    cold.registry_config = json!({});
+    cold.behavior = publishing(documented(), "1.0.0");
+    let report = published(cold.run().await);
+    assert!(!report.up_to_date);
+    assert_eq!(report.resource_version, 1);
+
+    let mut restart = Host::new(&dir);
+    restart.registry_config = json!({});
+    restart.behavior = publishing(documented(), "1.0.0");
+    let report = published(restart.run().await);
+    assert!(report.up_to_date, "an equal restart submits nothing");
+    assert_eq!(report.resource_version, 1);
 }

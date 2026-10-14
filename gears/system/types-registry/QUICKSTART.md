@@ -34,6 +34,37 @@ Use the gear's internal base URL:
 BASE="$TYPES_REGISTRY_INTERNAL"
 ```
 
+## In-process API and startup seeding
+
+Gears in the same process use the Rust API rather than HTTP: `PlatformTypesRegistryApi`
+for their own publication and reads, read-only `TypesRegistryApi` for reads on a tenant's
+behalf. The [SDK README](types-registry-sdk/README.md#publishing-from-a-gear) has a
+complete gear that declares `deps = [types_registry]`, resolves the platform API from
+`ClientHub` in its `init()`, reconciles its documents and reads them back.
+
+The registry publishes both contracts from its own `init()`, once its database holds the
+startup seed:
+
+- **Seed sources.** Every GTS declaration linked into the binary — Type Schemas
+  from `#[toolkit_gts::gts_type_schema(..)]`, Instances from `gts_instance!` and
+  `gts_instance_raw!`, the `toolkit-gts` bases among them — plus the configured `entities`, admitted as one
+  operation through the same admission as `/v2`. INFO `types_registry seed set` gives the
+  counts, `types_registry seeded the database` the result. A restart with equal documents
+  allocates no revision; a changed configured document is revised under compare-and-set;
+  a document left out is not deleted.
+- **Immediate validation.** A seed whose derivation base, `$ref` target or Instance-of type
+  is not itself seeded fails boot, naming it. `x-gts-ref` values are not looked up. The
+  whole seed must fit `limits.batch_candidates`, which `config/quickstart.yaml` and
+  `config/e2e-local.yaml` raise to 256; the seed waits at most `worker.operation_timeout`.
+- **No database, no API.** Without `gears.types-registry.database`, or when seeding fails,
+  neither contract is registered, and resolving one fails instead of falling back.
+- **Uncached.** Until T36 every read goes to the database.
+- **Two catalogues.** Until T38 the legacy client and `/v1` keep the in-memory catalogue,
+  seeded from the same declarations. Nothing mirrors later writes between the two.
+- **Several instances.** On one database, an admission accepted by one instance can wait
+  for another instance's outbox poll, up to a minute; keep `worker.operation_timeout` and
+  consumer deadlines above it.
+
 ## Examples
 
 Examples use `cf`, the only vendor allowed by default.
