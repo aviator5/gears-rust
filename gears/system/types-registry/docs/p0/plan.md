@@ -18,7 +18,7 @@ and dependent refresh. Both must be positive. Closure accounting is per document
 candidate overlay; the resolved-size budget applies to the canonical bytes of each effective
 artifact. Exceeding either refuses the candidate without committing partial state.
 
-The executable list uses task IDs **T1–T45**, plus the inserted **T35a** SDK payload-validation and **T35b** mock Type Schema admission tasks. T1–T30 are complete; **T31–T45 plus T35a/T35b are the 17 remaining tasks**. T35a and T35b follow T35 without renumbering existing work. Task status, acceptance criteria and recorded evidence are preserved; task references are synchronized with this numbering. The next task is T31 (database seeding and local ClientHub handoff), followed by T32 (full local Account Management/IdP/TR migration).
+The executable list uses task IDs **T1–T45**, plus the inserted **T35a** SDK payload-validation and **T35b** mock Type Schema admission tasks. T1–T32 are complete; **T33–T45 plus T35a/T35b are the 15 remaining tasks**. T35a and T35b follow T35 without renumbering existing work. Task status, acceptance criteria and recorded evidence are preserved; task references are synchronized with this numbering. The next task is T33 (the toolkit's platform-authenticated route axis), implemented on its own toolkit branch.
 
 ## Decisions and task numbering
 
