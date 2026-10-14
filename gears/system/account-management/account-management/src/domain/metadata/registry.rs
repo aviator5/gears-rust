@@ -31,7 +31,7 @@
 //!   deterministic `UUIDv5` derivation via upstream
 //!   [`gts::GtsId::to_uuid`].
 //! * `GtsMetadataSchemaRegistry` — the production implementation
-//!   backed by `types_registry_sdk::TypesRegistryClient`.
+//!   backed by `types_registry_sdk::PlatformTypesRegistryApi`.
 //!
 //! # Schema-id type contract
 //!

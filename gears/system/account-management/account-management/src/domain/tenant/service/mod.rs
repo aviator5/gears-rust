@@ -216,7 +216,7 @@ impl<R: TenantRepo> TenantService<R> {
     /// Construct a fully-wired service. Production wiring lives in the
     /// AM gear entry-point ([`crate::gear::AccountManagementGear`]):
     /// `types-registry` and `resource-group` are declared as hard `deps`,
-    /// so the entry-point hard-resolves `TypesRegistryClient` (passes
+    /// so the entry-point hard-resolves `PlatformTypesRegistryApi` (passes
     /// [`crate::infra::types_registry::GtsTenantTypeChecker`]) and
     /// `ResourceGroupClient` (passes
     /// [`crate::infra::rg::RgResourceOwnershipChecker`]); a missing

@@ -2,13 +2,13 @@
 //!
 //! Holds the [`GtsTenantTypeChecker`] adapter that connects the AM
 //! [`crate::domain::tenant_type::TenantTypeChecker`] domain trait to
-//! `types_registry_sdk::TypesRegistryClient` resolved from `ClientHub`
+//! `types_registry_sdk::PlatformTypesRegistryApi` resolved from `ClientHub`
 //! (FEATURE 2.3 `tenant-type-enforcement`).
 //!
 //! The `ClientHub` binding is wired in the AM gear entry-point
 //! ([`crate::gear::AccountManagementGear`]): `types-registry` is
 //! a hard `deps` of AM, so the runtime guarantees its init runs first
-//! and the entry-point fail-closes `init` if `TypesRegistryClient`
+//! and the entry-point fail-closes `init` if `PlatformTypesRegistryApi`
 //! cannot be resolved. There is no production fallback to
 //! [`crate::domain::tenant_type::InertTenantTypeChecker`]; that
 //! checker is reserved for unit tests.
