@@ -24,7 +24,8 @@
 
 use account_management_sdk::gts::TENANT_RESOURCE_TYPE;
 use toolkit_security::AccessScope;
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -39,7 +40,7 @@ const TENANT_TYPE_RESOLUTION_UNAVAILABLE: &str =
 /// the [`TenantContext`] forwarded to the `IdP` plugin.
 ///
 /// `tenant_type` on the returned context is mandatory: AM resolves the
-/// chained GTS identifier via [`TypesRegistryClient`] and surfaces an
+/// chained GTS identifier via [`PlatformTypesRegistryApi`] and surfaces an
 /// outage as [`DomainError::service_unavailable`] rather than leaking an
 /// `Option` through the plugin contract — plugins may route on the type
 /// (Keycloak realm name, Zitadel organization selection, vendor-side org
@@ -58,7 +59,7 @@ const TENANT_TYPE_RESOLUTION_UNAVAILABLE: &str =
 ///   transport failure.
 pub(crate) async fn resolve_active_tenant(
     tenant_repo: &dyn TenantRepo,
-    types_registry: &dyn TypesRegistryClient,
+    types_registry: &dyn PlatformTypesRegistryApi,
     scope: &AccessScope,
     tenant_id: Uuid,
 ) -> Result<TenantContext, DomainError> {
@@ -81,9 +82,14 @@ pub(crate) async fn resolve_active_tenant(
     }
 
     // `get_type_schema_by_uuid` returns the typed `GtsTypeId` directly
-    // so no string round-trip is needed.
+    // so no string round-trip is needed; an unknown type is as fatal as
+    // a failed read.
     let tenant_type = match types_registry
-        .get_type_schema_by_uuid(tenant.tenant_type_uuid)
+        .get_type_schema_by_uuid(
+            &PlatformSecurityContext::outbound_marker(),
+            tenant.tenant_type_uuid,
+            Projection::Default,
+        )
         .await
     {
         Ok(schema) => schema.type_id,

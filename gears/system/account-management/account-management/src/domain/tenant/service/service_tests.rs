@@ -44,253 +44,117 @@ use toolkit_security::AccessScope;
 
 const CUSTOMER_TENANT_TYPE_ID: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.customer.v1~");
 
-/// Test-only `TypesRegistryClient` that resolves every UUID to the
-/// same hard-coded chained `GtsTypeSchema`. The reaper / retention
-/// pipelines (and `UserService::resolve_active_tenant`) call
-/// `get_type_schema_by_uuid` on the tenant's `tenant_type_uuid`
-/// before `IdpPluginClient::deprovision_tenant`; the production code
+/// Test-only platform registry that resolves every UUID to the
+/// same hard-coded chained Type Schema. The reaper / retention
+/// pipelines (and `UserService::resolve_active_tenant`) read the
+/// tenant's `tenant_type_uuid` before
+/// `IdpPluginClient::deprovision_tenant`; the production code
 /// surfaces a miss as `ServiceUnavailable`, but the in-memory test
 /// repo seeds an opaque `Uuid::from_u128(0xAA)` that no real
-/// registry would know about. Returning the canonical
+/// registry would know about. Answering the canonical
 /// `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~` schema for
 /// any UUID keeps the existing fixtures viable without touching every
 /// `with_root` / `seed_tenant` call site — the precise UUID is not
 /// load-bearing for these tests, only the typed `tenant_type` on the
 /// resulting `TenantContext`.
+///
+/// Reads by identifier answer `NotFound`, so AM-owned resource schemas
+/// (`gts.cf.core.am.tenant.v1~` / `.user.v1~`) are absent and callers
+/// like `validate_tenant_name_via_gts` short-circuit to `Ok(())`: the
+/// AM-side `trim+empty` / DB `CHECK` constraints remain the
+/// authoritative gate in these tests.
 struct ConstantTypesRegistry;
 
-fn synth_type_schema(type_id: &str) -> types_registry_sdk::GtsTypeSchema {
-    let parent = types_registry_sdk::GtsTypeSchema::derive_parent_type_id(type_id)
-        .map(|p| std::sync::Arc::new(synth_type_schema(p.as_ref())));
-    types_registry_sdk::GtsTypeSchema::try_new(
-        types_registry_sdk::GtsTypeId::new(type_id),
-        serde_json::json!({}),
-        None,
-        parent,
-    )
-    .expect("synthetic GtsTypeSchema for test is valid")
+fn not_implemented() -> toolkit_canonical_errors::CanonicalError {
+    toolkit_canonical_errors::CanonicalError::internal("not implemented for constant test fake")
+        .create()
 }
 
 #[async_trait]
-impl types_registry_sdk::TypesRegistryClient for ConstantTypesRegistry {
-    async fn register(
+impl types_registry_sdk::PlatformTypesRegistryApi for ConstantTypesRegistry {
+    async fn batch_get_entities(
         &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(Vec::new())
-    }
-    async fn register_type_schemas(
-        &self,
-        _schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(Vec::new())
-    }
-    async fn get_type_schema(
-        &self,
-        type_id: &str,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        // Surface NOT_FOUND for AM-owned resource schemas
-        // (`gts.cf.core.am.tenant.v1~` / `.user.v1~`) so callers like
-        // `validate_tenant_name_via_gts` short-circuit to `Ok(())`
-        // and the AM-side `trim+empty` / DB `CHECK` constraints
-        // remain the authoritative gate in tests. The
-        // `get_type_schema_by_uuid` path below still returns a
-        // synthetic schema because `load_tenant_context` treats
-        // missing entries as a hard failure (`ServiceUnavailable`)
-        // after the IdP-metadata isolation refactor.
-        Err(types_registry_sdk::testing::not_found(type_id))
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        _type_uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        Ok(synth_type_schema(CUSTOMER_TENANT_TYPE_ID))
-    }
-    async fn get_type_schemas(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<
+        types_registry_sdk::BatchGetEntitiesResponse,
+        toolkit_canonical_errors::CanonicalError,
     > {
-        std::collections::HashMap::new()
+        let answers = request
+            .items
+            .into_iter()
+            .map(|item| {
+                let lookup = match item.key {
+                    types_registry_sdk::EntityKey::GtsUuid(uuid) => {
+                        types_registry_sdk::EntityLookup::Found {
+                            entity: Box::new(types_registry_sdk::Entity {
+                                gts_id: types_registry_sdk::GtsId::try_new(CUSTOMER_TENANT_TYPE_ID)
+                                    .expect("valid id"),
+                                gts_uuid: uuid,
+                                kind: types_registry_sdk::EntityKind::TypeSchema,
+                                lifecycle_status: types_registry_sdk::LifecycleStatus::Active,
+                                origin: None,
+                                content: None,
+                                resolved_schema: None,
+                                effective_traits: None,
+                                effective_traits_schema: None,
+                                provenance: None,
+                            }),
+                            etag: types_registry_sdk::Validator::from_bytes("constant"),
+                        }
+                    }
+                    types_registry_sdk::EntityKey::GtsId(_) => {
+                        types_registry_sdk::EntityLookup::NotFound
+                    }
+                };
+                (item.key, lookup)
+            })
+            .collect();
+        Ok(types_registry_sdk::BatchGetEntitiesResponse(answers))
     }
-    async fn get_type_schemas_by_uuid(
+
+    async fn list_entities(
         &self,
-        _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        std::collections::HashMap::new()
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, toolkit_canonical_errors::CanonicalError>
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, toolkit_canonical_errors::CanonicalError>
     {
-        Ok(Vec::new())
+        Err(not_implemented())
     }
-    async fn register_instances(
+
+    async fn register_entities(
         &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _key: types_registry_sdk::IdempotencyKey,
+        _request: types_registry_sdk::RegisterEntitiesRequest,
+    ) -> Result<types_registry_sdk::RegistrationOperation, toolkit_canonical_errors::CanonicalError>
     {
-        Ok(Vec::new())
+        Err(not_implemented())
     }
-    async fn get_instance(
+
+    async fn delete_entities(
         &self,
-        _id: &str,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::internal(
-            "not implemented for constant test fake",
-        ))
-    }
-    async fn get_instance_by_uuid(
-        &self,
-        _uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::internal(
-            "not implemented for constant test fake",
-        ))
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        std::collections::HashMap::new()
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        std::collections::HashMap::new()
-    }
-    async fn list_instances(
-        &self,
-        _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsInstance>, toolkit_canonical_errors::CanonicalError>
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _key: types_registry_sdk::IdempotencyKey,
+        _request: types_registry_sdk::DeleteEntitiesRequest,
+    ) -> Result<types_registry_sdk::DeletionOperation, toolkit_canonical_errors::CanonicalError>
     {
-        Ok(Vec::new())
+        Err(not_implemented())
+    }
+
+    async fn get_operation(
+        &self,
+        _ctx: &toolkit_security::PlatformSecurityContext,
+        _operation_id: Uuid,
+    ) -> Result<types_registry_sdk::Operation, toolkit_canonical_errors::CanonicalError> {
+        Err(not_implemented())
     }
 }
 
-/// Stub registry where `get_type_schema_by_uuid` always returns
-/// `CanonicalError::NotFound`. Drives the H1 fix's catalog-drift
+/// A registry that knows no tenant type: drives the catalog-drift
 /// fallback path on `load_tenant_context`.
-struct UuidNotFoundTypesRegistry;
-
-#[async_trait]
-impl types_registry_sdk::TypesRegistryClient for UuidNotFoundTypesRegistry {
-    async fn register(
-        &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(Vec::new())
-    }
-    async fn register_type_schemas(
-        &self,
-        _schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(Vec::new())
-    }
-    async fn get_type_schema(
-        &self,
-        type_id: &str,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::not_found(type_id))
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        type_uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::not_found(
-            type_uuid.as_simple().to_string(),
-        ))
-    }
-    async fn get_type_schemas(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        std::collections::HashMap::new()
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsTypeSchema, toolkit_canonical_errors::CanonicalError>,
-    > {
-        std::collections::HashMap::new()
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(Vec::new())
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(Vec::new())
-    }
-    async fn get_instance(
-        &self,
-        _id: &str,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::internal(
-            "not implemented for uuid-not-found fake",
-        ))
-    }
-    async fn get_instance_by_uuid(
-        &self,
-        _uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError> {
-        Err(types_registry_sdk::testing::internal(
-            "not implemented for uuid-not-found fake",
-        ))
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<
-        String,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        std::collections::HashMap::new()
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<
-        Uuid,
-        Result<types_registry_sdk::GtsInstance, toolkit_canonical_errors::CanonicalError>,
-    > {
-        std::collections::HashMap::new()
-    }
-    async fn list_instances(
-        &self,
-        _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsInstance>, toolkit_canonical_errors::CanonicalError>
-    {
-        Ok(Vec::new())
-    }
+fn uuid_not_found_types_registry() -> types_registry_sdk::testing_platform::MockTypesRegistry {
+    types_registry_sdk::testing_platform::MockTypesRegistry::new()
 }
 
 fn ctx_for(tenant_id: Uuid) -> SecurityContext {
@@ -4372,7 +4236,7 @@ async fn load_tenant_context_defers_on_gts_type_schema_not_found() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(Arc::new(UuidNotFoundTypesRegistry));
+    .with_types_registry(Arc::new(uuid_not_found_types_registry()));
 
     let err = svc
         .load_tenant_context(root)

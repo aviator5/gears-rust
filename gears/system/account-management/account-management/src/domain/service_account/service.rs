@@ -83,7 +83,7 @@ use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::ResourceType;
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -187,7 +187,7 @@ pub struct ServiceAccountService {
     /// Resolves a tenant's chained `tenant_type` for the plugin-facing
     /// context; an outage surfaces as `ServiceUnavailable` rather than
     /// leaking an `Option` through the contract.
-    types_registry: Arc<dyn TypesRegistryClient>,
+    types_registry: Arc<dyn PlatformTypesRegistryApi>,
     /// PEP gate run before any tenant read or `IdP` round trip.
     enforcer: PolicyEnforcer,
 }
@@ -198,7 +198,7 @@ impl ServiceAccountService {
     pub const fn new(
         tenant_repo: Arc<dyn TenantRepo>,
         idp: Arc<dyn IdpPluginClient>,
-        types_registry: Arc<dyn TypesRegistryClient>,
+        types_registry: Arc<dyn PlatformTypesRegistryApi>,
         enforcer: PolicyEnforcer,
     ) -> Self {
         Self {

@@ -31,9 +31,6 @@ use crate::domain::bootstrap::BootstrapService;
 use crate::domain::tenant::TenantRepo;
 use crate::gear::handle_bootstrap_failure;
 
-const TENANT_SCHEMA: &str = gts_id!("cf.core.am.tenant.v1~");
-const TENANT_TYPE_SCHEMA: &str = gts_id!("cf.core.am.tenant_type.v1~");
-
 /// Test-only helper that combines bootstrap config validation + saga
 /// execution in one call, mirroring the split init/serve production
 /// flow. Generic over `R: TenantRepo` so tests can pass
@@ -47,7 +44,7 @@ async fn run_bootstrap_phase<R: TenantRepo + 'static>(
     idp_required: bool,
     repo: Arc<R>,
     idp: Arc<dyn IdpPluginClient>,
-    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    types_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>,
 ) -> anyhow::Result<()> {
     let Some(boot_cfg) = bootstrap else {
         return Ok(());
@@ -457,117 +454,10 @@ fn seed_root_with_binding(
     });
 }
 
-/// Minimal `TypesRegistryClient` that returns a canned root-level AM
-/// `tenant_type` schema from `get_type_schema`. Mirrors the stub in
-/// `domain/bootstrap/service_tests.rs::StubTypesRegistry`. Inlined
-/// here so gear-level tests do not depend on test-mod visibility
-/// from a sibling gear.
-fn stub_types_registry() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-    use toolkit_canonical_errors::CanonicalError;
-    use types_registry_sdk::{
-        GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
-        TypesRegistryClient,
-    };
-
-    struct Stub;
-
-    #[async_trait]
-    impl TypesRegistryClient for Stub {
-        async fn register(
-            &self,
-            _entities: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, CanonicalError> {
-            unreachable!()
-        }
-        async fn register_type_schemas(
-            &self,
-            _type_schemas: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-            // Route per-id so the bootstrap-time GTS validation seam
-            // does not short-circuit before the IdP retry-loop branch
-            // these tests are designed to exercise. The AM tenant
-            // schema MUST advertise a `name` property; without it,
-            // `validate_tenant_name_via_gts` rejects `root_name` and
-            // the "valid config + CleanFailure" path never reaches
-            // `FakeOutcome::CleanFailure`.
-            let (id, body) = if type_id == TENANT_SCHEMA {
-                (
-                    TENANT_SCHEMA,
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "name": { "type": "string", "minLength": 1, "maxLength": 255 }
-                        }
-                    }),
-                )
-            } else {
-                (TENANT_TYPE_SCHEMA, serde_json::json!({}))
-            };
-            Ok(GtsTypeSchema::try_new(GtsTypeId::new(id), body, None, None)
-                .expect("canned root schema must construct"))
-        }
-        async fn get_type_schema_by_uuid(
-            &self,
-            _type_uuid: Uuid,
-        ) -> Result<GtsTypeSchema, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_type_schemas(
-            &self,
-            _type_ids: Vec<String>,
-        ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-            unreachable!()
-        }
-        async fn get_type_schemas_by_uuid(
-            &self,
-            _type_uuids: Vec<Uuid>,
-        ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-            unreachable!()
-        }
-        async fn list_type_schemas(
-            &self,
-            _query: TypeSchemaQuery,
-        ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-            unreachable!()
-        }
-        async fn register_instances(
-            &self,
-            _instances: Vec<serde_json::Value>,
-        ) -> Result<Vec<RegisterResult>, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_instances(
-            &self,
-            _ids: Vec<String>,
-        ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-            unreachable!()
-        }
-        async fn get_instances_by_uuid(
-            &self,
-            _uuids: Vec<Uuid>,
-        ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-            unreachable!()
-        }
-        async fn list_instances(
-            &self,
-            _query: InstanceQuery,
-        ) -> Result<Vec<GtsInstance>, CanonicalError> {
-            unreachable!()
-        }
-    }
-
-    Arc::new(Stub)
+/// The registry bootstrap preflight reads; see
+/// [`bootstrap_registry`](crate::infra::types_registry::test_helpers::bootstrap_registry).
+fn stub_types_registry() -> Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> {
+    crate::infra::types_registry::test_helpers::bootstrap_registry()
 }
 
 mod no_seed_startup_tests {

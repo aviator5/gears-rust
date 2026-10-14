@@ -89,7 +89,8 @@ use serde_json::Value;
 use tenant_resolver_sdk::TenantId;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection};
 
 use crate::config::AccountManagementConfig;
 use crate::domain::error::DomainError;
@@ -195,7 +196,7 @@ pub struct TenantService<R: TenantRepo> {
     /// fans out one `get_type_schema_by_uuid` call (or one batched
     /// `get_type_schemas_by_uuid` for `list_children`); the cache
     /// keeps real RTT off the hot path.
-    types_registry: Option<Arc<dyn TypesRegistryClient>>,
+    types_registry: Option<Arc<dyn PlatformTypesRegistryApi>>,
     /// PEP boundary (DESIGN §4.2). Every public CRUD method calls
     /// [`Self::authorize`] before any structural precondition or
     /// repo read. Cross-tenant authorization (subtree clamp,
@@ -251,7 +252,7 @@ impl<R: TenantRepo> TenantService<R> {
     /// tests (which usually pin an inert tenant-type checker) leave
     /// it unset.
     #[must_use]
-    pub fn with_types_registry(mut self, registry: Arc<dyn TypesRegistryClient>) -> Self {
+    pub fn with_types_registry(mut self, registry: Arc<dyn PlatformTypesRegistryApi>) -> Self {
         self.types_registry = Some(registry);
         self
     }
@@ -291,7 +292,11 @@ impl<R: TenantRepo> TenantService<R> {
             ))
         })?;
         let tenant_type = match registry
-            .get_type_schema_by_uuid(tenant.tenant_type_uuid)
+            .get_type_schema_by_uuid(
+                &PlatformSecurityContext::outbound_marker(),
+                tenant.tenant_type_uuid,
+                Projection::Default,
+            )
             .await
         {
             Ok(schema) => schema.type_id,
@@ -355,7 +360,14 @@ impl<R: TenantRepo> TenantService<R> {
     /// blip doesn't fail an otherwise-fine read.
     async fn resolve_tenant_type(&self, type_uuid: Uuid) -> Option<String> {
         let registry = self.types_registry.as_ref()?;
-        match registry.get_type_schema_by_uuid(type_uuid).await {
+        match registry
+            .get_type_schema_by_uuid(
+                &PlatformSecurityContext::outbound_marker(),
+                type_uuid,
+                Projection::Default,
+            )
+            .await
+        {
             Ok(schema) => Some(schema.type_id.as_ref().to_owned()),
             Err(err) => {
                 tracing::warn!(
@@ -424,7 +436,7 @@ impl<R: TenantRepo> TenantService<R> {
     }
 
     /// One types-registry round-trip for a set of tenant-type uuids.
-    /// Uuids the registry fails on are absent from the map; the
+    /// Unknown uuids, and every uuid of a failed read, are absent from the map; the
     /// projection then carries `tenant_type: None` (best-effort, same
     /// policy as the single-row helper). Empty when no registry is
     /// wired.
@@ -441,9 +453,25 @@ impl<R: TenantRepo> TenantService<R> {
         if uuids.is_empty() {
             return out;
         }
-        for (uuid, res) in registry.get_type_schemas_by_uuid(uuids).await {
-            if let Ok(schema) = res {
-                out.insert(uuid, schema.type_id.as_ref().to_owned());
+        match registry
+            .batch_get_type_schemas_by_uuid(
+                &PlatformSecurityContext::outbound_marker(),
+                &uuids,
+                Projection::Default,
+            )
+            .await
+        {
+            Ok(found) => {
+                out.extend(found.into_iter().filter_map(|(uuid, schema)| {
+                    schema.map(|schema| (uuid, schema.type_id.as_ref().to_owned()))
+                }));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "am.tenant.service",
+                    error = %err,
+                    "tenant_type batch resolution failed; returning the page without tenant types"
+                );
             }
         }
         out
