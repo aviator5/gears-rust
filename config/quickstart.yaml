@@ -462,6 +462,12 @@ gears:
     database:
       server: "sqlite_users"
       file: "types_registry.db"
+    config:
+      limits:
+        # The startup seed admits all linked inventory in one operation: 146
+        # documents with every example feature, 8 for `make quickstart`
+        # (T31 seed audit). The default of 100 does not fit.
+        batch_candidates: 256
   credstore:
     database:
       server: "sqlite_users"
