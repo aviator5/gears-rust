@@ -10,7 +10,7 @@ use super::*;
 use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
-use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 use crate::infra::types_registry::test_helpers::Tampered;
 
@@ -208,6 +208,66 @@ async fn rejects_parent_not_registered_as_invalid_tenant_type() {
         .await
         .expect_err("missing parent must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
+    assert!(err.to_string().contains("parent tenant type"), "got: {err}");
+}
+
+fn delete(registry: &MockTypesRegistry, type_id: &str) {
+    let content = registry.content(type_id).expect("seeded");
+    registry.seed_entity(Seed::new(type_id, content).deleted());
+}
+
+#[tokio::test]
+async fn a_deleted_child_type_admits_no_same_type_nesting() {
+    let registry = registry();
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([CUSTOMER])));
+    delete(&registry, CUSTOMER);
+    let checker = GtsTenantTypeChecker::new(registry);
+
+    let err = checker
+        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .await
+        .expect_err("a tombstone is not a tenant type");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
+    assert!(err.to_string().contains("deleted"), "got: {err}");
+}
+
+#[tokio::test]
+async fn a_deleted_child_type_admits_no_listed_parent() {
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
+    delete(&registry, CUSTOMER);
+    let checker = GtsTenantTypeChecker::new(registry);
+
+    let err = checker
+        .check_parent_child(uuid(PLATFORM), uuid(CUSTOMER))
+        .await
+        .expect_err("a tombstone is not a tenant type");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_parent_type_is_refused_even_when_listed() {
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
+    delete(&registry, PLATFORM);
+    let checker = GtsTenantTypeChecker::new(registry);
+
+    let err = checker
+        .check_parent_child(uuid(PLATFORM), uuid(CUSTOMER))
+        .await
+        .expect_err("a deleted parent type is refused");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got: {err}"
+    );
     assert!(err.to_string().contains("parent tenant type"), "got: {err}");
 }
 
