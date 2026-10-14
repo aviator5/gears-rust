@@ -8,11 +8,11 @@
 //!   `AccessScope::allow_all()` trust elevation at a single named
 //!   call site so this gear no longer carries that concern.
 //! - Hydrates the public `tenant_type` field through
-//!   [`TypesRegistryClient`] using either a single
+//!   [`PlatformTypesRegistryApi`] using either a single
 //!   `get_type_schema_by_uuid` (single-row results) or a batched
-//!   `get_type_schemas_by_uuid` (page-style results). Per DESIGN §3.4
-//!   / §5, **any** registry failure (single-row miss or even one
-//!   per-uuid error in a batch) fails the SDK call with
+//!   `batch_get_type_schemas_by_uuid` (page-style results). Per DESIGN §3.4
+//!   / §5, **any** registry failure (a failed read or one unknown
+//!   uuid in a batch) fails the SDK call with
 //!   [`TenantResolverError::Internal`]; the plugin must not return
 //!   raw UUIDs in place of the public chained `tenant_type`.
 //! - Maps `DomainError` to the SDK error taxonomy through

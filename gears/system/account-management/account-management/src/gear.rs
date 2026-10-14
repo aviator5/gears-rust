@@ -125,7 +125,7 @@ pub struct AccountManagementGear {
     /// [`Self::service`] so SDK consumers and the REST surface for
     /// `/tenants/{id}/metadata` can drive the list / get / put /
     /// delete / resolve flows without re-discovering the resolved
-    /// `TypesRegistryClient`. Wired during [`Gear::init`]; remains
+    /// `PlatformTypesRegistryApi`. Wired during [`Gear::init`]; remains
     /// unset until init runs.
     metadata_service: OnceLock<Arc<MetadataService>>,
     /// Hooks registered before [`Gear::init`] has set up the service.
@@ -993,13 +993,13 @@ impl Gear for AccountManagementGear {
         // succeeds or fully fails" contract.
         //
         // The plugin owns no state of its own; it borrows AM's `Db`
-        // and the already-resolved `TypesRegistryClient`.
+        // and the already-resolved `PlatformTypesRegistryApi`.
         // Registration order (when enabled):
         //   1. Build `PluginImpl` from the shared deps.
-        //   2. Register a `PluginV1<TenantResolverPluginSpecV1>`
-        //      instance in types-registry (with idempotent
-        //      `AlreadyExists` spec verification).
-        //   3. **Only after** types-registry succeeds, bind the
+        //   2. Reconcile a `PluginV1<TenantResolverPluginSpecV1>`
+        //      instance into types-registry and wait for its admission
+        //      (an equal restart submits nothing).
+        //   3. **Only after** types-registry admits it, bind the
         //      plugin under a scoped `ClientHub` entry keyed by its
         //      GTS instance id, matching the pattern in
         //      `static-tr-plugin` and `rg-tr-plugin`.
@@ -1192,13 +1192,13 @@ impl Gear for AccountManagementGear {
         //   on every ancestor hop.
         // * `Arc<dyn MetadataSchemaRegistry>` — the new
         //   `GtsMetadataSchemaRegistry` adapter wrapping the resolved
-        //   `TypesRegistryClient`. Reads `inheritance_policy` from
-        //   `effective_traits()["inheritance_policy"]`; missing /
+        //   `PlatformTypesRegistryApi`. Reads `inheritance_policy` from
+        //   the materialized `effective_traits`; missing /
         //   non-`"inherit"` values collapse to the documented
         //   `override_only` default per FEATURE §3.1.
         //
         // The `idp.required` policy DOES NOT apply here: the metadata
-        // subsystem depends on `TypesRegistryClient` (already
+        // subsystem depends on `PlatformTypesRegistryApi` (already
         // hard-required up-stream when `types-registry` was resolved),
         // so the service is always built. There is no fall-back stub
         // in production — tests construct `MetadataService::new`

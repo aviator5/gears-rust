@@ -915,8 +915,8 @@ impl<R: TenantRepo> BootstrapService<R> {
             }
         };
 
-        // `GtsTypeSchema` is by construction a type-schema (the
-        // `is_schema` axis is implicit in the type), so the only check
+        // `TypeSchema` is by construction a type-schema (the
+        // kind is implicit in the type), so the only check
         // remaining is that the chain root is AM's tenant_type root.
         let entity_type_id = entity.type_id.as_ref();
         let is_am_tenant_type = gts::GtsId::try_new(entity_type_id)
@@ -1915,7 +1915,7 @@ fn record_invariant_violation() {
 // @cpt-end:cpt-cf-account-management-dod-platform-bootstrap-audit-and-metrics:p1:inst-dod-bootstrap-invariant-telemetry
 
 /// Extract `allowed_parent_types` from a flat effective-traits map
-/// (the shape returned by `GtsTypeSchema::effective_traits`), which
+/// (the registry-materialized `effective_traits`), which
 /// keys traits directly rather than nesting them under
 /// `x-gts-traits` / `allOf`.
 fn extract_allowed_parent_types_from_effective(

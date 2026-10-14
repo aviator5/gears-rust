@@ -1017,7 +1017,7 @@ impl UserService {
     /// three times.
     ///
     /// `tenant_type` on the returned context is mandatory: AM resolves
-    /// the chained GTS identifier via `TypesRegistryClient` and
+    /// the chained GTS identifier via `PlatformTypesRegistryApi` and
     /// surfaces an outage as [`DomainError::service_unavailable`]
     /// rather than leaking an `Option` through the plugin contract.
     /// The opaque `metadata` blob is loaded from `tenant_idp_metadata`

@@ -1368,7 +1368,7 @@ async fn a_failed_registry_read_yields_internal_for_single_and_batch_hydration()
 #[tokio::test]
 async fn is_ancestor_not_affected_by_registry_failure() {
     // `is_ancestor` probes `tenants` for visibility and `tenant_closure` for
-    // the edge — it never calls TypesRegistryClient. A failing registry must
+    // the edge — it never calls the registry. A failing registry must
     // not affect the result.
     let port = setup();
     let (root, child) = seed_two_level(&port, ACTIVE, ACTIVE);
