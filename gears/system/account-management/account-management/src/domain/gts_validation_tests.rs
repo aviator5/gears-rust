@@ -321,3 +321,101 @@ async fn a_deleted_user_schema_fails_closed_as_unregistered() {
         "got {err:?}"
     );
 }
+
+// ---- conjunctive property constraints ------------------------------
+
+fn seed_user_with(registry: &MockTypesRegistry, body: &Value) {
+    registry.seed(super::USER_TYPE_ID, schema_doc(super::USER_TYPE_ID, body));
+}
+
+#[tokio::test]
+async fn an_inline_all_of_bound_applies_beside_the_own_property() {
+    let registry = MockTypesRegistry::new();
+    seed_user_with(
+        &registry,
+        &json!({
+            "type": "object",
+            "properties": { "username": { "type": "string", "maxLength": 255 } },
+            "allOf": [{ "properties": { "username": { "type": "string", "maxLength": 8 } } }],
+        }),
+    );
+
+    let err = super::validate_new_user_payload_via_gts(&user_payload("alexandria"), &registry)
+        .await
+        .expect_err("the tighter allOf bound applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+    super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry)
+        .await
+        .expect("both bounds admit a short name");
+}
+
+#[tokio::test]
+async fn bounds_from_two_all_of_members_both_apply() {
+    let registry = MockTypesRegistry::new();
+    seed_user_with(
+        &registry,
+        &json!({
+            "type": "object",
+            "allOf": [
+                { "properties": { "username": { "type": "string", "minLength": 3 } } },
+                { "properties": { "username": { "type": "string", "maxLength": 8 } } },
+            ],
+        }),
+    );
+
+    for (name, ok) in [("al", false), ("alice", true), ("alexandria", false)] {
+        let result = super::validate_new_user_payload_via_gts(&user_payload(name), &registry).await;
+        assert_eq!(result.is_ok(), ok, "{name}: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_referenced_bound_applies_beside_the_own_property_on_patch() {
+    let fields = "gts.cf.test.am.user_bounds.v1~";
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        fields,
+        schema_doc(
+            fields,
+            &json!({
+                "type": "object",
+                "properties": { "username": { "type": "string", "maxLength": 8 } },
+            }),
+        ),
+    );
+    seed_user_with(
+        &registry,
+        &json!({
+            "type": "object",
+            "allOf": [{ "$ref": gts_uri!(fields) }],
+            "properties": { "username": { "type": "string", "maxLength": 255 } },
+        }),
+    );
+    let patch = account_management_sdk::IdpUserPatch::new().with_username("alexandria");
+
+    let err = super::validate_user_patch_via_gts(&patch, &registry)
+        .await
+        .expect_err("the referenced bound applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn an_inline_bound_applies_to_the_tenant_name() {
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        super::TENANT_TYPE_ID,
+        schema_doc(
+            super::TENANT_TYPE_ID,
+            &json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "maxLength": 255 } },
+                "allOf": [{ "properties": { "name": { "type": "string", "maxLength": 4 } } }],
+            }),
+        ),
+    );
+
+    let err = super::validate_tenant_name_via_gts("acme-corp", &registry)
+        .await
+        .expect_err("the inline bound applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+}
