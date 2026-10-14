@@ -263,7 +263,7 @@ pub async fn validate_tenant_name_via_gts(
 async fn lookup_effective_properties(
     type_id: &'static str,
     types_registry: &dyn PlatformTypesRegistryApi,
-) -> Result<Option<BTreeMap<String, Value>>, DomainError> {
+) -> Result<Option<BTreeMap<String, Vec<Value>>>, DomainError> {
     let projection = Projection::Select(FieldSelection::with(&[EntityField::ResolvedSchema]));
     match types_registry
         .get_type_schema(
@@ -290,21 +290,28 @@ async fn lookup_effective_properties(
     }
 }
 
-/// The properties a registry-resolved schema declares. References are
-/// inlined at admission, so the `allOf` members carry the inherited
-/// declarations: they are collected first and the schema's own
-/// `properties` win on a key collision.
-fn effective_properties(schema: &Value) -> BTreeMap<String, Value> {
-    let mut out = BTreeMap::new();
-    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
-        for member in members {
-            out.extend(effective_properties(member));
+/// Every sub-schema a registry-resolved schema declares for each property.
+/// References are inlined at admission, so the `allOf` members carry the
+/// inherited declarations. The branches of a schema are conjunctive: a
+/// property declared at several places must satisfy all of them, so none
+/// overrides another.
+fn effective_properties(schema: &Value) -> BTreeMap<String, Vec<Value>> {
+    let mut out: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    collect_properties(schema, &mut out);
+    out
+}
+
+fn collect_properties(schema: &Value, out: &mut BTreeMap<String, Vec<Value>>) {
+    if let Some(own) = schema.get("properties").and_then(Value::as_object) {
+        for (key, value) in own {
+            out.entry(key.clone()).or_default().push(value.clone());
         }
     }
-    if let Some(own) = schema.get("properties").and_then(Value::as_object) {
-        out.extend(own.iter().map(|(key, value)| (key.clone(), value.clone())));
+    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
+        for member in members {
+            collect_properties(member, out);
+        }
     }
-    out
 }
 
 /// Compile the property sub-schema for `field_name` and validate
@@ -323,9 +330,9 @@ fn validate_property_value(
     type_id: &'static str,
     field_name: &str,
     field_value: &Value,
-    properties: &BTreeMap<String, Value>,
+    properties: &BTreeMap<String, Vec<Value>>,
 ) -> Result<(), DomainError> {
-    let Some(field_schema) = properties.get(field_name) else {
+    let Some(field_schemas) = properties.get(field_name) else {
         return Err(DomainError::Internal {
             diagnostic: format!(
                 "GTS schema `{type_id}` does not declare property `{field_name}` (catalog drift: \
@@ -336,8 +343,12 @@ fn validate_property_value(
             cause: None,
         });
     };
+    let field_schema = match field_schemas.as_slice() {
+        [single] => single.clone(),
+        several => serde_json::json!({ "allOf": several }),
+    };
     let validator =
-        jsonschema::validator_for(field_schema).map_err(|err| DomainError::Internal {
+        jsonschema::validator_for(&field_schema).map_err(|err| DomainError::Internal {
             diagnostic: format!(
                 "GTS schema `{type_id}` property `{field_name}` is not a valid JSON Schema \
              (catalog drift): {err}"
