@@ -5059,6 +5059,7 @@ dependencies = [
  "cf-gears-toolkit-utils",
  "cf-gears-types-registry-sdk",
  "chrono",
+ "figment",
  "gts",
  "heck 0.5.0",
  "inventory",

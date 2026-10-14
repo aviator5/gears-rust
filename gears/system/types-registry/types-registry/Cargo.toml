@@ -117,3 +117,5 @@ tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }
 # Builds test `OutboxMessage` timestamps.
 chrono = { workspace = true }
+# Database configuration for the host-runtime boot tests (T31).
+figment = { workspace = true }

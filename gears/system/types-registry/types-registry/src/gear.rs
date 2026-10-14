@@ -13,11 +13,15 @@ use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
 use tracing::{debug, info};
-use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
+use types_registry_sdk::{
+    PlatformTypesRegistryApi, RegisterResult, RegisterSummary, TypesRegistryApi,
+    TypesRegistryClient,
+};
 
 use crate::config::TypesRegistryConfig;
 use crate::domain::admission::OperationDispatch;
 use crate::domain::legacy_local_client::TypesRegistryLocalClient;
+use crate::domain::local_client::LocalClient;
 use crate::domain::policy::RegistrationPolicy;
 use crate::domain::ports::Stores;
 use crate::domain::ports::metrics::AdmissionMetrics;
@@ -266,6 +270,17 @@ impl Gear for TypesRegistryGear {
 
         let api: Arc<dyn TypesRegistryClient> = local_client;
         ctx.client_hub().register::<dyn TypesRegistryClient>(api);
+
+        // Only past the seed barrier: a host without a database, or one whose seed
+        // failed, publishes neither, and a resolution fails rather than falling back.
+        if let Some(registry) = self.registry.get() {
+            let client = Arc::new(LocalClient::new(Arc::clone(registry)));
+            ctx.client_hub()
+                .register::<dyn PlatformTypesRegistryApi>(Arc::clone(&client) as _);
+            ctx.client_hub()
+                .register::<dyn TypesRegistryApi>(client as _);
+            info!("types_registry published the platform and tenant APIs in ClientHub");
+        }
 
         Ok(())
     }
