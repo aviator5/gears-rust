@@ -6,10 +6,15 @@ use account_management_sdk::IdpPluginSpecV1;
 use account_management_sdk::idp::IdpPluginClient;
 use async_trait::async_trait;
 use credstore_sdk::SecretRef;
+use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
 use toolkit::{Gear, context::GearCtx};
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
+    ReconcileOptions, ReconcileReport,
+};
 
 use crate::config::{KeycloakIdpPluginConfig, KeycloakIdpPluginEnabledProbe};
 use crate::domain::credstore::{CredStoreReader, CredStoreWriter};
@@ -222,49 +227,21 @@ impl Gear for KeycloakIdpPluginGear {
         )
         .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: build_registration: {e}"))?;
 
-        // Publish to types-registry. Idempotent restart: treat
-        // `AlreadyExists` as success ONLY when the stored spec
-        // matches our current serialised instance — otherwise fail
-        // immediately so a stale catalogue entry surfaces as an
-        // operator-actionable error rather than a silent drift.
-        // Mirrors the pattern in `static-idp-plugin` and the AM-
-        // owned TR plugin in `account-management::module`.
+        // Publish to types-registry; the backend is registered only once the
+        // instance is admitted (or found up to date).
         let registry = ctx
             .client_hub()
-            .get::<dyn TypesRegistryClient>()
-            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: get TypesRegistryClient: {e}"))?;
-        let results = registry
-            .register(vec![instance_json.clone()])
-            .await
-            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: types-registry register: {e}"))?;
-        for result in &results {
-            if let RegisterResult::Err { error, .. } = result {
-                if matches!(
-                    error,
-                    toolkit::api::canonical_prelude::CanonicalError::AlreadyExists { .. }
-                ) {
-                    let existing =
-                        registry
-                            .get_instance(instance_id.as_ref())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "keycloak-idp-plugin: verify existing instance: {e}"
-                                )
-                            })?;
-                    if existing.object != instance_json {
-                        return Err(anyhow::anyhow!(
-                            "keycloak-idp-plugin: instance `{instance_id}` already registered \
-                             with a different spec — refusing to silently drift",
-                        ));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "keycloak-idp-plugin: types-registry registration failed: {error}"
-                    ));
-                }
-            }
-        }
+            .get::<dyn PlatformTypesRegistryApi>()
+            .map_err(|e| {
+                anyhow::anyhow!("keycloak-idp-plugin: get PlatformTypesRegistryApi: {e}")
+            })?;
+        publish_instance(
+            registry.as_ref(),
+            instance_id.as_ref(),
+            instance_json,
+            ctx.cancellation_token(),
+        )
+        .await?;
 
         let plugin = Arc::new(KeycloakIdpPlugin {
             tenant_facade,
@@ -391,6 +368,49 @@ async fn pre_warm_bootstrap_admin_with_retry(
     Err(anyhow::anyhow!(
         "keycloak-idp-plugin: bootstrap admin pre-warm bailed after {attempts_used}/{max_attempts} attempt(s) ({backoff:?} backoff between attempts); last error: {final_err}"
     ))
+}
+
+/// Budget for publishing the plugin instance from `init()`. With several
+/// registry instances on one database an admission can wait up to a minute
+/// for another instance's outbox.
+const PUBLICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Reconcile this plugin's instance and wait for its admission.
+///
+/// # Errors
+/// A refused or unsettled admission, naming the instance and its outcome;
+/// the deadline or cancellation.
+async fn publish_instance(
+    registry: &dyn PlatformTypesRegistryApi,
+    instance_id: &str,
+    instance_json: serde_json::Value,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let publisher = PublisherContext {
+        name: KeycloakIdpPluginGear::MODULE_NAME.to_owned(),
+        version: env!("CARGO_PKG_VERSION").parse()?,
+    };
+    let mut options = ReconcileOptions::default();
+    options.deadline = PUBLICATION_DEADLINE;
+    let gts_id = GtsId::try_new(instance_id)?;
+    registry
+        .reconcile_entities_and_await(
+            &PlatformSecurityContext::outbound_marker(),
+            &publisher,
+            &[(gts_id.clone(), instance_json)],
+            &options,
+            cancel,
+        )
+        .await
+        .map_err(|error| {
+            let outcome = ReconcileReport::from_canonical(&error)
+                .and_then(|report| report.outcomes.get(&gts_id).cloned());
+            anyhow::anyhow!(
+                "keycloak-idp-plugin: publishing instance {instance_id} failed: {error}; \
+                 outcome: {outcome:?}"
+            )
+        })?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Glue wiring the echo Service to `IdpPluginClient` and publishing the GTS instance — see crate root (lib.rs) for behaviour and prod-safety warnings.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use account_management_sdk::{IdpPluginClient, IdpPluginSpecV1};
 use async_trait::async_trait;
@@ -8,11 +9,19 @@ use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit_security::PlatformSecurityContext;
 use tracing::{info, warn};
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
+    ReconcileOptions, ReconcileReport,
+};
 
 use crate::config::StaticIdpPluginConfig;
 use crate::domain::Service;
+
+/// Budget for publishing the plugin instance from `init()`. With several registry instances
+/// on one database an admission can wait up to a minute for another instance's outbox.
+const PUBLICATION_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Static `IdP` plugin gear.
 ///
@@ -72,41 +81,33 @@ impl Gear for StaticIdpPlugin {
             cfg.priority,
         )?;
 
-        // Publish to types-registry for catalogue visibility.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json.clone()]).await?;
-        // Idempotent restart: treat `AlreadyExists` as success only when
-        // the stored spec matches our current serialized instance; fail
-        // otherwise so a stale registration under the same ID surfaces
-        // immediately rather than masking a config drift. Mirrors the
-        // pattern in `account_management::gear::init` for the AM-
-        // owned TR plugin.
-        for result in &results {
-            if let RegisterResult::Err { error, .. } = result {
-                if matches!(
-                    error,
-                    toolkit_canonical_errors::CanonicalError::AlreadyExists { .. }
-                ) {
-                    let existing =
-                        registry
-                            .get_instance(instance_id.as_ref())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!("static-idp-plugin: verify existing instance: {e}")
-                            })?;
-                    if existing.object != instance_json {
-                        return Err(anyhow::anyhow!(
-                            "static-idp-plugin: instance `{instance_id}` already registered \
-                             with a different spec",
-                        ));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "static-idp-plugin: registration failed: {error}"
-                    ));
-                }
-            }
-        }
+        // Publish to types-registry; the backend is registered only once the instance is
+        // admitted (or found up to date).
+        let registry = ctx.client_hub().get::<dyn PlatformTypesRegistryApi>()?;
+        let publisher = PublisherContext {
+            name: Self::MODULE_NAME.to_owned(),
+            version: env!("CARGO_PKG_VERSION").parse()?,
+        };
+        let mut options = ReconcileOptions::default();
+        options.deadline = PUBLICATION_DEADLINE;
+        let gts_id = GtsId::try_new(instance_id.as_ref())?;
+        registry
+            .reconcile_entities_and_await(
+                &PlatformSecurityContext::outbound_marker(),
+                &publisher,
+                &[(gts_id.clone(), instance_json)],
+                &options,
+                ctx.cancellation_token(),
+            )
+            .await
+            .map_err(|error| {
+                let outcome = ReconcileReport::from_canonical(&error)
+                    .and_then(|report| report.outcomes.get(&gts_id).cloned());
+                anyhow::anyhow!(
+                    "static-idp-plugin: publishing instance {instance_id} failed: {error}; \
+                     outcome: {outcome:?}"
+                )
+            })?;
 
         self.service
             .set(service.clone())
@@ -127,3 +128,8 @@ impl Gear for StaticIdpPlugin {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

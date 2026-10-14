@@ -675,11 +675,8 @@ impl Gear for AccountManagementGear {
         //     service-layer CRUD return value.
         //   * the `IdpPluginSpecV1` instance enumeration used by the
         //     vendor-based plugin selection block immediately below.
-        let types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = ctx
-            .client_hub()
-            .get::<dyn types_registry_sdk::TypesRegistryClient>()
-            .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryClient: {e}"))?;
-        // The database-backed platform API serves the readers migrated so far (T32).
+        // Without a database bound to types-registry the platform API is
+        // not published, and AM fails here: there is no legacy fallback.
         let platform_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = ctx
             .client_hub()
             .get::<dyn types_registry_sdk::PlatformTypesRegistryApi>()
@@ -796,7 +793,7 @@ impl Gear for AccountManagementGear {
         // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-resolve-plugin
         let idp: Arc<dyn IdpPluginClient> = Arc::new(LazyIdpProvider::new(
             ctx.client_hub(),
-            Arc::clone(&types_registry),
+            Arc::clone(&platform_registry),
             cfg.idp.vendor.clone(),
             cfg.idp.required,
         ));
