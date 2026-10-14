@@ -1207,8 +1207,9 @@ impl Gear for AccountManagementGear {
         // in production — tests construct `MetadataService::new`
         // directly with a `StubMetadataSchemaRegistry`.
         let metadata_repo: Arc<dyn MetadataRepo> = Arc::new(MetadataRepoImpl::new(Arc::clone(&db)));
-        let schema_registry: Arc<dyn MetadataSchemaRegistry> =
-            Arc::new(GtsMetadataSchemaRegistry::new(Arc::clone(&types_registry)));
+        let schema_registry: Arc<dyn MetadataSchemaRegistry> = Arc::new(
+            GtsMetadataSchemaRegistry::new(Arc::clone(&platform_registry)),
+        );
         let metadata_service = Arc::new(
             MetadataService::new(
                 metadata_repo,
