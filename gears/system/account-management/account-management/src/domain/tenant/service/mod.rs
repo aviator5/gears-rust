@@ -90,7 +90,7 @@ use tenant_resolver_sdk::TenantId;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::PlatformSecurityContext;
-use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection};
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions};
 
 use crate::config::AccountManagementConfig;
 use crate::domain::error::DomainError;
@@ -295,7 +295,7 @@ impl<R: TenantRepo> TenantService<R> {
             .get_type_schema_by_uuid(
                 &PlatformSecurityContext::outbound_marker(),
                 tenant.tenant_type_uuid,
-                Projection::Default,
+                ReadOptions::default(),
             )
             .await
         {
@@ -364,7 +364,7 @@ impl<R: TenantRepo> TenantService<R> {
             .get_type_schema_by_uuid(
                 &PlatformSecurityContext::outbound_marker(),
                 type_uuid,
-                Projection::Default,
+                ReadOptions::default(),
             )
             .await
         {
@@ -457,7 +457,7 @@ impl<R: TenantRepo> TenantService<R> {
             .batch_get_type_schemas_by_uuid(
                 &PlatformSecurityContext::outbound_marker(),
                 &uuids,
-                Projection::Default,
+                ReadOptions::default(),
             )
             .await
         {

@@ -64,7 +64,7 @@ use crate::domain::util::backoff::compute_next_backoff;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
     EntityField, FieldSelection, LifecycleStatus, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions,
 };
 
 /// Internal classification produced by `BootstrapService::classify`.
@@ -848,7 +848,12 @@ impl<R: TenantRepo> BootstrapService<R> {
             registry.get_type_schema(
                 &PlatformSecurityContext::outbound_marker(),
                 &self.root_type.gts_id,
-                Projection::Select(FieldSelection::with(&[EntityField::EffectiveTraits])),
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[
+                        EntityField::EffectiveTraits,
+                    ])),
+                    ..ReadOptions::default()
+                },
             ),
         )
         .await

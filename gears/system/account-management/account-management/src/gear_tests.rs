@@ -477,7 +477,7 @@ mod no_seed_startup_tests {
     use toolkit_security::PlatformSecurityContext;
     use types_registry_sdk::{
         EntityField, FieldSelection, GtsTypeId, PlatformTypesRegistryApi,
-        PlatformTypesRegistryApiExt, Projection,
+        PlatformTypesRegistryApiExt, Projection, ReadOptions,
     };
 
     use crate::gear::AccountManagementGear;
@@ -589,7 +589,7 @@ mod no_seed_startup_tests {
         let root_type = GtsTypeId::new(ROOT_TENANT_TYPE);
         assert!(
             registry
-                .get_type_schema(&platform, &root_type, Projection::Default)
+                .get_type_schema(&platform, &root_type, ReadOptions::default())
                 .await
                 .is_err(),
             "the test must not accidentally provide a YAML root seed"
@@ -638,10 +638,13 @@ mod no_seed_startup_tests {
             .get_type_schema(
                 &platform,
                 &root_type,
-                Projection::Select(FieldSelection::with(&[
-                    EntityField::EffectiveTraits,
-                    EntityField::ResolvedSchema,
-                ])),
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[
+                        EntityField::EffectiveTraits,
+                        EntityField::ResolvedSchema,
+                    ])),
+                    ..ReadOptions::default()
+                },
             )
             .await
             .expect("admitted root type");
@@ -765,7 +768,7 @@ mod no_seed_startup_tests {
                 .get_type_schema(
                     &PlatformSecurityContext::outbound_marker(),
                     &GtsTypeId::new(ROOT_TENANT_TYPE),
-                    Projection::Default,
+                    ReadOptions::default(),
                 )
                 .await;
             assert!(
@@ -800,7 +803,7 @@ mod restart_tests {
     use toolkit_security::{PlatformSecurityContext, SecurityContext};
     use types_registry_sdk::{
         EntityField, FieldSelection, GtsTypeId, Origin, PlatformTypesRegistryApi,
-        PlatformTypesRegistryApiExt, Projection, TypeSchema,
+        PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
     };
     use uuid::Uuid;
 
@@ -961,10 +964,13 @@ mod restart_tests {
                 .get_type_schema(
                     &PlatformSecurityContext::outbound_marker(),
                     &GtsTypeId::new(type_id),
-                    Projection::Select(FieldSelection::with(&[
-                        EntityField::Origin,
-                        EntityField::EffectiveTraits,
-                    ])),
+                    ReadOptions {
+                        projection: Projection::Select(FieldSelection::with(&[
+                            EntityField::Origin,
+                            EntityField::EffectiveTraits,
+                        ])),
+                        ..ReadOptions::default()
+                    },
                 )
                 .await
         }
@@ -982,7 +988,10 @@ mod restart_tests {
             .get_instance(
                 &PlatformSecurityContext::outbound_marker(),
                 &id,
-                Projection::Select(FieldSelection::with(&[EntityField::Origin])),
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[EntityField::Origin])),
+                    ..ReadOptions::default()
+                },
             )
             .await;
         match read {
