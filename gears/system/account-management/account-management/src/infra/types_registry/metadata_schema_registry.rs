@@ -38,7 +38,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
     EntityField, FieldSelection, LifecycleStatus, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection, TypeSchema,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
 };
 use uuid::Uuid;
 
@@ -100,7 +100,10 @@ async fn read_schema(
         .get_type_schema(
             &PlatformSecurityContext::outbound_marker(),
             type_id,
-            projection,
+            ReadOptions {
+                projection,
+                ..ReadOptions::default()
+            },
         )
         .await
         .map_err(|err| map_registry_err(err, schema_str))?;
@@ -245,7 +248,7 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
             .batch_get_type_schemas_by_uuid(
                 &PlatformSecurityContext::outbound_marker(),
                 schema_uuids,
-                Projection::Default,
+                ReadOptions::default(),
             )
             .await
             .map_err(|err| DomainError::service_unavailable(format!("types-registry: {err}")))?;
@@ -267,7 +270,7 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
             .get_type_schema_by_uuid(
                 &PlatformSecurityContext::outbound_marker(),
                 schema_uuid,
-                Projection::Default,
+                ReadOptions::default(),
             )
             .await
             .map_err(|err| map_registry_err(err, &token))?;

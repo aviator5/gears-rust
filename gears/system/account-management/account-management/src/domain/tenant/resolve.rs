@@ -25,7 +25,7 @@
 use account_management_sdk::gts::TENANT_RESOURCE_TYPE;
 use toolkit_security::AccessScope;
 use toolkit_security::PlatformSecurityContext;
-use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection};
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -88,7 +88,7 @@ pub(crate) async fn resolve_active_tenant(
         .get_type_schema_by_uuid(
             &PlatformSecurityContext::outbound_marker(),
             tenant.tenant_type_uuid,
-            Projection::Default,
+            ReadOptions::default(),
         )
         .await
     {

@@ -86,7 +86,7 @@ use toolkit_gts::gts_id;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
     EntityField, FieldSelection, GtsTypeId, LifecycleStatus, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions,
 };
 
 use crate::domain::error::DomainError;
@@ -269,7 +269,10 @@ async fn lookup_effective_properties(
         .get_type_schema(
             &PlatformSecurityContext::outbound_marker(),
             &GtsTypeId::new(type_id),
-            projection,
+            ReadOptions {
+                projection,
+                ..ReadOptions::default()
+            },
         )
         .await
     {

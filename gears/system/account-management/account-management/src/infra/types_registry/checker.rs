@@ -43,7 +43,7 @@ use serde_json::Value;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
     EntityField, FieldSelection, GtsId, LifecycleStatus, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection, TypeSchema,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
 };
 use uuid::Uuid;
 
@@ -149,8 +149,14 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
 
         let map = match tokio::time::timeout(
             self.probe_timeout,
-            self.registry
-                .batch_get_type_schemas_by_uuid(&ctx, &requested, projection),
+            self.registry.batch_get_type_schemas_by_uuid(
+                &ctx,
+                &requested,
+                ReadOptions {
+                    projection,
+                    ..ReadOptions::default()
+                },
+            ),
         )
         .await
         {

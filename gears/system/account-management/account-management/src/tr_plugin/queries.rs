@@ -48,7 +48,7 @@ use tenant_resolver_sdk::{
     TenantInfo, TenantRef, TenantResolverError, TenantStatus as SdkTenantStatus,
 };
 use toolkit_security::PlatformSecurityContext;
-use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection};
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions};
 
 use crate::domain::tenant::hierarchy_read_port::{
     BarrierMode, StatusFilter, TenantHierarchyReadPort,
@@ -163,7 +163,7 @@ async fn resolve_tenant_type_one(
         .get_type_schema_by_uuid(
             &PlatformSecurityContext::outbound_marker(),
             type_uuid,
-            Projection::Default,
+            ReadOptions::default(),
         )
         .await
     {
@@ -202,7 +202,7 @@ async fn resolve_tenant_types_for_uuids(
         .batch_get_type_schemas_by_uuid(
             &PlatformSecurityContext::outbound_marker(),
             &distinct,
-            Projection::Default,
+            ReadOptions::default(),
         )
         .await
         .map_err(|err| {
