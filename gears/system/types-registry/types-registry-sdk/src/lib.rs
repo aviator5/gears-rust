@@ -42,6 +42,8 @@ pub use reconcile::{
     ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport, ReconcileStop,
     Reconciliation,
 };
+#[cfg(feature = "rest-client")]
+pub use rest_client::{PLATFORM_BASE_PATH, PlatformTypesRegistryRestClient};
 
 // Legacy API and model re-exports.
 mod legacy;

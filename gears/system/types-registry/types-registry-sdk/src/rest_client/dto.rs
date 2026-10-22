@@ -4,11 +4,6 @@
 //! to one. Encoding refuses what the wire cannot carry, in the shape the local client
 //! refuses it. Decoding refuses a malformed payload rather than defaulting it, and keeps
 //! an omitted document apart from a selected JSON `null`.
-// The platform client (next commit) is the first caller; until then only tests use them.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the platform REST client is their first caller")
-)]
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

@@ -20,6 +20,19 @@ complete listings (`list_type_schemas`, `list_instances`). The platform extensio
 reconciles explicit documents with `reconcile_entities_and_await`. Import the extension
 trait to call them; with both imported, choose one by UFCS.
 
+### Platform API over REST (`rest-client`)
+
+`PlatformTypesRegistryRestClient` implements `PlatformTypesRegistryApi` against
+`/types-registry/platform/v1/` for a gear in another process. Every attempt carries the
+process's `X-ToolKit-Internal-Token` from `ClientConfig::internal_token_provider`,
+resolved afresh, and never a bearer; the `PlatformSecurityContext` argument is not sent.
+Each call is a safe read or carries its `Idempotency-Key`, so it retries under
+`ClientConfig::retry`. A mutation returns its operation as read back, after the receipt's
+`Retry-After` (bounded by `retry.max_delay`) when the operation is still running; a failed
+read-back is `Aborted` with reason `OPERATION_READ_FAILED` naming the operation, and the
+same key replays it. The `otel` feature adds trace propagation and RED client metrics.
+The tenant client, the directory-resolving wrappers and `#[provides]` follow in T35.
+
 The GTS identifier types the models use (`GtsId`, `GtsTypeId`, `GtsInstanceId`,
 `GtsIdPattern`, `GtsIdSegment`) are re-exported, so building a request needs no direct
 `gts` dependency.
@@ -394,8 +407,8 @@ event carries `reconcile_id` directly.
   `depends_on` steer admission, `strict()` panics on an unexpected call, and `calls`,
   `reads` and `submissions` record what happened. `install` registers it in a `ClientHub`
   under both contracts.
-- `testing_platform::conformance::run` holds the contract checks that the mock and the
-  registry's local client both pass.
+- `testing_platform::conformance::run` holds the contract checks that the mock, the
+  registry's local client and the REST client over TCP all pass.
 
 ## Legacy API
 
