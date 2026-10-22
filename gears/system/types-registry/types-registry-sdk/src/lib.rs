@@ -12,6 +12,8 @@ pub mod models;
 pub mod precondition;
 pub mod reason;
 mod reconcile;
+#[cfg(feature = "rest-client")]
+mod rest_client;
 
 #[cfg(any(test, feature = "test-util"))]
 #[expect(
