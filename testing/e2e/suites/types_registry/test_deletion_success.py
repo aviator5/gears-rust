@@ -55,7 +55,7 @@ async def test_delete_one_entity_leaves_a_readable_tombstone(
     await assert_exact_entity(registry_http, registry_api_path, schema, schema_entity(schema, 1))
 
     operation = await delete_one_and_poll(
-        registry_http, registry_api_path, schema["gts_id"], 1, RECEIPT
+        registry_http, schema["gts_id"], 1, RECEIPT
     )
     assert_operation(
         operation, completed("deletion", removal(schema, "succeeded", 2)), ordered=True
@@ -86,7 +86,6 @@ async def test_batch_deletion_reports_mixed_key_outcomes_in_request_order(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [
             target(spare, 1, key=gts_uuid(spare["gts_id"])),
             target(instance, 1),
@@ -121,7 +120,6 @@ async def test_deleting_an_instance_keeps_its_schema_and_sibling(
 
     operation = await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(instance, 1)],
         removal(instance, "succeeded", 2),
     )
@@ -152,7 +150,7 @@ async def test_deletion_through_a_registry_reference(
     )
     reference = read.json()["gts_uuid"]
 
-    operation = await delete_one_and_poll(registry_http, registry_api_path, reference, 1, RECEIPT)
+    operation = await delete_one_and_poll(registry_http, reference, 1, RECEIPT)
     assert_operation(
         operation, completed("deletion", removal(reference, "succeeded", 2)), ordered=True
     )
@@ -190,13 +188,12 @@ async def test_deletion_keeps_the_current_content_after_several_revisions(
         current["content"]["title"] = title
         current["expected_resource_version"] = version - 1
         await register_and_assert(
-            registry_http, registry_api_path, [current], outcome(schema, "succeeded", version)
+            registry_http, [current], outcome(schema, "succeeded", version)
         )
     await assert_exact_entity(registry_http, registry_api_path, schema, schema_entity(current, 3))
 
     operation = await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(schema, 3)],
         removal(schema, "succeeded", 4),
     )

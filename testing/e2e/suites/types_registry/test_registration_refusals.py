@@ -31,7 +31,6 @@ async def test_register_batch_with_partial_failure(
     blocked = registration_fixture("blocked_instance")
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [blocked, broken, independent],
         outcome(blocked, "failed", None, "blocked_by_dependency"),
         outcome(
@@ -89,7 +88,7 @@ async def test_register_batch_refuses_mismatched_schema_id(
         )
 
     assert_bad_request(
-        await post_registration(registry_http, registry_api_path, [instance, schema]),
+        await post_registration(registry_http, [instance, schema]),
         invalid_argument(
             "entity", "VALIDATION_FAILED", description, resource_name=schema["gts_id"]
         ),
@@ -128,7 +127,6 @@ async def test_register_batch_rejects_invalid_content_for_scalar_schema(
 
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [valid, *invalid],
         outcome(valid, "succeeded", 1),
         *(outcome(document, "failed", None, "invalid_value") for document in invalid),

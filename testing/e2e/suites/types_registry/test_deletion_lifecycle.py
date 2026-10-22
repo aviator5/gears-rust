@@ -68,7 +68,7 @@ async def test_a_tombstone_keeps_its_effective_documents_under_both_keys(
         )
 
     await delete_and_assert(
-        registry_http, registry_api_path, [target(derived, 1)], removal(derived, "succeeded", 2)
+        registry_http, [target(derived, 1)], removal(derived, "succeeded", 2)
     )
     tombstone = _trait_derived_entity(derived, base, 2, "deleted")
     for key in keys:
@@ -112,7 +112,7 @@ async def test_deletion_moves_an_entity_between_discovery_filters(
     other = deletion_fixture("other_schema")
     await given_registered(person, other)
     await delete_and_assert(
-        registry_http, registry_api_path, [target(person, 1)], removal(person, "succeeded", 2)
+        registry_http, [target(person, 1)], removal(person, "succeeded", 2)
     )
     live = {**mandatory(other), "origin": managed(1)}
     tombstone = {**mandatory(person, "deleted"), "origin": managed(2)}
@@ -164,7 +164,7 @@ async def test_a_readable_tombstone_cannot_become_a_new_dependency(
     other = deletion_fixture("other_schema")
     await given_registered(person)
     await delete_and_assert(
-        registry_http, registry_api_path, [target(person, 1)], removal(person, "succeeded", 2)
+        registry_http, [target(person, 1)], removal(person, "succeeded", 2)
     )
     tombstone = schema_entity(person, 2, lifecycle_status="deleted")
     before = await assert_exact_entity(registry_http, registry_api_path, person, tombstone)
@@ -181,7 +181,6 @@ async def test_a_readable_tombstone_cannot_become_a_new_dependency(
 
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [instance, derived, referrer, other],
         deleted_dependency(instance, "conforming_type"),
         # The derivation role wins over the `allOf` `$ref` naming the same base.

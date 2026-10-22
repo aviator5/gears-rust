@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 
 from .helpers import (
+    PLATFORM_API,
     assert_exact,
     assert_exact_entity,
     assert_json,
@@ -54,7 +55,7 @@ async def test_a_single_dry_run_deletion_changes_nothing(
 
     prediction = await await_deletion(
         registry_http,
-        await delete_one(registry_http, registry_api_path, schema["gts_id"], 1, dry_run=True),
+        await delete_one(registry_http, schema["gts_id"], 1, dry_run=True),
         dry_run=True,
     )
     assert_operation(
@@ -71,7 +72,7 @@ async def test_a_single_dry_run_deletion_changes_nothing(
     )
     assert_json(after.json(), before.json())
     await delete_and_assert(
-        registry_http, registry_api_path, [target(schema, 1)], removal(schema, "succeeded", 2)
+        registry_http, [target(schema, 1)], removal(schema, "succeeded", 2)
     )
 
 
@@ -89,7 +90,6 @@ async def test_a_dry_run_predicts_a_whole_graph_through_virtual_deletions(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(document, 1) for document in chain],
         *(removal(document, "succeeded", None) for document in chain),
         dry_run=True,
@@ -98,7 +98,6 @@ async def test_a_dry_run_predicts_a_whole_graph_through_virtual_deletions(
         await _state(registry_http, registry_api_path, document, 1, etag=etag)
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(document, 1) for document in chain],
         *(removal(document, "succeeded", 2) for document in chain),
     )
@@ -122,7 +121,7 @@ async def test_a_failed_dependant_keeps_its_target_blocked_in_both_modes(
     revised["content"]["title"] = "Revised Referrer"
     revised["expected_resource_version"] = 1
     await register_and_assert(
-        registry_http, registry_api_path, [revised], outcome(second, "succeeded", 2)
+        registry_http, [revised], outcome(second, "succeeded", 2)
     )
     batch = [target(person, 1), target(referrer, 1), target(second, 1), target(other, 1)]
     stale = removal(
@@ -140,7 +139,6 @@ async def test_a_failed_dependant_keeps_its_target_blocked_in_both_modes(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         batch,
         blocked(person, 1),
         removal(referrer, "succeeded", None),
@@ -154,7 +152,6 @@ async def test_a_failed_dependant_keeps_its_target_blocked_in_both_modes(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         batch,
         blocked(person, 1),
         removal(referrer, "succeeded", 2),
@@ -178,25 +175,22 @@ async def test_a_passing_dry_run_does_not_reserve_deletion_eligibility(
     await given_registered(person)
     prediction = await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(person, 1)],
         removal(person, "succeeded", None),
         dry_run=True,
     )
     await register_and_assert(
-        registry_http, registry_api_path, [referrer], outcome(referrer, "succeeded", 1)
+        registry_http, [referrer], outcome(referrer, "succeeded", 1)
     )
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(person, 1)],
         blocked(person, 1),
         exact_messages=True,
     )
     for document in (person, referrer):
         await _state(registry_http, registry_api_path, document, 1)
-    polled = await registry_http.get(
-        f"{registry_api_path}/operations/{prediction['operation_id']}"
+    polled = await registry_http.platform.get(f"{PLATFORM_API}/operations/{prediction['operation_id']}"
     )
     assert_json(polled.json(), prediction)

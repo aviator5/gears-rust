@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 import pytest
 
 from .helpers import (
+    PLATFORM_API,
     RECEIPT,
     TRACE_ID,
     assert_exact_entity,
@@ -55,10 +56,10 @@ def _assert_receipt(response, *, replayed_operation_id=None):
     return receipt, urljoin(str(response.url), response.headers["location"])
 
 
-async def _submit_and_await(client, api_path, schema, key, *items):
+async def _submit_and_await(client, schema, key, *items):
     """Submit under `key`, check the fresh receipt and the whole terminal operation."""
     receipt, location = _assert_receipt(
-        await post_registration(client, api_path, [schema], idempotency_key=key)
+        await post_registration(client, [schema], idempotency_key=key)
     )
     operation = await poll_operation(client, receipt, location, "registration")
     assert_operation(operation, completed("registration", *items))
@@ -73,7 +74,7 @@ async def test_replay_retains_the_creation_outcome_after_a_revision(
     schema = registration_fixture("person_schema")
     k1 = str(uuid.uuid4())
     original, original_location = await _submit_and_await(
-        registry_http, registry_api_path, schema, k1, outcome(schema, "succeeded", 1)
+        registry_http, schema, k1, outcome(schema, "succeeded", 1)
     )
 
     revised = deepcopy(schema)
@@ -81,7 +82,6 @@ async def test_replay_retains_the_creation_outcome_after_a_revision(
     revised["expected_resource_version"] = 1
     await _submit_and_await(
         registry_http,
-        registry_api_path,
         revised,
         str(uuid.uuid4()),
         outcome(schema, "succeeded", 2),
@@ -91,7 +91,7 @@ async def test_replay_retains_the_creation_outcome_after_a_revision(
     )
 
     replay_receipt, replay_location = _assert_receipt(
-        await post_registration(registry_http, registry_api_path, [schema], idempotency_key=k1),
+        await post_registration(registry_http, [schema], idempotency_key=k1),
         replayed_operation_id=original["operation_id"],
     )
     assert replay_location == original_location
@@ -118,7 +118,7 @@ async def test_reusing_a_key_for_different_content_is_a_conflict(
     schema = registration_fixture("person_schema")
     k1 = str(uuid.uuid4())
     original, original_location = await _submit_and_await(
-        registry_http, registry_api_path, schema, k1, outcome(schema, "succeeded", 1)
+        registry_http, schema, k1, outcome(schema, "succeeded", 1)
     )
     before = await assert_exact_entity(
         registry_http, registry_api_path, schema, schema_entity(schema, 1)
@@ -127,7 +127,7 @@ async def test_reusing_a_key_for_different_content_is_a_conflict(
     changed = deepcopy(schema)
     changed["content"]["title"] = "A different request under the same key"
     assert_problem(
-        await post_registration(registry_http, registry_api_path, [changed], idempotency_key=k1),
+        await post_registration(registry_http, [changed], idempotency_key=k1),
         409,
         {
             "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~",
@@ -168,7 +168,6 @@ async def test_a_new_key_does_not_turn_duplicate_creation_into_replay(
     schema = registration_fixture("person_schema")
     original, _ = await _submit_and_await(
         registry_http,
-        registry_api_path,
         schema,
         str(uuid.uuid4()),
         outcome(schema, "succeeded", 1),
@@ -179,7 +178,6 @@ async def test_a_new_key_does_not_turn_duplicate_creation_into_replay(
 
     duplicate, _ = await _submit_and_await(
         registry_http,
-        registry_api_path,
         schema,
         str(uuid.uuid4()),
         outcome(schema, "failed", None, "already_exists"),
@@ -202,7 +200,7 @@ async def test_an_unknown_operation_is_a_not_found_naming_the_operation(
     """Polling an operation that was never created names an operation, not an entity."""
     operation_id = str(uuid.uuid4())
     assert_not_found(
-        await registry_http.get(f"{registry_api_path}/operations/{operation_id}"),
+        await registry_http.platform.get(f"{PLATFORM_API}/operations/{operation_id}"),
         {
             "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
             "title": "Not Found",
@@ -228,7 +226,6 @@ async def test_replay_keeps_a_refusal_after_its_dependency_arrives(
     k1 = str(uuid.uuid4())
     refused, refused_location = await _submit_and_await(
         registry_http,
-        registry_api_path,
         referrer,
         k1,
         outcome(
@@ -242,7 +239,6 @@ async def test_replay_keeps_a_refusal_after_its_dependency_arrives(
     )
     await _submit_and_await(
         registry_http,
-        registry_api_path,
         target,
         str(uuid.uuid4()),
         outcome(target, "succeeded", 1),
@@ -252,7 +248,7 @@ async def test_replay_keeps_a_refusal_after_its_dependency_arrives(
     )
 
     replay_receipt, replay_location = _assert_receipt(
-        await post_registration(registry_http, registry_api_path, [referrer], idempotency_key=k1),
+        await post_registration(registry_http, [referrer], idempotency_key=k1),
         replayed_operation_id=refused["operation_id"],
     )
     assert replay_location == refused_location
@@ -264,7 +260,6 @@ async def test_replay_keeps_a_refusal_after_its_dependency_arrives(
 
     admitted, _ = await _submit_and_await(
         registry_http,
-        registry_api_path,
         referrer,
         str(uuid.uuid4()),
         outcome(referrer, "succeeded", 1),
@@ -300,7 +295,6 @@ async def test_changing_only_the_precondition_conflicts_with_a_used_key(
     current["expected_resource_version"] = 1
     await _submit_and_await(
         registry_http,
-        registry_api_path,
         current,
         str(uuid.uuid4()),
         outcome(schema, "succeeded", 2),
@@ -310,7 +304,6 @@ async def test_changing_only_the_precondition_conflicts_with_a_used_key(
     k1 = str(uuid.uuid4())
     stale, stale_location = await _submit_and_await(
         registry_http,
-        registry_api_path,
         candidate,
         k1,
         outcome(schema, "failed", None, "precondition_failed"),
@@ -322,7 +315,7 @@ async def test_changing_only_the_precondition_conflicts_with_a_used_key(
     corrected = {**candidate, "expected_resource_version": 2}
     assert_problem(
         await post_registration(
-            registry_http, registry_api_path, [corrected], idempotency_key=k1
+            registry_http, [corrected], idempotency_key=k1
         ),
         409,
         key_conflict(stale["operation_id"]),
@@ -341,7 +334,6 @@ async def test_changing_only_the_precondition_conflicts_with_a_used_key(
 
     await _submit_and_await(
         registry_http,
-        registry_api_path,
         corrected,
         str(uuid.uuid4()),
         outcome(schema, "succeeded", 3),

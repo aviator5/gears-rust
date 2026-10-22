@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
 use toolkit_db::{DBProvider, Db, DbError};
 use toolkit_macros::domain_model;
+use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
 
 use crate::config::TypesRegistryConfig;
@@ -355,14 +356,14 @@ impl RegistryService {
 
     /// Accept a submission and dispatch it durably; the outbox admits it.
     /// Acceptance and dispatch share one transaction, so a committed operation
-    /// always has a driver.
+    /// always has a driver. Platform only (D17): no tenant context can reach it.
     ///
     /// # Errors
     /// [`ServiceError::Acceptance`] for every synchronous refusal, including the
     /// fingerprint conflict.
     pub async fn submit(
         &self,
-        _caller: CallerContext<'_>,
+        _caller: &PlatformSecurityContext,
         request: &SubmitRequest,
         now: OffsetDateTime,
     ) -> Result<Accepted, ServiceError> {
@@ -409,13 +410,14 @@ impl RegistryService {
     }
 
     /// Submit a single or batch deletion through the shared admission path (SPEC §8.4).
+    /// Platform only (D17), as [`Self::submit`].
     ///
     /// # Errors
     /// [`ServiceError::Acceptance`] for every synchronous refusal. An unknown
     /// Registry Reference is not one: its item fails in the worker.
     pub async fn delete(
         &self,
-        _caller: CallerContext<'_>,
+        _caller: &PlatformSecurityContext,
         request: &DeleteRequest,
         now: OffsetDateTime,
     ) -> Result<Accepted, ServiceError> {
@@ -436,14 +438,15 @@ impl RegistryService {
         .await?)
     }
 
-    /// Read one operation and its per-candidate outcomes.
+    /// Read one operation and its per-candidate outcomes. Platform only (D17), as
+    /// [`Self::submit`]: no tenant route reads an operation.
     ///
     /// # Errors
     /// [`ServiceError::Storage`] for a read failure. An absent operation is
     /// `Ok(None)`, because "not found" is an answer rather than a fault.
     pub async fn operation(
         &self,
-        _caller: CallerContext<'_>,
+        _caller: &PlatformSecurityContext,
         id: Uuid,
     ) -> Result<Option<OperationRecord>, ServiceError> {
         self.operation_record(id).await

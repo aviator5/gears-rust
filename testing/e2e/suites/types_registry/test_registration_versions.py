@@ -38,7 +38,6 @@ async def test_contiguous_minors_are_ordered_within_a_batch(
     second = registration_fixture("person_minor_1_schema")
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [second, first],
         outcome(second, "succeeded", 1),
         outcome(first, "succeeded", 1),
@@ -59,7 +58,6 @@ async def test_missing_predecessor_refuses_later_minor(
     before = await _read(registry_http, registry_api_path, first, 1)
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [skipped],
         outcome(skipped, "failed", None, "missing_predecessor"),
     )
@@ -87,7 +85,6 @@ async def test_major_only_and_minor_shapes_conflict_in_both_directions(
 
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [a_minor, b_major],
         outcome(a_minor, "failed", None, "family_shape_conflict"),
         outcome(b_major, "failed", None, "family_shape_conflict"),
@@ -120,7 +117,7 @@ async def test_minor_revision_is_refused_before_existence_lookup(
 
     for candidate in (changed, absent):
         assert_bad_request(
-            await post_registration(registry_http, registry_api_path, [candidate]),
+            await post_registration(registry_http, [candidate]),
             invalid_argument(
                 "expected_resource_version",
                 "VALIDATION_FAILED",
@@ -149,7 +146,6 @@ async def test_failed_first_minor_blocks_the_next_minor(
     }
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [second, first],
         outcome(second, "failed", None, "blocked_by_predecessor"),
         outcome(
@@ -177,7 +173,7 @@ async def test_a_compatible_minor_with_changed_content_needs_no_skip(
     second["content"]["properties"]["nickname"] = {"type": "string"}
 
     operation = await register_and_assert(
-        registry_http, registry_api_path, [second], outcome(second, "succeeded", 1)
+        registry_http, [second], outcome(second, "succeeded", 1)
     )
     await read_created(registry_http, registry_api_path, schema_entity(second, 1), operation)
     assert_exact(
@@ -209,7 +205,6 @@ async def test_an_incompatible_minor_is_refused_without_a_skip_request(
 
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [second],
         outcome(second, "failed", None, "incompatible_with_baseline"),
     )

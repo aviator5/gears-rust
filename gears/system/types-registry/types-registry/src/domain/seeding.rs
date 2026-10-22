@@ -291,7 +291,7 @@ pub async fn seed(
     let ctx = PlatformSecurityContext::outbound_marker();
     let seeder = Seeder {
         registry,
-        caller: CallerContext::Platform(&ctx),
+        ctx: &ctx,
         window: &window,
     };
     let mut backoff = BACKOFF_INITIAL;
@@ -351,7 +351,7 @@ fn stopped(stop: Stop, budget: Duration, set: &SeedSet, contention: Vec<SeedFail
 
 struct Seeder<'s> {
     registry: &'s RegistryService,
-    caller: CallerContext<'s>,
+    ctx: &'s PlatformSecurityContext,
     window: &'s Budget<'s>,
 }
 
@@ -380,7 +380,7 @@ impl Seeder<'_> {
             .window
             .bounded(
                 self.registry
-                    .submit(self.caller, &request, OffsetDateTime::now_utc()),
+                    .submit(self.ctx, &request, OffsetDateTime::now_utc()),
             )
             .await?;
         let accepted = match submitted {
@@ -414,7 +414,11 @@ impl Seeder<'_> {
                 .collect();
             let answers = match self
                 .window
-                .bounded(self.registry.batch_get(self.caller, &items, selection))
+                .bounded(self.registry.batch_get(
+                    CallerContext::Platform(self.ctx),
+                    &items,
+                    selection,
+                ))
                 .await?
             {
                 Ok(answers) => answers,

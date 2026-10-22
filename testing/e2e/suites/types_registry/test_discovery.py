@@ -311,7 +311,7 @@ async def test_the_lifecycle_filter_separates_live_rows_and_tombstones(
     device_schema = discovery_fixture("device_schema")
     await given_registered(person_schema, device_schema)
     operation = await delete_one_and_poll(
-        registry_http, registry_api_path, person_schema["gts_id"], 1, RECEIPT
+        registry_http, person_schema["gts_id"], 1, RECEIPT
     )
     assert_operation(
         operation,

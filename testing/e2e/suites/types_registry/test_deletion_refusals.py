@@ -4,6 +4,7 @@ from copy import deepcopy
 import pytest
 
 from .helpers import (
+    PLATFORM_API,
     ENTITY_SELECT,
     assert_absent,
     assert_bad_request,
@@ -30,12 +31,12 @@ from .helpers import (
 )
 
 
-async def _revise(client, api_path, document, title, version):
+async def _revise(client, document, title, version):
     revised = deepcopy(document)
     revised["content"]["title"] = title
     revised["expected_resource_version"] = version - 1
     await register_and_assert(
-        client, api_path, [revised], outcome(document, "succeeded", version)
+        client, [revised], outcome(document, "succeeded", version)
     )
     return revised
 
@@ -65,14 +66,13 @@ async def test_a_stale_precondition_fails_the_item_and_a_fresh_read_retries(
     """A stale version is a terminal item, not a 412; rereading recovers."""
     schema = deletion_fixture("person_schema")
     await given_registered(schema)
-    revised = await _revise(registry_http, registry_api_path, schema, "Revised Person", 2)
+    revised = await _revise(registry_http, schema, "Revised Person", 2)
     before = await assert_exact_entity(
         registry_http, registry_api_path, schema, schema_entity(revised, 2)
     )
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(schema, 1)],
         removal(schema, "failed", None, "precondition_failed"),
     )
@@ -81,7 +81,6 @@ async def test_a_stale_precondition_fails_the_item_and_a_fresh_read_retries(
     )
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(schema, 2)],
         removal(schema, "succeeded", 3),
     )
@@ -101,13 +100,12 @@ async def test_an_absent_identifier_fails_without_reserving_it(
     schema = deletion_fixture("person_schema")
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(schema, 1)],
         removal(schema, "failed", None, "precondition_failed"),
     )
     await assert_absent(registry_http, registry_api_path, schema)
     await register_and_assert(
-        registry_http, registry_api_path, [schema], outcome(schema, "succeeded", 1)
+        registry_http, [schema], outcome(schema, "succeeded", 1)
     )
 
 
@@ -119,7 +117,7 @@ async def test_a_new_deletion_of_a_tombstone_is_not_active_whatever_its_version(
     schema = deletion_fixture("person_schema")
     await given_registered(schema)
     await delete_and_assert(
-        registry_http, registry_api_path, [target(schema, 1)], removal(schema, "succeeded", 2)
+        registry_http, [target(schema, 1)], removal(schema, "succeeded", 2)
     )
     tombstone = schema_entity(schema, 2, lifecycle_status="deleted")
     before = await assert_exact_entity(registry_http, registry_api_path, schema, tombstone)
@@ -127,7 +125,6 @@ async def test_a_new_deletion_of_a_tombstone_is_not_active_whatever_its_version(
     for version in (1, 2):
         await delete_and_assert(
             registry_http,
-            registry_api_path,
             [target(schema, version)],
             removal(schema, "failed", None, "not_active"),
         )
@@ -143,14 +140,13 @@ async def test_independent_successes_survive_item_refusals(
     other = deletion_fixture("other_schema")
     absent = schema_with_id(person, person["gts_id"].replace(".person.v1~", ".absent.v1~"))
     await given_registered(person, other)
-    revised = await _revise(registry_http, registry_api_path, other, "Revised Other", 2)
+    revised = await _revise(registry_http, other, "Revised Other", 2)
     other_before = await assert_exact_entity(
         registry_http, registry_api_path, other, schema_entity(revised, 2)
     )
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(person, 1), target(other, 1), target(absent, 1)],
         removal(person, "succeeded", 2),
         removal(other, "failed", None, "precondition_failed"),
@@ -186,26 +182,25 @@ async def test_missing_preconditions_and_if_match_are_synchronous_refusals(
 
     for response, expected in (
         (
-            await delete_one(registry_http, registry_api_path, person["gts_id"], None),
+            await delete_one(registry_http, person["gts_id"], None),
             _requires_version(person),
         ),
         (
             await post_batch_delete(
                 registry_http,
-                registry_api_path,
                 [target(other, 1), {"entity_key": person["gts_id"]}],
             ),
             _requires_version(person),
         ),
         (
             await delete_one(
-                registry_http, registry_api_path, person["gts_id"], 1, headers=if_match
+                registry_http, person["gts_id"], 1, headers=if_match
             ),
             refused_if_match,
         ),
         (
             await post_batch_delete(
-                registry_http, registry_api_path, [target(person, 1)], headers=if_match
+                registry_http, [target(person, 1)], headers=if_match
             ),
             refused_if_match,
         ),
@@ -234,12 +229,12 @@ async def test_both_deletion_routes_require_an_idempotency_key(
         "Idempotency-Key", "VALIDATION_FAILED", "an Idempotency-Key header is required"
     )
     for response in (
-        await registry_http.delete(
-            f"{registry_api_path}/entities/{schema['gts_id']}",
+        await registry_http.platform.delete(
+            f"{PLATFORM_API}/entities/{schema['gts_id']}",
             params={"expected_resource_version": 1},
         ),
-        await registry_http.post(
-            f"{registry_api_path}/entities:batchDelete",
+        await registry_http.platform.post(
+            f"{PLATFORM_API}/entities:batchDelete",
             json={"items": [target(schema, 1)]},
         ),
     ):
@@ -268,7 +263,6 @@ async def test_one_entity_under_two_key_spellings_is_a_duplicate(
 
     response = await post_batch_delete(
         registry_http,
-        registry_api_path,
         [target(person, 1), target(other, 1), target(person, 1, key=reference)],
     )
     assert "location" not in response.headers, response.headers
@@ -306,13 +300,12 @@ async def test_an_unknown_registry_reference_fails_its_item_only(
     )
 
     single = await await_deletion(
-        registry_http, await delete_one(registry_http, registry_api_path, unknown, 1)
+        registry_http, await delete_one(registry_http, unknown, 1)
     )
     assert_operation(single, completed("deletion", removal(unknown, "failed", None, "precondition_failed")), ordered=True)
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(candidate, 1, key=unknown), target(person, 1), target(other, 1)],
         removal(unknown, "failed", None, "precondition_failed"),
         removal(person, "succeeded", 2),
@@ -330,7 +323,7 @@ async def test_an_unknown_registry_reference_fails_its_item_only(
     )
 
     await register_and_assert(
-        registry_http, registry_api_path, [candidate], outcome(candidate, "succeeded", 1)
+        registry_http, [candidate], outcome(candidate, "succeeded", 1)
     )
     assert_exact(
         await get_entity(registry_http, registry_api_path, unknown, select=ENTITY_SELECT),

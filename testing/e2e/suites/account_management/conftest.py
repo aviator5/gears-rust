@@ -19,7 +19,7 @@ from typing import Optional
 import httpx
 import pytest
 
-from ..types_registry.helpers import RECEIPT, get_entity, submit_and_poll
+from ..types_registry.helpers import RECEIPT, RegistryHttp, get_entity, submit_and_poll
 
 REQUEST_TIMEOUT = 5.0  # per-request hard timeout for all E2E calls
 
@@ -197,7 +197,7 @@ def _child_conversion(base: str, tid: str, rid: str) -> str:
     return f"{base}/account-management/v1/tenants/{tid}/child-conversions/{rid}"
 
 
-# The registry's database API; T34 moves platform registration to its own route.
+# The registry's tenant read API; registration is a platform call (`PLATFORM_API`).
 TYPES_REGISTRY_API = "types-registry/v2"
 
 
@@ -264,11 +264,12 @@ def create_tenant(am_base_url, am_headers):
 
 
 @pytest.fixture
-def create_metadata_schema(am_base_url, am_headers):
+def create_metadata_schema(am_base_url, am_headers, platform_headers):
     """Factory fixture: register a metadata GTS schema in the types-registry.
 
     Returns the chained ``type_id`` (a string). Registers through the
-    registry's database API, the catalogue AM reads: the current document
+    registry's platform API with the internal token alone, and reads with the
+    tenant bearer, from the database catalogue AM reads: the current document
     is read and compared, an absent one is created and a differing one is
     updated under its ``expected_resource_version``, then the operation is
     polled and its item outcome checked -- ``completed`` alone is not
@@ -294,10 +295,11 @@ def create_metadata_schema(am_base_url, am_headers):
         }
         if payload_schema is not None:
             content["properties"] = {"payload": payload_schema}
+        base = am_base_url.rstrip("/") + "/"
         async with httpx.AsyncClient(
-            base_url=am_base_url.rstrip("/") + "/",
-            headers=am_headers,
-            timeout=10.0,
+            base_url=base, headers=platform_headers, timeout=10.0
+        ) as platform, RegistryHttp(
+            platform=platform, base_url=base, headers=am_headers, timeout=10.0
         ) as client:
             for _attempt in range(3):
                 current = await get_entity(
@@ -318,7 +320,7 @@ def create_metadata_schema(am_base_url, am_headers):
                 if expected is not None:
                     candidate["expected_resource_version"] = expected
                 operation = await submit_and_poll(
-                    client, TYPES_REGISTRY_API, [candidate], RECEIPT
+                    client, [candidate], RECEIPT
                 )
                 [item] = operation["items"]
                 if item["status"] in ("succeeded", "unchanged"):

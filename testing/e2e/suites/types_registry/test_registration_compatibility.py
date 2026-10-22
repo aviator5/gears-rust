@@ -37,7 +37,6 @@ async def test_optional_property_at_an_open_level_is_incompatible(
     open_addition["expected_resource_version"] = 1
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [open_addition],
         outcome(schema, "failed", None, "incompatible_with_baseline"),
     )
@@ -72,7 +71,6 @@ async def test_direct_instance_prevents_abstract_transition(
     abstract["expected_resource_version"] = 1
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [abstract],
         outcome(schema, "failed", None, "dependent_invalid"),
     )
@@ -126,7 +124,6 @@ async def test_derived_schema_prevents_final_transition(
     final["expected_resource_version"] = 1
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [final],
         outcome(base, "failed", None, "dependent_invalid"),
     )
@@ -167,7 +164,7 @@ async def test_breaking_contract_is_published_under_a_new_major(
     # A v1 value with a string `name` no longer conforms: a breaking change.
     v2["content"]["properties"]["name"]["type"] = "integer"
     await register_and_assert(
-        registry_http, registry_api_path, [v2], outcome(v2, "succeeded", 1)
+        registry_http, [v2], outcome(v2, "succeeded", 1)
     )
     v2_read = await assert_exact_entity(
         registry_http, registry_api_path, v2, schema_entity(v2, 1)
@@ -260,7 +257,7 @@ async def test_a_revision_refreshes_transitive_schema_references(
         )
 
     await register_and_assert(
-        registry_http, registry_api_path, [revised], outcome(person, "succeeded", 2)
+        registry_http, [revised], outcome(person, "succeeded", 2)
     )
 
     fresh = {}

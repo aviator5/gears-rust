@@ -11,6 +11,22 @@ import httpx
 
 
 GTS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "gts")
+# One plane per route (D17): submissions, deletions and operation reads are platform
+# calls carrying only the internal token; entity reads stay on the tenant API.
+PLATFORM_API = "types-registry/platform/v1"
+
+
+class RegistryHttp(httpx.AsyncClient):
+    """The tenant client for entity reads, carrying the platform client the
+    mutation and operation helpers send through.
+
+    Two clients rather than one with both credentials: a request carrying a bearer
+    and an internal token is refused `MIXED_CREDENTIALS` on every route.
+    """
+
+    def __init__(self, *, platform, **kwargs):
+        super().__init__(**kwargs)
+        self.platform = platform
 # Every request carries this valid W3C `traceparent`, so the wire `trace_id` the
 # canonical error layer echoes is deterministic. `extract_trace_id` prefers the
 # live OTel span, but the request span continues this inbound `traceparent`, so
@@ -457,7 +473,7 @@ async def poll_operation(client, receipt, location, kind, *, dry_run=False):
     try:
         async with asyncio.timeout(4):
             while True:
-                polled = await client.get(location)
+                polled = await client.platform.get(location)
                 assert polled.status_code == 200, polled.text
                 assert polled.headers["content-type"].startswith("application/json")
                 last_operation = polled.json()
@@ -480,13 +496,14 @@ def _idempotency_key():
     return {"Idempotency-Key": str(uuid.uuid4())}
 
 
-async def post_registration(client, api_path, candidates, *, idempotency_key=None, dry_run=False):
-    """Submit registration and return the raw HTTP response for receipt/refusal tests."""
+async def post_registration(client, candidates, *, idempotency_key=None, dry_run=False):
+    """Submit `POST {platform}/entities` and return the raw HTTP response for
+    receipt/refusal tests."""
     body = {"items": candidates}
     if dry_run:
         body["dry_run"] = True
-    return await client.post(
-        f"{api_path}/entities",
+    return await client.platform.post(
+        f"{PLATFORM_API}/entities",
         headers={
             "Idempotency-Key": str(uuid.uuid4()) if idempotency_key is None else idempotency_key
         },
@@ -495,23 +512,22 @@ async def post_registration(client, api_path, candidates, *, idempotency_key=Non
 
 
 async def submit_and_poll(
-    client, api_path, candidates, expected_receipt, *, dry_run=False, idempotency_key=None
+    client, candidates, expected_receipt, *, dry_run=False, idempotency_key=None
 ):
-    """Register a batch through `POST {api}/entities`."""
+    """Register a batch through `POST {platform}/entities`."""
     response = await post_registration(
-        client, api_path, candidates, dry_run=dry_run, idempotency_key=idempotency_key
+        client, candidates, dry_run=dry_run, idempotency_key=idempotency_key
     )
     receipt, location = _accept(response, expected_receipt)
     return await poll_operation(client, receipt, location, "registration", dry_run=dry_run)
 
 
 async def register_and_assert(
-    client, api_path, candidates, *items, dry_run=False, idempotency_key=None
+    client, candidates, *items, dry_run=False, idempotency_key=None
 ):
     """Submit, poll and compare the whole registration operation."""
     operation = await submit_and_poll(
         client,
-        api_path,
         candidates,
         RECEIPT,
         dry_run=dry_run,
@@ -530,14 +546,14 @@ def target(document, expected_resource_version, *, key=None):
 
 
 async def post_batch_delete(
-    client, api_path, targets, *, idempotency_key=None, dry_run=False, headers=None
+    client, targets, *, idempotency_key=None, dry_run=False, headers=None
 ):
-    """Submit `POST {api}/entities:batchDelete` and return the raw response."""
+    """Submit `POST {platform}/entities:batchDelete` and return the raw response."""
     body = {"items": targets}
     if dry_run:
         body["dry_run"] = True
-    return await client.post(
-        f"{api_path}/entities:batchDelete",
+    return await client.platform.post(
+        f"{PLATFORM_API}/entities:batchDelete",
         headers={**_key_header(idempotency_key), **(headers or {})},
         json=body,
     )
@@ -545,7 +561,6 @@ async def post_batch_delete(
 
 async def delete_one(
     client,
-    api_path,
     key,
     expected_resource_version,
     *,
@@ -553,14 +568,14 @@ async def delete_one(
     dry_run=False,
     headers=None,
 ):
-    """Submit `DELETE {api}/entities/{key}` and return the raw response."""
+    """Submit `DELETE {platform}/entities/{key}` and return the raw response."""
     params = {}
     if expected_resource_version is not None:
         params["expected_resource_version"] = expected_resource_version
     if dry_run:
         params["dry_run"] = "true"
-    return await client.delete(
-        f"{api_path}/entities/{key}",
+    return await client.platform.delete(
+        f"{PLATFORM_API}/entities/{key}",
         headers={**_key_header(idempotency_key), **(headers or {})},
         params=params,
     )
@@ -576,34 +591,34 @@ async def await_deletion(client, response, expected_receipt=RECEIPT, *, dry_run=
     return await poll_operation(client, receipt, location, "deletion", dry_run=dry_run)
 
 
-async def delete_batch_and_poll(client, api_path, targets, expected_receipt):
-    """Delete a batch through `POST {api}/entities:batchDelete`.
+async def delete_batch_and_poll(client, targets, expected_receipt):
+    """Delete a batch through `POST {platform}/entities:batchDelete`.
 
     Each target is `{"entity_key": ..., "expected_resource_version": ...}`; the key is
     a canonical GTS identifier or a Registry Reference UUID.
     """
     return await await_deletion(
-        client, await post_batch_delete(client, api_path, targets), expected_receipt
+        client, await post_batch_delete(client, targets), expected_receipt
     )
 
 
-async def delete_one_and_poll(client, api_path, key, expected_resource_version, expected_receipt):
-    """Delete one entity through `DELETE {api}/entities/{key}`."""
+async def delete_one_and_poll(client, key, expected_resource_version, expected_receipt):
+    """Delete one entity through `DELETE {platform}/entities/{key}`."""
     return await await_deletion(
         client,
-        await delete_one(client, api_path, key, expected_resource_version),
+        await delete_one(client, key, expected_resource_version),
         expected_receipt,
     )
 
 
 async def delete_and_assert(
-    client, api_path, targets, *items, dry_run=False, idempotency_key=None, exact_messages=False
+    client, targets, *items, dry_run=False, idempotency_key=None, exact_messages=False
 ):
     """Batch-delete, poll and compare the whole operation in request order."""
     operation = await await_deletion(
         client,
         await post_batch_delete(
-            client, api_path, targets, idempotency_key=idempotency_key, dry_run=dry_run
+            client, targets, idempotency_key=idempotency_key, dry_run=dry_run
         ),
         dry_run=dry_run,
     )

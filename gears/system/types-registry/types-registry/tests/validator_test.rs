@@ -77,11 +77,11 @@ impl Harness {
         };
         let accepted = match kind {
             OperationKind::Registration => {
-                self.service.submit(common::caller(), &request, NOW).await
+                self.service.submit(common::platform(), &request, NOW).await
             }
             OperationKind::Deletion => {
                 self.service
-                    .delete(common::caller(), &common::deletion_of(request), NOW)
+                    .delete(common::platform(), &common::deletion_of(request), NOW)
                     .await
             }
         }
@@ -92,7 +92,7 @@ impl Harness {
             .expect("admitted");
         let operation = self
             .service
-            .operation(common::caller(), accepted.operation_id)
+            .operation(common::platform(), accepted.operation_id)
             .await
             .expect("read")
             .expect("operation");

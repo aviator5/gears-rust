@@ -38,18 +38,17 @@ async def _assert_replay(client, response, operation, location):
         response.json(),
         {"operation_id": operation["operation_id"], "status": "completed", "replayed": True},
     )
-    polled = await client.get(response.url.join(location))
+    polled = await client.platform.get(response.url.join(location))
     assert_json(polled.json(), operation)
 
 
-async def _single(client, api_path, key, version, idempotency_key):
-    return await delete_one(client, api_path, key, version, idempotency_key=idempotency_key)
+async def _single(client, key, version, idempotency_key):
+    return await delete_one(client, key, version, idempotency_key=idempotency_key)
 
 
-async def _batch(client, api_path, key, version, idempotency_key):
+async def _batch(client, key, version, idempotency_key):
     return await post_batch_delete(
         client,
-        api_path,
         [{"entity_key": key, "expected_resource_version": version}],
         idempotency_key=idempotency_key,
     )
@@ -76,7 +75,7 @@ async def test_a_deletion_replays_across_routes_and_key_spellings(
         idempotency_key = str(uuid.uuid4())
         route, spelling = start
         response = await route(
-            registry_http, registry_api_path, keys[spelling], 1, idempotency_key
+            registry_http, keys[spelling], 1, idempotency_key
         )
         location = response.headers["location"]
         operation = await await_deletion(registry_http, response)
@@ -90,7 +89,7 @@ async def test_a_deletion_replays_across_routes_and_key_spellings(
         for route, spelling in replays:
             await _assert_replay(
                 registry_http,
-                await route(registry_http, registry_api_path, keys[spelling], 1, idempotency_key),
+                await route(registry_http, keys[spelling], 1, idempotency_key),
                 operation,
                 location,
             )
@@ -110,26 +109,26 @@ async def test_a_refusal_replays_after_its_blocker_disappears(
     referrer = deletion_fixture("person_referrer_schema")
     await given_registered(person, referrer)
     idempotency_key = str(uuid.uuid4())
-    response = await _batch(registry_http, registry_api_path, person["gts_id"], 1, idempotency_key)
+    response = await _batch(registry_http, person["gts_id"], 1, idempotency_key)
     location = response.headers["location"]
     refused = await await_deletion(registry_http, response)
     assert_operation(
         refused, completed("deletion", blocked(person, 1)), ordered=True, exact_messages=True
     )
     await delete_and_assert(
-        registry_http, registry_api_path, [target(referrer, 1)], removal(referrer, "succeeded", 2)
+        registry_http, [target(referrer, 1)], removal(referrer, "succeeded", 2)
     )
 
     await _assert_replay(
         registry_http,
-        await _batch(registry_http, registry_api_path, person["gts_id"], 1, idempotency_key),
+        await _batch(registry_http, person["gts_id"], 1, idempotency_key),
         refused,
         location,
     )
     # Neither the refusal nor the blocker's deletion moved the target's version.
     await assert_exact_entity(registry_http, registry_api_path, person, schema_entity(person, 1))
     await delete_and_assert(
-        registry_http, registry_api_path, [target(person, 1)], removal(person, "succeeded", 2)
+        registry_http, [target(person, 1)], removal(person, "succeeded", 2)
     )
     await assert_exact_entity(
         registry_http,
@@ -161,7 +160,7 @@ async def test_changed_targets_or_preconditions_conflict_with_a_used_key(
     other = deletion_fixture("other_schema")
     await given_registered(person, other)
     idempotency_key = str(uuid.uuid4())
-    response = await _batch(registry_http, registry_api_path, person["gts_id"], 1, idempotency_key)
+    response = await _batch(registry_http, person["gts_id"], 1, idempotency_key)
     location = response.headers["location"]
     operation = await await_deletion(registry_http, response)
     other_before = await assert_exact_entity(
@@ -170,11 +169,11 @@ async def test_changed_targets_or_preconditions_conflict_with_a_used_key(
 
     for key, version in ((other["gts_id"], 1), (person["gts_id"], 2)):
         assert_problem(
-            await _batch(registry_http, registry_api_path, key, version, idempotency_key),
+            await _batch(registry_http, key, version, idempotency_key),
             409,
             key_conflict(operation["operation_id"]),
         )
-    polled = await registry_http.get(response.url.join(location))
+    polled = await registry_http.platform.get(response.url.join(location))
     assert_json(polled.json(), operation)
     await assert_exact_entity(
         registry_http,
@@ -201,7 +200,6 @@ async def test_dry_run_and_real_deletion_are_different_requests(
     idempotency_key = str(uuid.uuid4())
     prediction = await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(schema, 1)],
         removal(schema, "succeeded", None),
         dry_run=True,
@@ -209,11 +207,11 @@ async def test_dry_run_and_real_deletion_are_different_requests(
     )
 
     assert_problem(
-        await _batch(registry_http, registry_api_path, schema["gts_id"], 1, idempotency_key),
+        await _batch(registry_http, schema["gts_id"], 1, idempotency_key),
         409,
         key_conflict(prediction["operation_id"]),
     )
     await assert_exact_entity(registry_http, registry_api_path, schema, schema_entity(schema, 1))
     await delete_and_assert(
-        registry_http, registry_api_path, [target(schema, 1)], removal(schema, "succeeded", 2)
+        registry_http, [target(schema, 1)], removal(schema, "succeeded", 2)
     )

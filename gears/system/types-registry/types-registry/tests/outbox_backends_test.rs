@@ -65,7 +65,7 @@ async fn assert_delivery(db: &Arc<DBProvider<DbError>>, backend: &str) {
         }],
     };
     let accepted = registry
-        .submit(common::caller(), &request, NOW)
+        .submit(common::platform(), &request, NOW)
         .await
         .unwrap_or_else(|e| panic!("{backend}: accept: {e}"));
     assert_eq!(
@@ -76,7 +76,7 @@ async fn assert_delivery(db: &Arc<DBProvider<DbError>>, backend: &str) {
 
     let operation = await_delivery(&format!("{backend}: registration"), || async {
         let record = registry
-            .operation(common::caller(), accepted.operation_id)
+            .operation(common::platform(), accepted.operation_id)
             .await
             .unwrap_or_else(|e| panic!("{backend}: read the operation: {e}"))
             .unwrap_or_else(|| panic!("{backend}: the operation exists"));
@@ -142,7 +142,7 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
 
     let warmup = second
         .submit(
-            common::caller(),
+            common::platform(),
             &SubmitRequest {
                 idempotency_key: Some("warmup-key".to_owned()),
                 dry_run: false,
@@ -161,7 +161,7 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
         &format!("{backend}: the second pipeline delivers"),
         || async {
             let record = second
-                .operation(common::caller(), warmup.operation_id)
+                .operation(common::platform(), warmup.operation_id)
                 .await
                 .unwrap_or_else(|e| panic!("{backend}: read the warm-up operation: {e}"))
                 .unwrap_or_else(|| panic!("{backend}: the warm-up operation exists"));
@@ -195,7 +195,7 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
 
     let accepted = submitter
         .submit(
-            common::caller(),
+            common::platform(),
             &SubmitRequest {
                 idempotency_key: Some("contended-key".to_owned()),
                 dry_run: false,
@@ -248,7 +248,7 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
 
     let operation = await_delivery(&format!("{backend}: contended registration"), || async {
         let record = submitter
-            .operation(common::caller(), accepted.operation_id)
+            .operation(common::platform(), accepted.operation_id)
             .await
             .unwrap_or_else(|e| panic!("{backend}: read the operation: {e}"))
             .unwrap_or_else(|| panic!("{backend}: the operation exists"));

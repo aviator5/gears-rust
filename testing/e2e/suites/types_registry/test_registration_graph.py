@@ -6,6 +6,7 @@ import uuid
 import pytest
 
 from .helpers import (
+    PLATFORM_API,
     assert_absent,
     assert_exact_entity,
     assert_json,
@@ -46,7 +47,6 @@ async def test_derived_schema_precedes_its_base_in_the_request(
     derived = registration_fixture("derived_employee_schema")
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [derived, base],
         outcome(derived, "succeeded", 1),
         outcome(base, "succeeded", 1),
@@ -74,7 +74,6 @@ async def test_referrer_precedes_its_target_in_the_request(
     referrer = registration_fixture("person_referrer_schema")
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [referrer, target],
         outcome(referrer, "succeeded", 1),
         outcome(target, "succeeded", 1),
@@ -102,7 +101,6 @@ async def test_missing_conforming_schema_can_be_registered_before_retry(
     instance = registration_fixture("person_instance")
     missing = await register_and_assert(
         registry_http,
-        registry_api_path,
         [instance],
         outcome(
             instance,
@@ -115,10 +113,10 @@ async def test_missing_conforming_schema_can_be_registered_before_retry(
     )
     await assert_absent(registry_http, registry_api_path, instance)
     await register_and_assert(
-        registry_http, registry_api_path, [schema], outcome(schema, "succeeded", 1)
+        registry_http, [schema], outcome(schema, "succeeded", 1)
     )
     admitted = await register_and_assert(
-        registry_http, registry_api_path, [instance], outcome(instance, "succeeded", 1)
+        registry_http, [instance], outcome(instance, "succeeded", 1)
     )
     await read_created(
         registry_http,
@@ -126,8 +124,7 @@ async def test_missing_conforming_schema_can_be_registered_before_retry(
         instance_entity(instance, 1),
         admitted,
     )
-    original_response = await registry_http.get(
-        f"{registry_api_path}/operations/{missing['operation_id']}"
+    original_response = await registry_http.platform.get(f"{PLATFORM_API}/operations/{missing['operation_id']}"
     )
     assert original_response.status_code == 200, original_response.text
     assert original_response.headers["content-type"].startswith("application/json")
@@ -151,7 +148,6 @@ async def test_invalid_instance_does_not_block_valid_neighbour(
 
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [valid, invalid],
         outcome(valid, "succeeded", 1),
         outcome(invalid, "failed", None, "invalid_value"),
@@ -190,7 +186,6 @@ async def test_failed_base_revision_blocks_its_new_referrer(
     for dry_run, independent_version in ((True, None), (False, 1)):
         await register_and_assert(
             registry_http,
-            registry_api_path,
             batch,
             outcome(referrer, "failed", None, "blocked_by_dependency"),
             outcome(base, "failed", None, "incompatible_with_baseline"),
@@ -224,7 +219,6 @@ async def test_reference_cycle_fails_beside_an_independent_success(
     c = registration_fixture("person_schema")
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [c, b, a],
         outcome(c, "succeeded", 1),
         outcome(b, "failed", None, "invalid_schema"),
@@ -245,7 +239,6 @@ async def test_a_derivation_and_conformance_chain_registers_in_reverse_order(
     employee = _employee_instance(registration_fixture("person_instance"), derived)
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [employee, derived, base],
         outcome(employee, "succeeded", 1),
         outcome(derived, "succeeded", 1),
@@ -283,7 +276,6 @@ async def test_a_failed_branch_does_not_block_its_sibling_under_a_shared_base(
 
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [broken_employee, employee, broken, derived, base],
         outcome(broken_employee, "failed", None, "blocked_by_dependency"),
         outcome(employee, "succeeded", 1),

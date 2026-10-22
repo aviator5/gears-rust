@@ -4,6 +4,7 @@
 //!
 //! Each test binary uses a subset of these helpers, hence the lint allowances.
 
+pub mod platform_server;
 mod test_stores;
 
 use std::path::{Path, PathBuf};
@@ -217,6 +218,19 @@ pub fn caller() -> types_registry::domain::caller::CallerContext<'static> {
     static CONTEXT: std::sync::LazyLock<toolkit_security::PlatformSecurityContext> =
         std::sync::LazyLock::new(toolkit_security::PlatformSecurityContext::outbound_marker);
     types_registry::domain::caller::CallerContext::Platform(&CONTEXT)
+}
+
+/// The platform context a test's mutation or operation read is made for, as the local
+/// platform client passes it: the outbound marker, which P0 reads nowhere (C2/C6).
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "not every integration test crate that compiles common mutates"
+)]
+pub fn platform() -> &'static toolkit_security::PlatformSecurityContext {
+    static CONTEXT: std::sync::LazyLock<toolkit_security::PlatformSecurityContext> =
+        std::sync::LazyLock::new(toolkit_security::PlatformSecurityContext::outbound_marker);
+    &CONTEXT
 }
 
 pub fn metrics() -> std::sync::Arc<dyn types_registry::domain::ports::metrics::AdmissionMetrics> {

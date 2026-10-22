@@ -71,7 +71,7 @@ async fn first_delivery_with_mode(
 ) -> Uuid {
     let receipt = registry
         .submit(
-            common::caller(),
+            common::platform(),
             &SubmitRequest {
                 idempotency_key: Some("missing-dependency".to_owned()),
                 dry_run,
@@ -103,7 +103,7 @@ async fn assert_missing_dependency(
     dependency_kind: &str,
 ) {
     let operation = registry
-        .operation(common::caller(), operation_id)
+        .operation(common::platform(), operation_id)
         .await
         .expect("read operation")
         .expect("operation exists");
@@ -240,7 +240,7 @@ async fn a_missing_dependency_does_not_prevent_an_independent_candidate_from_com
     )
     .await;
     let operation = registry
-        .operation(common::caller(), operation_id)
+        .operation(common::platform(), operation_id)
         .await
         .expect("read")
         .expect("operation");
@@ -298,7 +298,7 @@ async fn dry_run_missing_dependencies_keep_the_same_diagnostics_without_entity_w
         )
         .await;
         let operation = registry
-            .operation(common::caller(), operation_id)
+            .operation(common::platform(), operation_id)
             .await
             .expect("read dry-run operation")
             .expect("operation exists");
@@ -339,7 +339,7 @@ async fn an_instance_before_its_conforming_type_in_the_same_batch_succeeds() {
     .await;
 
     let operation = registry
-        .operation(common::caller(), operation_id)
+        .operation(common::platform(), operation_id)
         .await
         .expect("read operation")
         .expect("operation exists");

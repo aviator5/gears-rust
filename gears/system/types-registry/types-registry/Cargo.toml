@@ -108,6 +108,11 @@ testcontainers = { workspace = true }
 test-containers = { workspace = true }
 # `Router::oneshot` for the REST contract tests (T9).
 tower = { workspace = true }
+# The `OoP` route-auth stack and its shared-secret token for the TCP tests (T34).
+toolkit-http-middleware = { workspace = true }
+secrecy = { workspace = true }
+# A plain HTTP client for the TCP auth matrix (T34).
+toolkit-http = { workspace = true }
 # In-memory exporter for metric contract tests.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Captures span and event fields in unit tests.

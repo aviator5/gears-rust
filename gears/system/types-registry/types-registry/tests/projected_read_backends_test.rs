@@ -116,7 +116,7 @@ fn schema() -> Value {
 async fn admit(service: &RegistryService, key: &str, gts_id: &str, content: Value) {
     let accepted = service
         .submit(
-            common::caller(),
+            common::platform(),
             &SubmitRequest {
                 idempotency_key: Some(key.to_owned()),
                 dry_run: false,

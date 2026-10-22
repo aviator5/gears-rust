@@ -45,7 +45,7 @@ async def test_default_policy_refuses_non_platform_vendor(
     """The default stays closed for acme outside its configured e2e region."""
     schema = _acme_schema(registration_fixture("person_schema"), "outside")
     assert_bad_request(
-        await post_registration(registry_http, registry_api_path, [schema]),
+        await post_registration(registry_http, [schema]),
         {
             "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
             "title": "Failed Precondition",
@@ -87,7 +87,7 @@ async def test_a_disallowed_skip_is_refused_on_commit_and_dry_run(
     for dry_run in (False, True):
         assert_bad_request(
             await post_registration(
-                registry_http, registry_api_path, [second], dry_run=dry_run
+                registry_http, [second], dry_run=dry_run
             ),
             invalid_argument(
                 "skip_compatibility_check",
@@ -149,7 +149,7 @@ async def test_an_allowed_skip_is_recorded_on_only_the_new_minor(
     }
     second["skip_compatibility_check"] = True
     await register_and_assert(
-        registry_http, registry_api_path, [second], outcome(second, "succeeded", 1)
+        registry_http, [second], outcome(second, "succeeded", 1)
     )
     second_read = await get_entity(
         registry_http, registry_api_path, second["gts_id"], select="content,provenance"
@@ -191,6 +191,6 @@ async def test_configured_region_admits_acme_schema(
     """The configured acme region admits a schema that reads back unchanged."""
     schema = _acme_schema(registration_fixture("person_schema"), "e2e")
     operation = await register_and_assert(
-        registry_http, registry_api_path, [schema], outcome(schema, "succeeded", 1)
+        registry_http, [schema], outcome(schema, "succeeded", 1)
     )
     await read_created(registry_http, registry_api_path, schema_entity(schema, 1), operation)

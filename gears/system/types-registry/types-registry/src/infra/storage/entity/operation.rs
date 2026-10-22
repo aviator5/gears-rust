@@ -23,13 +23,13 @@ use uuid::Uuid;
 
 use super::enums::{OperationKind, OperationStatus, Plane};
 
-// ponytail: ceiling C6 — no PDP; and ceiling C8 — every P0 operation is
-// `plane = 1` platform, but the plane is expressed by this column and the contract,
-// not enforced by the transport (an in-process gear has no inbound
-// platform-identity validator, and `OperationBuilder` cannot mark a route
-// platform-only). `unrestricted` matches: `tenant_id` is always NULL in P0.
+// ponytail: ceiling C6 — no PDP; and ceiling C8 — no platform listener. Every P0
+// operation is `plane = 1` platform: the transport admits mutations only on the
+// platform routes, behind a validated internal token (D17), but any valid token may
+// mutate and an embedded host serves those routes on the gateway's one listener.
+// `unrestricted` matches: `tenant_id` is always NULL in P0.
 //
-// Upgrade path: a platform listener with `PlatformIdentity`, then
+// Upgrade path: a platform listener and workload policy over `PlatformIdentity`, then
 // `#[secure(tenant_col = "tenant_id", ...)]` plus `PolicyEnforcer` (SPEC §9 C6 and
 // C8, §12). Neither needs a schema migration.
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]

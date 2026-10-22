@@ -695,7 +695,7 @@ async fn a_failed_read_back_names_the_accepted_operation_and_the_same_key_recove
     let operation_id = aborted_operation(&lost);
     assert!(
         h.service
-            .operation(common::caller(), operation_id)
+            .operation(common::platform(), operation_id)
             .await
             .expect("reads")
             .is_some(),

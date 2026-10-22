@@ -168,7 +168,7 @@ async fn the_handler_admits_the_operation_its_payload_names() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     assert_eq!(
@@ -183,7 +183,7 @@ async fn the_handler_admits_the_operation_its_payload_names() {
     assert!(matches!(result, MessageResult::Ok), "got: {result:?}");
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -198,7 +198,7 @@ async fn a_duplicate_delivery_changes_nothing() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     let payload = accepted.operation_id.to_string();
@@ -238,7 +238,7 @@ async fn a_duplicate_delivery_changes_nothing() {
     assert_eq!(after_second.lifecycle_status, LifecycleStatus::Active);
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -282,7 +282,7 @@ async fn a_storage_failure_during_admission_is_retried() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
 
@@ -292,7 +292,7 @@ async fn a_storage_failure_during_admission_is_retried() {
     assert!(matches!(result, MessageResult::Retry), "got: {result:?}");
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -310,7 +310,7 @@ async fn a_transient_failure_on_the_last_attempt_is_terminalized_and_acked() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
 
@@ -324,7 +324,7 @@ async fn a_transient_failure_on_the_last_attempt_is_terminalized_and_acked() {
     );
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -349,7 +349,7 @@ async fn an_admission_past_the_delivery_budget_is_terminalized_without_being_adm
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     assert_eq!(accepted.status, OperationStatus::Pending);
@@ -364,7 +364,7 @@ async fn an_admission_past_the_delivery_budget_is_terminalized_without_being_adm
     );
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -398,7 +398,7 @@ async fn a_delivery_past_the_budget_acks_an_operation_a_prior_pass_completed() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     registry
@@ -415,7 +415,7 @@ async fn a_delivery_past_the_budget_acks_an_operation_a_prior_pass_completed() {
     );
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -434,7 +434,7 @@ async fn a_status_read_that_fails_past_the_budget_terminalizes_rather_than_retri
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
 
@@ -449,7 +449,7 @@ async fn a_status_read_that_fails_past_the_budget_terminalizes_rather_than_retri
 
     let unhooked = service_without_dispatch(&db, stores());
     let operation = unhooked
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -478,7 +478,7 @@ async fn a_stalled_status_path_is_bounded_by_the_handler_as_a_whole() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
 
@@ -517,7 +517,7 @@ async fn a_failure_write_after_a_slow_admission_stays_inside_the_delivery_deadli
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
 
@@ -532,7 +532,7 @@ async fn a_failure_write_after_a_slow_admission_stays_inside_the_delivery_deadli
 
     let unhooked = service_without_dispatch(&db, stores());
     let operation = unhooked
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -560,7 +560,7 @@ async fn an_overrunning_admission_is_cut_off_with_lease_left_to_fail_it() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
 
@@ -574,7 +574,7 @@ async fn an_overrunning_admission_is_cut_off_with_lease_left_to_fail_it() {
 
     let unhooked = service_without_dispatch(&db, stores());
     let operation = unhooked
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -598,7 +598,7 @@ async fn failing_an_operation_that_never_ran_still_terminalizes_it() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     assert_eq!(accepted.status, OperationStatus::Pending);
@@ -609,7 +609,7 @@ async fn failing_an_operation_that_never_ran_still_terminalizes_it() {
     assert!(matches!(result, MessageResult::Ok), "got: {result:?}");
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -634,7 +634,7 @@ async fn a_system_failure_records_the_cause_kind_and_never_the_drivers_own_text(
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     let result = handler
@@ -657,7 +657,7 @@ async fn a_system_failure_records_the_cause_kind_and_never_the_drivers_own_text(
     );
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -694,7 +694,7 @@ async fn invalid_scope_is_terminalized_on_the_first_delivery_with_a_system_diagn
     let registry = service_without_dispatch(&db, common::TestStores::failing_running());
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     let result = handler
@@ -706,7 +706,7 @@ async fn invalid_scope_is_terminalized_on_the_first_delivery_with_a_system_diagn
          terminalizes it rather than spending the budget: {result:?}",
     );
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("exists");
@@ -727,7 +727,7 @@ async fn a_foreign_payload_type_is_rejected_by_the_handler() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
 
@@ -749,7 +749,7 @@ async fn a_foreign_payload_type_is_rejected_by_the_handler() {
     );
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -883,7 +883,7 @@ async fn enqueue_routes_independent_operations_to_different_partitions() {
         "another partition completes while the first is paused",
         || async {
             let record = registry
-                .operation(common::caller(), second_id)
+                .operation(common::platform(), second_id)
                 .await
                 .unwrap()
                 .unwrap();
@@ -908,7 +908,7 @@ async fn enqueue_routes_independent_operations_to_different_partitions() {
     );
     assert_eq!(
         registry
-            .operation(common::caller(), first_id)
+            .operation(common::platform(), first_id)
             .await
             .unwrap()
             .unwrap()
@@ -919,7 +919,7 @@ async fn enqueue_routes_independent_operations_to_different_partitions() {
     resume.send(()).expect("release the first admission");
     let first = await_delivery("first partition resumes", || async {
         let record = registry
-            .operation(common::caller(), first_id)
+            .operation(common::platform(), first_id)
             .await
             .unwrap()
             .unwrap();
@@ -936,14 +936,14 @@ async fn an_accepted_operation_is_admitted_by_the_outbox() {
     let (registry, handle) = started(&db, stores()).await;
 
     let accepted = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await
         .expect("accept");
     assert_eq!(accepted.status, OperationStatus::Pending);
 
     let operation = await_delivery("registration through the outbox", || async {
         let record = registry
-            .operation(common::caller(), accepted.operation_id)
+            .operation(common::platform(), accepted.operation_id)
             .await
             .expect("read the operation")
             .expect("the operation exists");
@@ -980,7 +980,7 @@ async fn stopping_the_pipeline_leaves_no_silent_enqueue() {
     handle.stop().await;
 
     let refused = registry
-        .submit(common::caller(), &registration("key", TARGET), NOW)
+        .submit(common::platform(), &registration("key", TARGET), NOW)
         .await;
     assert!(
         refused.is_err(),
@@ -1024,7 +1024,7 @@ async fn a_second_pipeline_refuses_to_bind_rather_than_starting_unreachable() {
 
     let accepted = registry
         .submit(
-            common::caller(),
+            common::platform(),
             &registration("after-refused-bind", TARGET),
             NOW,
         )
@@ -1032,7 +1032,7 @@ async fn a_second_pipeline_refuses_to_bind_rather_than_starting_unreachable() {
         .expect("accept");
     let operation = await_delivery("the first pipeline still delivers", || async {
         let record = registry
-            .operation(common::caller(), accepted.operation_id)
+            .operation(common::platform(), accepted.operation_id)
             .await
             .unwrap()
             .unwrap();
@@ -1056,13 +1056,17 @@ async fn a_temporary_failure_is_redelivered_by_the_pipeline_until_it_clears() {
         .expect("start the admission outbox");
 
     let accepted = registry
-        .submit(common::caller(), &registration("retried-key", TARGET), NOW)
+        .submit(
+            common::platform(),
+            &registration("retried-key", TARGET),
+            NOW,
+        )
         .await
         .expect("accept");
 
     let operation = await_delivery("a redelivered admission completes", || async {
         let record = registry
-            .operation(common::caller(), accepted.operation_id)
+            .operation(common::platform(), accepted.operation_id)
             .await
             .unwrap()?;
         (record.status == OperationStatus::Completed).then_some(record)
@@ -1171,7 +1175,11 @@ async fn a_system_failure_whose_write_lands_is_acked_without_a_failed_delivery()
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("terminalized", TARGET), NOW)
+        .submit(
+            common::platform(),
+            &registration("terminalized", TARGET),
+            NOW,
+        )
         .await
         .expect("accept");
     let result = handler
@@ -1190,7 +1198,7 @@ async fn a_system_failure_whose_write_lands_is_acked_without_a_failed_delivery()
     );
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -1207,7 +1215,7 @@ async fn a_failed_terminalization_keeps_the_message_instead_of_acking_it() {
 
     let accepted = registry
         .submit(
-            common::caller(),
+            common::platform(),
             &registration("unterminalized", TARGET),
             NOW,
         )
@@ -1229,7 +1237,7 @@ async fn a_failed_terminalization_keeps_the_message_instead_of_acking_it() {
     );
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -1251,7 +1259,7 @@ async fn an_unwritable_system_failure_is_redelivered_past_the_budget_too() {
 
     let accepted = registry
         .submit(
-            common::caller(),
+            common::platform(),
             &registration("unterminalizable", TARGET),
             NOW,
         )
@@ -1269,7 +1277,7 @@ async fn an_unwritable_system_failure_is_redelivered_past_the_budget_too() {
     assert_eq!(counted.outcomes(), vec![DeliveryOutcome::Retried]);
 
     let operation = registry
-        .operation(common::caller(), accepted.operation_id)
+        .operation(common::platform(), accepted.operation_id)
         .await
         .expect("read")
         .expect("the operation exists");
@@ -1287,7 +1295,7 @@ async fn a_retried_terminalization_failure_says_so_in_the_log() {
     let handler = AdmissionHandler::new(Arc::clone(&registry), MAX_ATTEMPTS);
 
     let accepted = registry
-        .submit(common::caller(), &registration("logged", TARGET), NOW)
+        .submit(common::platform(), &registration("logged", TARGET), NOW)
         .await
         .expect("accept");
     let result = handler

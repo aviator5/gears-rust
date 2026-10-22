@@ -26,7 +26,7 @@ async def test_missing_schema_dialect_refuses_the_whole_batch(
     instance = registration_fixture("person_instance")
     del schema["content"]["$schema"]
     assert_bad_request(
-        await post_registration(registry_http, registry_api_path, [instance, schema]),
+        await post_registration(registry_http, [instance, schema]),
         invalid_argument(
             "entity",
             "VALIDATION_FAILED",
@@ -49,7 +49,7 @@ async def test_major_zero_allows_breaking_revision_but_quarantines_instances(
     revised["content"]["properties"]["name"]["type"] = "integer"
     revised["expected_resource_version"] = 1
     await register_and_assert(
-        registry_http, registry_api_path, [revised], outcome(schema, "succeeded", 2)
+        registry_http, [revised], outcome(schema, "succeeded", 2)
     )
     await assert_exact_entity(
         registry_http, registry_api_path, revised, schema_entity(revised, 2)
@@ -61,7 +61,6 @@ async def test_major_zero_allows_breaking_revision_but_quarantines_instances(
     instance["content"]["name"] = 42
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [instance],
         outcome(instance, "failed", None, "instance_of_major_zero"),
     )
@@ -88,7 +87,6 @@ async def test_stable_schemas_cannot_derive_from_or_reference_major_zero(
     )
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [derived, referrer],
         outcome(derived, "failed", None, "stable_derives_from_major_zero"),
         outcome(referrer, "failed", None, "stable_refs_major_zero"),

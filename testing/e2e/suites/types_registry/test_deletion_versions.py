@@ -47,7 +47,7 @@ async def test_either_major_is_deleted_without_a_successor(
     kept_etag = await _state(registry_http, registry_api_path, kept, 1)
 
     await delete_and_assert(
-        registry_http, registry_api_path, [target(removed, 1)], removal(removed, "succeeded", 2)
+        registry_http, [target(removed, 1)], removal(removed, "succeeded", 2)
     )
     await _state(registry_http, registry_api_path, removed, 2, "deleted")
     await _state(registry_http, registry_api_path, kept, 1, etag=kept_etag)
@@ -64,7 +64,6 @@ async def test_a_middle_minor_is_deleted_while_a_higher_one_stays(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(minors[1], 1)],
         removal(minors[1], "succeeded", 2),
     )
@@ -83,12 +82,12 @@ async def test_the_next_minor_is_admitted_after_its_predecessor_is_deleted(
     third = deletion_fixture("person_minor_2_schema")
     await given_registered(first, second)
     await delete_and_assert(
-        registry_http, registry_api_path, [target(second, 1)], removal(second, "succeeded", 2)
+        registry_http, [target(second, 1)], removal(second, "succeeded", 2)
     )
     second_etag = await _state(registry_http, registry_api_path, second, 2, "deleted")
 
     await register_and_assert(
-        registry_http, registry_api_path, [third], outcome(third, "succeeded", 1)
+        registry_http, [third], outcome(third, "succeeded", 1)
     )
     await _state(registry_http, registry_api_path, third, 1)
     await _state(registry_http, registry_api_path, second, 2, "deleted", etag=second_etag)
@@ -104,13 +103,12 @@ async def test_a_new_minor_is_compared_against_its_deleted_predecessor(
     narrowing = deletion_fixture("person_minor_2_incompatible_schema")
     await given_registered(first, second)
     await delete_and_assert(
-        registry_http, registry_api_path, [target(second, 1)], removal(second, "succeeded", 2)
+        registry_http, [target(second, 1)], removal(second, "succeeded", 2)
     )
     second_etag = await _state(registry_http, registry_api_path, second, 2, "deleted")
 
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [narrowing],
         outcome(narrowing, "failed", None, "incompatible_with_baseline"),
     )
@@ -128,14 +126,12 @@ async def test_a_tombstone_still_fixes_its_majors_shape(
     await given_registered(major_only)
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(major_only, 1)],
         removal(major_only, "succeeded", 2),
     )
 
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [first_minor],
         outcome(first_minor, "failed", None, "family_shape_conflict"),
     )
@@ -162,7 +158,6 @@ async def test_major_zero_keeps_dependency_safety(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(base, 1)],
         blocked(base, 1),
         exact_messages=True,
@@ -171,7 +166,6 @@ async def test_major_zero_keeps_dependency_safety(
         await _state(registry_http, registry_api_path, document, 1, etag=etag)
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(base, 1), target(dependant, 1)],
         removal(base, "succeeded", 2),
         removal(dependant, "succeeded", 2),

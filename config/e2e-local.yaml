@@ -110,6 +110,13 @@ gears:
       # Authentication Configuration
       auth_disabled: false
       require_auth_by_default: true
+      # The platform plane (D20): platform routes such as
+      # /types-registry/platform/v1/* admit a validated X-ToolKit-Internal-Token
+      # only, and are refused without an inbound authenticator. The e2e
+      # `platform_headers` fixture sends this secret (E2E_INTERNAL_TOKEN).
+      internal_auth:
+        provider: shared_secret
+        secret: "e2e-internal-token"
 
       # Throttling zones referenced by the mini-chat create_chat route
       # (ThrottlingSpec in gears/mini-chat/.../api/rest/routes/chats.rs).

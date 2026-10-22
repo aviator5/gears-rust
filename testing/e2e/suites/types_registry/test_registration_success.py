@@ -19,7 +19,7 @@ async def test_register_schema(registry_http, registry_api_path, registration_fi
     """A submitted schema completes, then reads back by GTS ID and by UUID."""
     schema = registration_fixture("person_schema")
     operation = await register_and_assert(
-        registry_http, registry_api_path, [schema], outcome(schema, "succeeded", 1)
+        registry_http, [schema], outcome(schema, "succeeded", 1)
     )
     # A dependency-free root resolves to itself and inherits no traits.
     entity = await read_created(
@@ -35,10 +35,10 @@ async def test_register_instance(registry_http, registry_api_path, registration_
     schema = registration_fixture("person_schema")
     instance = registration_fixture("person_instance")
     await register_and_assert(
-        registry_http, registry_api_path, [schema], outcome(schema, "succeeded", 1)
+        registry_http, [schema], outcome(schema, "succeeded", 1)
     )
     operation = await register_and_assert(
-        registry_http, registry_api_path, [instance], outcome(instance, "succeeded", 1)
+        registry_http, [instance], outcome(instance, "succeeded", 1)
     )
     # Schema-only documents are absent from an Instance, not null.
     await read_created(
@@ -55,7 +55,6 @@ async def test_register_batch_with_instance_first(
     instance = registration_fixture("person_instance")
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [instance, schema],
         outcome(instance, "succeeded", 1),
         outcome(schema, "succeeded", 1),
@@ -75,7 +74,6 @@ async def test_register_scalar_schema_and_string_instance(
     instance = registration_fixture("label_instance")
     operation = await register_and_assert(
         registry_http,
-        registry_api_path,
         [instance, schema],
         outcome(instance, "succeeded", 1),
         outcome(schema, "succeeded", 1),

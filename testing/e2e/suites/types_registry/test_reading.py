@@ -161,7 +161,7 @@ async def test_effective_documents_are_selected_independently(
     other_schema = reading_fixture("other_schema")
     other_instance = reading_fixture("other_instance")
     await given_registered(base, derived, other_schema, other_instance)
-    operation = await submit_and_poll(registry_http, registry_api_path, [employee], RECEIPT)
+    operation = await submit_and_poll(registry_http, [employee], RECEIPT)
     assert_operation(operation, completed("registration", outcome(employee, "succeeded", 1)))
 
     effective_documents = {
@@ -197,7 +197,7 @@ async def test_effective_documents_are_selected_independently(
 
     # The inherited envelope is closed: an undeclared top-level field is refused.
     intruder = reading_fixture("trait_derived_extra_field_instance")
-    operation = await submit_and_poll(registry_http, registry_api_path, [intruder], RECEIPT)
+    operation = await submit_and_poll(registry_http, [intruder], RECEIPT)
     assert_operation(
         operation, completed("registration", outcome(intruder, "failed", None, "invalid_value"))
     )
@@ -288,7 +288,7 @@ async def test_a_projected_tombstone_is_not_an_absence(
         },
     )
     operation = await delete_one_and_poll(
-        registry_http, registry_api_path, person_schema["gts_id"], 1, RECEIPT
+        registry_http, person_schema["gts_id"], 1, RECEIPT
     )
     assert_operation(
         operation, completed("deletion", removal(person_schema, "succeeded", 2)), ordered=True
@@ -471,7 +471,7 @@ async def test_a_batch_reads_a_tombstone_beside_a_live_entity(
         reading_fixture("device_instance"),
     )
     operation = await delete_one_and_poll(
-        registry_http, registry_api_path, person_schema["gts_id"], 1, RECEIPT
+        registry_http, person_schema["gts_id"], 1, RECEIPT
     )
     assert_operation(
         operation, completed("deletion", removal(person_schema, "succeeded", 2)), ordered=True
@@ -631,7 +631,7 @@ async def test_every_read_route_observes_a_completed_revision(
         person_schema["gts_id"], selected(person_schema, person_schema["content"], 1)
     )
     revised = reading_fixture("person_schema_revised")
-    operation = await submit_and_poll(registry_http, registry_api_path, [revised], RECEIPT)
+    operation = await submit_and_poll(registry_http, [revised], RECEIPT)
     assert_operation(operation, completed("registration", outcome(revised, "succeeded", 2)))
 
     # The revision changes only the title; exact read now goes by the retained UUID.
@@ -778,7 +778,6 @@ async def test_an_etag_survives_a_no_op_and_changes_with_a_revision(
     # Identical content is a no-op: no new version, so the validator still holds.
     operation = await submit_and_poll(
         registry_http,
-        registry_api_path,
         [{**person_schema, "expected_resource_version": 1}],
         RECEIPT,
     )
@@ -786,7 +785,7 @@ async def test_an_etag_survives_a_no_op_and_changes_with_a_revision(
     assert_exact(await read(person_schema, schema_etag), {"status": 304, "etag": schema_etag})
 
     operation = await submit_and_poll(
-        registry_http, registry_api_path, [reading_fixture("person_schema_revised")], RECEIPT
+        registry_http, [reading_fixture("person_schema_revised")], RECEIPT
     )
     assert_operation(operation, completed("registration", outcome(person_schema, "succeeded", 2)))
     revised_etag = assert_exact(
@@ -853,7 +852,7 @@ async def test_batch_revalidation_answers_each_key(
         },
     )
     operation = await submit_and_poll(
-        registry_http, registry_api_path, [reading_fixture("person_schema_revised")], RECEIPT
+        registry_http, [reading_fixture("person_schema_revised")], RECEIPT
     )
     assert_operation(operation, completed("registration", outcome(person_schema, "succeeded", 2)))
 
@@ -1035,7 +1034,7 @@ async def test_a_base_refresh_changes_the_derived_etag(
     ]
 
     operation = await submit_and_poll(
-        registry_http, registry_api_path, [reading_fixture("trait_base_schema_revised")], RECEIPT
+        registry_http, [reading_fixture("trait_base_schema_revised")], RECEIPT
     )
     assert_operation(operation, completed("registration", outcome(base, "succeeded", 2)))
 

@@ -62,7 +62,6 @@ async def test_a_live_instance_blocks_deletion_of_its_schema(
     for dry_run in (True, False):
         await delete_and_assert(
             registry_http,
-            registry_api_path,
             [target(schema, 1)],
             blocked(schema, 1),
             dry_run=dry_run,
@@ -83,7 +82,6 @@ async def test_an_instance_is_deleted_before_its_schema_despite_request_order(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(schema, 1), target(instance, 1)],
         removal(schema, "succeeded", 2),
         removal(instance, "succeeded", 2),
@@ -132,7 +130,6 @@ async def test_a_derived_schema_is_one_dependant_of_its_base(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(base, 1)],
         blocked(base, 1),
         exact_messages=True,
@@ -142,7 +139,6 @@ async def test_a_derived_schema_is_one_dependant_of_its_base(
     if not by_identifier:
         await delete_and_assert(
             registry_http,
-            registry_api_path,
             [target(base, 1), target(derived, 1)],
             removal(base, "succeeded", 2),
             removal(derived, "succeeded", 2),
@@ -163,7 +159,6 @@ async def test_a_schema_reference_blocks_deletion_of_its_target(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(person, 1)],
         blocked(person, 1),
         exact_messages=True,
@@ -185,7 +180,6 @@ async def test_a_complete_derivation_and_conformance_chain_is_deleted(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(document, 1) for document in chain],
         *(removal(document, "succeeded", 2) for document in chain),
     )
@@ -205,7 +199,6 @@ async def test_every_branch_is_deleted_before_their_shared_target(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(document, 1) for document in batch],
         *(removal(document, "succeeded", 2) for document in batch),
     )
@@ -227,7 +220,6 @@ async def test_partial_success_stands_when_a_dependant_is_outside_the_batch(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(person, 1), target(referrer, 1)],
         blocked(person, 1),
         removal(referrer, "succeeded", 2),
@@ -255,13 +247,12 @@ async def test_only_the_current_revisions_references_protect_a_target(
     )
     revised["expected_resource_version"] = 1
     await register_and_assert(
-        registry_http, registry_api_path, [revised], outcome(referrer, "succeeded", 2)
+        registry_http, [revised], outcome(referrer, "succeeded", 2)
     )
     revised_etag = await _state(registry_http, registry_api_path, revised, 2)
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(person, 1), target(replacement, 1)],
         removal(person, "succeeded", 2),
         blocked(replacement, 1),
@@ -283,7 +274,7 @@ async def test_an_entity_reference_does_not_protect_its_named_entity(
     )
 
     await delete_and_assert(
-        registry_http, registry_api_path, [target(person, 1)], removal(person, "succeeded", 2)
+        registry_http, [target(person, 1)], removal(person, "succeeded", 2)
     )
     after = await assert_exact_entity(
         registry_http,
@@ -309,7 +300,6 @@ async def test_only_direct_dependants_are_counted(
 
     await delete_and_assert(
         registry_http,
-        registry_api_path,
         [target(person, 1)],
         blocked(person, 1),
         exact_messages=True,

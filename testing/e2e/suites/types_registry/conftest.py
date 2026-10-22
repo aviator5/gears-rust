@@ -9,7 +9,7 @@ import uuid
 import httpx
 import pytest
 
-from .helpers import RECEIPT, TRACEPARENT, assert_operation, submit_and_poll
+from .helpers import RECEIPT, TRACEPARENT, RegistryHttp, assert_operation, submit_and_poll
 
 
 SCENARIO_TESTS = pytest.StashKey[dict[str, list[str]]]()
@@ -17,14 +17,24 @@ SCENARIO_TESTS = pytest.StashKey[dict[str, list[str]]]()
 
 @pytest.fixture
 def registry_api_path():
-    """Use the configured API version without an automatic fallback."""
+    """The tenant read API, in the configured version without an automatic fallback.
+
+    Mutations and operation reads go to the platform API (`helpers.PLATFORM_API`).
+    """
     return f"types-registry/{os.getenv('TYPES_REGISTRY_API_VERSION', 'v2')}"
 
 
 @pytest.fixture
-async def registry_http(base_url, auth_headers):
+async def registry_http(base_url, auth_headers, platform_headers):
+    """The tenant client for reads, carrying the platform client for mutations."""
+    base = base_url.rstrip("/") + "/"
     async with httpx.AsyncClient(
-        base_url=base_url.rstrip("/") + "/",
+        base_url=base,
+        headers={**platform_headers, "traceparent": TRACEPARENT},
+        timeout=3.0,
+    ) as platform, RegistryHttp(
+        platform=platform,
+        base_url=base,
         headers={**auth_headers, "traceparent": TRACEPARENT},
         timeout=3.0,
     ) as client:
@@ -96,7 +106,7 @@ def given_registered(registry_http, registry_api_path):
 
     async def register(*items):
         operation = await submit_and_poll(
-            registry_http, registry_api_path, list(items), RECEIPT
+            registry_http, list(items), RECEIPT
         )
         assert_operation(
             operation,

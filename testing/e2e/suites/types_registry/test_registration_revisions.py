@@ -35,7 +35,7 @@ async def test_optional_property_at_a_closed_root_is_compatible(
     revised["content"]["properties"]["nickname"] = {"type": "string"}
     revised["expected_resource_version"] = 1
     await register_and_assert(
-        registry_http, registry_api_path, [revised], outcome(schema, "succeeded", 2)
+        registry_http, [revised], outcome(schema, "succeeded", 2)
     )
     after = await assert_exact_entity(
         registry_http, registry_api_path, schema, schema_entity(revised, 2)
@@ -66,7 +66,7 @@ async def test_instance_revision_does_not_revise_its_schema(
     revised["content"]["name"] = "Alicia"
     revised["expected_resource_version"] = 1
     await register_and_assert(
-        registry_http, registry_api_path, [revised], outcome(instance, "succeeded", 2)
+        registry_http, [revised], outcome(instance, "succeeded", 2)
     )
     instance_after = await assert_exact_entity(
         registry_http, registry_api_path, instance, instance_entity(revised, 2)
@@ -100,7 +100,7 @@ async def test_equal_instance_content_is_unchanged(
 
     same = {**instance, "expected_resource_version": 1}
     await register_and_assert(
-        registry_http, registry_api_path, [same], outcome(instance, "unchanged", 1)
+        registry_http, [same], outcome(instance, "unchanged", 1)
     )
     after = await assert_exact_entity(
         registry_http,
@@ -130,14 +130,13 @@ async def test_stale_writer_reads_and_rebases_its_description(
     writer_a["expected_resource_version"] = 1
 
     await register_and_assert(
-        registry_http, registry_api_path, [writer_b], outcome(schema, "succeeded", 2)
+        registry_http, [writer_b], outcome(schema, "succeeded", 2)
     )
     b_current = await assert_exact_entity(
         registry_http, registry_api_path, schema, schema_entity(writer_b, 2)
     )
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [writer_a],
         outcome(schema, "failed", None, "precondition_failed"),
     )
@@ -155,7 +154,7 @@ async def test_stale_writer_reads_and_rebases_its_description(
     reconciled["content"]["description"] = writer_a["content"]["description"]
     reconciled["expected_resource_version"] = 2
     await register_and_assert(
-        registry_http, registry_api_path, [reconciled], outcome(schema, "succeeded", 3)
+        registry_http, [reconciled], outcome(schema, "succeeded", 3)
     )
     await assert_exact_entity(
         registry_http, registry_api_path, schema, schema_entity(reconciled, 3)
@@ -173,7 +172,7 @@ async def test_tombstone_refuses_creation_and_revision(
         registry_http, registry_api_path, schema, schema_entity(schema, 1)
     )
     deletion = await delete_one_and_poll(
-        registry_http, registry_api_path, schema["gts_id"], 1, RECEIPT
+        registry_http, schema["gts_id"], 1, RECEIPT
     )
     assert_operation(
         deletion, completed("deletion", removal(schema, "succeeded", 2)), ordered=True
@@ -186,14 +185,12 @@ async def test_tombstone_refuses_creation_and_revision(
 
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [schema],
         outcome(schema, "failed", None, "already_exists"),
     )
     revision = {**schema, "expected_resource_version": 2}
     await register_and_assert(
         registry_http,
-        registry_api_path,
         [revision],
         outcome(schema, "failed", None, "entity_deleted"),
     )

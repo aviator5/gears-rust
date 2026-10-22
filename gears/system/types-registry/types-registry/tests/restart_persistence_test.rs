@@ -75,7 +75,7 @@ async fn submit_admitted(
     request: &SubmitRequest,
     now: OffsetDateTime,
 ) -> Result<Accepted, ServiceError> {
-    let accepted = svc.submit(common::caller(), request, now).await?;
+    let accepted = svc.submit(common::platform(), request, now).await?;
     if !accepted.terminal() {
         svc.admit(accepted.operation_id, now).await?;
     }
@@ -203,7 +203,7 @@ async fn a_schema_and_instance_survive_database_reopen() {
 
         for operation_id in [accepted_schema.operation_id, accepted_instance.operation_id] {
             let op = svc
-                .operation(common::caller(), operation_id)
+                .operation(common::platform(), operation_id)
                 .await
                 .expect("read operation")
                 .expect("the operation exists");
@@ -330,7 +330,7 @@ async fn a_schema_and_instance_survive_database_reopen() {
         (instance_operation_id, CF_INSTANCE),
     ] {
         let op = svc
-            .operation(common::caller(), operation_id)
+            .operation(common::platform(), operation_id)
             .await
             .expect("read operation")
             .expect("the operation survived");
@@ -372,7 +372,7 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
         let db = test_db_file(&path).await;
         let accepted = service(&db)
             .submit(
-                common::caller(),
+                common::platform(),
                 &submission("resume-key", CF_TYPE, authored.clone()),
                 BOOT,
             )
@@ -403,7 +403,7 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
     let svc = service(&db);
     let replay = svc
         .submit(
-            common::caller(),
+            common::platform(),
             &submission("resume-key", CF_TYPE, authored.clone()),
             BOOT,
         )
@@ -425,7 +425,7 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
         .expect("a redelivery admits the operation acceptance left behind");
 
     let op = svc
-        .operation(common::caller(), accepted_id)
+        .operation(common::platform(), accepted_id)
         .await
         .expect("read operation")
         .expect("the operation exists");

@@ -19,19 +19,37 @@ Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
 ## Surfaces
 
-| Base path | What it is |
-|---|---|
-| `/types-registry/v1` | Legacy in-memory API; removed after consumer migration |
-| `/types-registry/v2` | Database-backed async API below; promoted to `/v1` after migration |
+| Base path | Credential | What it is |
+|---|---|---|
+| `/types-registry/platform/v1` | `X-ToolKit-Internal-Token` | The database-backed API below: submissions, deletions, operations and entity reads |
+| `/types-registry/v2` | `Authorization: Bearer` | The same entity reads for tenants (exact, `:batchGet`, discovery); promoted to `/v1` after migration |
+| `/types-registry/v1` | `Authorization: Bearer` | Legacy in-memory API; removed after consumer migration |
 
-`/v2` manages global platform entities. Routes are internal (`exposed = false`)
-but appear in `/cf/docs`. External mutation access requires platform
-authentication and PDP authorization before dispatch.
+One plane per route: a platform route serves a validated internal token and refuses a bearer
+alone, a tenant route the reverse, and a request carrying both is refused `401
+MIXED_CREDENTIALS` on either. Only platform callers register, delete or read operations;
+a tenant bearer reaches none of them. Routes are internal (`exposed = false`) but appear in
+`/cf/docs`. Callers are authenticated, not yet authorized: any valid internal token may
+mutate.
 
-Use the gear's internal base URL:
+Through the api-gateway, platform routes need its `internal_auth`; without it they are
+refused. For a local server, a shared secret:
+
+```yaml
+gears:
+  api-gateway:
+    config:
+      internal_auth:
+        provider: shared_secret
+        secret: "dev-internal-token"
+```
 
 ```bash
 BASE="$TYPES_REGISTRY_INTERNAL"
+PLATFORM="$BASE/types-registry/platform/v1"
+TENANT="$BASE/types-registry/v2"
+INTERNAL_TOKEN="dev-internal-token"   # the internal_auth secret
+TOKEN="<a tenant bearer>"            # for the tenant reads
 ```
 
 ## In-process API and startup seeding
@@ -48,7 +66,7 @@ startup seed:
 - **Seed sources.** Every GTS declaration linked into the binary — Type Schemas
   from `#[toolkit_gts::gts_type_schema(..)]`, Instances from `gts_instance!` and
   `gts_instance_raw!`, the `toolkit-gts` bases among them — plus the configured `entities`, admitted as one
-  operation through the same admission as `/v2`. INFO `types_registry seed set` gives the
+  operation through the same admission as the platform API. INFO `types_registry seed set` gives the
   counts, `types_registry seeded the database` the result. A restart with equal documents
   allocates no revision; a changed configured document is revised under compare-and-set;
   a document left out is not deleted.
@@ -72,7 +90,8 @@ Examples use `cf`, the only vendor allowed by default.
 ### Register a Type Schema, then poll the outcome
 
 ```bash
-RECEIPT=$(curl -s -X POST "$BASE/types-registry/v2/entities" \
+RECEIPT=$(curl -s -X POST "$PLATFORM/entities" \
+  -H "X-ToolKit-Internal-Token: $INTERNAL_TOKEN" \
   -H "Idempotency-Key: register-example-event-1" \
   -H "Content-Type: application/json" \
   -d '{
@@ -100,15 +119,18 @@ OPERATION_ID=$(printf '%s' "$RECEIPT" |
 Follow the `Location`:
 
 ```bash
-curl -s "$BASE/types-registry/v2/operations/$OPERATION_ID" | python3 -m json.tool
+curl -s "$PLATFORM/operations/$OPERATION_ID" \
+  -H "X-ToolKit-Internal-Token: $INTERNAL_TOKEN" | python3 -m json.tool
 ```
 
 The completed response contains a `succeeded` item at `resource_version: 1`.
 
-`completed` means every item is terminal. Read the entity:
+`completed` means every item is terminal. Read the entity, here as a tenant (the platform
+route `$PLATFORM/entities/{key}` answers the same with the internal token):
 
 ```bash
-curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~" \
+curl -s "$TENANT/entities/gts.cf.core.example.event.v1~" \
+  -H "Authorization: Bearer $TOKEN" \
   | python3 -m json.tool
 ```
 
@@ -139,7 +161,8 @@ check; `false` means no waiver, not that a check ran (a first minor or a major-0
 has none). An Instance omits the group even when selected:
 
 ```bash
-curl -s "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?\$select=content,effective_traits" \
+curl -s "$TENANT/entities/gts.cf.core.example.event.v1~?\$select=content,effective_traits" \
+  -H "Authorization: Bearer $TOKEN" \
   | python3 -m json.tool
 ```
 
@@ -155,7 +178,8 @@ Dry run persists a pollable prediction without changing entities:
 
 ```bash
 curl -s -X DELETE \
-  "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?expected_resource_version=1&dry_run=true" \
+  "$PLATFORM/entities/gts.cf.core.example.event.v1~?expected_resource_version=1&dry_run=true" \
+  -H "X-ToolKit-Internal-Token: $INTERNAL_TOKEN" \
   -H "Idempotency-Key: rehearse-delete-1"
 ```
 
@@ -163,7 +187,8 @@ To commit, omit `dry_run` and use a new key; reusing the dry-run key returns `40
 
 ```bash
 curl -s -X DELETE \
-  "$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~?expected_resource_version=1" \
+  "$PLATFORM/entities/gts.cf.core.example.event.v1~?expected_resource_version=1" \
+  -H "X-ToolKit-Internal-Token: $INTERNAL_TOKEN" \
   -H "Idempotency-Key: delete-1"
 ```
 
@@ -180,7 +205,8 @@ are a duplicate and refuse the batch. This one deletes an Instance by its identi
 Type Schema by its Registry Reference; the worker deletes the dependant first:
 
 ```bash
-curl -s -X POST "$BASE/types-registry/v2/entities:batchDelete" \
+curl -s -X POST "$PLATFORM/entities:batchDelete" \
+  -H "X-ToolKit-Internal-Token: $INTERNAL_TOKEN" \
   -H "Idempotency-Key: delete-batch-1" \
   -H "Content-Type: application/json" \
   -d '{
@@ -203,7 +229,8 @@ A key that names no entity, in either form, is still accepted; only its item fai
 Each `entity_key` is a GTS identifier or a Registry Reference UUID:
 
 ```bash
-curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
+curl -s -X POST "$TENANT/entities:batchGet" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
         "items": [
@@ -234,7 +261,8 @@ A top-level `"$select"` applies to every key and follows the exact read's rules,
 `found` entity is exactly what `GET /entities/{key}` returns for the same selection:
 
 ```bash
-curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
+curl -s -X POST "$TENANT/entities:batchGet" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{ "$select": "content", "items": [{ "entity_key": "gts.cf.core.example.event.v1~" }] }'
 ```
@@ -251,13 +279,15 @@ An exact read's `ETag` and a batch result's `etag` are the same value, quotes in
 that key and `$select`. Send it back unchanged and an unchanged entity costs no body:
 
 ```bash
-URL="$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~"
-ETAG=$(curl -si "$URL" | awk 'tolower($1) == "etag:" { print $2 }' | tr -d '\r')
+URL="$TENANT/entities/gts.cf.core.example.event.v1~"
+AUTH="Authorization: Bearer $TOKEN"
+ETAG=$(curl -si "$URL" -H "$AUTH" | awk 'tolower($1) == "etag:" { print $2 }' | tr -d '\r')
 
-curl -si "$URL" -H "If-None-Match: $ETAG"
+curl -si "$URL" -H "$AUTH" -H "If-None-Match: $ETAG"
 # 304 Not Modified, the same ETag, no body
 
-curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
+curl -s -X POST "$TENANT/entities:batchGet" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "$(python3 -c 'import json, sys; print(json.dumps({"items": [{"entity_key": sys.argv[1], "if_none_match": sys.argv[2]}]}))' \
         gts.cf.core.example.event.v1~ "$ETAG")"
@@ -274,7 +304,8 @@ identifier. `lifecycle_status` is `active` by default; `deleted` lists only tomb
 `all` lists both. Tombstones are always readable by key:
 
 ```bash
-curl -s "$BASE/types-registry/v2/entities?limit=2&pattern=gts.cf.core.*" \
+curl -s "$TENANT/entities?limit=2&pattern=gts.cf.core.*" \
+  -H "Authorization: Bearer $TOKEN" \
   | python3 -m json.tool
 ```
 
@@ -297,7 +328,8 @@ Page items take `$select` exactly as the exact read does; the default is documen
 a page never carries a validator. Select documents on the page directly:
 
 ```bash
-curl -s "$BASE/types-registry/v2/entities?limit=20&pattern=gts.cf.core.*&\$select=content" \
+curl -s "$TENANT/entities?limit=20&pattern=gts.cf.core.*&\$select=content" \
+  -H "Authorization: Bearer $TOKEN" \
   | python3 -m json.tool
 ```
 
@@ -310,9 +342,9 @@ continuation and stop when `next_cursor` is absent:
 CURSOR=""
 IDS=""
 while :; do
-  URL="$BASE/types-registry/v2/entities?limit=100&\$select=gts_id"
+  URL="$TENANT/entities?limit=100&\$select=gts_id"
   [ -z "$CURSOR" ] || URL="$URL&cursor=$CURSOR"
-  PAGE=$(curl -s "$URL")
+  PAGE=$(curl -s "$URL" -H "Authorization: Bearer $TOKEN")
   IDS="$IDS $(echo "$PAGE" | python3 -c 'import json,sys
 for item in json.load(sys.stdin)["items"]: print(item["gts_id"])')"
   CURSOR=$(echo "$PAGE" | python3 -c 'import json,sys
@@ -327,7 +359,8 @@ for i in range(0, len(keys), 100):
     print(json.dumps({"$select": "content",
                       "items": [{"entity_key": k} for k in keys[i:i + 100]]}))' \
   | while read -r BODY; do
-      curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
+      curl -s -X POST "$TENANT/entities:batchGet" \
+        -H "Authorization: Bearer $TOKEN" \
         -H "Content-Type: application/json" -d "$BODY"
     done
 ```
@@ -347,7 +380,8 @@ before the page limit:
 
 ```bash
 # Instances directly of one root, not of the types derived from it.
-curl -s "$BASE/types-registry/v2/entities?pattern=gts.cf.core.example.event.v1~*&depth=2&kind=instance" \
+curl -s "$TENANT/entities?pattern=gts.cf.core.example.event.v1~*&depth=2&kind=instance" \
+  -H "Authorization: Bearer $TOKEN" \
   | python3 -m json.tool
 ```
 
