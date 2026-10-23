@@ -5114,6 +5114,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand 0.10.1",
+ "secrecy",
  "semver",
  "serde",
  "serde_json",

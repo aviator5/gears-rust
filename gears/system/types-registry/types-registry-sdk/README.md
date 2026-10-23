@@ -22,7 +22,7 @@ complete listings (`list_type_schemas`, `list_instances`). The platform extensio
 reconciles explicit documents with `reconcile_entities_and_await`. Import the extension
 trait to call them; with both imported, choose one by UFCS.
 
-### Platform API over REST (`rest-client`)
+### Both APIs over REST (`rest-client`)
 
 `PlatformTypesRegistryRestClient` implements `PlatformTypesRegistryApi` against
 `/types-registry/platform/v1/` for a gear in another process. Every attempt carries the
@@ -32,8 +32,17 @@ Each call is a safe read or carries its `Idempotency-Key`, so it retries under
 `ClientConfig::retry`. A mutation returns its operation as read back, after the receipt's
 `Retry-After` (bounded by `retry.max_delay`) when the operation is still running; a failed
 read-back is `Aborted` with reason `OPERATION_READ_FAILED` naming the operation, and the
-same key replays it. The `otel` feature adds trace propagation and RED client metrics.
-The tenant client, the directory-resolving wrappers and `#[provides]` follow in T35.
+same key replays it.
+
+`TypesRegistryRestClient` implements `TypesRegistryApi` — the same reads, models,
+projection and validators — on the registry's tenant routes. Each call sends the bearer
+of the `SecurityContext` it is given, which the registry validates again, and never the
+internal token; one client serves every caller and holds no request's context. A context
+without a bearer sends no credential and is refused `401`. Both reads retry under
+`ClientConfig::retry`. The tenant routes' path is internal to the client.
+
+The `otel` feature adds trace propagation and RED client metrics to both clients. The
+directory-resolving wrappers and `#[provides]` follow in T35.
 
 The GTS identifier types the models use (`GtsId`, `GtsTypeId`, `GtsInstanceId`,
 `GtsIdPattern`, `GtsIdSegment`) are re-exported, so building a request needs no direct

@@ -43,7 +43,9 @@ pub use reconcile::{
     Reconciliation,
 };
 #[cfg(feature = "rest-client")]
-pub use rest_client::{PLATFORM_BASE_PATH, PlatformTypesRegistryRestClient};
+pub use rest_client::{
+    PLATFORM_BASE_PATH, PlatformTypesRegistryRestClient, TypesRegistryRestClient,
+};
 
 // Legacy API and model re-exports.
 mod legacy;

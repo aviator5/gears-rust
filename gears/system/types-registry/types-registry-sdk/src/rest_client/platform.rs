@@ -10,20 +10,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_contract::runtime::client::build_default_http_client;
 use toolkit_contract::runtime::config::ClientConfig;
-use toolkit_contract::runtime::http::{attach_internal_token, map_http_error, parse_retry_after};
-use toolkit_contract::runtime::retry::retry_with_backoff;
 use toolkit_contract::runtime::transport_error::TransportError;
 use toolkit_http::{HttpClient, HttpError, RequestBuilder};
 use toolkit_security::PlatformSecurityContext;
-use tracing::Instrument;
 use uuid::Uuid;
 
 use super::dto::{
     AcceptedDto, BatchGetBody, DeleteBody, LookupsDto, OperationDto, PageDto, SubmitBody,
     discovery_query, parse,
 };
+use super::transport::{Answer, Credential, Transport, client_span, traced};
 use crate::contract::PlatformTypesRegistryApi;
 use crate::gts::OperationResource;
 use crate::models::{
@@ -47,8 +44,7 @@ const SERVICE: &str = "PlatformTypesRegistryApi";
 /// (D19); a failed read-back names the accepted operation, so the caller can replay the
 /// same key.
 pub struct PlatformTypesRegistryRestClient {
-    http: HttpClient,
-    config: ClientConfig,
+    transport: Transport,
 }
 
 impl PlatformTypesRegistryRestClient {
@@ -57,67 +53,30 @@ impl PlatformTypesRegistryRestClient {
     /// # Errors
     /// Whatever the `toolkit-http` builder returns.
     pub fn new(config: ClientConfig) -> Result<Self, HttpError> {
-        let http = build_default_http_client(SERVICE, &config)?;
-        Ok(Self { http, config })
+        let transport = Transport::new(SERVICE, PLATFORM_BASE_PATH, config)?;
+        Ok(Self { transport })
     }
 
     /// A client over a caller-built transport; only `config`'s call-time fields apply.
     #[must_use]
     pub fn with_http_client(http: HttpClient, config: ClientConfig) -> Self {
-        Self { http, config }
+        let transport = Transport::with_http_client(http, PLATFORM_BASE_PATH, config);
+        Self { transport }
     }
 
     fn url(&self, path: &str) -> String {
-        format!(
-            "{}{PLATFORM_BASE_PATH}{path}",
-            self.config.base_url.trim_end_matches('/')
-        )
+        self.transport.url(path)
     }
 
-    /// One exchange under the retry policy: every attempt is built afresh and carries a
-    /// freshly resolved internal token. A non-success status is a `TransportError` carrying
-    /// the registry's Problem; a success keeps its status and the headers the caller reads.
+    /// One exchange carrying a freshly resolved internal token on every attempt.
     async fn exchange(
         &self,
         rpc: &'static str,
         build: impl Fn(&HttpClient) -> Result<RequestBuilder, TransportError>,
     ) -> Result<Answer, TransportError> {
-        retry_with_backoff(&self.config.retry, || async {
-            let builder = attach_internal_token(
-                build(&self.http)?,
-                self.config.internal_token_provider.as_ref(),
-                rpc,
-            );
-            let attempt = async {
-                let response = builder.send().await.map_err(map_send_error)?;
-                let status = response.status().as_u16();
-                let headers = response.headers();
-                let retry_after = parse_retry_after(headers);
-                let location = headers
-                    .get("location")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                let body = response.bytes().await.map_err(TransportError::network)?;
-                if (200..300).contains(&status) {
-                    Ok(Answer {
-                        status,
-                        location,
-                        retry_after,
-                        body,
-                    })
-                } else {
-                    Err(map_http_error(
-                        status,
-                        String::from_utf8_lossy(&body).into_owned(),
-                        retry_after,
-                    ))
-                }
-            };
-            tokio::time::timeout(self.config.timeout, attempt)
-                .await
-                .map_err(|_| TransportError::Timeout(self.config.timeout))?
-        })
-        .await
+        self.transport
+            .exchange(rpc, Credential::Internal, build)
+            .await
     }
 
     /// `GET …/operations/{id}`, decoded.
@@ -151,7 +110,7 @@ impl PlatformTypesRegistryRestClient {
             })
             .await?;
         let receipt = Receipt::read(&answer)?;
-        if let Some(pause) = receipt.pause(self.config.retry.max_delay) {
+        if let Some(pause) = receipt.pause(self.transport.config.retry.max_delay) {
             tokio::time::sleep(pause).await;
         }
         let operation_id = receipt.operation_id;
@@ -172,14 +131,6 @@ impl PlatformTypesRegistryRestClient {
 }
 
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
-
-/// A success: its status, the receipt headers and the body.
-struct Answer {
-    status: u16,
-    location: Option<String>,
-    retry_after: Option<Duration>,
-    body: bytes::Bytes,
-}
 
 /// Why an operation read failed: the exchange, or what it returned.
 enum Fetch {
@@ -238,14 +189,6 @@ impl Receipt {
     }
 }
 
-fn map_send_error(err: HttpError) -> TransportError {
-    match err {
-        HttpError::Overloaded => TransportError::Overloaded,
-        HttpError::Timeout(d) | HttpError::DeadlineExceeded(d) => TransportError::Timeout(d),
-        other => TransportError::network(other),
-    }
-}
-
 /// The local client's refusal after acceptance: retry with the same key (D19).
 fn read_back_failed(operation_id: Uuid) -> CanonicalError {
     OperationResource::aborted(format!(
@@ -291,36 +234,17 @@ fn wrong_kind(operation_id: Uuid) -> CanonicalError {
     .create()
 }
 
-/// The span a generated client opens for one method.
-macro_rules! client_span {
+/// The span a generated client opens for one platform method.
+macro_rules! span {
     ($method:literal, $http_method:literal, $route:literal) => {
-        tracing::info_span!(
-            concat!("PlatformTypesRegistryApi.", $method),
-            otel.kind = "client",
-            rpc.system = "rest",
-            rpc.service = SERVICE,
-            rpc.method = $method,
-            http.method = $http_method,
-            http.route = concat!("/types-registry/platform/v1", $route),
-            error = tracing::field::Empty,
+        client_span!(
+            "PlatformTypesRegistryApi",
+            "/types-registry/platform/v1",
+            $method,
+            $http_method,
+            $route
         )
     };
-}
-
-/// Run `call` inside `span`, recording a failure on it as a generated client does.
-async fn traced<T>(
-    span: tracing::Span,
-    call: impl Future<Output = Result<T, CanonicalError>>,
-) -> Result<T, CanonicalError> {
-    async {
-        let result = call.await;
-        if result.is_err() {
-            tracing::Span::current().record("error", true);
-        }
-        result
-    }
-    .instrument(span)
-    .await
 }
 
 #[async_trait]
@@ -330,7 +254,7 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryRestClient {
         _ctx: &PlatformSecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        let span = client_span!("batch_get_entities", "POST", "/entities:batchGet");
+        let span = span!("batch_get_entities", "POST", "/entities:batchGet");
         traced(span, async {
             let body = BatchGetBody::encode(&request)?;
             let url = self.url("/entities:batchGet");
@@ -351,7 +275,7 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryRestClient {
         _ctx: &PlatformSecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        let span = client_span!("list_entities", "GET", "/entities");
+        let span = span!("list_entities", "GET", "/entities");
         traced(span, async {
             let query = toolkit_contract::query::to_query_string(&discovery_query(&request))
                 .map_err(|e| TransportError::serialization(e.to_string()))?;
@@ -373,7 +297,7 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryRestClient {
         key: IdempotencyKey,
         request: RegisterEntitiesRequest,
     ) -> Result<RegistrationOperation, CanonicalError> {
-        let span = client_span!("register_entities", "POST", "/entities");
+        let span = span!("register_entities", "POST", "/entities");
         traced(span, async {
             let body = SubmitBody::encode(request)?;
             match self
@@ -394,7 +318,7 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryRestClient {
         key: IdempotencyKey,
         request: DeleteEntitiesRequest,
     ) -> Result<DeletionOperation, CanonicalError> {
-        let span = client_span!("delete_entities", "POST", "/entities:batchDelete");
+        let span = span!("delete_entities", "POST", "/entities:batchDelete");
         traced(span, async {
             let body = DeleteBody::encode(request)?;
             match self
@@ -413,7 +337,7 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryRestClient {
         _ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError> {
-        let span = client_span!("get_operation", "GET", "/operations/{operation_id}");
+        let span = span!("get_operation", "GET", "/operations/{operation_id}");
         traced(span, async {
             match self.fetch_operation(operation_id).await {
                 Ok(operation) => Ok(operation),
