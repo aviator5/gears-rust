@@ -28,7 +28,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use types_registry_sdk::PlatformTypesRegistryApi;
-use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 use uuid::Uuid;
 
 use super::PluginImpl;
@@ -1363,6 +1363,36 @@ async fn a_failed_registry_read_yields_internal_for_single_and_batch_hydration()
         matches!(err, TenantResolverError::Internal(_)),
         "got {err:?}"
     );
+}
+
+/// A tenant whose type was deleted keeps its identifier on single and
+/// batch hydration; only an unknown UUID fails the call.
+#[tokio::test]
+async fn a_deleted_tenant_type_hydrates_on_single_and_batch_reads() {
+    let port = setup();
+    let root = seed_root(&port, ACTIVE);
+    let type_uuid = types_registry_sdk::GtsId::try_new(TEST_TYPE_ID)
+        .expect("valid id")
+        .to_uuid();
+    port.rows
+        .lock()
+        .unwrap()
+        .get_mut(&root)
+        .expect("seeded")
+        .tenant_type_uuid = type_uuid;
+    let registry = MockTypesRegistry::new();
+    registry.seed_entity(Seed::new(TEST_TYPE_ID, serde_json::json!({})).deleted());
+    let port_dyn: Arc<dyn TenantHierarchyReadPort> = Arc::clone(&port) as _;
+    let plugin = PluginImpl::new(port_dyn, Arc::new(registry));
+
+    let info = plugin.get_tenant(&ctx(), TenantId(root)).await.unwrap();
+    assert_eq!(info.tenant_type.as_deref(), Some(TEST_TYPE_ID));
+    let infos = plugin
+        .get_tenants(&ctx(), &[TenantId(root)], &GetTenantsOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].tenant_type.as_deref(), Some(TEST_TYPE_ID));
 }
 
 #[tokio::test]

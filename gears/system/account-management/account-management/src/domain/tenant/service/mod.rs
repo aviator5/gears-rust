@@ -89,7 +89,7 @@ use serde_json::Value;
 use tenant_resolver_sdk::TenantId;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
-use types_registry_sdk::{PlatformTypesRegistryApi, ReadOptions, TypesRegistryApi};
+use types_registry_sdk::{PlatformTypesRegistryApi, TypesRegistryApi};
 
 use crate::config::AccountManagementConfig;
 use crate::domain::error::DomainError;
@@ -107,7 +107,7 @@ use crate::domain::tenant::model::{
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::resource_checker::ResourceOwnershipChecker;
 use crate::domain::tenant_type::checker::TenantTypeChecker;
-use crate::domain::type_reads::TypeReads;
+use crate::domain::types_registry_reader::TypesRegistryReader;
 
 /// Upper bound on the byte size of the opaque `IdP`-metadata blob AM
 /// will persist into `tenant_idp_metadata` and replay on every
@@ -195,8 +195,8 @@ pub struct TenantService<R: TenantRepo> {
     /// deployments without a registry plugin (in which case
     /// `Tenant.tenant_type` is left as `None`). Production reads
     /// rely on the registry client's own caching — every CRUD return
-    /// fans out one `get_type_schema_by_uuid` call (or one batched
-    /// `get_type_schemas_by_uuid` for `list_children`); the cache
+    /// fans out one `resolve_type_id` call (or one batched
+    /// `resolve_type_ids` for `list_children`); the cache
     /// keeps real RTT off the hot path.
     types_registry: Option<Arc<dyn TypesRegistryApi>>,
     /// The platform client for the service's own background pipelines —
@@ -285,16 +285,19 @@ impl<R: TenantRepo> TenantService<R> {
     /// The registry reads for `origin`: a request's under its caller, the
     /// background pipelines' through the platform API. Neither stands in
     /// for the other.
-    fn type_reads<'a>(&'a self, origin: CallerOrigin<'a>) -> Option<TypeReads<'a>> {
+    fn types_registry_reader<'a>(
+        &'a self,
+        origin: CallerOrigin<'a>,
+    ) -> Option<TypesRegistryReader<'a>> {
         match origin {
             CallerOrigin::Request(ctx) => self
                 .types_registry
                 .as_deref()
-                .map(|api| TypeReads::caller(api, ctx)),
+                .map(|api| TypesRegistryReader::caller(api, ctx)),
             CallerOrigin::Background => self
                 .platform_types_registry
                 .as_deref()
-                .map(TypeReads::Platform),
+                .map(TypesRegistryReader::Platform),
         }
     }
 
@@ -327,17 +330,14 @@ impl<R: TenantRepo> TenantService<R> {
                 detail: format!("tenant {tenant_id} not found"),
                 resource: tenant_id.to_string(),
             })?;
-        let reads = self.type_reads(origin).ok_or_else(|| {
+        let reader = self.types_registry_reader(origin).ok_or_else(|| {
             DomainError::service_unavailable(format!(
                 "tenant_type resolution requires a types-registry client \
                  (tenant {tenant_id} cannot be fed to the IdP plugin without one)"
             ))
         })?;
-        let tenant_type = match reads
-            .get_type_schema_by_uuid(tenant.tenant_type_uuid, ReadOptions::default())
-            .await
-        {
-            Ok(schema) => schema.type_id,
+        let tenant_type = match reader.resolve_type_id(tenant.tenant_type_uuid).await {
+            Ok(type_id) => type_id,
             // Catalog drift: the tenant row references a
             // `tenant_type_uuid` that the registry no longer
             // resolves. SDK contract on `IdpTenantContext::tenant_type`
@@ -397,12 +397,9 @@ impl<R: TenantRepo> TenantService<R> {
     /// public `tenant_type` field on [`Tenant`] is `Option<String>`
     /// precisely so a registry blip doesn't fail an otherwise-fine read.
     async fn resolve_tenant_type(&self, ctx: &SecurityContext, type_uuid: Uuid) -> Option<String> {
-        let reads = self.type_reads(CallerOrigin::Request(ctx))?;
-        match reads
-            .get_type_schema_by_uuid(type_uuid, ReadOptions::default())
-            .await
-        {
-            Ok(schema) => Some(schema.type_id.as_ref().to_owned()),
+        let reader = self.types_registry_reader(CallerOrigin::Request(ctx))?;
+        match reader.resolve_type_id(type_uuid).await {
+            Ok(type_id) => Some(type_id.as_ref().to_owned()),
             Err(err) => {
                 tracing::warn!(
                     target: "am.tenant.service",
@@ -481,7 +478,7 @@ impl<R: TenantRepo> TenantService<R> {
         mut uuids: Vec<Uuid>,
     ) -> std::collections::HashMap<Uuid, String> {
         let mut out = std::collections::HashMap::new();
-        let Some(reads) = self.type_reads(CallerOrigin::Request(ctx)) else {
+        let Some(reader) = self.types_registry_reader(CallerOrigin::Request(ctx)) else {
             return out;
         };
         uuids.sort_unstable();
@@ -489,13 +486,10 @@ impl<R: TenantRepo> TenantService<R> {
         if uuids.is_empty() {
             return out;
         }
-        match reads
-            .batch_get_type_schemas_by_uuid(&uuids, ReadOptions::default())
-            .await
-        {
+        match reader.resolve_type_ids(&uuids).await {
             Ok(found) => {
-                out.extend(found.into_iter().filter_map(|(uuid, schema)| {
-                    schema.map(|schema| (uuid, schema.type_id.as_ref().to_owned()))
+                out.extend(found.into_iter().filter_map(|(uuid, type_id)| {
+                    type_id.map(|type_id| (uuid, type_id.as_ref().to_owned()))
                 }));
             }
             Err(err) => {
@@ -804,8 +798,9 @@ impl<R: TenantRepo> TenantService<R> {
         // Runs AFTER the local parent precondition so a missing or
         // inactive parent fails fast on the local read instead of
         // burning a Types Registry round-trip first.
-        if let Some(reads) = self.type_reads(CallerOrigin::Request(ctx)) {
-            crate::domain::gts_validation::validate_tenant_name_via_gts(&input.name, reads).await?;
+        if let Some(reader) = self.types_registry_reader(CallerOrigin::Request(ctx)) {
+            crate::domain::gts_validation::validate_tenant_name_via_gts(&input.name, reader)
+                .await?;
         }
         // No AM-side schema validation of `input.provisioning_metadata`:
         // the IdP plugin owns that shape end-to-end per the
@@ -1823,9 +1818,9 @@ impl<R: TenantRepo> TenantService<R> {
         // PATCH — no shape change, no need to validate).
         if let Some(ref new_name) = patch.name
             && new_name != &current.name
-            && let Some(reads) = self.type_reads(CallerOrigin::Request(ctx))
+            && let Some(reader) = self.types_registry_reader(CallerOrigin::Request(ctx))
         {
-            crate::domain::gts_validation::validate_tenant_name_via_gts(new_name, reads).await?;
+            crate::domain::gts_validation::validate_tenant_name_via_gts(new_name, reader).await?;
         }
         let updated = self.repo.update_tenant_mutable(&scope, id, &patch).await?;
 

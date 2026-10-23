@@ -25,7 +25,7 @@
 
 use account_management_sdk::gts::TENANT_RESOURCE_TYPE;
 use toolkit_security::{AccessScope, SecurityContext};
-use types_registry_sdk::{ReadOptions, TypesRegistryApi, TypesRegistryApiExt};
+use types_registry_sdk::{TypesRegistryApi, TypesRegistryApiExt};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -86,14 +86,14 @@ pub(crate) async fn resolve_active_tenant(
         });
     }
 
-    // `get_type_schema_by_uuid` returns the typed `GtsTypeId` directly
-    // so no string round-trip is needed; an unknown type is as fatal as
-    // a failed read.
+    // `resolve_type_id` returns the typed `GtsTypeId` directly so no
+    // string round-trip is needed; an unknown type is as fatal as a
+    // failed read.
     let tenant_type = match types_registry
-        .get_type_schema_by_uuid(ctx, tenant.tenant_type_uuid, ReadOptions::default())
+        .resolve_type_id(ctx, tenant.tenant_type_uuid)
         .await
     {
-        Ok(schema) => schema.type_id,
+        Ok(type_id) => type_id,
         Err(err) => {
             tracing::warn!(
                 target: "am.tenant.resolve",

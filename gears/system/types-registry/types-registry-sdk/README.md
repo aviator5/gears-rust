@@ -15,7 +15,9 @@ Both are resolved from `ClientHub` as trait objects. Every method returns
 matching, and an operation item's failure with `AdmissionFailure::from_canonical`.
 
 `PlatformTypesRegistryApiExt` and `TypesRegistryApiExt` add kind-narrowed reads
-(`get_type_schema`, `get_instance`, their `_by_uuid` and `batch_get_*` variants) and
+(`get_type_schema`, `get_instance`, their `_by_uuid` and `batch_get_*` variants),
+identifier and Registry Reference resolution (`resolve_type_uuid`, `resolve_type_id`,
+`resolve_instance_uuid`, `resolve_instance_id` and their plural forms) and
 complete listings (`list_type_schemas`, `list_instances`). The platform extension also
 reconciles explicit documents with `reconcile_entities_and_await`. Import the extension
 trait to call them; with both imported, choose one by UFCS.
@@ -236,6 +238,17 @@ Single and batch typed read helpers take `ReadOptions`. Its default uses
 and apply `fresh` to every request, including each chunk of a batch read. `fresh`
 controls the client cache and is not sent on the wire. On a client without a
 cache, this flag has no effect.
+
+The `resolve_*` helpers map a registered entity's identifier to its Registry Reference
+(`resolve_type_uuid`, `resolve_instance_uuid`) and back (`resolve_type_id`,
+`resolve_instance_id`), with plural forms that batch like `batch_get_*`. They take no
+options: each always reads the registry, selecting the mandatory fields only through the
+normal client cache, and answers from the snapshot read. Active and deleted entities both
+resolve. An unregistered identifier, an unknown Registry Reference, or one of the other kind
+is `NotFound` on the single helper and `None` in the batch answer; a malformed or wrong-kind
+identifier is `InvalidArgument` before any read. When only the deterministic UUID of an
+identifier is needed, for instance before it is registered, use `GtsId::to_uuid`, which
+reads nothing.
 
 `EntityField::Provenance` selects a managed Type Schema's `provenance` group as a whole:
 `TypeSchema::provenance` is `None` when unselected and `Some(Provenance { .. })` when

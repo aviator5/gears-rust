@@ -33,7 +33,7 @@ use account_management_sdk::{
 use serde_json::json;
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing_platform::MockTypesRegistry;
+use types_registry_sdk::testing_platform::{MockTypesRegistry, Seed};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -48,7 +48,7 @@ const USER_SCHEMA: &str = gts_id!("cf.core.am.user.v1~");
 /// matching Type Schema is pre-registered in [`make_service`]'s
 /// `MockTypesRegistry` so `UserService::resolve_active_tenant`
 /// can resolve the typed `GtsTypeId` via
-/// `get_type_schema_by_uuid` (mandatory after the IdP-metadata
+/// `resolve_type_id` (mandatory after the IdP-metadata
 /// isolation refactor — a missing schema now surfaces as
 /// `ServiceUnavailable` instead of `Option::None`). Tests that need
 /// a specific failure shape override the registry stub.
@@ -227,6 +227,28 @@ async fn create_user_happy_path_returns_projection() {
     let calls = idp.create_calls_snapshot();
     assert_eq!(calls[0].0, tenant_id, "tenant scope is forwarded");
     assert_eq!(calls[0].1, "alice");
+}
+
+/// A tenant whose type was deleted keeps its identifier: the request
+/// read resolves the tombstone and the `IdP` is called as usual.
+#[tokio::test]
+async fn create_user_under_a_tenant_of_a_deleted_type_resolves_its_type() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x1);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let types_registry = Arc::new(MockTypesRegistry::new());
+    types_registry
+        .seed_entity(Seed::new(TEST_TENANT_TYPE_ID, json!({ "type": "object" })).deleted());
+    seed_user_schema(&types_registry);
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    idp.set_create_projection(IdpUser::new(Uuid::from_u128(0xABCD), "alice"));
+    let svc = UserService::new(tenants, idp.clone(), types_registry, mock_enforcer());
+
+    svc.create_user(&ctx(), tenant_id, payload("alice"))
+        .await
+        .expect("a deleted tenant type still resolves");
+
+    assert_eq!(idp.create_call_count(), 1);
 }
 
 /// Mirror of [`create_user_happy_path_returns_projection`] with

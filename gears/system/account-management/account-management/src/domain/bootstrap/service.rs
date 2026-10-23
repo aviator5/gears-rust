@@ -1054,7 +1054,9 @@ impl<R: TenantRepo> BootstrapService<R> {
             deadline,
             crate::domain::gts_validation::validate_tenant_name_via_gts(
                 &self.cfg.root_name,
-                crate::domain::type_reads::TypeReads::Platform(registry.as_ref()),
+                crate::domain::types_registry_reader::TypesRegistryReader::Platform(
+                    registry.as_ref(),
+                ),
             ),
         )
         .await

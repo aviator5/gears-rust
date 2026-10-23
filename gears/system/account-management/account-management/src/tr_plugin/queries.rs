@@ -10,8 +10,8 @@
 //! - Hydrates the public `tenant_type` field through
 //!   [`PlatformTypesRegistryApi`] — a named system read, see
 //!   [`super::plugin_impl::PluginImpl`] — using either a single
-//!   `get_type_schema_by_uuid` (single-row results) or a batched
-//!   `batch_get_type_schemas_by_uuid` (page-style results). Per DESIGN §3.4
+//!   `resolve_type_id` (single-row results) or a batched
+//!   `resolve_type_ids` (page-style results). Per DESIGN §3.4
 //!   / §5, **any** registry failure (a failed read or one unknown
 //!   uuid in a batch) fails the SDK call with
 //!   [`TenantResolverError::Internal`]; the plugin must not return
@@ -49,7 +49,7 @@ use tenant_resolver_sdk::{
     TenantInfo, TenantRef, TenantResolverError, TenantStatus as SdkTenantStatus,
 };
 use toolkit_security::PlatformSecurityContext;
-use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions};
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt};
 
 use crate::domain::tenant::hierarchy_read_port::{
     BarrierMode, StatusFilter, TenantHierarchyReadPort,
@@ -161,14 +161,10 @@ async fn resolve_tenant_type_one(
     type_uuid: Uuid,
 ) -> Result<String, TenantResolverError> {
     match registry
-        .get_type_schema_by_uuid(
-            &PlatformSecurityContext::outbound_marker(),
-            type_uuid,
-            ReadOptions::default(),
-        )
+        .resolve_type_id(&PlatformSecurityContext::outbound_marker(), type_uuid)
         .await
     {
-        Ok(schema) => Ok(schema.type_id.as_ref().to_owned()),
+        Ok(type_id) => Ok(type_id.as_ref().to_owned()),
         Err(err) => {
             tracing::warn!(
                 target: "tr_plugin",
@@ -200,11 +196,7 @@ async fn resolve_tenant_types_for_uuids(
         return Ok(HashMap::new());
     }
     let resolved = registry
-        .batch_get_type_schemas_by_uuid(
-            &PlatformSecurityContext::outbound_marker(),
-            &distinct,
-            ReadOptions::default(),
-        )
+        .resolve_type_ids(&PlatformSecurityContext::outbound_marker(), &distinct)
         .await
         .map_err(|err| {
             tracing::warn!(
@@ -215,8 +207,8 @@ async fn resolve_tenant_types_for_uuids(
             TenantResolverError::Internal("tenant resolver tenant_type hydration failed".to_owned())
         })?;
     let mut out: HashMap<Uuid, String> = HashMap::with_capacity(resolved.len());
-    for (uuid, schema) in resolved {
-        let Some(schema) = schema else {
+    for (uuid, type_id) in resolved {
+        let Some(type_id) = type_id else {
             tracing::warn!(
                 target: "tr_plugin",
                 tenant_type_uuid = %uuid,
@@ -226,7 +218,7 @@ async fn resolve_tenant_types_for_uuids(
                 "tenant resolver tenant_type hydration failed".to_owned(),
             ));
         };
-        out.insert(uuid, schema.type_id.as_ref().to_owned());
+        out.insert(uuid, type_id.as_ref().to_owned());
     }
     Ok(out)
 }

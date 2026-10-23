@@ -4,7 +4,7 @@
 //! [`TypesRegistryApi`] under that request's own [`SecurityContext`], passed
 //! down unchanged. A platform operation with no request behind it —
 //! bootstrap, retention, the provisioning reaper — reads through
-//! [`PlatformTypesRegistryApi`]. A helper serving both takes a [`TypeReads`],
+//! [`PlatformTypesRegistryApi`]. A helper serving both takes a [`TypesRegistryReader`],
 //! so each call site names its caller. No variant is built from the other:
 //! a tenant-API failure is returned as is, never retried on the platform
 //! API, and no context is constructed for a caller that has none.
@@ -23,7 +23,7 @@ use uuid::Uuid;
 /// The registry and the caller a read is made for.
 #[domain_model]
 #[derive(Clone, Copy)]
-pub enum TypeReads<'a> {
+pub enum TypesRegistryReader<'a> {
     /// A read for the request whose context `ctx` is.
     Caller {
         api: &'a dyn TypesRegistryApi,
@@ -33,7 +33,7 @@ pub enum TypeReads<'a> {
     Platform(&'a dyn PlatformTypesRegistryApi),
 }
 
-impl<'a> TypeReads<'a> {
+impl<'a> TypesRegistryReader<'a> {
     /// A read for `ctx`'s request.
     #[must_use]
     pub fn caller(api: &'a dyn TypesRegistryApi, ctx: &'a SecurityContext) -> Self {
@@ -62,49 +62,33 @@ impl<'a> TypeReads<'a> {
         }
     }
 
-    /// See [`TypesRegistryApiExt::get_type_schema_by_uuid`].
+    /// See [`TypesRegistryApiExt::resolve_type_id`].
     ///
     /// # Errors
     /// The registry's.
-    pub async fn get_type_schema_by_uuid(
-        self,
-        type_uuid: Uuid,
-        options: ReadOptions,
-    ) -> Result<TypeSchema, CanonicalError> {
+    pub async fn resolve_type_id(self, type_uuid: Uuid) -> Result<GtsTypeId, CanonicalError> {
         match self {
-            Self::Caller { api, ctx } => api.get_type_schema_by_uuid(ctx, type_uuid, options).await,
+            Self::Caller { api, ctx } => api.resolve_type_id(ctx, type_uuid).await,
             Self::Platform(api) => {
-                api.get_type_schema_by_uuid(
-                    &PlatformSecurityContext::outbound_marker(),
-                    type_uuid,
-                    options,
-                )
-                .await
+                api.resolve_type_id(&PlatformSecurityContext::outbound_marker(), type_uuid)
+                    .await
             }
         }
     }
 
-    /// See [`TypesRegistryApiExt::batch_get_type_schemas_by_uuid`].
+    /// See [`TypesRegistryApiExt::resolve_type_ids`].
     ///
     /// # Errors
     /// The registry's.
-    pub async fn batch_get_type_schemas_by_uuid(
+    pub async fn resolve_type_ids(
         self,
         type_uuids: &[Uuid],
-        options: ReadOptions,
-    ) -> Result<HashMap<Uuid, Option<TypeSchema>>, CanonicalError> {
+    ) -> Result<HashMap<Uuid, Option<GtsTypeId>>, CanonicalError> {
         match self {
-            Self::Caller { api, ctx } => {
-                api.batch_get_type_schemas_by_uuid(ctx, type_uuids, options)
-                    .await
-            }
+            Self::Caller { api, ctx } => api.resolve_type_ids(ctx, type_uuids).await,
             Self::Platform(api) => {
-                api.batch_get_type_schemas_by_uuid(
-                    &PlatformSecurityContext::outbound_marker(),
-                    type_uuids,
-                    options,
-                )
-                .await
+                api.resolve_type_ids(&PlatformSecurityContext::outbound_marker(), type_uuids)
+                    .await
             }
         }
     }

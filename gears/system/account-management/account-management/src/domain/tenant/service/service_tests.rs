@@ -4171,7 +4171,7 @@ async fn hard_delete_batch_redacts_vendor_detail_on_terminal_failure() {
 
 // ---- catalog-drift on load_tenant_context surfaces as ServiceUnavailable ---
 //
-// `CanonicalError::NotFound` on `get_type_schema_by_uuid` means the row's
+// `CanonicalError::NotFound` on `resolve_type_id` means the row's
 // `tenant_type_uuid` no longer resolves through the Types Registry.
 // The SDK contract on `IdpTenantContext::tenant_type` requires a
 // *resolved* chained `GtsTypeId`, so the helper surfaces
@@ -4211,6 +4211,60 @@ async fn load_tenant_context_defers_on_gts_type_schema_not_found() {
         }
         other => panic!("expected ServiceUnavailable, got {other:?}"),
     }
+}
+
+// ---- a deleted tenant type still names its tenants ----------------------
+//
+// A tenant row keeps the identifier of its type after the type is deleted:
+// request reads hydrate it on single and page results, and the background
+// context load resolves it for the IdP plugin. Only an unknown UUID is drift.
+
+#[tokio::test]
+async fn a_deleted_tenant_type_still_hydrates_on_reads_and_context_loads() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x201);
+    let type_uuid = gts::GtsId::try_new(CUSTOMER_TENANT_TYPE_ID)
+        .expect("valid id")
+        .to_uuid();
+    let registry = Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
+    registry.seed_entity(
+        types_registry_sdk::testing_platform::Seed::new(
+            CUSTOMER_TENANT_TYPE_ID,
+            serde_json::json!({}),
+        )
+        .deleted(),
+    );
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let mut root_row = repo.find_by_id_unchecked(root).expect("root row");
+    root_row.tenant_type_uuid = type_uuid;
+    repo.insert_tenant_raw(TenantModel {
+        id: child,
+        parent_id: Some(root),
+        name: "child".into(),
+        depth: 1,
+        ..root_row.clone()
+    });
+    repo.insert_tenant_raw(root_row);
+    repo.seed_closure(root, child, 0, TenantStatus::Active);
+    repo.seed_closure(child, child, 0, TenantStatus::Active);
+    let svc = make_service(repo, FakeOutcome::Ok).with_registry(registry);
+
+    let tenant = svc.get_tenant(&ctx_for(root), root).await.expect("read ok");
+    assert_eq!(tenant.tenant_type.as_deref(), Some(CUSTOMER_TENANT_TYPE_ID));
+    let page = svc
+        .list_children(&ctx_for(root), root, &ODataQuery::default().with_limit(10))
+        .await
+        .expect("list ok");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].tenant_type.as_deref(),
+        Some(CUSTOMER_TENANT_TYPE_ID)
+    );
+    let context = svc
+        .load_tenant_context(CallerOrigin::Background, root)
+        .await
+        .expect("a tombstone still resolves");
+    assert_eq!(context.tenant_type.as_ref(), CUSTOMER_TENANT_TYPE_ID);
 }
 
 // ---- H4: MAX_IDP_METADATA_BYTES boundary cap --------------------------

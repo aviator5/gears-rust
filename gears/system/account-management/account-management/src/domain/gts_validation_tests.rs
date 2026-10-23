@@ -42,7 +42,7 @@ use toolkit_gts::gts_uri;
 use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 use crate::domain::error::DomainError;
-use crate::domain::type_reads::TypeReads;
+use crate::domain::types_registry_reader::TypesRegistryReader;
 use crate::infra::types_registry::test_helpers::{CallerSpy, Tampered, assert_only_caller, caller};
 
 // ---- helpers -------------------------------------------------------
@@ -190,7 +190,7 @@ async fn user_payload_registry_transport_error_surfaces_as_service_unavailable()
 #[tokio::test]
 async fn tenant_name_schema_not_registered_short_circuits_to_ok() {
     let registry = MockTypesRegistry::new();
-    super::validate_tenant_name_via_gts("acme", TypeReads::caller(&registry, &caller(1)))
+    super::validate_tenant_name_via_gts("acme", TypesRegistryReader::caller(&registry, &caller(1)))
         .await
         .expect("schema-not-found short-circuits to Ok");
 }
@@ -198,7 +198,7 @@ async fn tenant_name_schema_not_registered_short_circuits_to_ok() {
 #[tokio::test]
 async fn tenant_name_valid_passes_registered_schema() {
     let registry = registry_with_tenant_schema(255);
-    super::validate_tenant_name_via_gts("acme", TypeReads::caller(&registry, &caller(1)))
+    super::validate_tenant_name_via_gts("acme", TypesRegistryReader::caller(&registry, &caller(1)))
         .await
         .expect("valid name passes the registered schema");
 }
@@ -207,10 +207,12 @@ async fn tenant_name_valid_passes_registered_schema() {
 async fn tenant_name_oversized_rejects_with_validation() {
     let registry = registry_with_tenant_schema(255);
     let oversized = "x".repeat(256);
-    let err =
-        super::validate_tenant_name_via_gts(&oversized, TypeReads::caller(&registry, &caller(1)))
-            .await
-            .expect_err("oversize name must be rejected");
+    let err = super::validate_tenant_name_via_gts(
+        &oversized,
+        TypesRegistryReader::caller(&registry, &caller(1)),
+    )
+    .await
+    .expect_err("oversize name must be rejected");
     match err {
         DomainError::Validation { detail } => {
             assert!(
@@ -225,18 +227,22 @@ async fn tenant_name_oversized_rejects_with_validation() {
 #[tokio::test]
 async fn tenant_name_empty_rejects_with_validation() {
     let registry = registry_with_tenant_schema(255);
-    let err = super::validate_tenant_name_via_gts("", TypeReads::caller(&registry, &caller(1)))
-        .await
-        .expect_err("empty name must be rejected");
+    let err =
+        super::validate_tenant_name_via_gts("", TypesRegistryReader::caller(&registry, &caller(1)))
+            .await
+            .expect_err("empty name must be rejected");
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
 #[tokio::test]
 async fn tenant_name_registry_transport_error_surfaces_as_service_unavailable() {
     let registry = unavailable_registry();
-    let err = super::validate_tenant_name_via_gts("acme", TypeReads::caller(&registry, &caller(1)))
-        .await
-        .expect_err("registry transport error must surface");
+    let err = super::validate_tenant_name_via_gts(
+        "acme",
+        TypesRegistryReader::caller(&registry, &caller(1)),
+    )
+    .await
+    .expect_err("registry transport error must surface");
     assert!(
         matches!(err, DomainError::ServiceUnavailable { .. }),
         "expected ServiceUnavailable, got {err:?}"
@@ -428,10 +434,12 @@ async fn an_inline_bound_applies_to_the_tenant_name() {
         ),
     );
 
-    let err =
-        super::validate_tenant_name_via_gts("acme-corp", TypeReads::caller(&registry, &caller(1)))
-            .await
-            .expect_err("the inline bound applies");
+    let err = super::validate_tenant_name_via_gts(
+        "acme-corp",
+        TypesRegistryReader::caller(&registry, &caller(1)),
+    )
+    .await
+    .expect_err("the inline bound applies");
     assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
 }
 
@@ -463,9 +471,12 @@ async fn tenant_name_reads_for_each_request_caller() {
     let spy = CallerSpy::for_requests(Arc::new(registry_with_tenant_schema(255)));
     for n in [1, 2] {
         let ctx = caller(n);
-        super::validate_tenant_name_via_gts("acme", TypeReads::caller(spy.as_ref(), &ctx))
-            .await
-            .expect("valid name");
+        super::validate_tenant_name_via_gts(
+            "acme",
+            TypesRegistryReader::caller(spy.as_ref(), &ctx),
+        )
+        .await
+        .expect("valid name");
         assert_only_caller(&spy.callers(), &ctx);
         spy.clear();
     }
@@ -477,9 +488,12 @@ async fn tenant_name_reads_for_each_request_caller() {
 async fn a_failed_request_read_does_not_fall_back_to_the_platform_api() {
     let spy = CallerSpy::for_requests(Arc::new(unavailable_registry()));
     let ctx = caller(1);
-    let err = super::validate_tenant_name_via_gts("acme", TypeReads::caller(spy.as_ref(), &ctx))
-        .await
-        .expect_err("registry down");
+    let err = super::validate_tenant_name_via_gts(
+        "acme",
+        TypesRegistryReader::caller(spy.as_ref(), &ctx),
+    )
+    .await
+    .expect_err("registry down");
     assert!(
         matches!(err, DomainError::ServiceUnavailable { .. }),
         "got {err:?}"
@@ -493,9 +507,12 @@ async fn a_failed_request_read_does_not_fall_back_to_the_platform_api() {
 #[tokio::test]
 async fn the_platform_tenant_name_check_reads_only_the_platform_api() {
     let spy = CallerSpy::for_platform(Arc::new(registry_with_tenant_schema(4)));
-    let err = super::validate_tenant_name_via_gts("acme-corp", TypeReads::Platform(spy.as_ref()))
-        .await
-        .expect_err("the platform read still applies the bound");
+    let err = super::validate_tenant_name_via_gts(
+        "acme-corp",
+        TypesRegistryReader::Platform(spy.as_ref()),
+    )
+    .await
+    .expect_err("the platform read still applies the bound");
     assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
     assert_eq!(spy.platform_reads(), 1);
     assert!(spy.callers().is_empty());
