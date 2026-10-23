@@ -522,6 +522,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=types-registry-db
 
+      - name: Test types-registry host (out-of-process bootstrap)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=types-registry-host
+
       - name: Test oagw (pg/mysql conformance + migrations, integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-db

@@ -2750,18 +2750,25 @@ A normative reference, not a task: its items carry no checkboxes. Each names its
 
 Commits inside the task: (1) tenant routes on shared domain calls and the tenant REST client; (2) the authenticator bootstrap/gate and SPEC §8.4.
 
+**Progress (stage 1 done; the closing stage below is next).**
+- Commit 1, `951798dc1`: the tenant REST client. The tenant routes and their shared handlers already existed from T34, so it adds only `TR-SDK/src/rest_client/tenant.rs` (`TypesRegistryRestClient`, base path a private constant) over a `transport.rs` extracted from the platform client and parameterised by the plane's credential. The exact read has no client method, as in T34: the extension reads through `batchGet`, and the route's `ETag`/`304` is checked over TCP with a real bearer.
+- Commit 2 landed as two: `4dae4e3de`, the registry-local caller gate (user decision: registry-local, toolkit's `oop_serve` unchanged), and the host commit — `apps/cf-types-registry-host`, SPEC §8.4, `config/types-registry-host.yaml` and the `types-registry-host` integration lane with its CI step. User decision: OIDC always linked; the static plugin only under the non-default `dev-authn` feature, because it registers itself `accept_all` whenever linked.
+- The bootstrap test cannot start the binary without a tenant authenticator: linking authn-resolver always registers one. That half is proven on the stack `oop_serve` builds without one (`platform_routes_auth_test`); the spawned binary proves the other half.
+- Codex reviewed every slice: transport/credential/path/retry/query mutants, gate-scope, plane-branch and gate-removal mutants, and host mutants (no bearer bridge, OIDC winning). All were killed, after two test additions (the exact-read `304` over TCP, the gate-scope composition test) and one test fix (bounded readiness polling).
+- e2e: `make e2e-local SUITE=types_registry` (184 passed, 2 skipped) and `SUITE=account_management` (22 passed), with `APP__SERVER__HOME_DIR` on an empty scratch directory: `~/.cf-gears` holds a types-registry database from another branch whose seeds no longer admit (`compatibility_undecidable`).
+
 **Acceptance criteria:**
-- [ ] Real TCP tenant reads match the T30 local client: `ETag`/`304`, `unchanged` and cursor semantics, the validator as the unquoted token (SPEC §8.5); each call forwards its own `SecurityContext` bearer and never the internal token; tenant handlers read `Extension<SecurityContext>` only
-- [ ] The tenant routes share their handlers' domain calls with the platform twins; `get_operation` has no tenant route
-- [ ] The standalone registry installs `AuthNResolverBearerAuthenticator` over a linked production authn-resolver/plugin and records that topology in SPEC §8.4 (P30). `AuthNResolverClient` has no current remote contract/adapter; do not add an unrelated RPC migration. Without an authenticator a tenant route answers a canonical `401` before dispatch while platform routes are served
-- [ ] Provide the production registry host entry in a separate composition crate (`apps/cf-types-registry-host`) using existing OoP bootstrap/CLI, its own database and linked production AuthN. Do not add authn-resolver as a dependency of the registry gear crate: authn already depends on it, which would create a Cargo cycle. Use the standalone listener without pulling AM/RG/TR declarations through the full example/gateway composition. This deployable registry entry is reused by T41/T43
+- [x] Real TCP tenant reads match the T30 local client: `ETag`/`304`, `unchanged` and cursor semantics, the validator as the unquoted token (SPEC §8.5); each call forwards its own `SecurityContext` bearer and never the internal token; tenant handlers read `Extension<SecurityContext>` only
+- [x] The tenant routes share their handlers' domain calls with the platform twins; `get_operation` has no tenant route
+- [x] The standalone registry installs `AuthNResolverBearerAuthenticator` over a linked production authn-resolver/plugin and records that topology in SPEC §8.4 (P30). `AuthNResolverClient` has no current remote contract/adapter; do not add an unrelated RPC migration. Without an authenticator a tenant route answers a canonical `401` before dispatch while platform routes are served
+- [x] Provide the production registry host entry in a separate composition crate (`apps/cf-types-registry-host`) using existing OoP bootstrap/CLI, its own database and linked production AuthN. Do not add authn-resolver as a dependency of the registry gear crate: authn already depends on it, which would create a Cargo cycle. Use the standalone listener without pulling AM/RG/TR declarations through the full example/gateway composition. This deployable registry entry is reused by T41/T43
 - [ ] Every REST-contract item owned by T35 is met; the interim tenant path is adapter-internal, so callers see the semantic API only
 
 **Verification:**
-- [ ] The tenant cases of `rest_client_contract_test`
+- [x] The tenant cases of `rest_client_contract_test`
 - [ ] The tenant rows of the auth matrix and the bootstrap test of the shared verification, on both hosts
-- [ ] `cargo test -p cf-gears-types-registry-sdk --features rest-client`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`
-- [ ] `make e2e-local` green; gear tests
+- [x] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (295 + 6 doctests); `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`
+- [ ] `make e2e-local` green; gear tests — gear tests 1274 passed and both registry e2e suites green (above); the unscoped `make e2e-local` is not yet run
 
 **Closing stage — resolving clients, provides and both-host auth matrix:**
 

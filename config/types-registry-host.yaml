@@ -1,0 +1,75 @@
+# The standalone types-registry (`cf-types-registry-host`, SPEC §8.4): its own database,
+# the platform plane over a shared-secret internal token, and the tenant plane over the
+# linked authn-resolver.
+#
+# Run locally, with the static AuthN plugin standing in for an identity provider:
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+#     cargo run -p cf-types-registry-host --features dev-authn -- \
+#     --config config/types-registry-host.yaml
+#
+# Platform calls send `X-ToolKit-Internal-Token: local-internal-token`; tenant reads send
+# `Authorization: Bearer local-tenant-token`. A production build has no `dev-authn`: drop
+# the `static-authn-plugin` block and configure `oidc-authn-plugin` for the real issuer.
+
+server:
+  home_dir: "~/.cf-types-registry-host"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/types-registry-host.log"
+    file_level: info
+
+database:
+  servers:
+    sqlite:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        busy_timeout: "5000"
+
+oop_http:
+  listen_addr: "127.0.0.1:9095"
+  advertise_uri: "http://127.0.0.1:9095"
+  allow_loopback_advertise: true
+  internal_auth:
+    provider: shared_secret
+    secret: "local-internal-token"
+
+gears:
+  types-registry:
+    database:
+      server: "sqlite"
+      file: "types_registry.db"
+    config: {}
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # `dev-authn` builds only. A lower priority than OIDC, so it is the selected plugin.
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 10
+      mode: static_tokens
+      tokens:
+        - token: "local-tenant-token"
+          identity:
+            subject_id: "00000000-0000-0000-0000-000000000001"
+            subject_tenant_id: "00000000-0000-0000-0000-000000000002"
+            token_scopes: ["*"]
+
+  # Always linked; see gears/system/authn-resolver/plugins/oidc-authn-plugin/docs/config-example.yaml.
+  oidc-authn-plugin:
+    config:
+      priority: 100
+      jwt:
+        trusted_issuers:
+          - issuer: "https://idp.example.com"
+        claim_mapping:
+          subject_id: "sub"
+          subject_tenant_id: "tenant_id"
+      s2s_oauth:
+        discovery_url: "https://idp.example.com"
+        default_subject_type: "gts.cf.core.security.subject_user.v1~"

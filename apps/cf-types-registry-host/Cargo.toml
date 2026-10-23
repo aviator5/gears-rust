@@ -1,0 +1,52 @@
+[package]
+name = "cf-types-registry-host"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The types-registry gear as an out-of-process service, with its own database and linked AuthN"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Local runs and the bootstrap test only. `static-authn-plugin` registers itself whenever it
+# is linked — `accept_all` unless configured otherwise — so a production build never has it.
+dev-authn = ["dep:static-authn-plugin"]
+# Kubernetes TokenReview for the platform plane (`oop_http.internal_auth.provider: kube`).
+k8s-auth = ["toolkit/k8s-auth"]
+
+[[bin]]
+name = "cf-types-registry-host"
+path = "src/main.rs"
+
+[dependencies]
+toolkit = { workspace = true, features = ["bootstrap"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+
+# The registry, and the tenant-plane AuthN it validates bearers with (P30). Linked here
+# rather than in the gear crate: authn-resolver already depends on types-registry.
+types-registry = { workspace = true }
+authn-resolver = { workspace = true }
+oidc-authn-plugin = { package = "cf-gears-oidc-authn-plugin", path = "../../gears/system/authn-resolver/plugins/oidc-authn-plugin" }
+static-authn-plugin = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The SDK's REST clients against the spawned binary.
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
+toolkit-contract = { workspace = true, features = ["rest-client"] }
+toolkit-security = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
+gts = { workspace = true }
+secrecy = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+uuid = { workspace = true }

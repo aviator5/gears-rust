@@ -54,6 +54,7 @@ members = [
     "gears/system/durable-execution/durable-execution-sdk",
     "apps/cf-gears-example-server",
     "apps/cf-gears-flight-control",
+    "apps/cf-types-registry-host",
     "tools/gts-analyze",
     "tools/xtask",
     "libs/toolkit",

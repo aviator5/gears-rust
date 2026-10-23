@@ -407,7 +407,7 @@ test-graph-storage-pg: install-tools
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
-	types-registry-db oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
+	types-registry-db types-registry-host oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
 	pricing-pg coord-pg products-pg ledger-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
@@ -451,6 +451,10 @@ lane_env_usage-collector-ch = CH_REQUIRE_DOCKER=1
 ## types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
 lane_args_types-registry-db = -p cf-gears-types-registry --features integration -E 'binary(/_backends_test$$/)'
+
+## The standalone registry binary started as its own process (no Docker). Its bootstrap
+## test needs the static AuthN plugin, which only the non-default `dev-authn` feature links.
+lane_args_types-registry-host = -p cf-types-registry-host --features dev-authn
 
 ## OAGW's database tier: the repository conformance suite and the
 ## migration tests on PostgreSQL and MySQL (Docker required; no skip without

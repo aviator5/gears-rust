@@ -5304,6 +5304,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-types-registry-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cf-gears-authn-resolver",
+ "cf-gears-oidc-authn-plugin",
+ "cf-gears-static-authn-plugin",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "clap",
+ "gts",
+ "secrecy",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cfb"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
