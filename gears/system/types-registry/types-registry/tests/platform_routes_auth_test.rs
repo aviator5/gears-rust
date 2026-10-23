@@ -13,7 +13,9 @@ use toolkit_http::{HttpClient, HttpClientBuilder, RequestBuilder};
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 
 mod common;
-use common::platform_server::{INTERNAL_TOKEN, PlatformServer, TENANT_BEARER, serve};
+use common::platform_server::{
+    INTERNAL_TOKEN, PlatformServer, TENANT_BEARER, serve, serve_without_tenant_authenticator,
+};
 
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
 const PLATFORM: &str = "/types-registry/platform/v1";
@@ -96,6 +98,7 @@ async fn send(
             .json(&json!({ "items": [{ "entity_key": CF_TYPE }] }))
             .unwrap(),
         "tenant_list" => http.get(&format!("{base}{TENANT}/entities")),
+        "legacy_list" => http.get(&format!("{base}/types-registry/v1/entities")),
         other => panic!("unknown route {other}"),
     };
     let response = with(builder, credentials).send().await.expect("a response");
@@ -260,4 +263,39 @@ async fn a_tenant_bearer_mutates_nothing() {
     )
     .await;
     assert_eq!(status, 404, "nothing was registered: {body}");
+}
+
+/// A standalone registry without a tenant authenticator refuses every tenant route with a
+/// canonical `401` before its handler runs — never a `500` from the handler's extractor,
+/// never a served request — and still serves the platform routes.
+#[tokio::test]
+async fn without_a_tenant_authenticator_tenant_routes_are_refused_and_platform_routes_served() {
+    let server = serve_without_tenant_authenticator().await;
+    let mut nonce = 0;
+    for route in TENANT_ROUTES.into_iter().chain(["legacy_list"]) {
+        for credentials in [
+            Credentials::None,
+            Credentials::Bearer(TENANT_BEARER),
+            Credentials::Bearer("forged-bearer"),
+            Credentials::Token(INTERNAL_TOKEN),
+        ] {
+            nonce += 1;
+            let answer = send(&server, route, credentials, nonce).await;
+            assert_refused(
+                route,
+                credentials,
+                &answer,
+                types_registry_sdk::reason::unauthenticated::TENANT_AUTHENTICATION_UNAVAILABLE,
+            );
+        }
+    }
+    for route in PLATFORM_ROUTES {
+        nonce += 1;
+        let answer = send(&server, route, Credentials::Token(INTERNAL_TOKEN), nonce).await;
+        assert_served(route, Credentials::Token(INTERNAL_TOKEN), &answer);
+    }
+    nonce += 1;
+    let mixed = Credentials::Both(INTERNAL_TOKEN, TENANT_BEARER);
+    let answer = send(&server, "tenant_get", mixed, nonce).await;
+    assert_refused("tenant_get", mixed, &answer, "MIXED_CREDENTIALS");
 }

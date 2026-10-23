@@ -5561,3 +5561,54 @@ fn the_exact_read_declares_if_none_match_and_a_304_carrying_the_etag() {
     assert!(statuses.contains("\"unchanged\""), "{statuses}");
     assert!(schemas["EntityLookupDto"]["properties"]["etag"].is_object());
 }
+
+/// The caller gate (SPEC §8.4) refuses only the registry's own routes: a host route the
+/// registry is merged into, another method on a registry path and the host's fallback keep
+/// their answers, and still see the registry's service extension.
+#[tokio::test]
+async fn the_caller_gate_covers_only_the_registrys_own_routes() {
+    use axum::Extension;
+    use axum::routing::{get, patch};
+
+    let config = TypesRegistryConfig::default();
+    let legacy = Arc::new(TypesRegistryService::new(
+        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
+        config,
+    ));
+    let host = Router::new()
+        .route(
+            "/host",
+            get(|Extension(_): Extension<Arc<TypesRegistryService>>| async {
+                StatusCode::NO_CONTENT
+            }),
+        )
+        .route(
+            &format!("{V1}/entities"),
+            patch(|| async { StatusCode::ACCEPTED }),
+        )
+        .fallback(|| async { StatusCode::IM_A_TEAPOT });
+    let openapi = toolkit::api::OpenApiRegistryImpl::new();
+    let app = types_registry::api::rest::routes::register_routes(host, &openapi, legacy, None);
+
+    for (method, uri, expected) in [
+        ("GET", "/host".to_owned(), StatusCode::NO_CONTENT),
+        ("PATCH", format!("{V1}/entities"), StatusCode::ACCEPTED),
+        ("GET", "/elsewhere".to_owned(), StatusCode::IM_A_TEAPOT),
+        // No caller context: the listener installed no plane for these.
+        ("GET", format!("{V1}/entities"), StatusCode::UNAUTHORIZED),
+        ("GET", format!("{V2}/entities"), StatusCode::UNAUTHORIZED),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{method} {uri}");
+    }
+}

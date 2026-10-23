@@ -2,6 +2,9 @@
 
 use std::sync::Arc;
 
+use axum::extract::Request;
+use axum::middleware::{Next, from_fn};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Router};
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::canonical_prelude::StatusCode;
@@ -18,6 +21,10 @@ use super::dto::{
 };
 use super::handlers;
 pub use super::paths::{PLATFORM_V1, V1, V2};
+use toolkit_canonical_errors::CanonicalError;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
+use types_registry_sdk::reason;
+
 use crate::config::Limits;
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
@@ -37,7 +44,7 @@ impl LicenseFeature for License {}
 /// Registers all REST routes for the Types Registry gear.
 #[allow(clippy::needless_pass_by_value)]
 pub fn register_routes(
-    mut router: Router,
+    host: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<TypesRegistryService>,
     registry: Option<Arc<RegistryService>>,
@@ -50,7 +57,7 @@ pub fn register_routes(
     // gateway discovery; an embedded host still mounts them on the gateway's one listener,
     // where the gateway validates the token. T38 promotes the tenant reads to V1.
 
-    router = register_v1(router, openapi);
+    let mut router = register_v1(Router::new(), openapi);
     let limits = registry
         .as_deref()
         .map_or_else(Limits::default, |registry| *registry.limits());
@@ -64,7 +71,36 @@ pub fn register_routes(
         router = register_discovery(router, openapi, &limits, plane);
     }
 
-    router.layer(Extension(service)).layer(Extension(registry))
+    // Only the registry's own routes are gated; the host's are not ours to refuse.
+    host.merge(router.route_layer(from_fn(require_caller)))
+        .layer(Extension(service))
+        .layer(Extension(registry))
+}
+
+/// A canonical `401` for a request that reaches a route with no caller context.
+///
+/// Every route here is authenticated on one plane, so its request carries the plane's
+/// context once the listener has validated the credential. A standalone host with no tenant
+/// authenticator installs no tenant plane at all (`oop_serve`), and its tenant routes would
+/// otherwise reach their handlers unauthenticated: the legacy reads served, the database
+/// reads failing their extractor with a `500` (SPEC §8.4). Platform routes are refused
+/// earlier by the listener's platform gate, so this never answers for them.
+async fn require_caller(request: Request, next: Next) -> Response {
+    let extensions = request.extensions();
+    if extensions.get::<SecurityContext>().is_some()
+        || extensions.get::<PlatformSecurityContext>().is_some()
+    {
+        return next.run(request).await;
+    }
+    tracing::warn!(
+        path = %request.uri().path(),
+        "types_registry refused a request with no validated caller; no tenant authenticator \
+         is installed"
+    );
+    CanonicalError::unauthenticated()
+        .with_reason(reason::unauthenticated::TENANT_AUTHENTICATION_UNAVAILABLE)
+        .create()
+        .into_response()
 }
 
 /// Declare the required mutation header via `param`. `OperationBuilder` still

@@ -59,6 +59,20 @@ pub async fn serve() -> PlatformServer {
 /// [`serve`], with `wrap` applied outermost, ahead of authentication: it sees every
 /// request as sent.
 pub async fn serve_with(wrap: impl FnOnce(Router) -> Router) -> PlatformServer {
+    serve_on(wrap, Some(DynBearerAuthenticator::new(StubBearer))).await
+}
+
+/// [`serve`] as a standalone host with no tenant authenticator in its `ClientHub`:
+/// `oop_serve` then installs no tenant plane.
+#[allow(dead_code, reason = "used by the auth matrix only")]
+pub async fn serve_without_tenant_authenticator() -> PlatformServer {
+    serve_on(|app| app, None).await
+}
+
+async fn serve_on(
+    wrap: impl FnOnce(Router) -> Router,
+    bearer: Option<DynBearerAuthenticator>,
+) -> PlatformServer {
     let dir = super::TestDir::new("tr-platform-tcp");
     let dsn = format!(
         "sqlite://{}?mode=rwc&journal_mode=wal",
@@ -106,7 +120,7 @@ pub async fn serve_with(wrap: impl FnOnce(Router) -> Router) -> PlatformServer {
     let app = wrap(layer_route_auth(
         router,
         policy,
-        Some(DynBearerAuthenticator::new(StubBearer)),
+        bearer,
         Some(DynInternalAuthenticator::new(internal)),
     ));
 
