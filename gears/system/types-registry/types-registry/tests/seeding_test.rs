@@ -69,7 +69,7 @@ async fn database(dir: &common::TestDir) -> Arc<DBProvider<DbError>> {
     common::provider_for_with_outbox(&dsn, 8).await
 }
 
-/// AM's linked base, copied verbatim from the e2e feature set's inventory.
+/// AM-style tenant-type base with the entity-reference keywords used by its inventory.
 fn am_base() -> Value {
     json!({
         "$id": format!("gts://{AM_BASE}"),
@@ -78,7 +78,7 @@ fn am_base() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "id": {"allOf": [{"type": "string", "format": "gts-instance-id", "x-gts-ref": "gts.*"}]},
+            "id": {"allOf": [{"type": "string", "format": "gts-instance-id", "x-gts-instance-ref": "gts.*"}]},
             "payload": {"type": "object"}
         },
         "required": ["payload"],
@@ -87,7 +87,7 @@ fn am_base() -> Value {
             "properties": {
                 "allowed_parent_types": {
                     "type": "array",
-                    "items": {"type": "string", "x-gts-ref": AM_BASE},
+                    "items": {"type": "string", "x-gts-type-ref": AM_BASE},
                     "default": []
                 },
                 "idp_provisioning": {"type": "boolean", "default": false}
@@ -99,7 +99,7 @@ fn am_base() -> Value {
     })
 }
 
-/// `config/e2e-local.yaml`'s customer: its platform-root parent is only an `x-gts-ref`.
+/// `config/e2e-local.yaml`'s customer: its platform-root parent is only an `x-gts-type-ref`.
 fn customer(description: &str) -> Value {
     json!({
         "$id": format!("gts://{CUSTOMER}"),
