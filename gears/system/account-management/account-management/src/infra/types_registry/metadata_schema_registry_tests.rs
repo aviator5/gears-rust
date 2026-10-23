@@ -10,7 +10,7 @@ use toolkit_gts::gts_uri;
 use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 use super::*;
-use crate::infra::types_registry::test_helpers::Tampered;
+use crate::infra::types_registry::test_helpers::{CallerSpy, Tampered, assert_only_caller, caller};
 
 const INHERITING: &str = "gts.cf.core.am.tenant_metadata.v1~acme.test.am.tier.v1~";
 const PLAIN: &str = "gts.cf.core.am.tenant_metadata.v1~acme.test.am.plain.v1~";
@@ -69,7 +69,7 @@ async fn reads_an_explicit_inherit_policy() {
     let adapter = GtsMetadataSchemaRegistry::new(registry());
 
     let policy = adapter
-        .resolve_inheritance_policy(&GtsTypeId::new(INHERITING))
+        .resolve_inheritance_policy(&caller(1), &GtsTypeId::new(INHERITING))
         .await
         .expect("policy");
 
@@ -81,7 +81,7 @@ async fn a_schema_without_traits_gets_the_envelope_default() {
     let adapter = GtsMetadataSchemaRegistry::new(registry());
 
     let policy = adapter
-        .resolve_inheritance_policy(&GtsTypeId::new(PLAIN))
+        .resolve_inheritance_policy(&caller(1), &GtsTypeId::new(PLAIN))
         .await
         .expect("policy");
 
@@ -99,7 +99,7 @@ async fn an_unknown_or_deleted_schema_is_a_metadata_not_found() {
         "gts.cf.core.am.tenant_metadata.v1~acme.test.am.absent.v1~",
     ] {
         let err = adapter
-            .resolve_inheritance_policy(&GtsTypeId::new(type_id))
+            .resolve_inheritance_policy(&caller(1), &GtsTypeId::new(type_id))
             .await
             .expect_err("not registered");
         assert!(
@@ -116,7 +116,7 @@ async fn a_failed_read_is_service_unavailable() {
     let adapter = GtsMetadataSchemaRegistry::new(registry);
 
     let err = adapter
-        .resolve_inheritance_policy(&GtsTypeId::new(INHERITING))
+        .resolve_inheritance_policy(&caller(1), &GtsTypeId::new(INHERITING))
         .await
         .expect_err("read failed");
     assert!(
@@ -130,7 +130,7 @@ async fn a_snapshot_without_effective_traits_is_not_the_default_policy() {
     let adapter = GtsMetadataSchemaRegistry::new(Arc::new(Tampered::without_documents(registry())));
 
     let err = adapter
-        .resolve_inheritance_policy(&GtsTypeId::new(INHERITING))
+        .resolve_inheritance_policy(&caller(1), &GtsTypeId::new(INHERITING))
         .await
         .expect_err("an incomplete projection is a contract break");
     assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
@@ -143,11 +143,19 @@ async fn validates_the_payload_against_the_resolved_schema() {
     let adapter = GtsMetadataSchemaRegistry::new(registry());
 
     adapter
-        .validate_value(&GtsTypeId::new(INHERITING), &json!({ "tier": "gold" }))
+        .validate_value(
+            &caller(1),
+            &GtsTypeId::new(INHERITING),
+            &json!({ "tier": "gold" }),
+        )
         .await
         .expect("a conforming value");
     let err = adapter
-        .validate_value(&GtsTypeId::new(INHERITING), &json!({ "tier": 3 }))
+        .validate_value(
+            &caller(1),
+            &GtsTypeId::new(INHERITING),
+            &json!({ "tier": 3 }),
+        )
         .await
         .expect_err("a malformed value");
     assert!(
@@ -155,7 +163,7 @@ async fn validates_the_payload_against_the_resolved_schema() {
         "{err:?}"
     );
     let err = adapter
-        .validate_value(&GtsTypeId::new(INHERITING), &json!({}))
+        .validate_value(&caller(1), &GtsTypeId::new(INHERITING), &json!({}))
         .await
         .expect_err("a missing required property");
     assert!(
@@ -171,7 +179,7 @@ async fn the_envelope_constraints_apply_to_a_derived_schema() {
     let adapter = GtsMetadataSchemaRegistry::new(registry());
 
     let err = adapter
-        .validate_value(&GtsTypeId::new(PLAIN), &json!("not an object"))
+        .validate_value(&caller(1), &GtsTypeId::new(PLAIN), &json!("not an object"))
         .await
         .expect_err("the envelope's payload type applies");
     assert!(
@@ -187,7 +195,11 @@ async fn a_deleted_schema_accepts_no_new_value() {
     let adapter = GtsMetadataSchemaRegistry::new(registry);
 
     let err = adapter
-        .validate_value(&GtsTypeId::new(INHERITING), &json!({ "tier": "gold" }))
+        .validate_value(
+            &caller(1),
+            &GtsTypeId::new(INHERITING),
+            &json!({ "tier": "gold" }),
+        )
         .await
         .expect_err("a tombstone is not registered");
     assert!(
@@ -201,7 +213,11 @@ async fn a_snapshot_without_resolved_schema_validates_nothing() {
     let adapter = GtsMetadataSchemaRegistry::new(Arc::new(Tampered::without_documents(registry())));
 
     let err = adapter
-        .validate_value(&GtsTypeId::new(INHERITING), &json!({ "tier": 3 }))
+        .validate_value(
+            &caller(1),
+            &GtsTypeId::new(INHERITING),
+            &json!({ "tier": 3 }),
+        )
         .await
         .expect_err("an incomplete projection is a contract break");
     assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
@@ -217,7 +233,7 @@ async fn hydrates_a_page_in_one_read_omitting_unknown_and_deleted_schemas() {
     let adapter = GtsMetadataSchemaRegistry::new(registry.clone());
 
     let ids = adapter
-        .resolve_ids_by_uuid(&[uuid(INHERITING), uuid(PLAIN), unknown])
+        .resolve_ids_by_uuid(&caller(1), &[uuid(INHERITING), uuid(PLAIN), unknown])
         .await
         .expect("hydration");
 
@@ -233,7 +249,7 @@ async fn a_failed_page_read_fails_hydration() {
     let adapter = GtsMetadataSchemaRegistry::new(registry);
 
     let err = adapter
-        .resolve_ids_by_uuid(&[uuid(INHERITING)])
+        .resolve_ids_by_uuid(&caller(1), &[uuid(INHERITING)])
         .await
         .expect_err("read failed");
     assert!(
@@ -249,12 +265,12 @@ async fn a_schema_that_does_not_round_trip_its_uuid_is_internal() {
     })));
 
     let err = adapter
-        .resolve_id_by_uuid(uuid(INHERITING))
+        .resolve_id_by_uuid(&caller(1), uuid(INHERITING))
         .await
         .expect_err("the answered id does not hash to the asked uuid");
     assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
     let err = adapter
-        .resolve_ids_by_uuid(&[uuid(INHERITING)])
+        .resolve_ids_by_uuid(&caller(1), &[uuid(INHERITING)])
         .await
         .expect_err("the same guard on the page");
     assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
@@ -267,11 +283,100 @@ async fn a_deleted_schema_uuid_is_an_orphan() {
     let adapter = GtsMetadataSchemaRegistry::new(registry);
 
     let err = adapter
-        .resolve_id_by_uuid(uuid(INHERITING))
+        .resolve_id_by_uuid(&caller(1), uuid(INHERITING))
         .await
         .expect_err("a tombstone hydrates nothing");
     assert!(
         matches!(err, DomainError::MetadataEntryNotFound { .. }),
         "{err:?}"
     );
+}
+
+// -------- who the schemas are read for (P33) --------
+
+/// One adapter serves every metadata request: each of its reads is made
+/// for the caller passed with it, and none reaches the platform API.
+#[tokio::test]
+async fn every_read_is_made_for_its_own_caller() {
+    let spy = CallerSpy::for_requests(registry());
+    let adapter = GtsMetadataSchemaRegistry::new(spy.clone());
+
+    for n in [1, 2] {
+        let ctx = caller(n);
+        adapter
+            .resolve_inheritance_policy(&ctx, &GtsTypeId::new(INHERITING))
+            .await
+            .expect("policy");
+        adapter
+            .validate_value(
+                &ctx,
+                &GtsTypeId::new(INHERITING),
+                &json!({ "tier": "gold" }),
+            )
+            .await
+            .expect("valid value");
+        adapter
+            .resolve_id_by_uuid(&ctx, uuid(INHERITING))
+            .await
+            .expect("known uuid");
+        adapter
+            .resolve_ids_by_uuid(&ctx, &[uuid(INHERITING), uuid(PLAIN)])
+            .await
+            .expect("known uuids");
+        assert_eq!(spy.callers().len(), 4, "one read per method");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+}
+
+/// A port implementation that relies on the default batch reverse lookup.
+struct SingleLookups(GtsMetadataSchemaRegistry);
+
+#[async_trait]
+impl MetadataSchemaRegistry for SingleLookups {
+    async fn resolve_inheritance_policy(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+    ) -> Result<InheritancePolicy, DomainError> {
+        self.0.resolve_inheritance_policy(ctx, type_id).await
+    }
+
+    async fn resolve_id_by_uuid(
+        &self,
+        ctx: &SecurityContext,
+        schema_uuid: Uuid,
+    ) -> Result<GtsTypeId, DomainError> {
+        self.0.resolve_id_by_uuid(ctx, schema_uuid).await
+    }
+
+    async fn validate_value(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+        value: &Value,
+    ) -> Result<(), DomainError> {
+        self.0.validate_value(ctx, type_id, value).await
+    }
+}
+
+/// The default `resolve_ids_by_uuid` forwards its caller to every single
+/// lookup it makes, and still omits unknown UUIDs.
+#[tokio::test]
+async fn the_default_batch_lookup_forwards_the_caller_to_each_lookup() {
+    let spy = CallerSpy::for_requests(registry());
+    let port = SingleLookups(GtsMetadataSchemaRegistry::new(spy.clone()));
+    let unknown = Uuid::from_u128(0xDEAD);
+
+    for n in [1, 2] {
+        let ctx = caller(n);
+        let found = port
+            .resolve_ids_by_uuid(&ctx, &[uuid(INHERITING), uuid(PLAIN), unknown])
+            .await
+            .expect("lookups");
+        assert_eq!(found.len(), 2, "the unknown uuid is omitted");
+        assert_eq!(spy.callers().len(), 3, "one lookup per uuid");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
 }

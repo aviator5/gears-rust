@@ -1311,7 +1311,7 @@ pub fn harness_tenant_type_uuid() -> Uuid {
 /// tenant type so `resolve_active_tenant` (which uses
 /// `tenant_type_uuid` to compute the chained id) does not fail closed.
 #[must_use]
-pub fn types_registry_for_users() -> Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> {
+pub fn types_registry_for_users() -> Arc<types_registry_sdk::testing_platform::MockTypesRegistry> {
     use serde_json::json;
     use types_registry_sdk::testing_platform::MockTypesRegistry;
 
@@ -1415,7 +1415,7 @@ pub fn build_services_full(
     harness: &Harness,
     idp: Arc<dyn IdpPluginClient>,
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
-    types_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>,
+    types_registry: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
 ) -> TestServices {
     build_services_full_with_sa_enforcer(
         harness,
@@ -1437,7 +1437,7 @@ pub fn build_services_full_with_sa_enforcer(
     harness: &Harness,
     idp: Arc<dyn IdpPluginClient>,
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
-    types_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>,
+    types_registry: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
     sa_enforcer: PolicyEnforcer,
 ) -> TestServices {
     build_services_with_enforcers(
@@ -1474,7 +1474,7 @@ pub fn build_services_with_enforcers(
     harness: &Harness,
     idp: Arc<dyn IdpPluginClient>,
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
-    types_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>,
+    types_registry: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
     tenant_enforcer: PolicyEnforcer,
     sa_enforcer: PolicyEnforcer,
 ) -> TestServices {
@@ -1491,20 +1491,23 @@ pub fn build_services_with_enforcers(
             tenant_enforcer,
             cfg,
         )
-        .with_types_registry(Arc::clone(&types_registry)),
+        .with_types_registry(
+            Arc::clone(&types_registry) as _,
+            Arc::clone(&types_registry) as _,
+        ),
     );
 
     let user_service = Arc::new(UserService::new(
         Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
         Arc::clone(&idp),
-        Arc::clone(&types_registry),
+        Arc::clone(&types_registry) as _,
         mock_enforcer(),
     ));
 
     let service_account_service = Arc::new(ServiceAccountService::new(
         Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
         Arc::clone(&idp),
-        Arc::clone(&types_registry),
+        Arc::clone(&types_registry) as _,
         sa_enforcer,
     ));
 

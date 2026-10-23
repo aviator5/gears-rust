@@ -125,7 +125,7 @@ pub struct AccountManagementGear {
     /// [`Self::service`] so SDK consumers and the REST surface for
     /// `/tenants/{id}/metadata` can drive the list / get / put /
     /// delete / resolve flows without re-discovering the resolved
-    /// `PlatformTypesRegistryApi`. Wired during [`Gear::init`]; remains
+    /// `TypesRegistryApi`. Wired during [`Gear::init`]; remains
     /// unset until init runs.
     metadata_service: OnceLock<Arc<MetadataService>>,
     /// Hooks registered before [`Gear::init`] has set up the service.
@@ -666,17 +666,28 @@ impl Gear for AccountManagementGear {
         // the service directly with `inert_tenant_type_checker()`
         // and bypass this init path.)
         //
-        // The resolved client is reused for three purposes:
-        //   * the type-compatibility barrier
-        //     ([`GtsTenantTypeChecker`])
-        //   * the `tenant_type_uuid` → chained-id lookup that lowers
-        //     `TenantModel` into the public
-        //     [`account_management_sdk::Tenant`] shape on every
-        //     service-layer CRUD return value.
-        //   * the `IdpPluginSpecV1` instance enumeration used by the
-        //     vendor-based plugin selection block immediately below.
-        // Without a database bound to types-registry the platform API is
-        // not published, and AM fails here: there is no legacy fallback.
+        // AM resolves both registry APIs and keeps them apart (P33):
+        //   * `request_registry` (`TypesRegistryApi`) serves every read
+        //     made while AM serves a request, under that request's own
+        //     `SecurityContext`: the type-compatibility barrier
+        //     ([`GtsTenantTypeChecker`]), the `tenant_type_uuid` →
+        //     chained-id lookup that lowers `TenantModel` into the public
+        //     [`account_management_sdk::Tenant`] shape, tenant-name and
+        //     user-payload validation, the user / service-account tenant
+        //     guard and the metadata schema registry. The shared services
+        //     hold the client only; the context arrives with each call.
+        //   * `platform_registry` (`PlatformTypesRegistryApi`) serves what
+        //     no request drives: root-type registration, the bootstrap
+        //     saga, the AM TR plugin's publication, retention and the
+        //     reaper, and two named system reads — the process-wide IdP
+        //     plugin selection below and the AM TR plugin's hierarchy
+        //     reads (see `tr_plugin::plugin_impl`).
+        // Without a database bound to types-registry neither API is
+        // published, and AM fails here: there is no legacy fallback.
+        let request_registry: Arc<dyn types_registry_sdk::TypesRegistryApi> = ctx
+            .client_hub()
+            .get::<dyn types_registry_sdk::TypesRegistryApi>()
+            .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryApi: {e}"))?;
         let platform_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = ctx
             .client_hub()
             .get::<dyn types_registry_sdk::PlatformTypesRegistryApi>()
@@ -739,7 +750,7 @@ impl Gear for AccountManagementGear {
 
         info!("types-registry client resolved from client hub; enabling GTS tenant-type checker");
         let tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync> =
-            Arc::new(GtsTenantTypeChecker::new(Arc::clone(&platform_registry)));
+            Arc::new(GtsTenantTypeChecker::new(Arc::clone(&request_registry)));
 
         // IdP provider plugin — lazy vendor-based selection.
         //
@@ -969,7 +980,10 @@ impl Gear for AccountManagementGear {
             enforcer,
             cfg,
         );
-        service = service.with_types_registry(Arc::clone(&platform_registry));
+        service = service.with_types_registry(
+            Arc::clone(&request_registry),
+            Arc::clone(&platform_registry),
+        );
 
         // Tenant Resolver Plugin (in-process, AM-co-located).
         //
@@ -1150,7 +1164,7 @@ impl Gear for AccountManagementGear {
             UserService::new(
                 Arc::clone(&repo) as Arc<dyn TenantRepo>,
                 Arc::clone(&idp),
-                Arc::clone(&platform_registry),
+                Arc::clone(&request_registry),
                 user_enforcer,
             )
             // Wire RG-membership cleanup so `delete_user` removes
@@ -1168,7 +1182,7 @@ impl Gear for AccountManagementGear {
         );
 
         // Build the service-account domain service. Shares the same
-        // `TenantRepoImpl` + platform registry client the user service uses
+        // `TenantRepoImpl` + request registry client the user service uses
         // for the tenant guard, and the same resolved `IdpPluginClient`
         // — machine identities are a separate PEP resource type, not a
         // separate provider. Holds no storage handles: like the user
@@ -1177,7 +1191,7 @@ impl Gear for AccountManagementGear {
         let service_account_service = Arc::new(ServiceAccountService::new(
             Arc::clone(&repo) as Arc<dyn TenantRepo>,
             Arc::clone(&idp),
-            Arc::clone(&platform_registry),
+            Arc::clone(&request_registry),
             service_account_enforcer,
         ));
 
@@ -1192,20 +1206,20 @@ impl Gear for AccountManagementGear {
         //   on every ancestor hop.
         // * `Arc<dyn MetadataSchemaRegistry>` — the new
         //   `GtsMetadataSchemaRegistry` adapter wrapping the resolved
-        //   `PlatformTypesRegistryApi`. Reads `inheritance_policy` from
+        //   `TypesRegistryApi`, read for each request's caller. Reads `inheritance_policy` from
         //   the materialized `effective_traits`; missing /
         //   non-`"inherit"` values collapse to the documented
         //   `override_only` default per FEATURE §3.1.
         //
         // The `idp.required` policy DOES NOT apply here: the metadata
-        // subsystem depends on `PlatformTypesRegistryApi` (already
+        // subsystem depends on `TypesRegistryApi` (already
         // hard-required up-stream when `types-registry` was resolved),
         // so the service is always built. There is no fall-back stub
         // in production — tests construct `MetadataService::new`
         // directly with a `StubMetadataSchemaRegistry`.
         let metadata_repo: Arc<dyn MetadataRepo> = Arc::new(MetadataRepoImpl::new(Arc::clone(&db)));
         let schema_registry: Arc<dyn MetadataSchemaRegistry> = Arc::new(
-            GtsMetadataSchemaRegistry::new(Arc::clone(&platform_registry)),
+            GtsMetadataSchemaRegistry::new(Arc::clone(&request_registry)),
         );
         let metadata_service = Arc::new(
             MetadataService::new(

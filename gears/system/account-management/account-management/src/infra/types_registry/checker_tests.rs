@@ -12,7 +12,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id, gts_uri};
 use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
-use crate::infra::types_registry::test_helpers::Tampered;
+use crate::infra::types_registry::test_helpers::{CallerSpy, Tampered, assert_only_caller, caller};
 
 const PLATFORM: &str = gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.platform.v1~");
 const CUSTOMER: &str = gts_id!("cf.core.am.tenant_type.v1~acme.am.tenant_type.customer.v1~");
@@ -73,7 +73,7 @@ async fn admits_when_parent_in_child_allowed_parent_types() {
     let checker = GtsTenantTypeChecker::new(registry.clone());
 
     checker
-        .check_parent_child(uuid(PLATFORM), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(CUSTOMER))
         .await
         .expect("admit when parent listed");
     // Single batch call — checker MUST NOT issue per-uuid round-trips.
@@ -89,7 +89,7 @@ async fn admits_same_type_nesting_when_self_listed() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     checker
-        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect("admit when self-nesting allowed");
 }
@@ -101,7 +101,7 @@ async fn rejects_same_type_nesting_when_self_not_listed() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("self-nesting must reject");
     assert!(matches!(err, DomainError::TypeNotAllowed { .. }));
@@ -119,7 +119,7 @@ async fn rejects_when_parent_not_in_allowed_list() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(stranger), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(stranger), uuid(CUSTOMER))
         .await
         .expect_err("parent not listed must reject");
     assert!(matches!(err, DomainError::TypeNotAllowed { .. }));
@@ -135,7 +135,7 @@ async fn a_parent_without_its_own_traits_gets_the_envelope_default() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(PLATFORM), uuid(PLATFORM))
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(PLATFORM))
         .await
         .expect_err("the default list is empty");
     assert!(
@@ -152,7 +152,7 @@ async fn rejects_child_not_under_envelope_as_invalid_tenant_type() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(ALIEN_ROOT), uuid(ALIEN_LEAF))
+        .check_parent_child(&caller(1), uuid(ALIEN_ROOT), uuid(ALIEN_LEAF))
         .await
         .expect_err("alien child must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
@@ -174,7 +174,7 @@ async fn rejects_parent_not_under_envelope_as_invalid_tenant_type() {
     })));
 
     let err = checker
-        .check_parent_child(uuid(ALIEN_LEAF), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(ALIEN_LEAF), uuid(CUSTOMER))
         .await
         .expect_err("alien parent must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
@@ -190,7 +190,7 @@ async fn rejects_child_not_registered_as_invalid_tenant_type() {
     let checker = GtsTenantTypeChecker::new(registry());
 
     let err = checker
-        .check_parent_child(Uuid::from_u128(0x1), Uuid::from_u128(0x2))
+        .check_parent_child(&caller(1), Uuid::from_u128(0x1), Uuid::from_u128(0x2))
         .await
         .expect_err("unregistered child must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
@@ -204,7 +204,7 @@ async fn rejects_parent_not_registered_as_invalid_tenant_type() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(Uuid::from_u128(0xCAFE), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), Uuid::from_u128(0xCAFE), uuid(CUSTOMER))
         .await
         .expect_err("missing parent must reject");
     assert!(matches!(err, DomainError::InvalidTenantType { .. }));
@@ -224,7 +224,7 @@ async fn a_deleted_child_type_admits_no_same_type_nesting() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("a tombstone is not a tenant type");
     assert!(
@@ -243,7 +243,7 @@ async fn a_deleted_child_type_admits_no_listed_parent() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(PLATFORM), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(CUSTOMER))
         .await
         .expect_err("a tombstone is not a tenant type");
     assert!(
@@ -261,7 +261,7 @@ async fn a_deleted_parent_type_is_refused_even_when_listed() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(PLATFORM), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(PLATFORM), uuid(CUSTOMER))
         .await
         .expect_err("a deleted parent type is refused");
     assert!(
@@ -287,7 +287,7 @@ async fn rejects_when_allowed_parent_types_contains_an_instance_identifier() {
     })));
 
     let err = checker
-        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("malformed entry must collapse the list to InvalidTenantType");
     assert!(
@@ -305,7 +305,7 @@ async fn rejects_when_allowed_parent_types_is_not_an_array() {
     })));
 
     let err = checker
-        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("malformed trait must reject");
     assert!(
@@ -326,7 +326,7 @@ async fn a_failed_batch_read_is_service_unavailable() {
     let checker = GtsTenantTypeChecker::new(registry);
 
     let err = checker
-        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("registry error must propagate");
     assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
@@ -341,7 +341,7 @@ async fn a_snapshot_without_the_selected_effective_traits_is_not_an_empty_list()
     let checker = GtsTenantTypeChecker::new(Arc::new(Tampered::without_documents(registry)));
 
     let err = checker
-        .check_parent_child(uuid(CUSTOMER), uuid(CUSTOMER))
+        .check_parent_child(&caller(1), uuid(CUSTOMER), uuid(CUSTOMER))
         .await
         .expect_err("an incomplete projection is a contract break");
     assert!(matches!(err, DomainError::Internal { .. }), "got: {err}");
@@ -354,7 +354,7 @@ async fn rejects_when_registry_probe_times_out() {
     let checker = GtsTenantTypeChecker::with_timeout(registry, 10);
 
     let err = checker
-        .check_parent_child(Uuid::from_u128(0x1), Uuid::from_u128(0x1))
+        .check_parent_child(&caller(1), Uuid::from_u128(0x1), Uuid::from_u128(0x1))
         .await
         .expect_err("slow registry must time out");
     assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
@@ -362,4 +362,49 @@ async fn rejects_when_registry_probe_times_out() {
         err.to_string().contains("types-registry: timeout exceeded"),
         "got: {err}"
     );
+}
+
+// -------- who the schemas are read for (P33) --------
+
+/// One checker serves every request: each check reads for the caller it
+/// was given, and none reaches the platform API.
+#[tokio::test]
+async fn each_check_reads_for_its_own_caller() {
+    let registry = registry();
+    seed_tenant_type(&registry, PLATFORM, None);
+    seed_tenant_type(&registry, CUSTOMER, Some(json!([PLATFORM])));
+    let spy = CallerSpy::for_requests(registry);
+    let checker = GtsTenantTypeChecker::new(spy.clone());
+
+    for n in [1, 2] {
+        let ctx = caller(n);
+        checker
+            .check_parent_child(&ctx, uuid(PLATFORM), uuid(CUSTOMER))
+            .await
+            .expect("admit when parent listed");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+}
+
+/// A failed tenant read is the check's answer; it is not retried on the
+/// platform API, which the spy refuses.
+#[tokio::test]
+async fn a_failed_read_does_not_fall_back_to_the_platform_api() {
+    let registry = registry();
+    registry.inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
+    let spy = CallerSpy::for_requests(registry);
+    let checker = GtsTenantTypeChecker::new(spy.clone());
+    let ctx = caller(1);
+
+    let err = checker
+        .check_parent_child(&ctx, uuid(PLATFORM), uuid(CUSTOMER))
+        .await
+        .expect_err("registry down");
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "got {err:?}"
+    );
+    assert_only_caller(&spy.callers(), &ctx);
+    assert_eq!(spy.platform_reads(), 0);
 }

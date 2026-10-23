@@ -1766,3 +1766,49 @@ mod cleanup {
         }
     }
 }
+
+// ---- who registry reads are made for (P33) --------------------
+
+/// Two callers through one shared service: the tenant guard's
+/// `tenant_type` read and the payload / patch schema reads are made for
+/// exactly the caller of each flow, and none reaches the platform API.
+#[tokio::test]
+async fn every_registry_read_names_the_requests_caller() {
+    use crate::infra::types_registry::test_helpers::{CallerSpy, assert_only_caller, caller_in};
+
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x70);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let user_id = Uuid::from_u128(0xF00D);
+    idp.set_create_projection(IdpUser::new(user_id, "alice"));
+    idp.set_update_projection(IdpUser::new(user_id, "alice"));
+    idp.set_list_items(vec![IdpUser::new(user_id, "alice")]);
+    let registry = Arc::new(registry_with_test_tenant_type());
+    seed_user_schema(&registry);
+    let spy = CallerSpy::for_requests(registry);
+    let svc = UserService::new(tenants, idp, spy.clone(), mock_enforcer());
+
+    for n in [1, 2] {
+        let ctx = caller_in(n, ctx_subject_root());
+        svc.create_user(&ctx, tenant_id, payload("alice"))
+            .await
+            .expect("create");
+        svc.update_user(&ctx, tenant_id, user_id, email_patch("new@example.com"))
+            .await
+            .expect("update");
+        svc.list_users(&ctx, tenant_id, ListUsersQuery::new(pagination()))
+            .await
+            .expect("list");
+        svc.get_user(&ctx, tenant_id, user_id).await.expect("get");
+        svc.delete_user(&ctx, tenant_id, user_id)
+            .await
+            .expect("delete");
+        // create and update: the tenant guard and the schema; list, get
+        // and delete: the tenant guard.
+        assert_eq!(spy.callers().len(), 7);
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+    assert_eq!(spy.platform_reads(), 0);
+}

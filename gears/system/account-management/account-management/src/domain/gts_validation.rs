@@ -4,7 +4,7 @@
 //! published under `gears/system/account-management/docs/schemas/`
 //! and registered in the GTS Types Registry at deployment time. This
 //! gear is the single AM-side seam that fetches a resolved schema
-//! from `PlatformTypesRegistryApi` and runs `jsonschema::validator_for`
+//! from the Types Registry and runs `jsonschema::validator_for`
 //! against the supplied field values — adapting the
 //! `cf-resource-group::domain::validation::validate_metadata_via_gts`
 //! pattern to AM's needs with one deliberate divergence: AM maps a
@@ -24,6 +24,14 @@
 //! fields. Validating per-property keeps the structural bounds
 //! authoritative without forcing synthetic `id` placeholders that
 //! couple the helper to the schema's `required` list.
+//!
+//! # Who reads the schema
+//!
+//! User payloads are validated only for a request, so their helpers take
+//! the request's `TypesRegistryApi` and `SecurityContext` and cannot be
+//! called on the platform API. The tenant-name check serves both a request
+//! (create / update) and the platform bootstrap saga, so it takes a
+//! [`TypeReads`] that names its caller.
 //!
 //! Service layers MUST call into this gear instead of hardcoding
 //! length / format constants at the call site so the schema files
@@ -83,13 +91,14 @@ use account_management_sdk::{IdpNewUser, IdpUserPatch};
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::SecurityContext;
 use types_registry_sdk::{
-    EntityField, FieldSelection, GtsTypeId, LifecycleStatus, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection, ReadOptions,
+    EntityField, FieldSelection, GtsTypeId, LifecycleStatus, Projection, ReadOptions,
+    TypesRegistryApi,
 };
 
 use crate::domain::error::DomainError;
+use crate::domain::type_reads::TypeReads;
 
 /// GTS type id of the Account Management user resource. Pinned to the
 /// same string the published JSON Schema declares as its `$id`.
@@ -127,9 +136,11 @@ pub(crate) const TENANT_TYPE_ID: &str = gts_id!("cf.core.am.tenant.v1~");
 /// See gear-level docs.
 pub async fn validate_new_user_payload_via_gts(
     payload: &IdpNewUser,
-    types_registry: &dyn PlatformTypesRegistryApi,
+    types_registry: &dyn TypesRegistryApi,
+    ctx: &SecurityContext,
 ) -> Result<(), DomainError> {
-    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, types_registry).await? else {
+    let reads = TypeReads::caller(types_registry, ctx);
+    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, reads).await? else {
         // Fail-closed: the user schema MUST be registered before
         // `provision_user` is exposed. Falling back to length-only
         // checks would silently disable `format: email` (and any
@@ -197,9 +208,11 @@ pub async fn validate_new_user_payload_via_gts(
 /// See gear-level docs.
 pub async fn validate_user_patch_via_gts(
     patch: &IdpUserPatch,
-    types_registry: &dyn PlatformTypesRegistryApi,
+    types_registry: &dyn TypesRegistryApi,
+    ctx: &SecurityContext,
 ) -> Result<(), DomainError> {
-    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, types_registry).await? else {
+    let reads = TypeReads::caller(types_registry, ctx);
+    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, reads).await? else {
         return Err(DomainError::service_unavailable(format!(
             "user patch validation requires `{USER_TYPE_ID}` to be registered \
              in the Types Registry; update_user is unavailable until the \
@@ -237,15 +250,17 @@ pub async fn validate_user_patch_via_gts(
 /// registered `gts.cf.core.am.tenant.v1~` (`minLength: 1, maxLength:
 /// 255`).
 ///
+/// `reads` names the caller: the request's context for create / update,
+/// the platform API for the bootstrap saga's root name only.
+///
 /// # Errors
 ///
 /// See gear-level docs.
 pub async fn validate_tenant_name_via_gts(
     name: &str,
-    types_registry: &dyn PlatformTypesRegistryApi,
+    reads: TypeReads<'_>,
 ) -> Result<(), DomainError> {
-    let Some(properties) = lookup_effective_properties(TENANT_TYPE_ID, types_registry).await?
-    else {
+    let Some(properties) = lookup_effective_properties(TENANT_TYPE_ID, reads).await? else {
         return Ok(());
     };
     validate_property_value(
@@ -262,12 +277,11 @@ pub async fn validate_tenant_name_via_gts(
 /// contract on other registry errors.
 async fn lookup_effective_properties(
     type_id: &'static str,
-    types_registry: &dyn PlatformTypesRegistryApi,
+    reads: TypeReads<'_>,
 ) -> Result<Option<BTreeMap<String, Vec<Value>>>, DomainError> {
     let projection = Projection::Select(FieldSelection::with(&[EntityField::ResolvedSchema]));
-    match types_registry
+    match reads
         .get_type_schema(
-            &PlatformSecurityContext::outbound_marker(),
             &GtsTypeId::new(type_id),
             ReadOptions {
                 projection,

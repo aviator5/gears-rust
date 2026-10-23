@@ -740,3 +740,48 @@ async fn revoke_denied_by_pdp_never_reaches_the_provider() {
     assert!(matches!(err, DomainError::CrossTenantDenied { .. }));
     assert_eq!(idp.revoke_call_count(), 0);
 }
+
+// ---- who registry reads are made for (P33) ------------------------
+
+/// Two callers through one shared service: the tenant guard's
+/// `tenant_type` read is made for exactly the caller of each flow, and
+/// none reaches the platform API.
+#[tokio::test]
+async fn the_tenant_guard_reads_for_each_requests_caller() {
+    use crate::infra::types_registry::test_helpers::{CallerSpy, assert_only_caller, caller_in};
+
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x3);
+    seed_tenant(&tenants, tenant_id, TenantStatus::Active, "acme");
+    let spy = CallerSpy::for_requests(Arc::new(registry_with_test_tenant_type()));
+    let svc = ServiceAccountService::new(
+        tenants,
+        Arc::new(FakeServiceAccountProvider::new()),
+        spy.clone(),
+        mock_enforcer(),
+    );
+
+    for n in [1, 2] {
+        let ctx = caller_in(n, ctx_subject_root());
+        let creds = svc
+            .create(
+                &ctx,
+                tenant_id,
+                "ci".to_owned(),
+                vec!["platform.read".to_owned()],
+            )
+            .await
+            .expect("create");
+        svc.list(&ctx, tenant_id).await.expect("list");
+        svc.rotate_secret(&ctx, tenant_id, &creds.client_id)
+            .await
+            .expect("rotate");
+        svc.revoke(&ctx, tenant_id, &creds.client_id)
+            .await
+            .expect("revoke");
+        assert_eq!(spy.callers().len(), 4, "one tenant guard per flow");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+    assert_eq!(spy.platform_reads(), 0);
+}

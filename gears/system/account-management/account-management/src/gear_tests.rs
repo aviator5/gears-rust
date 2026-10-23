@@ -543,6 +543,61 @@ mod no_seed_startup_tests {
         .with_db(DBProvider::new(db))
     }
 
+    /// AM init with only one of the two registry APIs in the hub.
+    async fn init_with_only(register: impl FnOnce(&ClientHub)) -> anyhow::Error {
+        let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {
+            account_management: json!({ "config": {} }),
+        });
+        let hub = Arc::new(ClientHub::new());
+        let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
+        hub.register::<dyn AuthZResolverApi>(authz);
+        register(&hub);
+        let gear = AccountManagementGear::default();
+        let ctx = context(
+            "account-management",
+            config,
+            hub,
+            migrated_sqlite(crate::Migrator::migrations()).await,
+        );
+        gear.init(&ctx)
+            .await
+            .expect_err("AM init must fail without both registry APIs")
+    }
+
+    /// Request paths read only through the tenant API: a host that
+    /// publishes the platform API alone fails AM init rather than
+    /// serving requests from the platform API (P33).
+    #[tokio::test]
+    async fn init_fails_without_the_tenant_api_even_with_the_platform_api() {
+        let err = init_with_only(|hub| {
+            let platform: Arc<dyn PlatformTypesRegistryApi> =
+                Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
+            hub.register::<dyn PlatformTypesRegistryApi>(platform);
+        })
+        .await;
+        assert!(
+            err.to_string().contains("failed to get TypesRegistryApi"),
+            "got: {err:#}"
+        );
+    }
+
+    /// And the platform paths need the platform API: the tenant API alone
+    /// does not stand in for it.
+    #[tokio::test]
+    async fn init_fails_without_the_platform_api_even_with_the_tenant_api() {
+        let err = init_with_only(|hub| {
+            let tenant: Arc<dyn types_registry_sdk::TypesRegistryApi> =
+                Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
+            hub.register::<dyn types_registry_sdk::TypesRegistryApi>(tenant);
+        })
+        .await;
+        assert!(
+            err.to_string()
+                .contains("failed to get PlatformTypesRegistryApi"),
+            "got: {err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn full_init_registers_and_validates_root_without_a_yaml_seed() {
         let config: Arc<dyn ConfigProvider> = Arc::new(StartupConfig {

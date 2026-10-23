@@ -31,7 +31,13 @@
 //!   deterministic `UUIDv5` derivation via upstream
 //!   [`gts::GtsId::to_uuid`].
 //! * `GtsMetadataSchemaRegistry` — the production implementation
-//!   backed by `types_registry_sdk::PlatformTypesRegistryApi`.
+//!   backed by `types_registry_sdk::TypesRegistryApi`.
+//!
+//! # Caller contract
+//!
+//! Every method runs for a metadata request and takes that request's
+//! [`SecurityContext`]. Implementations read the registry for that
+//! caller and keep no context between calls (P33).
 //!
 //! # Schema-id type contract
 //!
@@ -66,6 +72,7 @@ use gts::{GtsId, GtsTypeId};
 use parking_lot::Mutex;
 use serde_json::Value;
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -134,6 +141,7 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     /// projection.
     async fn resolve_inheritance_policy(
         &self,
+        ctx: &SecurityContext,
         type_id: &GtsTypeId,
     ) -> Result<InheritancePolicy, DomainError>;
 
@@ -150,7 +158,11 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     /// `Internal` rather than surfacing the UUID through a public
     /// envelope; this variant lets the registry stay schema-typed even
     /// when the row-level caller knows better.
-    async fn resolve_id_by_uuid(&self, schema_uuid: Uuid) -> Result<GtsTypeId, DomainError>;
+    async fn resolve_id_by_uuid(
+        &self,
+        ctx: &SecurityContext,
+        schema_uuid: Uuid,
+    ) -> Result<GtsTypeId, DomainError>;
 
     /// Batch reverse-lookup for the LIST flow: resolve a slice of
     /// `schema_uuid` values to their public chained ids in a single
@@ -161,8 +173,8 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     /// the map, so a single unregistered row does not poison the
     /// whole page.
     ///
-    /// Default impl is N round-trips per page; production adapter
-    /// overrides to a single registry call to amortise per-page.
+    /// Default impl is N round-trips per page, each for `ctx`; production
+    /// adapter overrides to a single registry call to amortise per-page.
     ///
     /// # Errors
     ///
@@ -170,11 +182,12 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     ///   failure (uniform with the single-row variant).
     async fn resolve_ids_by_uuid(
         &self,
+        ctx: &SecurityContext,
         schema_uuids: &[Uuid],
     ) -> Result<HashMap<Uuid, GtsTypeId>, DomainError> {
         let mut out = HashMap::with_capacity(schema_uuids.len());
         for &uuid in schema_uuids {
-            match self.resolve_id_by_uuid(uuid).await {
+            match self.resolve_id_by_uuid(ctx, uuid).await {
                 Ok(id) => {
                     out.insert(uuid, id);
                 }
@@ -207,7 +220,12 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     ///   required).
     /// * [`DomainError::Validation`] — `value` violates the schema;
     ///   the PUT handler maps this to HTTP 400 `code=validation`.
-    async fn validate_value(&self, type_id: &GtsTypeId, value: &Value) -> Result<(), DomainError>;
+    async fn validate_value(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+        value: &Value,
+    ) -> Result<(), DomainError>;
 }
 
 /// Compute the deterministic `schema_uuid` for an already-validated
@@ -325,6 +343,7 @@ impl Default for StubMetadataSchemaRegistry {
 impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
     async fn resolve_inheritance_policy(
         &self,
+        _ctx: &SecurityContext,
         type_id: &GtsTypeId,
     ) -> Result<InheritancePolicy, DomainError> {
         let state = self.inner.lock();
@@ -338,7 +357,11 @@ impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
             })
     }
 
-    async fn resolve_id_by_uuid(&self, schema_uuid: Uuid) -> Result<GtsTypeId, DomainError> {
+    async fn resolve_id_by_uuid(
+        &self,
+        _ctx: &SecurityContext,
+        schema_uuid: Uuid,
+    ) -> Result<GtsTypeId, DomainError> {
         let state = self.inner.lock();
         state
             .by_uuid
@@ -350,7 +373,12 @@ impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
             })
     }
 
-    async fn validate_value(&self, type_id: &GtsTypeId, _value: &Value) -> Result<(), DomainError> {
+    async fn validate_value(
+        &self,
+        _ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+        _value: &Value,
+    ) -> Result<(), DomainError> {
         let state = self.inner.lock();
         // Existence gate first — keeps the stub honest about the
         // unified-404 contract: validate_value against an unregistered

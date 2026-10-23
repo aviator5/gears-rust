@@ -37,7 +37,7 @@ use crate::domain::tenant::test_support::{
     FakeDeprovisionOutcome, FakeIdpProvisioner, FakeOutcome, FakeTenantRepo,
     constraint_bearing_enforcer, mock_enforcer,
 };
-use crate::infra::types_registry::test_helpers::ConstantTypeRegistry;
+use crate::infra::types_registry::test_helpers::{ConstantTypeRegistry, WithRegistry};
 use async_trait::async_trait;
 use std::sync::Mutex;
 use time::OffsetDateTime;
@@ -72,7 +72,7 @@ fn make_service(repo: Arc<FakeTenantRepo>, outcome: FakeOutcome) -> TenantServic
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)))
+    .with_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)))
 }
 
 fn child_input(child_id: Uuid, parent_id: Uuid) -> CreateTenantRequest {
@@ -140,7 +140,7 @@ async fn create_child_forwards_parent_context() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -820,7 +820,7 @@ fn svc_with(
         mock_enforcer(),
         cfg,
     )
-    .with_types_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)))
+    .with_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)))
 }
 
 #[allow(unknown_lints, de0309_must_have_domain_model)]
@@ -1310,7 +1310,7 @@ async fn reaper_records_idp_not_found_as_already_absent_distinct_from_compensate
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     let res = svc.reap_stuck_provisioning(StdDuration::from_secs(0)).await;
@@ -1378,7 +1378,7 @@ async fn reaper_defers_on_idp_retryable_failure() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     let res = svc.reap_stuck_provisioning(StdDuration::from_secs(0)).await;
@@ -1439,7 +1439,7 @@ async fn reaper_redrives_on_each_tick_when_idp_keeps_failing() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -1501,7 +1501,7 @@ async fn reaper_marks_terminal_failure_and_parks_row_out_of_retry_loop() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -1611,7 +1611,7 @@ async fn reaper_skips_rows_already_claimed_by_another_worker() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -1722,7 +1722,7 @@ async fn hard_delete_batch_skips_rows_already_claimed_by_another_worker() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -1789,7 +1789,7 @@ async fn hard_delete_batch_skips_parent_when_child_still_exists() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     svc.create_tenant(&ctx_for(root), child_input(parent, root))
@@ -1875,7 +1875,7 @@ async fn hard_delete_batch_holds_claim_on_deferred_child_present() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     svc.create_tenant(&ctx_for(root), child_input(parent, root))
@@ -1978,7 +1978,7 @@ async fn hard_delete_batch_invokes_cascade_hook_before_idp() {
         mock_enforcer(),
         cfg,
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -2054,7 +2054,7 @@ async fn hard_delete_batch_panicking_cascade_hook_classifies_terminal_and_parks(
         mock_enforcer(),
         cfg,
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -2161,7 +2161,7 @@ async fn hard_delete_batch_panicking_cascade_hook_classifies_terminal_and_parks(
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     let healthy_hook: TenantHardDeleteHook =
@@ -2223,7 +2223,7 @@ async fn hard_delete_batch_idp_terminal_parks_row_via_terminal_failure_at() {
         mock_enforcer(),
         cfg,
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -2428,6 +2428,7 @@ impl FakeTenantTypeChecker {
 impl TenantTypeChecker for FakeTenantTypeChecker {
     async fn check_parent_child(
         &self,
+        _ctx: &SecurityContext,
         parent_type: Uuid,
         child_type: Uuid,
     ) -> Result<(), DomainError> {
@@ -2464,7 +2465,7 @@ fn make_service_with_type_checker(
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)))
+    .with_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)))
 }
 
 /// AC §6 first bullet -- when the parent's `tenant_type` is not in
@@ -2816,7 +2817,7 @@ async fn hard_delete_batch_marks_idp_terminal_failure_as_failed() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -2876,7 +2877,7 @@ async fn create_tenant_finalization_tx_failure_compensates_idp_and_row() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -2933,7 +2934,7 @@ async fn create_tenant_finalization_failure_with_retryable_idp_leaves_row_for_re
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -2995,7 +2996,7 @@ async fn create_tenant_finalization_failure_persists_idp_metadata_for_reaper() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3058,7 +3059,7 @@ async fn create_tenant_upsert_idp_metadata_failure_runs_idp_compensation() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3111,7 +3112,7 @@ async fn create_tenant_clean_compensation_removes_pre_activation_idp_metadata() 
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3183,7 +3184,7 @@ async fn create_tenant_finalization_failure_with_unsupported_idp_required_leaves
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3258,7 +3259,7 @@ async fn hard_delete_batch_defers_unsupported_when_idp_required_true() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3316,7 +3317,7 @@ async fn reaper_marks_unsupported_terminal_when_idp_required_true() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3382,7 +3383,7 @@ async fn delete_tenant_propagates_rg_timeout_as_service_unavailable() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     // Create a child to act on.
@@ -3435,7 +3436,7 @@ async fn create_tenant_propagates_gts_timeout_as_service_unavailable() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3506,7 +3507,7 @@ async fn get_tenant_clamps_to_subtree_under_constraint_bearing_pdp() {
         constraint_bearing_enforcer(root),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     svc.create_tenant(&ctx_for(root), child_input(child, root))
@@ -3532,7 +3533,7 @@ async fn update_tenant_clamps_to_subtree_under_constraint_bearing_pdp() {
         constraint_bearing_enforcer(root),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     let target = Uuid::from_u128(0x301);
@@ -3565,7 +3566,7 @@ async fn delete_tenant_clamps_to_subtree_under_constraint_bearing_pdp() {
         constraint_bearing_enforcer(root),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
     let target = Uuid::from_u128(0x401);
@@ -3611,7 +3612,7 @@ async fn get_tenant_outside_caller_subtree_returns_not_found() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)));
+    .with_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)));
     setup_svc
         .create_tenant(&ctx_for(root), child_input(child, root))
         .await
@@ -3654,7 +3655,7 @@ async fn make_cross_subtree_svc(
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)));
+    .with_registry(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)));
     setup_svc
         .create_tenant(&ctx_for(root), child_input(child, root))
         .await
@@ -3834,7 +3835,7 @@ async fn reaper_terminal_counter_does_not_bump_on_lost_claim_during_mark() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -3956,7 +3957,7 @@ async fn reaper_compensable_path_refuses_delete_when_peer_reclaimed_and_parked_t
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -4084,7 +4085,7 @@ async fn hard_delete_batch_redacts_vendor_detail_on_retryable_failure() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -4144,7 +4145,7 @@ async fn hard_delete_batch_redacts_vendor_detail_on_terminal_failure() {
             ..AccountManagementConfig::default()
         },
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -4192,10 +4193,10 @@ async fn load_tenant_context_defers_on_gts_type_schema_not_found() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(Arc::new(uuid_not_found_types_registry()));
+    .with_registry(Arc::new(uuid_not_found_types_registry()));
 
     let err = svc
-        .load_tenant_context(root)
+        .load_tenant_context(CallerOrigin::Background, root)
         .await
         .expect_err("catalog drift on tenant_type_uuid MUST surface as ServiceUnavailable");
 
@@ -4238,7 +4239,7 @@ async fn create_tenant_rejects_oversize_provisioning_metadata_input() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -4290,7 +4291,7 @@ async fn create_tenant_rejects_oversize_plugin_returned_metadata_and_compensates
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -4335,7 +4336,7 @@ async fn create_tenant_accepts_metadata_at_cap_boundary() {
         mock_enforcer(),
         AccountManagementConfig::default(),
     )
-    .with_types_registry(::std::sync::Arc::new(ConstantTypeRegistry(
+    .with_registry(::std::sync::Arc::new(ConstantTypeRegistry(
         CUSTOMER_TENANT_TYPE_ID,
     )));
 
@@ -4544,4 +4545,154 @@ fn chain_is_complete_rejects_a_hole() {
 fn chain_is_complete_rejects_a_chain_on_a_direct_child() {
     let chain = [ancestor_at(2)];
     assert!(!chain_is_complete(1, 2, Some(&chain)));
+}
+
+// ---------------------------------------------------------------------------
+// Who registry reads are made for (P33)
+// ---------------------------------------------------------------------------
+
+mod caller_provenance {
+    use super::*;
+    use crate::infra::types_registry::test_helpers::{CallerSpy, assert_only_caller, caller_in};
+
+    /// Records the context of every check and admits it.
+    #[derive(Default)]
+    struct RecordingChecker(Mutex<Vec<SecurityContext>>);
+
+    #[async_trait]
+    impl TenantTypeChecker for RecordingChecker {
+        async fn check_parent_child(
+            &self,
+            ctx: &SecurityContext,
+            _parent_type: Uuid,
+            _child_type: Uuid,
+        ) -> Result<(), DomainError> {
+            self.0.lock().expect("lock").push(ctx.clone());
+            Ok(())
+        }
+    }
+
+    /// Two callers drive every public tenant flow through one shared
+    /// service: each registry read — the name check, the parent's `IdP`
+    /// context, the type check and every `tenant_type` lowering — is
+    /// made for exactly the caller of the flow, and none reaches the
+    /// platform API, which the spy refuses.
+    #[tokio::test]
+    async fn every_request_read_names_the_requests_caller() {
+        let root = Uuid::from_u128(0x100);
+        let repo = Arc::new(FakeTenantRepo::with_root(root));
+        let spy = CallerSpy::for_requests(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)));
+        let checker = Arc::new(RecordingChecker::default());
+        let svc = TenantService::new(
+            repo,
+            Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok)),
+            Arc::new(InertResourceOwnershipChecker),
+            checker.clone(),
+            mock_enforcer(),
+            AccountManagementConfig::default(),
+        )
+        .with_types_registry(spy.clone(), spy.clone());
+
+        for n in [1, 2] {
+            let ctx = caller_in(n, root);
+            let child = Uuid::from_u128(0x200 + n);
+
+            let created = svc
+                .create_tenant(&ctx, child_input(child, root))
+                .await
+                .expect("create");
+            assert_eq!(
+                created.tenant_type.as_deref(),
+                Some(CUSTOMER_TENANT_TYPE_ID)
+            );
+            svc.get_tenant(&ctx, child).await.expect("get");
+            svc.list_children(&ctx, root, &ODataQuery::default())
+                .await
+                .expect("list children");
+            svc.list_descendants(&ctx, root, &ODataQuery::default())
+                .await
+                .expect("list descendants");
+            svc.update_tenant(&ctx, child, UpdateTenantRequest::new().with_name("renamed"))
+                .await
+                .expect("update");
+            svc.suspend_tenant(&ctx, child).await.expect("suspend");
+            svc.unsuspend_tenant(&ctx, child).await.expect("unsuspend");
+            svc.delete_tenant(&ctx, child).await.expect("delete");
+
+            // name check + parent context + activation lowering, get,
+            // list children, list descendants, name check + lowering,
+            // suspend, unsuspend, delete.
+            assert_eq!(spy.callers().len(), 11, "every flow read the registry");
+            assert_only_caller(&spy.callers(), &ctx);
+            assert_only_caller(
+                &checker
+                    .0
+                    .lock()
+                    .expect("lock")
+                    .drain(..)
+                    .collect::<Vec<_>>(),
+                &ctx,
+            );
+            spy.clear();
+        }
+        assert_eq!(spy.platform_reads(), 0);
+    }
+
+    /// Retention has no request behind it: the `IdP` context it loads is
+    /// read through the platform API and never the tenant API.
+    #[tokio::test]
+    async fn retention_reads_through_the_platform_api() {
+        let root = Uuid::from_u128(0x100);
+        let repo = Arc::new(FakeTenantRepo::with_root(root));
+        repo.seed_soft_deleted_child_due_for_hard_delete(root);
+        let spy = CallerSpy::for_platform(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)));
+        let svc = make_service(repo, FakeOutcome::Ok).with_types_registry(spy.clone(), spy.clone());
+
+        let res = svc.hard_delete_batch(64).await;
+        assert_eq!(res.cleaned, 1);
+        assert_eq!(spy.platform_reads(), 1);
+        assert!(spy.callers().is_empty());
+    }
+
+    /// The provisioning reaper likewise reads through the platform API.
+    #[tokio::test]
+    async fn the_reaper_reads_through_the_platform_api() {
+        let root = Uuid::from_u128(0x100);
+        let repo = Arc::new(FakeTenantRepo::with_root(root));
+        let then = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("epoch");
+        repo.insert_tenant_raw(TenantModel {
+            id: Uuid::from_u128(0x215),
+            parent_id: Some(root),
+            name: "stuck".into(),
+            status: TenantStatus::Provisioning,
+            self_managed: false,
+            tenant_type_uuid: Uuid::from_u128(0xAA),
+            depth: 1,
+            created_at: then,
+            updated_at: then,
+            deleted_at: None,
+        });
+        let spy = CallerSpy::for_platform(Arc::new(ConstantTypeRegistry(CUSTOMER_TENANT_TYPE_ID)));
+        let svc = make_service(repo, FakeOutcome::Ok).with_types_registry(spy.clone(), spy.clone());
+
+        let res = svc.reap_stuck_provisioning(StdDuration::from_secs(0)).await;
+        assert_eq!(res.scanned, 1);
+        assert_eq!(spy.platform_reads(), 1);
+        assert!(spy.callers().is_empty());
+    }
+
+    /// An unknown tenant type still lowers to `tenant_type: None` for a
+    /// request, read for its caller only.
+    #[tokio::test]
+    async fn an_unknown_tenant_type_lowers_to_none_for_the_caller() {
+        let root = Uuid::from_u128(0x100);
+        let repo = Arc::new(FakeTenantRepo::with_root(root));
+        let spy = CallerSpy::for_requests(Arc::new(uuid_not_found_types_registry()));
+        let svc = make_service(repo, FakeOutcome::Ok).with_types_registry(spy.clone(), spy.clone());
+        let ctx = caller_in(1, root);
+
+        let tenant = svc.get_tenant(&ctx, root).await.expect("get");
+        assert_eq!(tenant.tenant_type, None);
+        assert_only_caller(&spy.callers(), &ctx);
+    }
 }

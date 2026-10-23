@@ -1048,11 +1048,13 @@ impl<R: TenantRepo> BootstrapService<R> {
         let Some(registry) = self.types_registry.as_ref() else {
             return Ok(());
         };
+        // A platform read: the saga runs for no request, and the root
+        // name is AM configuration, not a caller's input (P33).
         match tokio::time::timeout_at(
             deadline,
             crate::domain::gts_validation::validate_tenant_name_via_gts(
                 &self.cfg.root_name,
-                registry.as_ref(),
+                crate::domain::type_reads::TypeReads::Platform(registry.as_ref()),
             ),
         )
         .await

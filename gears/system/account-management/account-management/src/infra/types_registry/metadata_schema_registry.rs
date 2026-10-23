@@ -1,5 +1,5 @@
 //! `GtsMetadataSchemaRegistry` — production [`MetadataSchemaRegistry`]
-//! wired against `types_registry_sdk::PlatformTypesRegistryApi` resolved
+//! wired against `types_registry_sdk::TypesRegistryApi` resolved
 //! from `ClientHub`.
 //!
 //! Responsibilities (see
@@ -35,10 +35,10 @@ use gts::{GtsId, GtsTypeId};
 use serde_json::Value;
 use std::sync::Arc;
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::SecurityContext;
 use types_registry_sdk::{
-    EntityField, FieldSelection, LifecycleStatus, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
+    EntityField, FieldSelection, LifecycleStatus, Projection, ReadOptions, TypeSchema,
+    TypesRegistryApi, TypesRegistryApiExt,
 };
 use uuid::Uuid;
 
@@ -60,16 +60,17 @@ const INHERIT_POLICY_TOKEN: &str = "inherit";
 const OVERRIDE_POLICY_TOKEN: &str = "override_only";
 
 /// Production [`MetadataSchemaRegistry`] backed by the GTS Types
-/// Registry.
+/// Registry. Shared by every metadata request; each read is made for the
+/// caller passed with it.
 pub struct GtsMetadataSchemaRegistry {
-    registry: Arc<dyn PlatformTypesRegistryApi>,
+    registry: Arc<dyn TypesRegistryApi>,
 }
 
 impl GtsMetadataSchemaRegistry {
-    /// Construct a new registry adapter around the platform registry
+    /// Construct a new registry adapter around the tenant registry
     /// client resolved from `ClientHub`.
     #[must_use]
-    pub fn new(registry: Arc<dyn PlatformTypesRegistryApi>) -> Self {
+    pub fn new(registry: Arc<dyn TypesRegistryApi>) -> Self {
         Self { registry }
     }
 }
@@ -91,14 +92,15 @@ fn map_registry_err(err: CanonicalError, schema_token: &str) -> DomainError {
 /// One Type Schema by identifier under `projection`; a deleted schema is
 /// as absent as an unknown one.
 async fn read_schema(
-    registry: &dyn PlatformTypesRegistryApi,
+    registry: &dyn TypesRegistryApi,
+    ctx: &SecurityContext,
     type_id: &GtsTypeId,
     projection: Projection,
 ) -> Result<TypeSchema, DomainError> {
     let schema_str = type_id.as_ref();
     let schema = registry
         .get_type_schema(
-            &PlatformSecurityContext::outbound_marker(),
+            ctx,
             type_id,
             ReadOptions {
                 projection,
@@ -186,10 +188,12 @@ fn uuid_for_registered_schema(type_id: &str) -> Uuid {
 impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
     async fn resolve_inheritance_policy(
         &self,
+        ctx: &SecurityContext,
         type_id: &GtsTypeId,
     ) -> Result<InheritancePolicy, DomainError> {
         let schema = read_schema(
             self.registry.as_ref(),
+            ctx,
             type_id,
             Projection::Select(FieldSelection::with(&[EntityField::EffectiveTraits])),
         )
@@ -238,6 +242,7 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
 
     async fn resolve_ids_by_uuid(
         &self,
+        ctx: &SecurityContext,
         schema_uuids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, GtsTypeId>, DomainError> {
         // One batch read per page. A failed read fails the whole lookup;
@@ -245,11 +250,7 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
         // and the service layer decides per-row how to surface the miss.
         let found = self
             .registry
-            .batch_get_type_schemas_by_uuid(
-                &PlatformSecurityContext::outbound_marker(),
-                schema_uuids,
-                ReadOptions::default(),
-            )
+            .batch_get_type_schemas_by_uuid(ctx, schema_uuids, ReadOptions::default())
             .await
             .map_err(|err| DomainError::service_unavailable(format!("types-registry: {err}")))?;
         let mut out = std::collections::HashMap::with_capacity(found.len());
@@ -263,15 +264,15 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
         Ok(out)
     }
 
-    async fn resolve_id_by_uuid(&self, schema_uuid: Uuid) -> Result<GtsTypeId, DomainError> {
+    async fn resolve_id_by_uuid(
+        &self,
+        ctx: &SecurityContext,
+        schema_uuid: Uuid,
+    ) -> Result<GtsTypeId, DomainError> {
         let token = schema_uuid.to_string();
         let schema = self
             .registry
-            .get_type_schema_by_uuid(
-                &PlatformSecurityContext::outbound_marker(),
-                schema_uuid,
-                ReadOptions::default(),
-            )
+            .get_type_schema_by_uuid(ctx, schema_uuid, ReadOptions::default())
             .await
             .map_err(|err| map_registry_err(err, &token))?;
         if schema.lifecycle_status != LifecycleStatus::Active {
@@ -280,7 +281,12 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
         round_tripped(&schema, schema_uuid)
     }
 
-    async fn validate_value(&self, type_id: &GtsTypeId, value: &Value) -> Result<(), DomainError> {
+    async fn validate_value(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+        value: &Value,
+    ) -> Result<(), DomainError> {
         // Mirrors the `validate_provision_input_metadata_via_gts` pattern
         // from `domain::gts_validation` (the canonical AM seam for GTS
         // body validation) — single round-trip to the registry, then
@@ -296,6 +302,7 @@ impl MetadataSchemaRegistry for GtsMetadataSchemaRegistry {
         // public 404, not a deploy-prerequisite failure.
         let schema = read_schema(
             self.registry.as_ref(),
+            ctx,
             type_id,
             Projection::Select(FieldSelection::with(&[EntityField::ResolvedSchema])),
         )

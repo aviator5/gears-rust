@@ -42,7 +42,8 @@ use toolkit_gts::gts_uri;
 use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 use crate::domain::error::DomainError;
-use crate::infra::types_registry::test_helpers::Tampered;
+use crate::domain::type_reads::TypeReads;
+use crate::infra::types_registry::test_helpers::{CallerSpy, Tampered, assert_only_caller, caller};
 
 // ---- helpers -------------------------------------------------------
 
@@ -125,7 +126,7 @@ fn unavailable_registry() -> MockTypesRegistry {
 async fn user_payload_schema_not_registered_surfaces_service_unavailable() {
     let registry = MockTypesRegistry::new();
     let payload = user_payload("alice");
-    let err = super::validate_new_user_payload_via_gts(&payload, &registry)
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect_err(
             "schema-not-found MUST fail closed: provision_user has no AM-side \
@@ -148,7 +149,7 @@ async fn user_payload_schema_not_registered_surfaces_service_unavailable() {
 async fn user_payload_valid_username_passes_registered_schema() {
     let registry = registry_with_user_schema(255);
     let payload = user_payload("alice");
-    super::validate_new_user_payload_via_gts(&payload, &registry)
+    super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect("valid username passes the registered schema");
 }
@@ -157,7 +158,7 @@ async fn user_payload_valid_username_passes_registered_schema() {
 async fn user_payload_oversized_username_rejects_with_validation() {
     let registry = registry_with_user_schema(255);
     let payload = user_payload(&"x".repeat(256));
-    let err = super::validate_new_user_payload_via_gts(&payload, &registry)
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect_err("oversize username must be rejected by the registered schema");
     match err {
@@ -175,7 +176,7 @@ async fn user_payload_oversized_username_rejects_with_validation() {
 async fn user_payload_registry_transport_error_surfaces_as_service_unavailable() {
     let registry = unavailable_registry();
     let payload = user_payload("alice");
-    let err = super::validate_new_user_payload_via_gts(&payload, &registry)
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect_err("registry transport error must surface");
     assert!(
@@ -189,7 +190,7 @@ async fn user_payload_registry_transport_error_surfaces_as_service_unavailable()
 #[tokio::test]
 async fn tenant_name_schema_not_registered_short_circuits_to_ok() {
     let registry = MockTypesRegistry::new();
-    super::validate_tenant_name_via_gts("acme", &registry)
+    super::validate_tenant_name_via_gts("acme", TypeReads::caller(&registry, &caller(1)))
         .await
         .expect("schema-not-found short-circuits to Ok");
 }
@@ -197,7 +198,7 @@ async fn tenant_name_schema_not_registered_short_circuits_to_ok() {
 #[tokio::test]
 async fn tenant_name_valid_passes_registered_schema() {
     let registry = registry_with_tenant_schema(255);
-    super::validate_tenant_name_via_gts("acme", &registry)
+    super::validate_tenant_name_via_gts("acme", TypeReads::caller(&registry, &caller(1)))
         .await
         .expect("valid name passes the registered schema");
 }
@@ -206,9 +207,10 @@ async fn tenant_name_valid_passes_registered_schema() {
 async fn tenant_name_oversized_rejects_with_validation() {
     let registry = registry_with_tenant_schema(255);
     let oversized = "x".repeat(256);
-    let err = super::validate_tenant_name_via_gts(&oversized, &registry)
-        .await
-        .expect_err("oversize name must be rejected");
+    let err =
+        super::validate_tenant_name_via_gts(&oversized, TypeReads::caller(&registry, &caller(1)))
+            .await
+            .expect_err("oversize name must be rejected");
     match err {
         DomainError::Validation { detail } => {
             assert!(
@@ -223,7 +225,7 @@ async fn tenant_name_oversized_rejects_with_validation() {
 #[tokio::test]
 async fn tenant_name_empty_rejects_with_validation() {
     let registry = registry_with_tenant_schema(255);
-    let err = super::validate_tenant_name_via_gts("", &registry)
+    let err = super::validate_tenant_name_via_gts("", TypeReads::caller(&registry, &caller(1)))
         .await
         .expect_err("empty name must be rejected");
     assert!(matches!(err, DomainError::Validation { .. }));
@@ -232,7 +234,7 @@ async fn tenant_name_empty_rejects_with_validation() {
 #[tokio::test]
 async fn tenant_name_registry_transport_error_surfaces_as_service_unavailable() {
     let registry = unavailable_registry();
-    let err = super::validate_tenant_name_via_gts("acme", &registry)
+    let err = super::validate_tenant_name_via_gts("acme", TypeReads::caller(&registry, &caller(1)))
         .await
         .expect_err("registry transport error must surface");
     assert!(
@@ -275,12 +277,16 @@ async fn user_payload_honours_properties_inherited_through_a_reference() {
         ),
     );
 
-    super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry)
+    super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry, &caller(1))
         .await
         .expect("an inherited bound admits a short username");
-    let err = super::validate_new_user_payload_via_gts(&user_payload("alexandria"), &registry)
-        .await
-        .expect_err("the inherited maxLength applies");
+    let err = super::validate_new_user_payload_via_gts(
+        &user_payload("alexandria"),
+        &registry,
+        &caller(1),
+    )
+    .await
+    .expect_err("the inherited maxLength applies");
     assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
 }
 
@@ -290,7 +296,7 @@ async fn user_payload_validates_against_the_published_user_schema() {
     registry.seed_inventory();
     let payload = user_payload(&"x".repeat(256));
 
-    let err = super::validate_new_user_payload_via_gts(&payload, &registry)
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect_err("the published schema's username bound applies");
     assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
@@ -301,9 +307,10 @@ async fn a_snapshot_without_the_selected_resolved_schema_is_internal() {
     let registry = Arc::new(registry_with_user_schema(255));
     let tampered = Tampered::without_documents(registry);
 
-    let err = super::validate_new_user_payload_via_gts(&user_payload("alice"), &tampered)
-        .await
-        .expect_err("an incomplete projection is a contract break");
+    let err =
+        super::validate_new_user_payload_via_gts(&user_payload("alice"), &tampered, &caller(1))
+            .await
+            .expect_err("an incomplete projection is a contract break");
     assert!(matches!(err, DomainError::Internal { .. }), "got {err:?}");
 }
 
@@ -313,9 +320,10 @@ async fn a_deleted_user_schema_fails_closed_as_unregistered() {
     let content = registry.content(super::USER_TYPE_ID).expect("seeded");
     registry.seed_entity(Seed::new(super::USER_TYPE_ID, content).deleted());
 
-    let err = super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry)
-        .await
-        .expect_err("a tombstone is not a registered schema");
+    let err =
+        super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry, &caller(1))
+            .await
+            .expect_err("a tombstone is not a registered schema");
     assert!(
         matches!(err, DomainError::ServiceUnavailable { .. }),
         "got {err:?}"
@@ -340,11 +348,15 @@ async fn an_inline_all_of_bound_applies_beside_the_own_property() {
         }),
     );
 
-    let err = super::validate_new_user_payload_via_gts(&user_payload("alexandria"), &registry)
-        .await
-        .expect_err("the tighter allOf bound applies");
+    let err = super::validate_new_user_payload_via_gts(
+        &user_payload("alexandria"),
+        &registry,
+        &caller(1),
+    )
+    .await
+    .expect_err("the tighter allOf bound applies");
     assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
-    super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry)
+    super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry, &caller(1))
         .await
         .expect("both bounds admit a short name");
 }
@@ -364,7 +376,9 @@ async fn bounds_from_two_all_of_members_both_apply() {
     );
 
     for (name, ok) in [("al", false), ("alice", true), ("alexandria", false)] {
-        let result = super::validate_new_user_payload_via_gts(&user_payload(name), &registry).await;
+        let result =
+            super::validate_new_user_payload_via_gts(&user_payload(name), &registry, &caller(1))
+                .await;
         assert_eq!(result.is_ok(), ok, "{name}: {result:?}");
     }
 }
@@ -393,7 +407,7 @@ async fn a_referenced_bound_applies_beside_the_own_property_on_patch() {
     );
     let patch = account_management_sdk::IdpUserPatch::new().with_username("alexandria");
 
-    let err = super::validate_user_patch_via_gts(&patch, &registry)
+    let err = super::validate_user_patch_via_gts(&patch, &registry, &caller(1))
         .await
         .expect_err("the referenced bound applies");
     assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
@@ -414,8 +428,75 @@ async fn an_inline_bound_applies_to_the_tenant_name() {
         ),
     );
 
-    let err = super::validate_tenant_name_via_gts("acme-corp", &registry)
-        .await
-        .expect_err("the inline bound applies");
+    let err =
+        super::validate_tenant_name_via_gts("acme-corp", TypeReads::caller(&registry, &caller(1)))
+            .await
+            .expect_err("the inline bound applies");
     assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+}
+
+// ---- who the schema is read for (P33) -----------------------------
+
+/// Two requests through one shared registry: each read names its own
+/// caller, and neither reaches the platform API.
+#[tokio::test]
+async fn user_payload_and_patch_read_for_each_request_caller() {
+    let spy = CallerSpy::for_requests(Arc::new(registry_with_user_schema(255)));
+    let patch = account_management_sdk::IdpUserPatch::new().with_username("bob");
+
+    for n in [1, 2] {
+        let ctx = caller(n);
+        super::validate_new_user_payload_via_gts(&user_payload("alice"), spy.as_ref(), &ctx)
+            .await
+            .expect("valid payload");
+        super::validate_user_patch_via_gts(&patch, spy.as_ref(), &ctx)
+            .await
+            .expect("valid patch");
+        assert_only_caller(&spy.callers(), &ctx);
+        assert_eq!(spy.callers().len(), 2, "one schema read per helper");
+        spy.clear();
+    }
+}
+
+#[tokio::test]
+async fn tenant_name_reads_for_each_request_caller() {
+    let spy = CallerSpy::for_requests(Arc::new(registry_with_tenant_schema(255)));
+    for n in [1, 2] {
+        let ctx = caller(n);
+        super::validate_tenant_name_via_gts("acme", TypeReads::caller(spy.as_ref(), &ctx))
+            .await
+            .expect("valid name");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+}
+
+/// A tenant-API failure is the request's answer: it is not retried on
+/// the platform API, which the spy would refuse.
+#[tokio::test]
+async fn a_failed_request_read_does_not_fall_back_to_the_platform_api() {
+    let spy = CallerSpy::for_requests(Arc::new(unavailable_registry()));
+    let ctx = caller(1);
+    let err = super::validate_tenant_name_via_gts("acme", TypeReads::caller(spy.as_ref(), &ctx))
+        .await
+        .expect_err("registry down");
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "got {err:?}"
+    );
+    assert_only_caller(&spy.callers(), &ctx);
+    assert_eq!(spy.platform_reads(), 0);
+}
+
+/// The bootstrap saga has no request: its root-name check reads through
+/// the platform API and never the tenant API.
+#[tokio::test]
+async fn the_platform_tenant_name_check_reads_only_the_platform_api() {
+    let spy = CallerSpy::for_platform(Arc::new(registry_with_tenant_schema(4)));
+    let err = super::validate_tenant_name_via_gts("acme-corp", TypeReads::Platform(spy.as_ref()))
+        .await
+        .expect_err("the platform read still applies the bound");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+    assert_eq!(spy.platform_reads(), 1);
+    assert!(spy.callers().is_empty());
 }

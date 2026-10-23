@@ -219,3 +219,291 @@ impl types_registry_sdk::PlatformTypesRegistryApi for ConstantTypeRegistry {
         Err(not_implemented())
     }
 }
+
+/// The API a [`CallerSpy`] refuses: calling it panics the test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forbid {
+    /// A request path: every read must name the caller, so the platform
+    /// API is never reached.
+    Platform,
+    /// A platform operation (bootstrap, retention, reaper): there is no
+    /// caller to name, so the tenant API is never reached.
+    Tenant,
+}
+
+/// One read the spy answered: the caller's full context for a tenant
+/// read, nothing for a platform one.
+#[derive(Debug, Clone)]
+pub enum Seen {
+    Tenant(toolkit_security::SecurityContext),
+    Platform,
+}
+
+/// A registry that records who every read is made for and answers it
+/// from `inner`. The SDK mock and the local client ignore the caller, so
+/// only a spy shows that a request's own `SecurityContext` arrived — the
+/// clone keeps the bearer token that serde would drop.
+pub struct CallerSpy<R> {
+    inner: Arc<R>,
+    forbid: Forbid,
+    seen: parking_lot::Mutex<Vec<Seen>>,
+}
+
+impl<R> CallerSpy<R> {
+    /// A spy for request paths: tenant reads are recorded, a platform
+    /// call panics.
+    pub fn for_requests(inner: Arc<R>) -> Arc<Self> {
+        Self::forbidding(inner, Forbid::Platform)
+    }
+
+    /// A spy for platform operations: platform reads are recorded, a
+    /// tenant call panics.
+    pub fn for_platform(inner: Arc<R>) -> Arc<Self> {
+        Self::forbidding(inner, Forbid::Tenant)
+    }
+
+    fn forbidding(inner: Arc<R>, forbid: Forbid) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            forbid,
+            seen: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The contexts of every tenant read, in order.
+    pub fn callers(&self) -> Vec<toolkit_security::SecurityContext> {
+        self.seen
+            .lock()
+            .iter()
+            .filter_map(|seen| match seen {
+                Seen::Tenant(ctx) => Some(ctx.clone()),
+                Seen::Platform => None,
+            })
+            .collect()
+    }
+
+    /// How many platform reads were made.
+    pub fn platform_reads(&self) -> usize {
+        self.seen
+            .lock()
+            .iter()
+            .filter(|seen| matches!(seen, Seen::Platform))
+            .count()
+    }
+
+    /// Forget what was seen, so a second caller's reads stand alone.
+    pub fn clear(&self) {
+        self.seen.lock().clear();
+    }
+
+    fn tenant(&self, ctx: &toolkit_security::SecurityContext) {
+        assert_ne!(
+            self.forbid,
+            Forbid::Tenant,
+            "a platform operation read through the tenant API"
+        );
+        self.seen.lock().push(Seen::Tenant(ctx.clone()));
+    }
+
+    fn platform(&self) {
+        assert_ne!(
+            self.forbid,
+            Forbid::Platform,
+            "a request path read through the platform API"
+        );
+        self.seen.lock().push(Seen::Platform);
+    }
+}
+
+#[async_trait]
+impl<R: types_registry_sdk::TypesRegistryApi + 'static> types_registry_sdk::TypesRegistryApi
+    for CallerSpy<R>
+{
+    async fn batch_get_entities(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.tenant(ctx);
+        self.inner.batch_get_entities(ctx, request).await
+    }
+
+    async fn list_entities(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        self.tenant(ctx);
+        self.inner.list_entities(ctx, request).await
+    }
+}
+
+#[async_trait]
+impl<R: types_registry_sdk::PlatformTypesRegistryApi + 'static>
+    types_registry_sdk::PlatformTypesRegistryApi for CallerSpy<R>
+{
+    async fn batch_get_entities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.platform();
+        self.inner.batch_get_entities(ctx, request).await
+    }
+
+    async fn list_entities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        self.platform();
+        self.inner.list_entities(ctx, request).await
+    }
+
+    async fn register_entities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        key: types_registry_sdk::IdempotencyKey,
+        request: types_registry_sdk::RegisterEntitiesRequest,
+    ) -> Result<types_registry_sdk::RegistrationOperation, CanonicalError> {
+        self.platform();
+        self.inner.register_entities(ctx, key, request).await
+    }
+
+    async fn delete_entities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        key: types_registry_sdk::IdempotencyKey,
+        request: types_registry_sdk::DeleteEntitiesRequest,
+    ) -> Result<types_registry_sdk::DeletionOperation, CanonicalError> {
+        self.platform();
+        self.inner.delete_entities(ctx, key, request).await
+    }
+
+    async fn get_operation(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        operation_id: Uuid,
+    ) -> Result<types_registry_sdk::Operation, CanonicalError> {
+        self.platform();
+        self.inner.get_operation(ctx, operation_id).await
+    }
+}
+
+/// A distinct, fully populated caller: subject, subject type, home
+/// tenant, scopes and bearer token all derive from `n`.
+pub fn caller(n: u128) -> toolkit_security::SecurityContext {
+    caller_in(n, Uuid::from_u128(0x7E4A_4700_0000 + n))
+}
+
+/// As [`caller`], homed in `tenant`: for services whose PDP scope is the
+/// caller's home subtree.
+pub fn caller_in(n: u128, tenant: Uuid) -> toolkit_security::SecurityContext {
+    toolkit_security::SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0xC0FF_EE00_0000 + n))
+        .subject_type("user")
+        .subject_tenant_id(tenant)
+        .token_scopes(vec![format!("scope-{n}"), "am:read".to_owned()])
+        .bearer_token(format!("bearer-{n}"))
+        .build()
+        .expect("a complete caller context")
+}
+
+/// Asserts every context the spy recorded is `expected` itself — the
+/// bearer token included, which a serde round-trip would lose — and
+/// that at least one was recorded.
+pub fn assert_only_caller(
+    seen: &[toolkit_security::SecurityContext],
+    expected: &toolkit_security::SecurityContext,
+) {
+    use secrecy::ExposeSecret;
+    assert!(!seen.is_empty(), "no tenant read named the caller");
+    for ctx in seen {
+        assert_eq!(ctx.subject_id(), expected.subject_id());
+        assert_eq!(ctx.subject_type(), expected.subject_type());
+        assert_eq!(ctx.subject_tenant_id(), expected.subject_tenant_id());
+        assert_eq!(ctx.token_scopes(), expected.token_scopes());
+        assert_eq!(
+            ctx.bearer_token().map(ExposeSecret::expose_secret),
+            expected.bearer_token().map(ExposeSecret::expose_secret),
+            "the caller's bearer token was not forwarded"
+        );
+    }
+}
+
+#[async_trait]
+impl types_registry_sdk::TypesRegistryApi for Tampered {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &toolkit_security::SecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        types_registry_sdk::PlatformTypesRegistryApi::batch_get_entities(
+            self,
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            request,
+        )
+        .await
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &toolkit_security::SecurityContext,
+        request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        types_registry_sdk::PlatformTypesRegistryApi::list_entities(
+            self,
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            request,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl types_registry_sdk::TypesRegistryApi for ConstantTypeRegistry {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &toolkit_security::SecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        types_registry_sdk::PlatformTypesRegistryApi::batch_get_entities(
+            self,
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            request,
+        )
+        .await
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &toolkit_security::SecurityContext,
+        _request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        Err(not_implemented())
+    }
+}
+
+/// Wires one test registry as both of a `TenantService`'s clients, for
+/// tests that do not distinguish who a read is made for.
+pub trait WithRegistry {
+    #[must_use]
+    fn with_registry<T>(self, registry: Arc<T>) -> Self
+    where
+        T: types_registry_sdk::TypesRegistryApi
+            + types_registry_sdk::PlatformTypesRegistryApi
+            + 'static;
+}
+
+impl<R: crate::domain::tenant::repo::TenantRepo> WithRegistry
+    for crate::domain::tenant::service::TenantService<R>
+{
+    fn with_registry<T>(self, registry: Arc<T>) -> Self
+    where
+        T: types_registry_sdk::TypesRegistryApi
+            + types_registry_sdk::PlatformTypesRegistryApi
+            + 'static,
+    {
+        self.with_types_registry(Arc::clone(&registry) as _, registry as _)
+    }
+}

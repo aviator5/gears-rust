@@ -11,10 +11,12 @@
 //! * [`InertTenantTypeChecker`] — admits everything. Used in unit tests
 //!   only; not bound in production. AM declares `types-registry` as a
 //!   hard `deps` and the gear entry-point fail-closes `init` when
-//!   `PlatformTypesRegistryApi` cannot be resolved from `ClientHub`, so the
+//!   `TypesRegistryApi` cannot be resolved from `ClientHub`, so the
 //!   real implementation below is always wired in production.
 //! * [`crate::infra::types_registry::GtsTenantTypeChecker`] — the real
-//!   implementation that wraps `types_registry_sdk::PlatformTypesRegistryApi`.
+//!   implementation that wraps `types_registry_sdk::TypesRegistryApi`.
+//!   Every check runs for a request (tenant create, conversion approval),
+//!   so it reads under that request's [`SecurityContext`] (P33).
 //!   Resolves both schemas via `get_type_schemas_by_uuid` (one batched
 //!   round-trip), reads `effective_traits().allowed_parent_types`, and
 //!   admits iff the parent's chained GTS identifier is a member.
@@ -37,6 +39,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -54,6 +57,9 @@ use crate::domain::error::DomainError;
 /// (`dod-tenant-type-enforcement-gts-availability-surface`); every
 /// invocation re-resolves against GTS so trait updates and re-types
 /// take effect immediately.
+///
+/// `ctx` is the caller of the request being served; implementations read
+/// the registry for that caller and keep no context between calls.
 #[async_trait]
 pub trait TenantTypeChecker: Send + Sync {
     /// Validate parent-child type compatibility.
@@ -72,6 +78,7 @@ pub trait TenantTypeChecker: Send + Sync {
     // @cpt-begin:cpt-cf-account-management-algo-tenant-type-enforcement-same-type-nesting-admission:p1:inst-algo-stn-trait-contract
     async fn check_parent_child(
         &self,
+        ctx: &SecurityContext,
         parent_type: Uuid,
         child_type: Uuid,
     ) -> Result<(), DomainError>;
@@ -82,7 +89,7 @@ pub trait TenantTypeChecker: Send + Sync {
 /// No-op checker — admits every parent / child pairing. Reserved for
 /// unit tests; not bound in production. AM declares `types-registry`
 /// as a hard `deps` and the gear entry-point fail-closes `init`
-/// when `PlatformTypesRegistryApi` cannot be resolved from `ClientHub`.
+/// when `TypesRegistryApi` cannot be resolved from `ClientHub`.
 #[domain_model]
 #[derive(Debug, Default, Clone)]
 pub struct InertTenantTypeChecker;
@@ -91,6 +98,7 @@ pub struct InertTenantTypeChecker;
 impl TenantTypeChecker for InertTenantTypeChecker {
     async fn check_parent_child(
         &self,
+        _ctx: &SecurityContext,
         _parent_type: Uuid,
         _child_type: Uuid,
     ) -> Result<(), DomainError> {
@@ -116,7 +124,7 @@ mod tests {
         let c = InertTenantTypeChecker;
         let parent = Uuid::from_u128(0x1);
         let child = Uuid::from_u128(0x2);
-        c.check_parent_child(parent, child)
+        c.check_parent_child(&SecurityContext::anonymous(), parent, child)
             .await
             .expect("inert admits any pairing");
     }
@@ -125,7 +133,7 @@ mod tests {
     async fn inert_checker_admits_same_type_nesting() {
         let c = InertTenantTypeChecker;
         let same = Uuid::from_u128(0x3);
-        c.check_parent_child(same, same)
+        c.check_parent_child(&SecurityContext::anonymous(), same, same)
             .await
             .expect("inert admits same-type nesting");
     }

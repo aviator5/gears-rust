@@ -1,6 +1,8 @@
 //! `GtsTenantTypeChecker` — the production [`TenantTypeChecker`] wired
-//! against `types_registry_sdk::PlatformTypesRegistryApi` resolved from
-//! `ClientHub`.
+//! against `types_registry_sdk::TypesRegistryApi` resolved from
+//! `ClientHub`. Every check reads the schemas for the caller of the
+//! request it serves (P33): the context arrives with each call and the
+//! checker, shared by every request, holds none.
 //!
 //! Implements `algo-allowed-parent-types-evaluation` and
 //! `algo-same-type-nesting-admission` (FEATURE 2.3
@@ -8,7 +10,7 @@
 //!
 //! 1. Read the child's Type Schema (and, for different-parent calls,
 //!    also the parent's) via
-//!    `PlatformTypesRegistryApiExt::batch_get_type_schemas_by_uuid` —
+//!    `TypesRegistryApiExt::batch_get_type_schemas_by_uuid` —
 //!    one batched round-trip selecting `effective_traits`.
 //! 2. Reject children whose chain does not descend from the
 //!    `gts.cf.core.am.tenant_type.v1~` envelope (the only schema whose
@@ -40,10 +42,10 @@ use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::SecurityContext;
 use types_registry_sdk::{
-    EntityField, FieldSelection, GtsId, LifecycleStatus, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
+    EntityField, FieldSelection, GtsId, LifecycleStatus, Projection, ReadOptions, TypeSchema,
+    TypesRegistryApi, TypesRegistryApiExt,
 };
 use uuid::Uuid;
 
@@ -72,7 +74,7 @@ const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2_000;
 
 /// Production [`TenantTypeChecker`] backed by the GTS Types Registry.
 pub struct GtsTenantTypeChecker {
-    registry: Arc<dyn PlatformTypesRegistryApi>,
+    registry: Arc<dyn TypesRegistryApi>,
     probe_timeout: Duration,
 }
 
@@ -80,16 +82,13 @@ impl GtsTenantTypeChecker {
     /// Construct a new checker around a registry client resolved from
     /// `ClientHub`, using the default probe timeout.
     #[must_use]
-    pub fn new(registry: Arc<dyn PlatformTypesRegistryApi>) -> Self {
+    pub fn new(registry: Arc<dyn TypesRegistryApi>) -> Self {
         Self::with_timeout(registry, DEFAULT_PROBE_TIMEOUT_MS)
     }
 
     /// Construct a checker with an explicit GTS probe timeout (ms).
     #[must_use]
-    pub fn with_timeout(
-        registry: Arc<dyn PlatformTypesRegistryApi>,
-        probe_timeout_ms: u64,
-    ) -> Self {
+    pub fn with_timeout(registry: Arc<dyn TypesRegistryApi>, probe_timeout_ms: u64) -> Self {
         Self {
             registry,
             probe_timeout: Duration::from_millis(probe_timeout_ms.max(1)),
@@ -137,6 +136,7 @@ impl GtsTenantTypeChecker {
 impl TenantTypeChecker for GtsTenantTypeChecker {
     async fn check_parent_child(
         &self,
+        ctx: &SecurityContext,
         parent_type: Uuid,
         child_type: Uuid,
     ) -> Result<(), DomainError> {
@@ -145,12 +145,11 @@ impl TenantTypeChecker for GtsTenantTypeChecker {
             requested.push(parent_type);
         }
         let projection = Projection::Select(FieldSelection::with(&[EntityField::EffectiveTraits]));
-        let ctx = PlatformSecurityContext::outbound_marker();
 
         let map = match tokio::time::timeout(
             self.probe_timeout,
             self.registry.batch_get_type_schemas_by_uuid(
-                &ctx,
+                ctx,
                 &requested,
                 ReadOptions {
                     projection,
