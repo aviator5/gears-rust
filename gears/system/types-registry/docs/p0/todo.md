@@ -2259,7 +2259,7 @@ and quickstart, for the seven-route completeness check)
 
 ## Phase 7 — Both clients, real local AM, and every gear on the persistent registry
 
-Plans P26–P31. T28–T33 are complete; the next task is **T34**. The remaining sequence is **T34 → T35 → T35a → T35b → T36 → T37 → T38**. T35a adds the resolved-payload validation wrapper and T35b aligns mock Type Schema admission before consumer cutover; existing task numbers stay unchanged.
+Plans P26–P31 and P33. T28–T34a are complete; the next task is **T35**. The remaining sequence is **T35 → T35a → T35b → T36 → T37 → T38**. T35a adds the resolved-payload validation wrapper and T35b aligns mock Type Schema admission before consumer cutover; existing task numbers stay unchanged.
 
 - **Traits and local clients (T29, T30).** Both contracts, the platform and tenant extension helpers and both local clients land together, in one pull request.
 - **Embedded local handoff (T31).** All linked inventory and `cfg.entities` are admitted into the database before the new APIs are published in ClientHub. A new gear can reconcile in `init()` without waiting for REST, T37 or the fleet migration.
@@ -2694,6 +2694,53 @@ A normative reference, not a task: its items carry no checkboxes. Each names its
 - `docs/api/api.json` drops the `/v2/` mutation and operation routes: the API-contracts check needs `breaking-api-acknowledged` on the PR.
 
 **Dependencies:** T30, T33 **Files touched:** `TR-SDK/Cargo.toml`, `TR-SDK/src/{lib,rest_client/mod,rest_client/dto,rest_client/platform}.rs` and their tests, `TR-SDK/README.md`, `TR/src/api/rest/{paths,routes,handlers}.rs`, `TR/src/domain/{registry_service,local_client,seeding,caller,enums}.rs`, `TR/src/domain/admission/{acceptance,fingerprint}.rs`, `TR/src/infra/storage/entity/{operation,enums}.rs`, `TR/tests/{rest_client_contract_test,platform_routes_auth_test,api_rest_test}.rs`, `TR/tests/common/{mod,platform_server}.rs` and the tests calling the narrowed service, `config/e2e-local.yaml`, `testing/e2e/conftest.py`, `testing/e2e/suites/types_registry/{helpers,conftest,test_*}.py`, `scenarios/planes.md`, `README.md`, the AM e2e schema helper, `QUICKSTART.md`, `docs/api/api.json` **Scope:** L
+
+---
+
+### - [x] T34a: Account Management request-path reads on `TypesRegistryApi` with the caller's `SecurityContext`
+
+**Decision (P33, user, 2026-10-22).** P29/T32 shared one `PlatformTypesRegistryApi` across all of Account Management. P33 reverses that for request-path reads: every Type Schema, metadata-schema, payload-schema and UUID read AM makes while serving an incoming HTTP/API request goes through `TypesRegistryApi`/`TypesRegistryApiExt` with that request's original `&SecurityContext`, passed unchanged through every port and helper. `PlatformTypesRegistryApi` stays for publication, reconciliation, `init` and bootstrap, and for the autonomous background pipelines (retention, provisioning reaper). The task runs now, before T35; it is not deferred to T35, T41 or P1. T32's recorded outcome is left as written: it describes the state T32 delivered.
+
+**Scope.** In-process only. T30 delivered both local clients and both extension helpers, and T31 registers both APIs in `types-registry::init`, so in-process AM needs no tenant REST (T35). In P0 the local tenant client applies no tenant scope (T30), so answers stay the same. What changes is which caller each read names; T35's REST client will forward that caller as a bearer. T35 itself is not implemented here.
+
+**Acceptance criteria:**
+- [x] AM `init` resolves `dyn TypesRegistryApi` for request paths and `dyn PlatformTypesRegistryApi` for platform paths. If either is missing, `init` fails; there is no fallback
+- [x] Request paths read with the caller's context:
+  - tenant create: name validation, the parent/child type check, the parent's IdP context and lowering the activated tenant;
+  - `tenant_type` lowering for get, list-children, list-descendants, update, suspend, unsuspend and delete;
+  - the type check in conversion `approve`;
+  - metadata list, get, upsert, delete and resolve, including the default `resolve_ids_by_uuid` fallback, which forwards the context to each single lookup;
+  - user create/patch payload validation;
+  - the user and service-account tenant guard (`tenant_type` hydration).
+  `TenantTypeChecker::check_parent_child` and every `MetadataSchemaRegistry` method take `&SecurityContext`. `resolve_active_tenant` takes the caller's context next to its `AccessScope`, which is a PDP row filter and not a registry caller
+- [x] No request path calls the platform API, constructs a `SecurityContext` (anonymous or system), falls back to the platform API after a tenant-API error, or keeps a request context in a shared client, service or adapter
+- [x] Platform reads are explicit, named at their call sites, and each says why:
+  - root registration and the bootstrap saga, including bootstrap's root-name validation;
+  - `TenantService::load_tenant_context` from retention and the reaper (origin `Background`, kept apart from the create saga's origin `Request`);
+  - lazy IdP plugin discovery: a process-wide plugin selection cached across callers;
+  - the AM tenant-resolver plugin. It is a hierarchy resolver for authorization: `tr-authz-plugin` calls it with `SecurityContext::anonymous()` (gears-rust#1597), and the plugin's tenant reads already elevate to `allow_all`. This is a recorded exception. It is revisited once its callers hold a real forwarded or S2S context (#1597), with tenant REST (T35) used where needed. T35 alone does not change it, and the anonymous context is never forwarded to tenant REST.
+  User-supplied schema checks are never classed as system reads
+- [x] Preservation policies are unchanged apart from provenance: an unknown or failed UUID lowers to `tenant_type: None`; metadata orphan rows and their error mapping; the user schema fails closed; the tenant name falls back to AM's guard when its schema is absent
+
+**Verification:**
+- [x] A recording `TypesRegistryApi` spy keeps a full clone of each `SecurityContext` (bearer token, subject, subject tenant, token scopes), and its `PlatformTypesRegistryApi` side fails the test. The spy is needed because the SDK mock and the local client ignore the caller, so database and e2e runs cannot show propagation. Two successive callers through one shared service or adapter must be told apart on every path above
+- [x] Retention/reaper `load_tenant_context` and bootstrap name validation read through the platform API and never through the tenant API
+- [x] `cargo nextest run -p cf-gears-account-management`, `cargo clippy -p cf-gears-account-management --all-targets -- -D warnings`, `cargo fmt --check`
+
+**Done (2026-10-22, uncommitted in this worktree).**
+- `domain::type_reads::TypeReads` (`Caller { api, ctx }` or `Platform(api)`) names who each shared read is for. The tenant-name check takes one, because both requests and bootstrap call it; user payload and patch validation take the tenant API and the request's `SecurityContext` only, so a platform call cannot be written there. `TenantService` holds the tenant client for requests and the platform client for background work, and dispatches on `CallerOrigin::{Request(ctx), Background}`: the create saga loads the parent's IdP context with `Request(ctx)`, and retention and the reaper use `Background`. `TenantTypeChecker::check_parent_child` and every `MetadataSchemaRegistry` method take `&SecurityContext`, including the default `resolve_ids_by_uuid`. `resolve_active_tenant` takes the caller's context next to its `AccessScope`. AM `init` resolves both APIs and fails naming whichever is missing.
+- The platform API is still used for: root registration, the bootstrap saga including its root-name check, the TR plugin's publication, retention, the reaper, and two named system reads, each documented at its call site (`infra/idp/lazy.rs`, `tr_plugin/plugin_impl.rs`).
+- Proof: `test_helpers::CallerSpy` keeps a full clone of every `SecurityContext`, and `assert_only_caller` compares subject, subject type, subject tenant, scopes and the exposed bearer token. Two callers go through one shared instance in:
+  - the gts-validation, checker and metadata-adapter tests;
+  - `TenantService` `caller_provenance`: create, get, list children, list descendants, update, suspend, unsuspend and delete, 11 reads;
+  - `UserService`: create, update, list, get and delete, 7 reads;
+  - `ServiceAccountService`: create, list, rotate and revoke, 4 reads;
+  - `MetadataService` over the default batch: upsert, get, list, resolve and delete, 6 calls;
+  - conversion `approve`: the child's actor requests and the parent's actor approves, and the checker sees only the approver.
+  Further tests: a failed tenant read does not fall back; retention and the reaper read only through the platform API; an unknown type still lowers to `None`; `init` fails with only one of the two APIs. Codex's scratch mutation that sent the context through a serde round trip, which loses the bearer token, was caught by the new gts-validation tests.
+- Checks: `cargo nextest run -p cf-gears-account-management` 1256 passed; `cargo clippy -p cf-gears-account-management --all-targets -- -D warnings` clean, and also with `--all-features`; `cargo fmt -p cf-gears-account-management --check` clean. Not run: the PostgreSQL `integration` lane (needs Docker) and AM e2e. The P0 local tenant client ignores the caller, so an e2e run cannot show provenance in any case.
+
+**Dependencies:** T30, T31, T32 **Files likely touched:** `AM/account-management/src/{gear.rs,domain/{gts_validation,tenant/resolve,tenant/service/*,tenant_type/checker,metadata/{registry,service},user/service,service_account/service,conversion/service}.rs,infra/types_registry/*,infra/idp/lazy.rs,tr_plugin/*}` and their tests **Scope:** M
 
 ---
 

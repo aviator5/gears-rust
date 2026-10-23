@@ -18,11 +18,11 @@ and dependent refresh. Both must be positive. Closure accounting is per document
 candidate overlay; the resolved-size budget applies to the canonical bytes of each effective
 artifact. Exceeding either refuses the candidate without committing partial state.
 
-The executable list uses task IDs **T1–T45**, plus the inserted **T35a** SDK payload-validation and **T35b** mock Type Schema admission tasks. T1–T32 are complete; **T33–T45 plus T35a/T35b are the 15 remaining tasks**. T35a and T35b follow T35 without renumbering existing work. Task status, acceptance criteria and recorded evidence are preserved; task references are synchronized with this numbering. The next task is T33 (the toolkit's platform-authenticated route axis), implemented on its own toolkit branch.
+The executable list uses task IDs **T1–T45**, plus the inserted **T34a** AM request-context reads (P33), **T35a** SDK payload-validation and **T35b** mock Type Schema admission tasks. T1–T34 and T34a are complete (35 of 48); **T35–T45 plus T35a/T35b are the 13 remaining tasks**. T34a follows T34, and T35a and T35b follow T35, without renumbering existing work. Task status, acceptance criteria and recorded evidence are preserved; task references are synchronized with this numbering. The next task is T35 (tenant REST and both resolving clients).
 
 ## Decisions and task numbering
 
-References to P1–P31 in this plan, the spec and the task list name those historical decisions; their task numbers are local to the journal. The graph, index, checkpoints, risks and execution queue below use only current task IDs. There are no separate merged or removed tasks in the executable list. Checkpoint IDs (0–9, 7A and 8A) stay unchanged.
+References to P1–P31 in this plan, the spec and the task list name those historical decisions; their task numbers are local to the journal. P33 (2026-10-22) is recorded in SPEC §8.4 and in T34a. The graph, index, checkpoints, risks and execution queue below use only current task IDs. There are no separate merged or removed tasks in the executable list. Checkpoint IDs (0–9, 7A and 8A) stay unchanged.
 
 ## Dependency graph
 
@@ -98,6 +98,8 @@ T6 config ───────────────────────�
         T33 platform-authenticated axis (own toolkit PR; merged before T34's route move)
                    ▼
         T34 platform API over REST + platform routes + their e2e callers
+                   ▼
+        T34a AM request-path reads on TypesRegistryApi with the caller's context (P33)
                    ▼
         T35 tenant REST + both resolving/provides clients + complete auth closure
                    ▼
@@ -206,6 +208,7 @@ exists. From T7 onward the graph is vertical.
 - T32: Full Account Management local migration — one registry client and real REST proof
 - T33: Toolkit — a platform-authenticated auth axis; one plane per route (own pull request; open until merged)
 - T34: Platform API over REST
+- T34a: Account Management request-path reads on `TypesRegistryApi` with the caller's `SecurityContext` (P33)
 - T35: Tenant REST and both resolving clients — complete SDK transport handoff
 - T35a: SDK payload validation over a resolved Type Schema; depends on a compatible released GTS helper
 - T35b: Mock Type Schema admission uses GTS validation; valid fixtures first, then shared real-client conformance
@@ -320,9 +323,9 @@ collapsed into `invalid_schema`.
 
 ## Sequence
 
-**Accepted queue (P32): sequential, in numeric order.** Completed phases retain their status and evidence; the next implementation task is **T31**.
+**Accepted queue (P32): sequential, in numeric order.** Completed phases retain their status and evidence; T31–T34a are complete and the next implementation task is **T35**.
 
-1. Phase 7: T31 → T32 → T33 → T34 → T35 → T35a → T35b → T36 → T37 (Checkpoint 7A) → T38 (Checkpoint 7). T29/T30 are complete; T33 remains its own toolkit pull request. T35a delegates to the released GTS snapshot helper; any required GTS/spec migration is a separate prerequisite. T35b prepares valid fixtures before enabling mock Type Schema validation and needs no new upstream helper.
+1. Phase 7: T31 → T32 → T33 → T34 → T34a → T35 → T35a → T35b → T36 → T37 (Checkpoint 7A) → T38 (Checkpoint 7). T29/T30 are complete; T33 remains its own toolkit pull request. T35a delegates to the released GTS snapshot helper; any required GTS/spec migration is a separate prerequisite. T35b prepares valid fixtures before enabling mock Type Schema validation and needs no new upstream helper.
 2. Phase 8: T39 → T40 → T41 (Checkpoint 8A) → T42 → T43 (Checkpoint 8).
 3. Phase 9: T44 → T45 (Checkpoint 9).
 
