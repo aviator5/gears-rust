@@ -145,6 +145,13 @@ impl LazyIdpProvider {
                 };
                 // Every page, or the error of the first that fails: never a
                 // selection over a truncated listing.
+                //
+                // A platform read (P33): the selection is process-wide
+                // configuration, cached and then shared by every caller —
+                // the request, the bootstrap saga or the reaper that
+                // happens to trigger it first. Reading it for that one
+                // caller would let one caller's view decide the plugin
+                // for all of them.
                 let instances = self
                     .registry
                     .list_instances(&PlatformSecurityContext::outbound_marker(), query)

@@ -34,6 +34,16 @@ use crate::domain::tenant::hierarchy_read_port::TenantHierarchyReadPort;
 /// gates the call; the plugin reads unconditionally through the
 /// port (which itself elevates to `AccessScope::allow_all()` at a
 /// single named call site in the adapter).
+///
+/// The `tenant_type` hydration in [`super::queries`] is a platform read
+/// for the same reason — a named exception to P33's "request reads name
+/// their caller". The plugin is a hierarchy resolver behind
+/// tenant-resolver: its authorization caller, `tr-authz-plugin`, calls
+/// with `SecurityContext::anonymous()` (gears-rust#1597), so `_ctx` is
+/// not a forwarded user context, and the tenant reads it hydrates run
+/// with full-tree visibility. Revisit once callers hold a real
+/// forwarded or S2S context; never forward an anonymous context to the
+/// tenant API.
 pub struct PluginImpl {
     port: Arc<dyn TenantHierarchyReadPort>,
     types_registry: Arc<dyn PlatformTypesRegistryApi>,

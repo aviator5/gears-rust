@@ -8,7 +8,8 @@
 //!   `AccessScope::allow_all()` trust elevation at a single named
 //!   call site so this gear no longer carries that concern.
 //! - Hydrates the public `tenant_type` field through
-//!   [`PlatformTypesRegistryApi`] using either a single
+//!   [`PlatformTypesRegistryApi`] — a named system read, see
+//!   [`super::plugin_impl::PluginImpl`] — using either a single
 //!   `get_type_schema_by_uuid` (single-row results) or a batched
 //!   `batch_get_type_schemas_by_uuid` (page-style results). Per DESIGN §3.4
 //!   / §5, **any** registry failure (a failed read or one unknown
