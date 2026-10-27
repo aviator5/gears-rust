@@ -5113,17 +5113,22 @@ dependencies = [
 name = "cf-gears-types-registry-sdk"
 version = "0.3.9"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "bytes",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
  "gts",
  "parking_lot",
  "proptest",
  "rand 0.10.3",
+ "secrecy",
  "semver",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "time",

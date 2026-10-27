@@ -155,6 +155,7 @@ pub enum StopReason {
     Deadline,
     ReadFailed,
     InvalidInput,
+    Stalled,
     Cancelled,
     InvalidDeadline,
 }
@@ -167,6 +168,7 @@ impl From<ReconcileStop> for StopReason {
             ReconcileStop::Deadline => Self::Deadline,
             ReconcileStop::ReadFailed => Self::ReadFailed,
             ReconcileStop::InvalidInput => Self::InvalidInput,
+            ReconcileStop::Stalled => Self::Stalled,
         }
     }
 }
@@ -180,6 +182,7 @@ impl StopReason {
             Self::Deadline => "deadline",
             Self::ReadFailed => "read_failed",
             Self::InvalidInput => "invalid_input",
+            Self::Stalled => "stalled",
             Self::Cancelled => "cancelled",
             Self::InvalidDeadline => "invalid_deadline",
         }
