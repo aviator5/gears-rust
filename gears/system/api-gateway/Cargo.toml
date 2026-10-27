@@ -71,6 +71,9 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 serde-saphyr = { workspace = true }
+# The registry's real routes for its plane matrix behind this gateway: a test-only seam
+# between the gateway's middleware and the registry's route declarations.
+types-registry = { workspace = true }
 
 [features]
 grpc = []
