@@ -31,7 +31,8 @@ pub mod submit;
 use submit::{Failure, Stop, await_registration, bounded, deadline_after, jittered};
 
 mod telemetry;
-use telemetry::{Run, StopReason, error_fields, operation_id_of};
+pub use telemetry::error_fields;
+use telemetry::{Run, StopReason, operation_id_of};
 
 /// Retryable transport failure limit per batch, excluding hinted throttling.
 const TRANSPORT_ATTEMPTS: u32 = 3;

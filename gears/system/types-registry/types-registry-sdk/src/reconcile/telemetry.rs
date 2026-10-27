@@ -20,6 +20,7 @@ pub struct ErrorFields {
     pub diagnostic_code: Option<String>,
 }
 
+/// Machine-readable causes and reference identifiers, excluding free-text descriptions.
 pub fn error_fields(error: &CanonicalError) -> ErrorFields {
     let mut fields = ErrorFields {
         category: category(error),

@@ -12,6 +12,7 @@ pub mod models;
 #[cfg(any(feature = "rest-client", feature = "rest-server"))]
 mod paths;
 pub mod precondition;
+mod publication;
 pub mod reason;
 mod reconcile;
 #[cfg(feature = "rest-server")]
@@ -45,6 +46,7 @@ pub use models::{
     RegistrationOutcome, TypeSchema, Validator,
 };
 
+pub use publication::{PublicationError, publish_startup_entities};
 pub use reconcile::{
     ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport, ReconcileStop,
     Reconciliation, STARTUP_PUBLICATION_DEADLINE,

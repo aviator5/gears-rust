@@ -84,14 +84,12 @@ after wiring.
 ```rust,no_run
 # // This doctest cannot depend on the registry gear; stand the SDK in for it.
 # pub extern crate types_registry_sdk as types_registry;
-use std::time::Duration;
-
 use toolkit::{Gear, GearCtx};
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
     EntityField, FieldSelection, GtsId, GtsTypeId, Origin, PlatformTypesRegistryApi,
-    PlatformTypesRegistryApiExt, Projection, PublisherContext, ReadOptions, ReconcileOptions,
-    ReconcileOutcome, ReconcileReport, Reconciliation,
+    PlatformTypesRegistryApiExt, Projection, PublisherContext, ReadOptions,
+    publish_startup_entities,
 };
 
 // `deps` makes this gear's `init()` run after the registry's.
@@ -117,54 +115,14 @@ impl Gear for ExampleEvents {
                 "type": "object"
             }),
         )];
-        let mut options = ReconcileOptions::default();
-        options.deadline = Duration::from_secs(120);
-
-        // The startup gate: up to date, or every desired identifier admitted.
-        match registry
-            .reconcile_entities_and_await(
-                &platform,
-                &publisher,
-                &desired,
-                &options,
-                ctx.cancellation_token(),
-            )
-            .await
-        {
-            // Every document already matched; nothing was submitted.
-            Ok(Reconciliation::UpToDate) => {}
-            Ok(Reconciliation::Reconciled(outcomes)) => {
-                for (id, _) in &desired {
-                    match outcomes.get(id) {
-                        Some(ReconcileOutcome::Admitted) => {}
-                        Some(ReconcileOutcome::Rejected(cause)) => {
-                            anyhow::bail!("{id} was rejected: {cause}");
-                        }
-                        Some(ReconcileOutcome::Pending(cause)) => {
-                            anyhow::bail!("{id} did not settle: {cause:?}");
-                        }
-                        None => anyhow::bail!("{id} has no outcome"),
-                    }
-                }
-            }
-            Err(error) => {
-                // Name what did not settle, then fail this gear's boot.
-                if let Some(report) = ReconcileReport::from_canonical(&error) {
-                    for (id, outcome) in &report.outcomes {
-                        match outcome {
-                            ReconcileOutcome::Admitted => {}
-                            ReconcileOutcome::Rejected(cause) => {
-                                tracing::error!(%id, %cause, "registration rejected");
-                            }
-                            ReconcileOutcome::Pending(cause) => {
-                                tracing::error!(%id, ?cause, "registration not settled");
-                            }
-                        }
-                    }
-                }
-                return Err(error.into());
-            }
-        }
+        // Returns only once every desired document is admitted or already up to date.
+        publish_startup_entities(
+            registry.as_ref(),
+            &publisher,
+            &desired,
+            ctx.cancellation_token(),
+        )
+        .await?;
 
         let type_id = GtsTypeId::try_new("gts.cf.example.events.user_created.v1~")?;
         let read = registry
@@ -190,7 +148,19 @@ impl Gear for ExampleEvents {
 
 Success is `UpToDate`, or `Reconciled` with every desired identifier `Admitted`. An accepted
 operation, or an `Ok` from a single `register_entities`, is not: an item can still fail in
-admission.
+admission. Neither helper requires a second check of successful outcomes.
+
+`publish_startup_entities` uses the platform outbound marker and the shared 120-second
+`STARTUP_PUBLICATION_DEADLINE`. It awaits reconciliation in the current task, without
+spawning or changing the gear's lifecycle. Pass the owning gear's publisher name and version;
+`env!("CARGO_PKG_VERSION")` must be evaluated in that gear, not in the SDK.
+
+On failure, `PublicationError` names the publisher and each rejected or pending identifier,
+with the stop reason and machine-readable cause. `canonical_error()` and the error's
+`source()` retain the original `CanonicalError`; `report()` exposes the decoded
+`ReconcileReport`, when present. Propagate it with `?` or add `anyhow::Context` so the source
+chain stays intact. Cancellation still names the requested identifiers even without a report.
+For custom budgets, batching or security contexts, call `reconcile_entities_and_await` directly.
 
 The examples use vendor `cf`, the only one a registry admits without configuration. Another
 vendor needs a `registration_policy` entry for its region in the registry's configuration:
