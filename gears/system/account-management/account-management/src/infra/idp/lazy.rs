@@ -1,6 +1,6 @@
 //! Lazy vendor/priority selection of an [`IdpPluginClient`].
 //!
-//! Concrete IdP plugins may initialize after AM, so eager selection would race
+//! Concrete `IdP` plugins may initialize after AM, so eager selection would race
 //! their publication. [`LazyIdpProvider`] forwards calls to the first successful
 //! selection cached by [`toolkit::plugins::GtsPluginSelector`]; failures are
 //! not cached. List every catalogue page and keep only instances with a scoped

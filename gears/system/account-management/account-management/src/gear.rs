@@ -67,7 +67,7 @@ use crate::tr_plugin::PluginImpl as TrPluginImpl;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
-use types_registry_sdk::PlatformTypesRegistryApiExt;
+use types_registry_sdk::publish_startup_entities;
 
 type ConcreteService = TenantService<TenantRepoImpl>;
 
@@ -683,10 +683,7 @@ impl Gear for AccountManagementGear {
                 root_cfg,
                 ctx.cancellation_token(),
             )
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("account-management root tenant type registration failed: {error}")
-            })?;
+            .await?;
 
             info!(
                 target: "am.root_tenant_type",
@@ -986,28 +983,16 @@ impl Gear for AccountManagementGear {
             let tr_instance_json = serde_json::to_value(&tr_instance)
                 .map_err(|e| anyhow::anyhow!("tr-plugin: serialize instance failed: {e}"))?;
             let tr_gts_id = types_registry_sdk::GtsId::try_new(tr_instance_id.as_ref())?;
-            let mut tr_options = types_registry_sdk::ReconcileOptions::default();
-            tr_options.deadline = types_registry_sdk::STARTUP_PUBLICATION_DEADLINE;
-            platform_registry
-                .reconcile_entities_and_await(
-                    &toolkit_security::PlatformSecurityContext::outbound_marker(),
-                    &types_registry_sdk::PublisherContext {
-                        name: Self::MODULE_NAME.to_owned(),
-                        version: env!("CARGO_PKG_VERSION").parse()?,
-                    },
-                    &[(tr_gts_id.clone(), tr_instance_json)],
-                    &tr_options,
-                    ctx.cancellation_token(),
-                )
-                .await
-                .map_err(|error| {
-                    let outcome = types_registry_sdk::ReconcileReport::from_canonical(&error)
-                        .and_then(|report| report.outcomes.get(&tr_gts_id).cloned());
-                    anyhow::anyhow!(
-                        "tr-plugin: publishing instance {tr_instance_id} failed: {error}; \
-                         outcome: {outcome:?}"
-                    )
-                })?;
+            publish_startup_entities(
+                platform_registry.as_ref(),
+                &types_registry_sdk::PublisherContext {
+                    name: Self::MODULE_NAME.to_owned(),
+                    version: env!("CARGO_PKG_VERSION").parse()?,
+                },
+                &[(tr_gts_id, tr_instance_json)],
+                ctx.cancellation_token(),
+            )
+            .await?;
             // Only after types-registry has admitted the instance
             // (or found it up to date) do we publish the
             // scoped client to the hub. A failure above returns Err

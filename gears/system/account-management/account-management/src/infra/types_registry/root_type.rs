@@ -7,10 +7,8 @@
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use toolkit_gts::GTS_ID_URI_PREFIX;
-use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
-    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
-    ReconcileOptions, ReconcileReport, STARTUP_PUBLICATION_DEADLINE,
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
 };
 
 use crate::domain::root_type::{RootTypeConfig, TENANT_TYPE_BASE};
@@ -33,22 +31,7 @@ pub async fn register_root_type(
         name: "account-management".to_owned(),
         version: env!("CARGO_PKG_VERSION").parse()?,
     };
-    let mut options = ReconcileOptions::default();
-    options.deadline = STARTUP_PUBLICATION_DEADLINE;
-    registry
-        .reconcile_entities_and_await(
-            &PlatformSecurityContext::outbound_marker(),
-            &publisher,
-            &[(id.clone(), desired)],
-            &options,
-            cancel,
-        )
-        .await
-        .map_err(|error| {
-            let outcome = ReconcileReport::from_canonical(&error)
-                .and_then(|report| report.outcomes.get(&id).cloned());
-            anyhow::anyhow!("root tenant type {id} was not admitted: {error}; outcome: {outcome:?}")
-        })?;
+    publish_startup_entities(registry, &publisher, &[(id, desired)], cancel).await?;
     Ok(())
 }
 

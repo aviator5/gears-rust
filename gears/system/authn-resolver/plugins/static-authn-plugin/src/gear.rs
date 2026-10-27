@@ -10,17 +10,15 @@ use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::context::GearCtx;
 use toolkit::contracts::SystemCapability;
 use toolkit::gts::PluginV1;
-use toolkit_security::PlatformSecurityContext;
 use tracing::info;
 use types_registry_sdk::{
-    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
-    ReconcileOptions, ReconcileReport, STARTUP_PUBLICATION_DEADLINE,
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
 };
 
 use crate::config::StaticAuthNPluginConfig;
 use crate::domain::Service;
 
-/// Static token-to-identity AuthN plugin.
+/// Static token-to-identity `AuthN` plugin.
 ///
 /// The schema comes from `toolkit-gts` inventory. After proxy wiring, `post_init`
 /// publishes the instance through consumed `PlatformTypesRegistryApi`, awaits
@@ -103,29 +101,16 @@ impl SystemCapability for StaticAuthNPlugin {
         let registry = p.hub.get::<dyn PlatformTypesRegistryApi>().map_err(|e| {
             anyhow::anyhow!("static-authn-plugin: no PlatformTypesRegistryApi to publish to: {e}")
         })?;
-        let mut options = ReconcileOptions::default();
-        options.deadline = STARTUP_PUBLICATION_DEADLINE;
-        registry
-            .reconcile_entities_and_await(
-                &PlatformSecurityContext::outbound_marker(),
-                &PublisherContext {
-                    name: Self::MODULE_NAME.to_owned(),
-                    version: env!("CARGO_PKG_VERSION").parse()?,
-                },
-                &[(p.instance_id.clone(), p.instance.clone())],
-                &options,
-                &p.cancel,
-            )
-            .await
-            .map_err(|error| {
-                let outcome = ReconcileReport::from_canonical(&error)
-                    .and_then(|report| report.outcomes.get(&p.instance_id).cloned());
-                anyhow::anyhow!(
-                    "static-authn-plugin: publishing instance {} failed: {error}; \
-                     outcome: {outcome:?}",
-                    p.instance_id
-                )
-            })?;
+        publish_startup_entities(
+            registry.as_ref(),
+            &PublisherContext {
+                name: Self::MODULE_NAME.to_owned(),
+                version: env!("CARGO_PKG_VERSION").parse()?,
+            },
+            &[(p.instance_id.clone(), p.instance.clone())],
+            &p.cancel,
+        )
+        .await?;
 
         // Register scoped client in ClientHub, only past admission.
         let api: Arc<dyn AuthNResolverPluginClient> = Arc::clone(&p.service) as _;
