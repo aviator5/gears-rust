@@ -10,10 +10,8 @@ use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
 use toolkit::{Gear, context::GearCtx};
-use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
-    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
-    ReconcileOptions, ReconcileReport, STARTUP_PUBLICATION_DEADLINE,
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
 };
 
 use crate::config::{KeycloakIdpPluginConfig, KeycloakIdpPluginEnabledProbe};
@@ -379,26 +377,8 @@ async fn publish_instance(
         name: KeycloakIdpPluginGear::MODULE_NAME.to_owned(),
         version: env!("CARGO_PKG_VERSION").parse()?,
     };
-    let mut options = ReconcileOptions::default();
-    options.deadline = STARTUP_PUBLICATION_DEADLINE;
     let gts_id = GtsId::try_new(instance_id)?;
-    registry
-        .reconcile_entities_and_await(
-            &PlatformSecurityContext::outbound_marker(),
-            &publisher,
-            &[(gts_id.clone(), instance_json)],
-            &options,
-            cancel,
-        )
-        .await
-        .map_err(|error| {
-            let outcome = ReconcileReport::from_canonical(&error)
-                .and_then(|report| report.outcomes.get(&gts_id).cloned());
-            anyhow::anyhow!(
-                "keycloak-idp-plugin: publishing instance {instance_id} failed: {error}; \
-                 outcome: {outcome:?}"
-            )
-        })?;
+    publish_startup_entities(registry, &publisher, &[(gts_id, instance_json)], cancel).await?;
     Ok(())
 }
 

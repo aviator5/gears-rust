@@ -9,17 +9,15 @@ use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
-use toolkit_security::PlatformSecurityContext;
 use tracing::{info, warn};
 use types_registry_sdk::{
-    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
-    ReconcileOptions, ReconcileReport, STARTUP_PUBLICATION_DEADLINE,
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
 };
 
 use crate::config::StaticIdpPluginConfig;
 use crate::domain::Service;
 
-/// Static IdP plugin for bootstrap and tenant lifecycle without an external IdP.
+/// Static `IdP` plugin for bootstrap and tenant lifecycle without an external `IdP`.
 ///
 /// `init` publishes `PluginV1<IdpPluginSpecV1>` with the configured vendor/priority,
 /// awaits admission, then binds [`Service`] as a scoped `IdpPluginClient`.
@@ -81,26 +79,14 @@ impl Gear for StaticIdpPlugin {
             name: Self::MODULE_NAME.to_owned(),
             version: env!("CARGO_PKG_VERSION").parse()?,
         };
-        let mut options = ReconcileOptions::default();
-        options.deadline = STARTUP_PUBLICATION_DEADLINE;
         let gts_id = GtsId::try_new(instance_id.as_ref())?;
-        registry
-            .reconcile_entities_and_await(
-                &PlatformSecurityContext::outbound_marker(),
-                &publisher,
-                &[(gts_id.clone(), instance_json)],
-                &options,
-                ctx.cancellation_token(),
-            )
-            .await
-            .map_err(|error| {
-                let outcome = ReconcileReport::from_canonical(&error)
-                    .and_then(|report| report.outcomes.get(&gts_id).cloned());
-                anyhow::anyhow!(
-                    "static-idp-plugin: publishing instance {instance_id} failed: {error}; \
-                     outcome: {outcome:?}"
-                )
-            })?;
+        publish_startup_entities(
+            registry.as_ref(),
+            &publisher,
+            &[(gts_id, instance_json)],
+            ctx.cancellation_token(),
+        )
+        .await?;
 
         self.service
             .set(service.clone())

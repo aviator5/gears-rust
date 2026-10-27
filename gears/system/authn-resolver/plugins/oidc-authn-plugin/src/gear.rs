@@ -18,11 +18,9 @@ use toolkit::client_hub::ClientHub;
 use toolkit::context::GearCtx;
 use toolkit::contracts::SystemCapability;
 use toolkit::gts::PluginV1;
-use toolkit_security::PlatformSecurityContext;
 use tracing::{info, warn};
 use types_registry_sdk::{
-    GtsId, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, PublisherContext,
-    ReconcileOptions, ReconcileReport, STARTUP_PUBLICATION_DEADLINE,
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
 };
 
 use crate::config::{INSTANCE_SUFFIX, OidcAuthNGearConfig};
@@ -120,29 +118,16 @@ impl SystemCapability for OidcAuthNPluginGear {
         let registry = p.hub.get::<dyn PlatformTypesRegistryApi>().map_err(|e| {
             anyhow::anyhow!("oidc-authn-plugin: no PlatformTypesRegistryApi to publish to: {e}")
         })?;
-        let mut options = ReconcileOptions::default();
-        options.deadline = STARTUP_PUBLICATION_DEADLINE;
-        registry
-            .reconcile_entities_and_await(
-                &PlatformSecurityContext::outbound_marker(),
-                &PublisherContext {
-                    name: Self::MODULE_NAME.to_owned(),
-                    version: env!("CARGO_PKG_VERSION").parse()?,
-                },
-                &[(p.instance_id.clone(), p.instance.clone())],
-                &options,
-                &p.cancel,
-            )
-            .await
-            .map_err(|error| {
-                let outcome = ReconcileReport::from_canonical(&error)
-                    .and_then(|report| report.outcomes.get(&p.instance_id).cloned());
-                anyhow::anyhow!(
-                    "oidc-authn-plugin: publishing instance {} failed: {error}; \
-                     outcome: {outcome:?}",
-                    p.instance_id
-                )
-            })?;
+        publish_startup_entities(
+            registry.as_ref(),
+            &PublisherContext {
+                name: Self::MODULE_NAME.to_owned(),
+                version: env!("CARGO_PKG_VERSION").parse()?,
+            },
+            &[(p.instance_id.clone(), p.instance.clone())],
+            &p.cancel,
+        )
+        .await?;
 
         // Register plugin in ClientHub using the canonical GTS instance-id
         // scope consumed by authn-resolver runtime lookup, only past admission:

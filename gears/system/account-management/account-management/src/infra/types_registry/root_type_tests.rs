@@ -122,6 +122,12 @@ async fn a_refused_root_is_startup_fatal_and_names_it() {
         error.to_string().contains("incompatible_with_baseline"),
         "{error:#}"
     );
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<CanonicalError>().is_some()),
+        "the original canonical error stays available: {error:#}"
+    );
 }
 
 #[tokio::test]

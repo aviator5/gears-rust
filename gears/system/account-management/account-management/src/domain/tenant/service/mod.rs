@@ -188,7 +188,7 @@ pub struct TenantService<R: TenantRepo> {
     /// incompatible parent / child type pairings before any tenants /
     /// closure rows are written.
     tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync>,
-    /// Request registry for type hydration, tenant-name checks and parent IdP context
+    /// Request registry for type hydration, tenant-name checks and parent `IdP` context
     /// (P33). Single returns use `resolve_type_id`; `list_children` batches with
     /// `resolve_type_ids`. Tests may omit it, leaving `Tenant.tenant_type` as `None`.
     /// Reads hit the database until the SDK cache (T36).
