@@ -80,7 +80,7 @@ Ordinary gears can omit the registry dependency: its system-gear init runs first
 The host must then link a database-backed registry or consumer init fails.
 This [consumer-migration branch](https://github.com/aviator5/gears-rust/pull/1) moves
 AM and AuthZ/TR publishers onto this local-only path. AM request-path reads use
-`TypesRegistryApi` with the caller’s context; AuthN plugins consume the platform
+`TypesRegistryApi` with the caller’s context; `AuthN` plugins consume the platform
 contract and publish in `post_init`. T41/T42 retain full remote publication and
 readiness work; the remaining legacy consumers move in T38.
 
