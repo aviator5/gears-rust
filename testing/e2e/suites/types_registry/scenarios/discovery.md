@@ -2,7 +2,7 @@
 
 End-to-end discovery scenarios cover namespace patterns, the `kind`, `depth` and lifecycle filters, projection, cursor continuation and hydration through `:batchGet`. The local launcher uses **SQLite**; these tests do not prove PostgreSQL/MySQL or tenant/PDP behavior.
 
-Every scenario has an e2e test in [test_discovery.py](../test_discovery.py); the [suite README](../README.md) lists each group. Each scenario lists its source fixtures before Given and refers to them by name in Given/When/Then; all fixture links point to `fixtures/discovery/`. Every scenario registers into a fresh target namespace and discovers through that namespace's pattern; entities in a neighbouring namespace are controls the pattern must exclude.
+Every scenario has an e2e test in [test_discovery.py](../test_discovery.py) or [test_discovery_patterns.py](../test_discovery_patterns.py); the [suite README](../README.md) lists each group. Each scenario lists its source fixtures before Given and refers to them by name in Given/When/Then; all fixture links point to `fixtures/discovery/`. Every scenario registers into a fresh target namespace. Namespace-isolation scenarios additionally register neighbouring controls; identifier-matching scenarios use version, name, kind and chain controls within the target namespace.
 
 Unless a scenario says otherwise, discovery lists only active entities, a walk follows every `next_cursor` with the same query until none remains, and it returns each matching entity once in canonical GTS-ID order. Items are projected as an exact read projects them: the mandatory `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` accompany every selection, an absent `$select` returns the document-free default metadata, and a field that does not apply to an item's kind is absent. Pages carry no validators.
 
@@ -17,6 +17,12 @@ Unless a scenario says otherwise, discovery lists only active entities, a walk f
   - [TR-DISC-101 — Kind selects Type Schemas or Instances](#tr-disc-101--kind-selects-type-schemas-or-instances)
   - [TR-DISC-102 — Pattern, depth, kind, and selection compose](#tr-disc-102--pattern-depth-kind-and-selection-compose)
   - [TR-DISC-103 — Lifecycle filter separates live rows and tombstones](#tr-disc-103--lifecycle-filter-separates-live-rows-and-tombstones)
+  - [TR-DISC-104 — Type scopes, version wildcards and token boundaries](#tr-disc-104--type-scopes-version-wildcards-and-token-boundaries)
+  - [TR-DISC-105 — Pinned type minors and major zero](#tr-disc-105--pinned-type-minors-and-major-zero)
+  - [TR-DISC-106 — Concrete instance structure and base-minor flexibility](#tr-disc-106--concrete-instance-structure-and-base-minor-flexibility)
+  - [TR-DISC-107 — Later wildcards and beginning-of-ID anchoring](#tr-disc-107--later-wildcards-and-beginning-of-id-anchoring)
+  - [TR-DISC-108 — Three segments pin independently](#tr-disc-108--three-segments-pin-independently)
+  - [TR-DISC-109 — Unregistered UUID selectors remain valid](#tr-disc-109--unregistered-uuid-selectors-remain-valid)
 - [Cursor continuation](#cursor-continuation)
   - [TR-DISC-201 — A changed pattern cannot reuse a cursor](#tr-disc-201--a-changed-pattern-cannot-reuse-a-cursor)
   - [TR-DISC-202 — Page size may change without changing cursor identity](#tr-disc-202--page-size-may-change-without-changing-cursor-identity)
@@ -96,6 +102,83 @@ Unless a scenario says otherwise, discovery lists only active entities, a walk f
 **When:** Discover using the target namespace pattern with absent lifecycle, `active`, `deleted`, and `all`.
 
 **Then:** absent and `active` return only the target live schema, `deleted` only the target tombstone, and `all` both target schemas in canonical order. No neighbouring control appears. The tombstone remains exact-readable.
+
+### Identifier matching coverage
+
+These client examples follow GTS specification §10 and `gts-spec/tests/shared_id_pattern_cases.py` (`MATCH_CASES`). Expected result sets are authored independently of the matcher and compared as complete metadata pages at limit 2, including ordering and continuation. Tests generate schemas from `person_schema` in a fresh namespace and verify every admission outcome.
+
+| GTS matching cases | HTTP scenario |
+|---|---|
+| `type`, `all_majors`, `first_minor_wildcard` | TR-DISC-104 |
+| `pinned_minor`, `v0_chain`, `v0_minor_wildcard`, `v0_pinned` | TR-DISC-105 |
+| `instance`, `instance_pinned` (admissible subset) | TR-DISC-106 |
+| `later_minor_wildcard`, `later_chain_wildcard`, `derived_type`, `anchored_type`, chain prefix | TR-DISC-107 |
+| `chain_instance`, pinned base/derived/instance selectors (admissible subset) | TR-DISC-108 |
+| UUID selector acceptance / empty selection | TR-DISC-109 |
+
+The managed admission profile limits which specification candidates can be created through HTTP: a schema major cannot mix major-only and minor-bearing spelling; a version family holds only one kind; registered instances require a major-only last segment, reject explicit UUID tails, and cannot instantiate a major-zero type. Therefore positive UUID matching, explicit instance-minor matching and same-family type/instance distinctions remain lower-level test responsibilities. These are coverage limits, not changes to GTS matching rules.
+
+Selector-to-selector coverage (`COVERAGE_CASES`) is not discovery: stored entities have concrete identifiers. Exhaustive invalid syntax and numeric/length bounds also remain lower-level checks; this suite does not claim complete spec coverage.
+
+### TR-DISC-104 — Type scopes, version wildcards and token boundaries
+
+**Fixtures:** [person_schema](../fixtures/discovery/person_schema.json); generated versioned roots, branches and instances from this schema via `pattern_entities`.
+
+**Given:** Person roots with contiguous minors 0–2 under major 1, minors 0–1 under major 0, major-only roots 2 and 10, instances and derived branches, and a `person_extra` control. A derived `employee.v1.0~` under the major-only `person.v2~` root places an explicit minor only in the later segment.
+
+**When:** Query `person.v1~`, `person.v1~*`, `person.v1.*`, `person.*`, `person.v*`, `person.v2.*`, `person.v2~*`, and a namespace wildcard after `person.v2~`.
+
+**Then:** Concrete type and chain wildcard select the same branch across base minors. Family/version-marker wildcards span majors but exclude `person_extra`. Major 1 excludes major 10. `v2.*` excludes the major-only branch selected by `v2~*`, even though its derived type carries an explicit minor. The later namespace wildcard includes only the direct instance and derived type under major 2.
+
+### TR-DISC-105 — Pinned type minors and major zero
+
+**Fixtures:** [person_schema](../fixtures/discovery/person_schema.json); generated versioned roots, branches and instances from this schema via `pattern_entities`.
+
+**Given:** The same roots and branches; only stable majors have instances.
+
+**When:** Query `v1.0~` with and without `*`, `v0~*`, `v0.*`, and `v0.1~*`.
+
+**Then:** Pinned minor 0 excludes minors 1 and 2 while retaining descendants with independently versioned segments. Major zero follows the same rules.
+
+### TR-DISC-106 — Concrete instance structure and base-minor flexibility
+
+**Fixtures:** [person_schema](../fixtures/discovery/person_schema.json); generated versioned roots, branches and instances from this schema via `pattern_entities`.
+
+**Given:** Direct `alice.v1` instances across base minors, `alice.v10` and `alice_extra.v1` controls, and derived employee types with longer chains.
+
+**When:** Query `person.v1~…alice.v1`, pin the base minor, pin the instance minor, then pin both. Also query instance selectors ending in `employee.v1` and `employee.v1.0`, whose corresponding type branches and longer chains are registered.
+
+**Then:** Flexible base minor selects three instances; a pinned base selects one. Other names, majors and type branches are excluded. A pinned instance minor matches nothing because registered instances have major-only final segments. The employee instance selectors return empty pages: a same-name type and its longer descendants cannot satisfy a concrete instance selector.
+
+### TR-DISC-107 — Later wildcards and beginning-of-ID anchoring
+
+**Fixtures:** [person_schema](../fixtures/discovery/person_schema.json); generated versioned roots, branches and instances from this schema via `pattern_entities`.
+
+**Given:** Explicit-minor employee branches under two base minors, a major-only employee branch under base minor 2, their descendants, and direct alice instances.
+
+**When:** Query a later `employee.v1.*`, `employee.v1~*`, concrete employee type, pinned employee type, a namespace wildcard after the base, and a root selector whose employee name occurs only in later segments.
+
+**Then:** The minor wildcard excludes the major-only employee branch; the chain wildcard and concrete type include it. A pinned derived minor narrows only that segment. The namespace wildcard includes both direct instances and derived branches, but no other first-segment major. Root matching never starts at a later segment.
+
+### TR-DISC-108 — Three segments pin independently
+
+**Fixtures:** [person_schema](../fixtures/discovery/person_schema.json); generated versioned roots, branches and instances from this schema via `pattern_entities`.
+
+**Given:** Two base minors × two explicit derived minors and a branch with an omitted derived minor under base minor 2, each with an `item.v2` instance.
+
+**When:** Query the three-segment instance selector, pin the derived minor, pin the base minor, pin the final instance minor to 0, and pin base and derived minors together.
+
+**Then:** Each pin constrains only its own segment; omitted base/derived minors remain flexible, including the omitted-derived-minor branch. Pinned final minors produce empty pages because stored instances have major-only final segments. Combining base minor 0 and derived minor 0 selects exactly `leaf_0_0`.
+
+### TR-DISC-109 — Unregistered UUID selectors remain valid
+
+**Fixtures:** [person_schema](../fixtures/discovery/person_schema.json); generated versioned roots, branches and instances from this schema via `pattern_entities`.
+
+**Given:** Named instances, derived types and other type majors. Managed registration rejects explicit UUID tails.
+
+**When:** Query a UUID selector under flexible major 1, pinned minor 0, and major 2.
+
+**Then:** Each valid selector returns an empty page, rather than a syntax error or named instances. This proves selector acceptance and exclusion only.
 
 ## Cursor continuation
 
