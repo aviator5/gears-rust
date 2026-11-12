@@ -29,6 +29,7 @@ pub type ConcreteMembershipService = MembershipService<GroupRepository, Membersh
 pub type ConcreteRgService = RgService<GroupRepository, MembershipRepository>;
 
 // @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-gear-scaffold:p1
+// @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-managed-publication:p1
 /// Resource-group gear.
 ///
 /// Publication (`gts_publication(...)`, run by the runtime before any application

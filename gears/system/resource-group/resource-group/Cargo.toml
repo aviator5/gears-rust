@@ -81,7 +81,7 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 # Consumer-owned integration tests against real persisted registry admission.
-types-registry = { workspace = true }
+types-registry = { package = "cf-gears-types-registry", path = "../../types-registry/types-registry" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }

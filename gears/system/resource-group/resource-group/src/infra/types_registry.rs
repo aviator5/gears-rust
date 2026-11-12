@@ -18,6 +18,7 @@ use crate::domain::error::DomainError;
 use crate::domain::type_catalog::{RgType, RgTypeCatalog, TypeUse};
 
 /// Production [`RgTypeCatalog`].
+// @cpt-dod:cpt-cf-resource-group-dod-type-mgmt-registry-catalog:p1
 pub struct RegistryTypeCatalog {
     registry: Arc<dyn TypesRegistryApi>,
 }

@@ -10,7 +10,7 @@ from typing import Optional
 import httpx
 import pytest
 
-from ..types_registry.helpers import PLATFORM_API, RECEIPT, submit_and_poll
+from ..types_registry.helpers import PLATFORM_API, RECEIPT, get_entity, submit_and_poll
 
 REQUEST_TIMEOUT = 5.0  # per-request hard timeout for all E2E calls
 RG_BASE_TYPE = "gts.cf.core.rg.type.v1~"
@@ -95,14 +95,23 @@ def _platform_headers() -> dict:
 
 async def publish_rg_type(base_url: str, code: str, **traits) -> dict:
     """Publish an RG type through the types registry's platform API and wait
-    for its admission. Resource-group has no type endpoint of its own."""
+    for its admission. Existing declarations use a version-matched revision
+    so successive suite runs sharing a registry can publish the same type."""
     async with httpx.AsyncClient(
         base_url=base_url.rstrip("/") + "/", headers=_platform_headers(), timeout=10.0
     ) as platform:
+        candidate = {"gts_id": code, "content": rg_type_schema(code, **traits)}
+        current = await get_entity(platform, PLATFORM_API, code, select="origin")
+        if current.status_code == 200:
+            candidate["expected_resource_version"] = current.json()["origin"]["resource_version"]
+        else:
+            assert current.status_code == 404, (
+                f"types-registry read of '{code}': {current.status_code} {current.text}"
+            )
         operation = await submit_and_poll(
             platform,
             PLATFORM_API,
-            [{"gts_id": code, "content": rg_type_schema(code, **traits)}],
+            [candidate],
             RECEIPT,
         )
     [item] = operation["items"]
@@ -122,7 +131,8 @@ def _seed_root_tenants():
     to the types registry (resource-group keeps no type catalogue); the rows
     store its GTS identifier.
 
-    Idempotent: uses INSERT OR IGNORE, and republishing is unchanged.
+    Idempotent: uses INSERT OR IGNORE, and republishes the type under its
+    current registry version so identical content is unchanged.
     """
     import asyncio
 

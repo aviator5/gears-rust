@@ -64,7 +64,7 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2b
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
+            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
             DomainError::InvalidParentType { message } => RgError::invalid_argument()
                 .with_field_violation(
                     field::PARENT_TYPE_FIELD,
@@ -73,7 +73,7 @@ impl From<DomainError> for CanonicalError {
                 )
                 .create(),
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
+            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2f
             // ⚠ wire change accepted in the migration plan: 409 → 400.
             DomainError::CycleDetected { message } => RgError::failed_precondition()
                 .with_precondition_violation(

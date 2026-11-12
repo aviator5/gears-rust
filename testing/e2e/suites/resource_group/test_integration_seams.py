@@ -2,7 +2,7 @@
 # @cpt-dod:cpt-cf-resource-group-dod-e2e-test-suite:p1
 """E2E integration seam tests for resource-group gear (Feature 0007).
 
-12 tests. One file. < 15 seconds. Zero flakes.
+Integration seam coverage for group operations and registry-owned types.
 
 Each test guards a specific integration seam -- a point where two independently
 correct components can break when connected. If the seam is already covered by
@@ -16,7 +16,8 @@ import uuid
 import httpx
 import pytest
 
-from .conftest import REQUEST_TIMEOUT, assert_group_shape
+from .conftest import REQUEST_TIMEOUT, assert_group_shape, publish_rg_type
+from ..types_registry.helpers import PLATFORM_API, get_entity
 
 
 # ── URL helpers ──────────────────────────────────────────────────────────
@@ -119,6 +120,35 @@ async def test_former_type_catalogue_routes_are_gone(
             f"{[p for p in paths if p.startswith('/types-registry/v1/types')]}"
         )
         assert "/resource-group/v1/groups" in paths, sorted(paths)
+
+
+# ── Registry publication contract ───────────────────────────────────────
+
+
+@pytest.mark.smoke
+async def test_type_publication_is_repeatable(
+    rg_base_url, platform_headers, create_type,
+):
+    """Seam: repeated fixture publication uses the registry revision contract.
+
+    A second suite using the same registry must admit an identical declaration
+    without creating a revision or failing with already_exists.
+    """
+    published = await create_type("repeat")
+    code = published["code"]
+    async with httpx.AsyncClient(
+        base_url=rg_base_url.rstrip("/") + "/",
+        headers=platform_headers,
+        timeout=REQUEST_TIMEOUT,
+    ) as client:
+        before = await get_entity(client, PLATFORM_API, code, select="origin,content")
+        assert before.status_code == 200, before.text
+
+        await publish_rg_type(rg_base_url, code)
+
+        after = await get_entity(client, PLATFORM_API, code, select="origin,content")
+        assert after.status_code == 200, after.text
+        assert after.json() == before.json()
 
 
 # ── S2: DTO roundtrip ───────────────────────────────────────────────────

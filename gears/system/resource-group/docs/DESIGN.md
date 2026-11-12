@@ -1,24 +1,49 @@
+---
+description: "Resource Group architecture, registry-owned type contracts, persistence and public interfaces."
+---
+
 <!-- Created: 2026-04-07 by Constructor Tech -->
 <!-- Updated: 2026-11-12 by Constructor Tech -->
 
 # Technical Design - Resource Group (RG)
+
+<!-- toc -->
+
+- [1. Architecture Overview](#1-architecture-overview)
+  - [1.1 Architectural Vision](#11-architectural-vision)
+  - [1.2 Architecture Drivers](#12-architecture-drivers)
+  - [1.3 Architecture Layers](#13-architecture-layers)
+  - [1.4 Implementation layout](#14-implementation-layout)
+- [2. Principles & Constraints](#2-principles--constraints)
+  - [2.1 Design Principles](#21-design-principles)
+  - [2.2 Constraints](#22-constraints)
+- [3. Technical Architecture](#3-technical-architecture)
+  - [3.1 Domain Model](#31-domain-model)
+  - [3.2 Component Model](#32-component-model)
+  - [3.3 API Contracts](#33-api-contracts)
+  - [3.4 Interactions & Sequences](#34-interactions--sequences)
+  - [3.5 Database schemas & tables](#35-database-schemas--tables)
+- [4. Runtime and Verification](#4-runtime-and-verification)
+  - [4.1 Transactions and concurrency](#41-transactions-and-concurrency)
+  - [4.2 Errors and observability](#42-errors-and-observability)
+  - [4.3 Tests](#43-tests)
+- [5. Source References](#5-source-references)
+
+<!-- /toc -->
 
 Resource Group manages a forest of groups and membership links to resources owned
 by other gears. Types Registry owns the GTS type definitions that govern group
 placement and payload validation. RG persists group instances, their ancestry and
 memberships in its own database.
 
-## Contents
-
-- [1. Architecture Overview](#1-architecture-overview)
-- [2. Principles & Constraints](#2-principles--constraints)
-- [3. Technical Architecture](#3-technical-architecture)
-- [4. Runtime and Verification](#4-runtime-and-verification)
-- [5. Source References](#5-source-references)
-
 ## 1. Architecture Overview
 
-### 1.1 Responsibilities
+### 1.1 Architectural Vision
+
+RG owns the group forest and memberships; Types Registry owns their type
+contracts. Declaring gears publish their schemas before application initialization.
+RG reads materialized schemas and traits with the caller's context, validates
+payloads through the registry SDK and persists only group and membership data.
 
 | Owner | Responsibility |
 | --- | --- |
@@ -39,7 +64,45 @@ HTTP routes expose group and membership operations under `/resource-group/v1`.
 The host supplies any outer route prefix, such as `/cf`. Type publication and
 reads use Types Registry's SDK and API.
 
-### 1.2 Component model
+### 1.2 Architecture Drivers
+
+| Driver | Design response |
+| --- | --- |
+| Consumer-owned type declarations | Managed GTS publication by RG and each declaring gear |
+| Caller-scoped type access | Registry reads forward the operation's SecurityContext |
+| Atomic forest and tenant invariants | Scoped repositories and retryable transactions maintain groups and closure rows together |
+| Registry I/O outside database transactions | Services resolve and validate type snapshots before beginning writes |
+| Preserve existing hierarchy during migration | Copy GTS identifiers onto groups and memberships before removing the local catalog |
+
+| Functional requirements | Design response |
+| --- | --- |
+| `cpt-cf-resource-group-fr-manage-types`, `cpt-cf-resource-group-fr-validate-type-code` | TypesRegistryApi resolves canonical GTS type contracts with the caller context. |
+| `cpt-cf-resource-group-fr-reject-duplicate-type`, `cpt-cf-resource-group-fr-seed-types` | Managed publication owns creation/revision admission before application initialization. |
+| `cpt-cf-resource-group-fr-validate-type-update-hierarchy`, `cpt-cf-resource-group-fr-delete-type-only-if-empty` | New writes use current snapshots; retained definitions support existing instances after type retirement. |
+| `cpt-cf-resource-group-fr-manage-entities`, `cpt-cf-resource-group-fr-enforce-forest-hierarchy`, `cpt-cf-resource-group-fr-validate-parent-type` | GroupService validates immutable types, parent placement and cycles before transactional writes. |
+| `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`, `cpt-cf-resource-group-fr-tenant-scope-ownership-graph` | Tenant type prefixes and scoped transactional checks enforce tenant ownership and root uniqueness. |
+| `cpt-cf-resource-group-fr-delete-entity-no-active-references`, `cpt-cf-resource-group-fr-force-delete`, `cpt-cf-resource-group-fr-subtree-operations` | GroupRepository refuses referenced non-force deletes and atomically maintains subtree closures on moves or force deletion. |
+| `cpt-cf-resource-group-fr-seed-groups`, `cpt-cf-resource-group-fr-seed-memberships` | Consumers bootstrap instances through normal authorized client operations after publishing their types; RG has no seed service. |
+| `cpt-cf-resource-group-fr-manage-membership`, `cpt-cf-resource-group-fr-query-membership-relations` | MembershipService and its repository enforce allowed resource types and tenant ownership and expose scoped lookups. |
+| `cpt-cf-resource-group-fr-closure-table`, `cpt-cf-resource-group-fr-query-group-hierarchy`, `cpt-cf-resource-group-fr-list-groups-depth` | Indexed closure rows support ancestor/descendant reads with relative depth. |
+| `cpt-cf-resource-group-fr-query-profile`, `cpt-cf-resource-group-fr-profile-change-no-rewrite`, `cpt-cf-resource-group-fr-reduced-constraints-behavior` | QueryProfile checks subsequent writes without truncating reads or rewriting existing data. |
+| `cpt-cf-resource-group-fr-rest-api`, `cpt-cf-resource-group-fr-odata-query` | OperationBuilder mounts group/membership routes; typed OData filters and cursors use stored identifiers. |
+| `cpt-cf-resource-group-fr-integration-read-port`, `cpt-cf-resource-group-fr-no-authz-and-sql-logic`, `cpt-cf-resource-group-fr-jwt-auth` | Public writes use authentication and PolicyEnforcer; trusted hierarchy reads bypass the PDP recursion without returning policy or SQL. |
+| `cpt-cf-resource-group-fr-deterministic-errors` | Domain errors and registry refusals map to canonical RFC-9457 categories; REST conversion tests verify their wire representation. |
+
+| Non-functional requirement | Design allocation and verification |
+| --- | --- |
+| `cpt-cf-resource-group-nfr-hierarchy-query-latency` | Indexed closure traversal and depth filters; validate the PRD latency target under the deployed query profile. |
+| `cpt-cf-resource-group-nfr-membership-query-latency` | Composite membership indexes and scoped SQL queries; validate the PRD latency target under representative load. |
+| `cpt-cf-resource-group-nfr-transactional-consistency` | Group, closure and tenant membership changes share transactions; SQLite and PostgreSQL behavior/concurrency suites verify atomicity. |
+| `cpt-cf-resource-group-nfr-deterministic-errors` | Domain errors map to canonical RFC-9457 responses; conversion and REST tests cover the mapping. |
+| `cpt-cf-resource-group-nfr-production-scale` | Set-based closure maintenance, indexed keys and cursor pagination bound query work. Projected PRD volumes remain deployment capacity targets, not a claim of a completed scale benchmark. |
+| `cpt-cf-resource-group-nfr-compatibility` | SDKs are the public boundary; the deliberate type CRUD/bootstrap removal requires the documented migration and breaking API acknowledgement. |
+| `cpt-cf-resource-group-nfr-data-lifecycle` | Scoped membership removal and transactional force deletion support tenant deprovisioning; behavior tests verify closure and membership cleanup. |
+
+The GTS identity and traits basis is recorded in `cpt-cf-resource-group-adr-p1-gts-type-system`. Its earlier local catalog and surrogate-key implementation is superseded by registry-owned definitions and stored GTS identifiers.
+
+### 1.3 Architecture Layers
 
 ```mermaid
 flowchart TD
@@ -65,7 +128,7 @@ Registry reads and payload compilation precede database write transactions. The
 transaction works with the resulting type snapshot and current RG rows. Ordinary
 group reads, membership reads and cleanup use stored type identifiers.
 
-### 1.3 Implementation layout
+### 1.4 Implementation layout
 
 | Location | Contents |
 | --- | --- |
@@ -81,11 +144,11 @@ group reads, membership reads and cleanup use stored type identifiers.
 
 ## 2. Principles & Constraints
 
-### 2.1 Policy-agnostic data model
+### 2.1 Design Principles
+
+#### Policy-agnostic data model
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-policy-agnostic`
-- [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-no-authz-decision`
-- [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-no-sql-filter-generation`
 
 RG checks graph and membership invariants. The PDP decides who may perform an
 operation and returns constraints; PolicyEnforcer and SecureORM apply them.
@@ -96,7 +159,7 @@ RG's group resource descriptor exposes tenant and resource identifiers. Producti
 wiring advertises no native group-predicate capability for its own nested groups;
 the PDP must expand group scopes into supported predicates or deny the operation.
 
-### 2.2 Forest integrity
+#### Forest integrity
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-strict-forest`
 
@@ -108,7 +171,7 @@ in the same transaction.
 The group's GTS type is immutable. `UpdateGroupRequest` carries name, parent and
 metadata; it has no type field.
 
-### 2.3 Tenant ownership
+#### Tenant ownership
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-tenant-scope-ownership-graph`
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-tenant-root-uniqueness`
@@ -129,7 +192,7 @@ default is `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`.
 Target-tenant authorization is enforced by the create path's PolicyEnforcer
 constraints. A caller-supplied target does not confer permission to write there.
 
-### 2.4 Registry-owned type contracts
+#### Registry-owned type contracts
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-dynamic-types`
 
@@ -157,7 +220,7 @@ The registry controls evolution of type definitions. RG applies the definition
 read for an operation; publication does not scan or rewrite existing RG rows.
 There is no distributed transaction between registry publication and an RG write.
 
-### 2.5 Payload and barrier metadata
+#### Payload and barrier metadata
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-barrier-as-data`
 
@@ -177,10 +240,9 @@ For tenant types, `metadata.self_managed` can express a barrier. RG stores and
 returns it without pruning hierarchy queries. Trusted tenant resolver and AuthZ
 consumers interpret it according to their own contracts.
 
-### 2.6 Query profiles
+#### Query profiles
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-query-profile-guardrail`
-- [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-profile-change-safety`
 
 `GroupService` receives a `QueryProfile`. Production gear wiring currently uses
 `max_depth = Some(10)` and `max_width = None`; these are service guardrails, not
@@ -190,9 +252,19 @@ Enabled depth and width limits are checked on create and move. Changing a
 profile does not rewrite stored groups or closure rows. Each write is evaluated
 against the active limits; existing data remains available to reads and cleanup.
 
-### 2.7 Persistence and availability
+### 2.2 Constraints
 
+- [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-no-authz-decision`
+- [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-no-sql-filter-generation`
+- [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-profile-change-safety`
 - [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-db-agnostic`
+- [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-gts-identifiers`
+
+Authorization decisions and SQL scope generation remain outside RG's domain
+services. Query profile changes apply to subsequent writes without rewriting
+the existing forest.
+
+Groups and memberships persist their GTS type identifiers directly; RG has no internal surrogate key for a type definition.
 
 The implementation supports PostgreSQL and SQLite. Executable migrations and
 backend-specific SQL live under `infra/storage/migrations/`. The reference
@@ -209,7 +281,7 @@ a platform identity.
 
 ## 3. Technical Architecture
 
-### 3.1 Domain model
+### 3.1 Domain Model
 
 | Model | Representation |
 | --- | --- |
@@ -224,7 +296,7 @@ A group references another group through `parent_id`. The closure table records
 all ancestor/descendant pairs, including `(group, group, 0)`. Memberships attach
 resources to groups; group nesting is represented by parent and closure rows.
 
-### 3.2 Components
+### 3.2 Component Model
 
 #### Gear composition
 
@@ -265,6 +337,8 @@ tenant ownership. This interface has no separate unscoped HTTP route.
 
 #### Type catalog adapter and repositories
 
+- [x] `p1` - **ID**: `cpt-cf-resource-group-component-type-catalog`
+
 - [x] `p1` - **ID**: `cpt-cf-resource-group-component-persistence-adapter`
 
 `RgTypeCatalog` is a domain port. `RegistryTypeCatalog` implements it over
@@ -277,121 +351,7 @@ only the group type is decoded as RG placement traits.
 Their SecureORM implementations operate on `DBRunner` connections/transactions;
 database policy remains with the runtime and PolicyEnforcer.
 
-### 3.3 Startup and declaration ownership
-
-The host runtime starts the system group first. Application database migrations
-and registry client wiring precede GTS publication, which completes before
-application `init`. RG publishes its base type; gears that use
-RG publish their own derived types through their own collectors.
-
-Account Management owns the user-group container
-`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the user member-handle
-`gts.cf.core.rg.type.v1~cf.core.am.user.v1~`. They arrive through AM's publication.
-Application initialization depends on successful admission of the declarations.
-The same declarations are available to the runtime's `publish-gts` deployment
-path.
-
-Registry publication can run concurrently across owners. A declaration whose
-base is pending is reconciled within the runtime's publication budget. RG
-initialization constructs its adapter without making registry requests.
-
-### 3.4 Write flows
-
-#### Create a group
-
-**ID**: `cpt-cf-resource-group-seq-create-entity-with-parent`
-
-1. Validate the requested RG type path and name.
-2. Read an active type through the caller's registry API and validate the group
-   payload with the SDK validator.
-3. Resolve create permissions, target tenant and applicable scope.
-4. In a retryable serializable transaction, read the actual parent, check
-   placement, tenant rules and profile limits, then insert the group and its
-   closure rows.
-5. Return the inserted representation.
-
-```mermaid
-sequenceDiagram
-    participant Caller
-    participant RG as GroupService
-    participant TR as TypesRegistryApi
-    participant PDP as PolicyEnforcer / AuthZ
-    participant DB as RG database
-    Caller->>RG: create_group(ctx, request)
-    RG->>TR: exact type read (ctx, selected artifacts)
-    TR-->>RG: materialized schema and traits
-    RG->>RG: SDK payload validation
-    RG->>PDP: authorize create and target tenant
-    PDP-->>RG: scope
-    RG->>DB: transaction: check parent, insert group and closure
-    DB-->>RG: committed row
-    RG-->>Caller: ResourceGroup
-```
-
-#### Update or move a group
-
-**ID**: `cpt-cf-resource-group-seq-move-subtree`
-
-The public update path authorizes the caller and reads the existing group under
-that scope before returning any type-shaped error. An update supplying non-null
-metadata or changing the parent obtains the group's exact type definition before
-the transaction. Deleted definitions remain usable because the registry retains
-their content. Supplied metadata is validated with the SDK. With an unchanged
-parent, renaming or clearing metadata to `null` takes the row-only path and does
-not request a type definition.
-
-The transaction re-reads the group and compares its type with the snapshot.
-A mismatched type is a conflict. A parent change checks the actual new parent,
-cycles, tenant ownership, placement and limits, then updates the parent pointer
-and closure rows atomically. Type and tenant ownership remain immutable.
-
-Rename/metadata updates use the backend-default isolation with a row lock.
-A parent change uses serializable isolation. If the initial parent snapshot
-suggested a row-only update but the transaction observes a parent change, it
-returns without writing and retries through the serializable path; any missing
-type lookup occurs between transaction attempts.
-
-#### Add a membership
-
-The caller is authorized for membership creation. RG first reads the group under
-the membership-derived group scope, then batch-reads the group and resource types
-from the registry. Both types must be active, and the group's traits must permit
-the resource type.
-
-A retryable serializable transaction rechecks the group's scope and type, checks
-for memberships of the resource in other tenants, and inserts the membership.
-The tenant check and insert share a transaction to prevent concurrent first
-memberships from assigning one resource to two tenants.
-
-#### Delete and cleanup
-
-Non-force group deletion locks its target and refuses groups with child groups
-or memberships. Force deletion removes subtree memberships and closure rows and
-deletes groups in a safe order inside one serializable transaction. Removing a
-membership is a scoped delete by its full key. These operations use the stored
-GTS identifiers and do not consult type definitions.
-
-### 3.5 Registry lifecycle and failure behavior
-
-| Operation | Type-definition requirement |
-| --- | --- |
-| Create group | Active RG type; validate payload and placement |
-| Add membership | Active group type and active concrete member resource type; validate allowed memberships |
-| Non-null metadata replacement / reparent existing group | Exact RG type definition, deleted included; unknown type is refused |
-| Rename or clear metadata with unchanged parent | No registry lookup |
-| Group/membership reads and filters | No registry lookup |
-| Membership removal / group deletion, including force | No registry lookup |
-
-An unknown or deleted group type is `TypeNotFound` when an active type is
-required. An unknown, deleted, malformed, wildcard or instance identifier used as
-a new member resource type is a validation error. Caller registry refusals retain
-401/403; an unavailable registry is reported as service unavailable. Missing
-required projections or undecodable RG traits are internal contract errors. SDK
-payload compilation or
-validation refusal is a validation error; an absent definition never silently
-skips validation on a path requiring one.
-
-### 3.6 Public API
+### 3.3 API Contracts
 
 Paths below are relative to the host prefix.
 
@@ -433,7 +393,161 @@ unquoted. Cursor handling and field validation use ToolKit's OData utilities.
 The [OpenAPI document](openapi.yaml) and [SDK traits](rust-traits.md) describe the
 transport and Rust boundaries respectively.
 
-### 3.7 Persistence model
+### 3.4 Interactions & Sequences
+
+#### Startup and declaration ownership
+
+**ID**: `cpt-cf-resource-group-seq-init-order`
+
+The host runtime starts the system group first. Application database migrations
+and registry client wiring precede GTS publication, which completes before
+application `init`. RG publishes its base type; gears that use
+RG publish their own derived types through their own collectors.
+
+Account Management owns the user-group container
+`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the user member-handle
+`gts.cf.core.rg.type.v1~cf.core.am.user.v1~`. They arrive through AM's publication.
+Application initialization depends on successful admission of the declarations.
+The same declarations are available to the runtime's `publish-gts` deployment
+path.
+
+Registry publication can run concurrently across owners. A declaration whose
+base is pending is reconciled within the runtime's publication budget. RG
+initialization constructs its adapter without making registry requests.
+
+#### Authentication and integration reads
+
+**ID**: `cpt-cf-resource-group-seq-auth-modes`
+
+Public group and membership requests authenticate through the gateway and pass
+through PolicyEnforcer. In-process PDP and tenant resolver consumers use the
+narrow trusted ResourceGroupReadHierarchy interface to avoid recursive policy
+evaluation. An external MTLS-only hierarchy read is a deferred deployment design,
+not a currently mounted bypass route.
+
+**ID**: `cpt-cf-resource-group-seq-jwt-rg-request`
+
+A bearer-authenticated request reaches the typed REST handler, then the public
+service, authorization and a scoped database operation. A type-dependent write
+also reads Types Registry with that caller's SecurityContext before its transaction.
+
+**ID**: `cpt-cf-resource-group-seq-authz-rg-sql-split`
+
+The PDP reads hierarchy or memberships through ResourceGroupReadHierarchy,
+interprets them and returns constraints. PolicyEnforcer and SecureORM apply those
+constraints; RG's domain services generate neither policy decisions nor SQL scopes.
+
+**ID**: `cpt-cf-resource-group-seq-e2e-authz-flow`
+
+The resource-group integration suite publishes types through the platform API,
+then exercises group and membership requests with a tenant bearer. The tr-authz
+launcher profile reuses the deployment registry and seeds stable root tenants;
+its current reduced feature set and deferred full chain are documented in
+`testing/e2e/suites/resource_group/e2e.yaml`.
+
+**ID**: `cpt-cf-resource-group-seq-mtls-authz-read`
+
+The PRD's unchecked p2 dual-auth requirement reserves a future external,
+certificate-authenticated hierarchy-only path. Current trusted consumers are
+co-located and use ClientHub; this sequence does not claim implemented MTLS routes.
+
+#### Write flows
+
+##### Create a group
+
+**ID**: `cpt-cf-resource-group-seq-create-entity-with-parent`
+
+1. Validate the requested RG type path and name.
+2. Read an active type through the caller's registry API and validate the group
+   payload with the SDK validator.
+3. Resolve create permissions, target tenant and applicable scope.
+4. In a retryable serializable transaction, read the actual parent, check
+   placement, tenant rules and profile limits, then insert the group and its
+   closure rows.
+5. Return the inserted representation.
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant RG as GroupService
+    participant TR as TypesRegistryApi
+    participant PDP as PolicyEnforcer / AuthZ
+    participant DB as RG database
+    Caller->>RG: create_group(ctx, request)
+    RG->>TR: exact type read (ctx, selected artifacts)
+    TR-->>RG: materialized schema and traits
+    RG->>RG: SDK payload validation
+    RG->>PDP: authorize create and target tenant
+    PDP-->>RG: scope
+    RG->>DB: transaction: check parent, insert group and closure
+    DB-->>RG: committed row
+    RG-->>Caller: ResourceGroup
+```
+
+##### Update or move a group
+
+**ID**: `cpt-cf-resource-group-seq-move-subtree`
+
+The public update path authorizes the caller and reads the existing group under
+that scope before returning any type-shaped error. An update supplying non-null
+metadata or changing the parent obtains the group's exact type definition before
+the transaction. Deleted definitions remain usable because the registry retains
+their content. Supplied metadata is validated with the SDK. With an unchanged
+parent, renaming or clearing metadata to `null` takes the row-only path and does
+not request a type definition.
+
+The transaction re-reads the group and compares its type with the snapshot.
+A mismatched type is a conflict. A parent change checks the actual new parent,
+cycles, tenant ownership, placement and limits, then updates the parent pointer
+and closure rows atomically. Type and tenant ownership remain immutable.
+
+Rename/metadata updates use the backend-default isolation with a row lock.
+A parent change uses serializable isolation. If the initial parent snapshot
+suggested a row-only update but the transaction observes a parent change, it
+returns without writing and retries through the serializable path; any missing
+type lookup occurs between transaction attempts.
+
+##### Add a membership
+
+The caller is authorized for membership creation. RG first reads the group under
+the membership-derived group scope, then batch-reads the group and resource types
+from the registry. Both types must be active, and the group's traits must permit
+the resource type.
+
+A retryable serializable transaction rechecks the group's scope and type, checks
+for memberships of the resource in other tenants, and inserts the membership.
+The tenant check and insert share a transaction to prevent concurrent first
+memberships from assigning one resource to two tenants.
+
+##### Delete and cleanup
+
+Non-force group deletion locks its target and refuses groups with child groups
+or memberships. Force deletion removes subtree memberships and closure rows and
+deletes groups in a safe order inside one serializable transaction. Removing a
+membership is a scoped delete by its full key. These operations use the stored
+GTS identifiers and do not consult type definitions.
+
+#### Registry lifecycle and failure behavior
+
+| Operation | Type-definition requirement |
+| --- | --- |
+| Create group | Active RG type; validate payload and placement |
+| Add membership | Active group type and active concrete member resource type; validate allowed memberships |
+| Non-null metadata replacement / reparent existing group | Exact RG type definition, deleted included; unknown type is refused |
+| Rename or clear metadata with unchanged parent | No registry lookup |
+| Group/membership reads and filters | No registry lookup |
+| Membership removal / group deletion, including force | No registry lookup |
+
+An unknown or deleted group type is `TypeNotFound` when an active type is
+required. An unknown, deleted, malformed, wildcard or instance identifier used as
+a new member resource type is a validation error. Caller registry refusals retain
+401/403; an unavailable registry is reported as service unavailable. Missing
+required projections or undecodable RG traits are internal contract errors. SDK
+payload compilation or
+validation refusal is a validation error; an absent definition never silently
+skips validation on a path requiring one.
+
+### 3.5 Database schemas & tables
 
 The RG database contains three domain tables. GTS identifiers are stored as text
 in `gts_type_id` with a length constraint of 1–1024 characters. There is no

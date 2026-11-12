@@ -9,6 +9,17 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Resource Group type definitions now live in Types Registry. The former
+  `/types-registry/v1/types` and `/types-registry/v1/types/{code}` CRUD routes,
+  SDK type CRUD methods and `ResourceGroupTypeBootstrap` are removed. Publish
+  declarations through Types Registry's platform API or managed GTS publication.
+  Export and publish custom type definitions before upgrading: the irreversible
+  RG database migration removes the local catalog while preserving type
+  identifiers, groups, memberships and hierarchy data. See the
+  [Resource Group design](gears/system/resource-group/docs/DESIGN.md).
+
 ## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-le-issue-admission-plugin-v0.1.1...cf-gears-le-issue-admission-plugin-v0.1.2) - 2026-11-11
 
 ### Other

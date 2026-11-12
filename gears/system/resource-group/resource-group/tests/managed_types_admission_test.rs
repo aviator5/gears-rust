@@ -4,6 +4,7 @@
     reason = "integration tests: a failed fixture or assertion step is a test failure"
 )]
 //! Resource-group types as managed registry entities (T38b RG slice).
+// @cpt-dod:cpt-cf-resource-group-dod-testing-managed-types:p1
 //!
 //! Admits the RG SDK's published base `gts.cf.core.rg.type.v1~` and derived RG
 //! types through the real local client and database/outbox admission, then reads
