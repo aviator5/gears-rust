@@ -140,16 +140,16 @@ transaction opens. Type and tenant identifiers are immutable after creation.
 **Actor**: `cpt-cf-resource-group-actor-tenant-administrator`
 
 **Success Scenarios**:
-- Group name, metadata, or type updated successfully
+- Group name, metadata, or parent updated successfully
 - Group type and tenant ownership remain immutable; parent changes validate the moved subtree placement
 
 **Error Scenarios**:
 - Group not found → NotFound
-- New type's allowed_parents does not include current parent → InvalidParentType
-- Children's types do not include new type in their allowed_parents → InvalidParentType
+- Parent change violates the stored type's placement rules → InvalidParentType
+- Replacement metadata, including removal, violates the type schema → Validation
 
 **Steps**:
-1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, type, metadata} - `inst-update-group-1`
+1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, parent_id, metadata}; nullable replacement fields must be explicit - `inst-update-group-1`
 2. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {group_id} — load existing group - `inst-update-group-2`
 3. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-update-group-3`
 4. [x] - `p1` - Preserve the stored type identifier and refuse a mismatched pre-read type snapshot - `inst-update-group-4`
@@ -157,7 +157,7 @@ transaction opens. Type and tenant identifiers are immutable after creation.
    2. [x] - `p1` - Determine whether the current row requires a structural parent change - `inst-update-group-4b`
    3. [x] - `p1` - Escalate an unexpected parent change to a serializable retry before any write - `inst-update-group-4c`
    4. [x] - `p1` - Validate the move with the current parent snapshot, placement traits and closure rules - `inst-update-group-4d`
-5. [x] - `p1` - Validate non-null replacement metadata through the SDK snapshot before the transaction; use the same immutable type inside the write - `inst-update-group-4e`
+5. [x] - `p1` - Validate replacement or removal of metadata through the SDK snapshot before the transaction; reject a concurrent unvalidated removal and use the same immutable type inside the write - `inst-update-group-4e`
 6. [x] - `p1` - DB: UPDATE resource_group SET name, parent_id, metadata, updated_at — preserve type and tenant identifiers - `inst-update-group-5`
 7. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
 
@@ -342,7 +342,7 @@ The system **MUST** implement REST endpoint handlers for group management under 
 - `GET /groups` — list groups with OData `$filter` (fields: `type`, `hierarchy/parent_id`, `tenant_id`, `id`, `name`; operators: `eq`, `ne`, `in`) and cursor-based pagination
 - `POST /groups` — create group, return 201 Created
 - `GET /groups/{group_id}` — get group by UUID, return 404 if not found
-- `PUT /groups/{group_id}` — update group (name, type, metadata) or move group (hierarchy.parent_id), return 200 OK
+- `PUT /groups/{group_id}` — replace mutable fields (name, parent_id, metadata); type and tenant ownership remain immutable, return 200 OK
 - `DELETE /groups/{group_id}?force={true|false}` — delete group, return 204 No Content
 - `GET /groups/{group_id}/hierarchy` — hierarchy depth traversal with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
 

@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
-use resource_group_sdk::{GROUP_MEMBERSHIP_RESOURCE_TYPE, models::ResourceGroupMembership};
+use resource_group_sdk::{
+    GROUP_MEMBERSHIP_RESOURCE_TYPE, MAX_MEMBERSHIP_KEY_BYTES, models::ResourceGroupMembership,
+};
 use toolkit_db::secure::TxConfig;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
@@ -132,6 +134,15 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceGroupMembership, DomainError> {
+        // Check the combined UTF-8 size before any registry or write work.
+        // Both membership indexes include these strings, plus the group UUID
+        // in the primary key; the portable bound leaves B-tree tuple room.
+        if resource_type.len().saturating_add(resource_id.len()) > MAX_MEMBERSHIP_KEY_BYTES {
+            return Err(DomainError::validation(format!(
+                "Membership resource_type and resource_id must total at most \
+                 {MAX_MEMBERSHIP_KEY_BYTES} UTF-8 bytes"
+            )));
+        }
         // Tenant compatibility, the allowed_membership_types check, and the
         // membership insert all share one transaction, and that transaction
         // is `SERIALIZABLE` (RG-01).

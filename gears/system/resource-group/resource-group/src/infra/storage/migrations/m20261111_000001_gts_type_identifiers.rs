@@ -24,6 +24,12 @@
 //! * MySQL: resource-group has never supported it (the initial migration
 //!   refuses); this migration refuses it too.
 //!
+//! Both backends bound membership keys to 2600 combined UTF-8 bytes for the
+//! type and resource identifiers, leaving PostgreSQL's standard 8 KiB B-tree
+//! pages room for the group UUID and tuple overhead. A preflight refuses old
+//! oversized keys before any DDL; shorten/remap those identifiers with the
+//! owning gear before upgrading. The old schema and rows remain intact.
+//!
 //! The catalogue's type definitions (`can_be_root`, allowed parent/membership
 //! types, metadata schemas) are not carried anywhere: the migration cannot
 //! publish them to the types registry, and dropping the catalogue removes the
@@ -38,10 +44,13 @@
 //! identifiers that remain.
 
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::ConnectionTrait;
+use sea_orm_migration::sea_orm::{ConnectionTrait, Statement};
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
+
+// Frozen with this migration; a future SDK limit change needs a new migration.
+const MAX_MEMBERSHIP_KEY_BYTES: usize = 2600;
 
 const POSTGRES_UP: &str = r"
 ALTER TABLE resource_group ADD COLUMN gts_type_code TEXT;
@@ -66,6 +75,9 @@ ALTER TABLE resource_group_membership DROP COLUMN gts_type_id;
 ALTER TABLE resource_group_membership RENAME COLUMN gts_type_code TO gts_type_id;
 ALTER TABLE resource_group_membership
     ADD CONSTRAINT ck_rgm_gts_type_id CHECK (length(gts_type_id) BETWEEN 1 AND 1024);
+ALTER TABLE resource_group_membership
+    ADD CONSTRAINT ck_rgm_key_bytes
+        CHECK (octet_length(gts_type_id) + octet_length(resource_id) <= 2600);
 ALTER TABLE resource_group_membership
     ADD CONSTRAINT resource_group_membership_pkey PRIMARY KEY (group_id, gts_type_id, resource_id);
 CREATE INDEX idx_rgm_gts_type_resource ON resource_group_membership (gts_type_id, resource_id);
@@ -120,6 +132,8 @@ CREATE TABLE resource_group_membership (
     gts_type_id TEXT NOT NULL CHECK (length(gts_type_id) BETWEEN 1 AND 1024),
     resource_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CONSTRAINT ck_rgm_key_bytes
+        CHECK (length(CAST(gts_type_id AS BLOB)) + length(CAST(resource_id AS BLOB)) <= 2600),
     CONSTRAINT fk_rgm_group_id
         FOREIGN KEY (group_id) REFERENCES resource_group(id)
         ON UPDATE CASCADE ON DELETE RESTRICT,
@@ -143,16 +157,43 @@ DROP TABLE gts_type;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::Postgres => POSTGRES_UP,
-            sea_orm::DatabaseBackend::Sqlite => SQLITE_UP,
-            backend => {
+        let backend = manager.get_database_backend();
+        let (sql, key_bytes) = match backend {
+            sea_orm::DatabaseBackend::Postgres => (
+                POSTGRES_UP,
+                "octet_length(t.schema_id) + octet_length(m.resource_id)",
+            ),
+            sea_orm::DatabaseBackend::Sqlite => (
+                SQLITE_UP,
+                "length(CAST(t.schema_id AS BLOB)) + length(CAST(m.resource_id AS BLOB))",
+            ),
+            _ => {
                 return Err(DbErr::Migration(format!(
                     "{backend:?} is not a supported backend for resource-group"
                 )));
             }
         };
-        manager.get_connection().execute_unprepared(sql).await?;
+        let conn = manager.get_connection();
+        let preflight = format!(
+            "SELECT 1 FROM resource_group_membership m \
+             JOIN gts_type t ON t.id = m.gts_type_id \
+             WHERE {key_bytes} > {MAX_MEMBERSHIP_KEY_BYTES} LIMIT 1"
+        );
+        if conn
+            .query_one_raw(Statement::from_string(backend, preflight))
+            .await?
+            .is_some()
+        {
+            return Err(DbErr::Migration(format!(
+                "{}: membership resource_type and resource_id exceed \
+                 {MAX_MEMBERSHIP_KEY_BYTES} combined UTF-8 bytes; \
+                 back up the database and remap oversized resource identifiers \
+                 with their owning gear or remove the affected memberships \
+                 before upgrading; the old schema and rows are unchanged",
+                self.name()
+            )));
+        }
+        conn.execute_unprepared(sql).await?;
         Ok(())
     }
 

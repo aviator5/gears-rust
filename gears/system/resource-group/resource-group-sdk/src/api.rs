@@ -128,6 +128,8 @@ pub trait ResourceGroupClient: Send + Sync {
     ///
     /// A group outside the caller's scope is reported as not found, exactly
     /// like a missing one.
+    /// The combined UTF-8 byte length of `resource_type` and `resource_id`
+    /// must not exceed [`crate::MAX_MEMBERSHIP_KEY_BYTES`].
     async fn add_membership(
         &self,
         ctx: &SecurityContext,

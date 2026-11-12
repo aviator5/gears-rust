@@ -9,12 +9,8 @@
 //! `--features integration`, Docker required; `RG_PG_REQUIRE_DOCKER=1` makes a
 //! missing Docker fail instead of skip), through the production runner.
 //!
-//! Also pins the key-size boundary the migration introduces: the membership
-//! primary key `(group_id, gts_type_id, resource_id)` now carries the GTS type
-//! identifier (at most 1024 ASCII bytes) instead of a `SMALLINT`, which leaves
-//! about 1.6 KB of PostgreSQL's ~2.7 KB btree entry limit for an incompressible
-//! `resource_id` (it was ~2.7 KB before). UUID resource ids, what RG's callers
-//! use, are far inside it.
+//! Also pins the portable 2600 combined UTF-8 byte membership key bound,
+//! including pre-upgrade refusal and remediation of legacy oversized keys.
 
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
@@ -170,6 +166,86 @@ async fn upgrade(db: &Db) -> Result<(), toolkit_db::migration_runner::MigrationE
     run_migrations_for_testing(db, Migrator::migrations())
         .await
         .map(drop)
+}
+
+#[tokio::test]
+async fn pg_oversized_legacy_membership_refuses_upgrade_before_ddl() {
+    let Some(f) = at_initial_schema().await else {
+        return;
+    };
+    seed_hierarchy(&f.raw).await;
+    // Both values fit the old schema independently, but their combined width
+    // cannot fit the new membership indexes. Random hex defeats compression.
+    run(
+        &f.raw,
+        "INSERT INTO gts_type (schema_id) SELECT 'gts.cf.core.rg.type.v1~' || \
+         substr(string_agg(md5(random()::text), ''), 1, 1001) FROM generate_series(1, 32)",
+    )
+    .await;
+    run(
+        &f.raw,
+        &format!(
+            "INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) \
+             SELECT '{ROOT}', (SELECT max(id) FROM gts_type), \
+             substr(string_agg(md5(random()::text), ''), 1, 2000) FROM generate_series(1, 63)"
+        ),
+    )
+    .await;
+
+    let err = upgrade(&f.db).await.expect_err("oversized legacy key");
+    let diagnostic = err.to_string();
+    assert!(diagnostic.contains("2600"), "{diagnostic}");
+    assert!(diagnostic.contains("UTF-8"), "{diagnostic}");
+    assert!(diagnostic.contains("before upgrading"), "{diagnostic}");
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'resource_group' AND column_name = 'gts_type_id'"
+        )
+        .await,
+        vec![vec!["smallint"]],
+        "the preflight refuses before altering groups"
+    );
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT octet_length(t.schema_id)::text, octet_length(m.resource_id)::text \
+             FROM resource_group_membership m JOIN gts_type t ON t.id = m.gts_type_id \
+             WHERE length(m.resource_id) = 2000"
+        )
+        .await,
+        vec![vec!["1024", "2000"]],
+        "the old catalogue and oversized membership remain intact"
+    );
+
+    // The operator can remediate the old key, coordinating the new identifier
+    // with its owning gear, then retry without losing the other memberships.
+    run(
+        &f.raw,
+        "UPDATE resource_group_membership SET resource_id = 'remapped-resource' \
+         WHERE length(resource_id) = 2000",
+    )
+    .await;
+    upgrade(&f.db).await.expect("upgrade after remediation");
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'resource_group' AND column_name = 'gts_type_id'"
+        )
+        .await,
+        vec![vec!["text"]],
+        "the refused attempt did not record the migration as applied"
+    );
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT count(*)::text FROM resource_group_membership"
+        )
+        .await,
+        vec![vec!["4"]]
+    );
 }
 
 #[tokio::test]
@@ -334,9 +410,8 @@ async fn pg_constraints_hold_and_the_key_boundary_is_explicit() {
         "{too_long}"
     );
 
-    // The boundary: with a maximal, incompressible type identifier (random
-    // hex; a repetitive one compresses), a UUID resource id still fits, and an
-    // incompressible resource id of 2000 bytes no longer fits a btree entry.
+    // A maximal, incompressible type identifier (random hex; a repetitive one
+    // compresses) leaves 1576 bytes for the resource id under the portable bound.
     let random_hex = |n: usize| {
         format!(
             "(SELECT substr(string_agg(md5(random()::text), ''), 1, {n}) \
@@ -362,11 +437,41 @@ async fn pg_constraints_hold_and_the_key_boundary_is_explicit() {
         ),
     )
     .await
-    .expect_err("index entry over the btree limit");
+    .expect_err("combined key byte bound");
     assert!(
-        oversized.to_string().contains("index row size"),
+        oversized.to_string().contains("ck_rgm_key_bytes"),
         "{oversized}"
     );
+    for (resource, accepted) in [
+        (random_hex(1576), true),
+        (random_hex(1577), false),
+        ("repeat('\u{436}', 788)".to_owned(), true),
+        ("repeat('\u{436}', 789)".to_owned(), false),
+    ] {
+        let result = exec(
+            &f.raw,
+            &format!(
+                "INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) \
+                 VALUES ('{ROOT}', {incompressible_type}, {resource})"
+            ),
+        )
+        .await;
+        if accepted {
+            result.expect("combined key is exactly 2600 UTF-8 bytes");
+        } else {
+            let err = result.expect_err("combined key exceeds 2600 UTF-8 bytes");
+            assert!(err.to_string().contains("ck_rgm_key_bytes"), "{err}");
+        }
+    }
+    run(
+        &f.raw,
+        &format!(
+            "INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) \
+             VALUES ('{ROOT}', '{USER_TYPE}', {})",
+            random_hex(2000)
+        ),
+    )
+    .await;
 }
 
 #[tokio::test]

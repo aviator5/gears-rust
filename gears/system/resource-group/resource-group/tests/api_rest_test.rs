@@ -2264,10 +2264,10 @@ async fn group_filter_cursor_preserves_the_original_filter() {
     );
 }
 
-/// Unsupported group operators and unknown membership types are client errors.
+/// Unsupported operators and null are errors; unknown membership types are values.
 #[tokio::test]
 async fn typed_filters_reject_unsupported_operators_and_null() {
-    let (router, tenant, _, known, _, _) = membership_filter_fixture().await;
+    let (router, tenant, group, known, _, resource) = membership_filter_fixture().await;
     let unknown = rg_type_id!("test.filter._.unknown.v1~");
     let group_type = rg_type_id!("test.filter._.group.v1~");
     // An unknown type is an ordinary value (no registry lookup on reads).
@@ -2283,14 +2283,19 @@ async fn typed_filters_reject_unsupported_operators_and_null() {
     let status = response.status();
     let body = response_body(response).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        body["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|m| m["resource_type"] == known),
-        "{body}"
-    );
+    let items = body["items"].as_array().unwrap();
+    let mut actual: Vec<_> = items
+        .iter()
+        .map(|m| {
+            assert_eq!(m["group_id"], group.to_string(), "{body}");
+            assert_eq!(m["resource_type"], known, "{body}");
+            m["resource_id"].as_str().unwrap()
+        })
+        .collect();
+    actual.sort_unstable();
+    let mut expected = vec![resource.as_str(), "second"];
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "{body}");
     for (endpoint, filter) in [
         ("groups", format!("type gt '{group_type}'")),
         ("groups", format!("contains(type, '{group_type}')")),

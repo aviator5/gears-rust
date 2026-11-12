@@ -157,7 +157,7 @@ impl From<DomainError> for CanonicalError {
             // never reaches the wire `detail`.
             DomainError::RegistryRefusedCaller(refusal) => refusal,
             DomainError::ServiceUnavailable { message } => {
-                tracing::warn!(%message, "resource-group dependency unavailable");
+                tracing::warn!(reason = %message, "resource-group dependency unavailable");
                 CanonicalError::service_unavailable().create()
             }
             DomainError::Database(db_err) => {

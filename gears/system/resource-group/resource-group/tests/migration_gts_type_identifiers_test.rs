@@ -166,6 +166,86 @@ async fn upgrade(db: &Db) -> Result<(), toolkit_db::migration_runner::MigrationE
 }
 
 #[tokio::test]
+async fn oversized_legacy_membership_refuses_upgrade_before_rebuilding_tables() {
+    let f = at_initial_schema().await;
+    seed_hierarchy(&f.raw).await;
+    let longest = format!("gts.cf.core.rg.type.v1~{}", "a".repeat(1001));
+    // 1000 characters, but 2000 UTF-8 bytes: the portable contract counts
+    // bytes rather than SQLite's character length.
+    let resource = "\u{436}".repeat(1000);
+    run(
+        &f.raw,
+        &format!("INSERT INTO gts_type (id, schema_id) VALUES (4, '{longest}')"),
+    )
+    .await;
+    run(
+        &f.raw,
+        &format!(
+            "INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) \
+             VALUES (X'{ROOT}', 4, '{resource}')"
+        ),
+    )
+    .await;
+
+    let err = upgrade(&f.db).await.expect_err("oversized legacy key");
+    let diagnostic = err.to_string();
+    assert!(diagnostic.contains("2600"), "{diagnostic}");
+    assert!(diagnostic.contains("UTF-8"), "{diagnostic}");
+    assert!(diagnostic.contains("before upgrading"), "{diagnostic}");
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT typeof(gts_type_id) FROM resource_group LIMIT 1"
+        )
+        .await,
+        vec![vec!["integer"]]
+    );
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT CAST(length(CAST(t.schema_id AS BLOB)) AS TEXT), \
+             CAST(length(CAST(m.resource_id AS BLOB)) AS TEXT) \
+             FROM resource_group_membership m JOIN gts_type t ON t.id = m.gts_type_id \
+             WHERE m.gts_type_id = 4"
+        )
+        .await,
+        vec![vec!["1024", "2000"]]
+    );
+    assert!(
+        rows(
+            &f.raw,
+            "SELECT name FROM sqlite_master WHERE name LIKE '%_backup' OR name LIKE '%_new'"
+        )
+        .await
+        .is_empty(),
+        "the preflight runs before any rebuild"
+    );
+    run(
+        &f.raw,
+        "UPDATE resource_group_membership SET resource_id = 'remapped-resource' WHERE gts_type_id = 4",
+    )
+    .await;
+    upgrade(&f.db).await.expect("upgrade after remediation");
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT typeof(gts_type_id) FROM resource_group LIMIT 1"
+        )
+        .await,
+        vec![vec!["text"]],
+        "the refused attempt did not record the migration as applied"
+    );
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT CAST(count(*) AS TEXT) FROM resource_group_membership"
+        )
+        .await,
+        vec![vec!["4"]]
+    );
+}
+
+#[tokio::test]
 async fn an_existing_hierarchy_keeps_every_row_under_its_gts_identifier() {
     let f = at_initial_schema().await;
     seed_hierarchy(&f.raw).await;
@@ -318,6 +398,37 @@ async fn constraints_hold_after_the_upgrade() {
     .await
     .expect_err("type identifier bound");
     assert!(too_long.to_string().contains("CHECK"), "{too_long}");
+
+    for (resource, accepted) in [
+        ("a".repeat(1576), true),
+        ("a".repeat(1577), false),
+        ("\u{436}".repeat(788), true),
+        ("\u{436}".repeat(789), false),
+    ] {
+        let result = exec(
+            &f.raw,
+            &format!(
+                "INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) \
+                 VALUES (X'{ROOT}', '{longest}', '{resource}')"
+            ),
+        )
+        .await;
+        if accepted {
+            result.expect("combined key is exactly 2600 UTF-8 bytes");
+        } else {
+            let err = result.expect_err("combined key exceeds 2600 UTF-8 bytes");
+            assert!(err.to_string().contains("ck_rgm_key_bytes"), "{err}");
+        }
+    }
+    run(
+        &f.raw,
+        &format!(
+            "INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) \
+             VALUES (X'{ROOT}', '{USER_TYPE}', '{}')",
+            "b".repeat(2000)
+        ),
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -39,6 +39,7 @@ pub use gts::{
     GROUP_MEMBERSHIP_RESOURCE_TYPE, GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH, TYPE_RESOURCE_TYPE,
 };
 pub use models::{
-    CreateGroupRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath, ResourceGroup,
-    ResourceGroupMembership, ResourceGroupWithDepth, UpdateGroupRequest,
+    CreateGroupRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath,
+    MAX_MEMBERSHIP_KEY_BYTES, ResourceGroup, ResourceGroupMembership, ResourceGroupWithDepth,
+    UpdateGroupRequest,
 };

@@ -361,8 +361,8 @@ reads and payload validation **MUST** precede database write transactions.
 Type deletion is owned by Types Registry; RG does not enforce its former
 local delete-if-unused policy. Group creation and membership additions require
 active types. Existing groups and memberships **MUST** remain readable and
-removable using their stored identifiers. Reparenting or replacing non-null
-metadata on an existing group uses the retained exact definition, including a
+removable using their stored identifiers. Reparenting, replacing metadata, or
+removing existing metadata uses the retained exact definition, including a
 deleted one; an absent definition **MUST NOT** silently bypass validation.
 
 ### 5.2 RG Entity Management
@@ -459,6 +459,11 @@ Membership fields:
 - `group_id` (UUID, reference to group entity)
 - `resource_type` (registered GTS type identifier permitted by the group type's membership traits)
 - `resource_id` (string, caller-defined resource identifier)
+
+The combined UTF-8 byte length of `resource_type` and `resource_id` **MUST NOT**
+exceed 2600 bytes on addition. Oversized keys **MUST** return a validation error
+before registry reads or database writes. Upgrade preflight **MUST** refuse
+oversized legacy keys before altering the schema; see DESIGN for remediation.
 
 Membership does not store `tenant_id` directly — tenant scope is derived from the referenced group's `tenant_id` via `group_id`. Membership requests are always scoped to a single tenant.
 

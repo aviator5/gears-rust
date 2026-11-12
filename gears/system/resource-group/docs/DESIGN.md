@@ -490,11 +490,14 @@ sequenceDiagram
 
 The public update path authorizes the caller and reads the existing group under
 that scope before returning any type-shaped error. An update supplying non-null
-metadata or changing the parent obtains the group's exact type definition before
-the transaction. Deleted definitions remain usable because the registry retains
-their content. Supplied metadata is validated with the SDK. With an unchanged
-parent, renaming or clearing metadata to `null` takes the row-only path and does
-not request a type definition.
+metadata, removing existing metadata, or changing the parent obtains the group's
+exact type definition before the transaction. Deleted definitions remain usable
+because the registry retains their content. The replacement metadata envelope,
+including `{}` for removal, is validated with the SDK. With an unchanged parent
+and metadata absent both before and after the update, a rename takes the
+row-only path without requesting a type definition. If metadata appears between
+the pre-read and the locked transaction read, that path returns a conflict
+rather than clearing it without validation.
 
 The transaction re-reads the group and compares its type with the snapshot.
 A mismatched type is a conflict. A parent change checks the actual new parent,
@@ -533,8 +536,8 @@ GTS identifiers and do not consult type definitions.
 | --- | --- |
 | Create group | Active RG type; validate payload and placement |
 | Add membership | Active group type and active concrete member resource type; validate allowed memberships |
-| Non-null metadata replacement / reparent existing group | Exact RG type definition, deleted included; unknown type is refused |
-| Rename or clear metadata with unchanged parent | No registry lookup |
+| Non-null metadata replacement / removal of existing metadata / reparent existing group | Exact RG type definition, deleted included; unknown type is refused |
+| Rename with unchanged parent and metadata remaining absent | No registry lookup |
 | Group/membership reads and filters | No registry lookup |
 | Membership removal / group deletion, including force | No registry lookup |
 
@@ -597,9 +600,38 @@ Tenant scoping is enforced through the owning group.
 
 SQLite uses its backend representation for UUIDs, timestamps and JSON while
 preserving the same relationships and indexes. Migrations are the executable
-source of truth for each backend. PostgreSQL B-tree entry-size limits also apply
-to membership keys: accepted type length alone does not guarantee that an
-arbitrarily long resource identifier fits in an index entry.
+source of truth for each backend.
+
+The combined UTF-8 byte length of `gts_type_id` and `resource_id` **MUST NOT**
+exceed 2600 (`MAX_MEMBERSHIP_KEY_BYTES` in the SDK). Membership admission checks
+this before a write transaction; a database CHECK enforces the same bound on
+both backends. This leaves room for the group UUID and tuple overhead under
+PostgreSQL's B-tree entry-size limit with the standard 8 KiB block size. A
+2000-byte resource identifier remains supported with a short type identifier;
+a 1024-byte type identifier leaves 1576 bytes for the resource identifier.
+The indexes continue to compare exact identifiers, without hash-based identity.
+
+This is a deliberate narrowing of the old surrogate-key schema's accepted key
+space. Before upgrading, stop writes and audit the old PostgreSQL database:
+
+```sql
+SELECT m.group_id, t.schema_id AS resource_type, m.resource_id,
+       octet_length(t.schema_id) + octet_length(m.resource_id) AS key_bytes
+FROM resource_group_membership m
+JOIN gts_type t ON t.id = m.gts_type_id
+WHERE octet_length(t.schema_id) + octet_length(m.resource_id) > 2600;
+```
+
+For SQLite, replace each `octet_length(value)` expression with
+`length(CAST(value AS BLOB))`. The migration performs this preflight on both
+backends and refuses before rebuilding tables or dropping the catalogue if
+any oversized keys remain. The old schema and rows remain intact. Export or
+back up the database, then coordinate a shorter resource identifier with its
+owning gear, or remove the affected membership through the old API and recreate
+it with the remapped identifier. Do not truncate identifiers automatically:
+that can link a different resource or create duplicate memberships. Repeat the
+audit until it returns no rows, then retry the upgrade. Existing cleanup remains
+available for oversized legacy memberships before the upgrade.
 
 ## 4. Runtime and Verification
 

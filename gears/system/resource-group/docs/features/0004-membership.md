@@ -80,6 +80,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 - Duplicate membership (same composite key) → Conflict
 - resource_type not in group type's allowed_membership_types → Validation error
 - resource_type GTS path not registered → Validation error
+- resource_type and resource_id exceed 2600 combined UTF-8 bytes → Validation error
 - Tenant-incompatible: resource already linked in incompatible tenant → TenantIncompatibility
 
 **Steps**:
@@ -172,6 +173,7 @@ The system **MUST** implement a Membership Service that provides add, remove, an
 - List: paginated query with OData `$filter` on `resource_id`, `resource_type`, `group_id`; cursor-based pagination
 - Tenant compatibility: derive tenant scope from group's tenant_id; reject if resource already linked in incompatible tenant
 - GTS identifiers persisted directly; registry snapshots provide type rules before writes
+- Add rejects keys over 2600 combined UTF-8 bytes before registry reads or database writes; both backends enforce the same constraint
 - Active reference integration: membership count checked by entity delete in feature 3
 
 **Implements**:
@@ -293,8 +295,10 @@ Test setup: SQLite in-memory, admitted registry definitions, GroupService and Me
 - No validation on resource_id in code — empty string will be inserted
 - Verify it either fails at DB constraint or succeeds (document behavior)
 
-#### TC-MBR-12: Remove membership with unregistered resource_type [P2]
-- resolve_id returns None → `DomainError::Validation("Unknown resource type")`
+#### TC-MBR-12: Remove membership after resource-type retirement [P2]
+- **Setup**: Create a membership, then retire its resource type in Types Registry.
+- **Assert**: Removal succeeds using the stored identifiers without a registry lookup.
+- **Assert**: Removing an absent composite key returns `DomainError::MembershipNotFound`.
 
 #### TC-MBR-13: Add membership to group with empty allowed_membership_types [P1]
 - Group type has `allowed_membership_types: []` — any resource_type should be rejected

@@ -17,7 +17,9 @@ use types_registry_sdk::{
 };
 use uuid::Uuid;
 
-use super::*;
+use super::RegistryTypeCatalog;
+use crate::domain::error::DomainError;
+use crate::domain::type_catalog::{RgTypeCatalog, TypeUse};
 
 #[toolkit_canonical_errors::resource_error(gts_id!("cf.core.types_registry.entity.v1~"))]
 struct Catalogue;

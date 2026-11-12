@@ -11,7 +11,7 @@
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
   - [2.1 SDK Contracts, Error Types & Gear Foundation &mdash; HIGH](#21-sdk-contracts-error-types--gear-foundation-mdash-high)
-  - [2.2 Registry-Owned Type Contracts &mdash; HIGH](#22-registry-owned-type-contracts-mdash-high)
+  - [2.2 Registry-Owned Type Contracts &mdash; HIGH](#22-registry-owned-type-contracts--high)
   - [2.3 Group Entity & Hierarchy Engine &mdash; HIGH](#23-group-entity--hierarchy-engine-mdash-high)
   - [2.4 Membership Management &mdash; MEDIUM](#24-membership-management-mdash-medium)
   - [2.5 Integration Read Port & Dual Authentication Modes &mdash; MEDIUM](#25-integration-read-port--dual-authentication-modes-mdash-medium)

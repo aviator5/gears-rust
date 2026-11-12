@@ -13,6 +13,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Maximum combined UTF-8 byte length of a membership's GTS type identifier
+/// and resource identifier. Leaves room for the group UUID and tuple overhead
+/// in PostgreSQL's B-tree indexes; enforced on all supported backends.
+pub const MAX_MEMBERSHIP_KEY_BYTES: usize = 2600;
+
 // -- GtsTypePath value object --
 
 // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-1

@@ -4,8 +4,9 @@
 
 use gts::GtsSchema;
 use serde_json::json;
+use toolkit_gts::gts_id;
 
-use super::*;
+use super::{MembershipTypeRef, ResourceGroupTypeTraitsV1, ResourceGroupTypeV1, RgTypeRef};
 
 const BASE: &str = gts_id!("cf.core.rg.type.v1~");
 

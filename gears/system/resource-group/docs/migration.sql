@@ -51,6 +51,8 @@ CREATE TABLE resource_group_membership (
         PRIMARY KEY (group_id, gts_type_id, resource_id),
     CONSTRAINT ck_rgm_gts_type_id
         CHECK (length(gts_type_id) BETWEEN 1 AND 1024),
+    CONSTRAINT ck_rgm_key_bytes
+        CHECK (octet_length(gts_type_id) + octet_length(resource_id) <= 2600),
     CONSTRAINT fk_rgm_group_id
         FOREIGN KEY (group_id) REFERENCES resource_group(id)
         ON UPDATE CASCADE ON DELETE RESTRICT
