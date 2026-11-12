@@ -24,7 +24,6 @@ use crate::domain::error::DomainError;
 use crate::domain::repo::GroupRepositoryTrait;
 use crate::infra::storage::FK_RESOURCE_GROUP_PARENT;
 use crate::infra::storage::entity::{
-    gts_type::{self, Entity as GtsTypeEntity},
     resource_group::{self as rg_entity, Entity as ResourceGroupEntity},
     resource_group_closure::{self as closure_entity, Entity as ClosureEntity},
     resource_group_membership::{self as membership_entity, Entity as MembershipEntity},
@@ -50,24 +49,10 @@ impl GroupRepository {
     // -- Private helper functions --
 
     /// Resolve a SMALLINT type ID to its GTS type path string.
-    async fn resolve_type_path(db: &impl DBRunner, type_id: i16) -> Result<String, DomainError> {
-        let scope = system_scope();
-        let model = GtsTypeEntity::find()
-            .filter(gts_type::Column::Id.eq(type_id))
-            .secure()
-            .scope_with(&scope)
-            .one(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?
-            .ok_or_else(|| DomainError::database(format!("Type ID {type_id} not found")))?;
-        Ok(model.schema_id)
-    }
-
-    /// Convert a database model to the SDK `ResourceGroup` type.
-    fn model_to_resource_group(model: rg_entity::Model, type_path: String) -> ResourceGroup {
+    fn model_to_resource_group(model: rg_entity::Model) -> ResourceGroup {
         ResourceGroup {
             id: model.id,
-            code: type_path,
+            code: model.gts_type_id,
             name: model.name,
             hierarchy: GroupHierarchy {
                 parent_id: model.parent_id,
@@ -143,9 +128,6 @@ impl GroupRepository {
             group_map.extend(groups.into_iter().map(|g| (g.id, g)));
         }
 
-        let all_type_ids: Vec<i16> = group_map.values().map(|g| g.gts_type_id).collect();
-        let type_path_map = self.resolve_type_paths_batch(db, &all_type_ids).await?;
-
         let mut results: Vec<ResourceGroupWithDepth> = Vec::new();
         for (gid, depth) in &group_depths {
             if let Some(ref df) = depth_filter
@@ -154,18 +136,14 @@ impl GroupRepository {
                 continue;
             }
             if let Some(model) = group_map.get(gid) {
-                let type_path = type_path_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
                 if let Some(ref tf) = type_filter
-                    && !tf.matches(&type_path)
+                    && !tf.matches(&model.gts_type_id)
                 {
                     continue;
                 }
                 results.push(ResourceGroupWithDepth {
                     id: model.id,
-                    code: type_path,
+                    code: model.gts_type_id.clone(),
                     name: model.name.clone(),
                     hierarchy: GroupHierarchyWithDepth {
                         parent_id: model.parent_id,
@@ -357,13 +335,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
 
-        match model {
-            Some(m) => {
-                let type_path = Self::resolve_type_path(db, m.gts_type_id).await?;
-                Ok(Some(Self::model_to_resource_group(m, type_path)))
-            }
-            None => Ok(None),
-        }
+        Ok(model.map(Self::model_to_resource_group))
     }
 
     /// Find the raw entity model by ID.
@@ -409,7 +381,7 @@ impl GroupRepositoryTrait for GroupRepository {
     }
 
     /// Return the id of any existing root group (`parent_id IS NULL`) whose
-    /// `gts_type.schema_id` starts with any of the given prefixes, or `None`
+    /// GTS type identifier starts with any of the given prefixes, or `None`
     /// when no such root exists. Used to enforce tenant-root uniqueness.
     ///
     /// Bypasses `SecureORM` because this check is a system invariant that
@@ -420,26 +392,19 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         type_prefixes: &[String],
     ) -> Result<Option<Uuid>, DomainError> {
-        use sea_orm::{Condition, JoinType, QuerySelect};
+        use sea_orm::Condition;
 
         if type_prefixes.is_empty() {
             return Ok(None);
         }
         let prefix_match = type_prefixes.iter().fold(Condition::any(), |cond, prefix| {
-            cond.add(gts_type::Column::SchemaId.starts_with(prefix.as_str()))
+            cond.add(rg_entity::Column::GtsTypeId.starts_with(prefix.as_str()))
         });
 
         // Bypass SecureORM: tenant-root uniqueness is a system invariant that
         // must see every tenant, not only the caller's scope.
         let scope = system_scope();
         let model: Option<rg_entity::Model> = ResourceGroupEntity::find()
-            .join(
-                JoinType::InnerJoin,
-                rg_entity::Entity::belongs_to(GtsTypeEntity)
-                    .from(rg_entity::Column::GtsTypeId)
-                    .to(gts_type::Column::Id)
-                    .into(),
-            )
             .filter(rg_entity::Column::ParentId.is_null())
             .filter(prefix_match)
             .secure()
@@ -452,11 +417,9 @@ impl GroupRepositoryTrait for GroupRepository {
 
     /// List groups with `OData` filtering and pagination.
     ///
-    /// The `type` filter field accepts GTS type path strings from the API
-    /// (e.g. `$filter=type eq 'gts.cf.core.rg.type.v1~x.test.org.v1~'`).
-    /// Before passing to `SeaORM`, string values for the `type` field are
-    /// resolved to SMALLINT surrogate IDs at the persistence boundary.
-    /// List groups with `OData` filtering and pagination.
+    /// The `type` filter field compares the stored GTS type identifier
+    /// (e.g. `$filter=type eq 'gts.cf.core.rg.type.v1~x.test.org.v1~'`); no
+    /// type registry is consulted.
     ///
     /// Uses the provided `AccessScope` for tenant-level filtering (`SecureORM`).
     async fn list_groups<C: DBRunner>(
@@ -466,14 +429,11 @@ impl GroupRepositoryTrait for GroupRepository {
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroup>, DomainError> {
         let base_query = ResourceGroupEntity::find().secure().scope_with(scope);
-        let (base_query, query_no_filter) =
-            prepare_filter::<GroupFilterField, GroupODataMapper, _>(
-                db,
-                base_query,
-                query,
-                GroupFilterField::Type,
-            )
-            .await?;
+        let (base_query, query_no_filter) = prepare_filter::<GroupFilterField, GroupODataMapper, _>(
+            base_query,
+            query,
+            GroupFilterField::Type,
+        )?;
 
         let page = paginate_odata::<GroupFilterField, GroupODataMapper, _, _, _, _>(
             base_query,
@@ -486,20 +446,10 @@ impl GroupRepositoryTrait for GroupRepository {
         .await
         .map_err(DomainError::from)?;
 
-        // Batch-resolve type paths for all groups in the page (single query)
-        let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();
-        let type_map = self.resolve_type_paths_batch(db, &type_ids).await?;
-
         let groups = page
             .items
             .into_iter()
-            .map(|model| {
-                let type_path = type_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
-                Self::model_to_resource_group(model, type_path)
-            })
+            .map(Self::model_to_resource_group)
             .collect();
 
         Ok(Page {
@@ -600,7 +550,7 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
+        gts_type_id: &str,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
@@ -610,7 +560,7 @@ impl GroupRepositoryTrait for GroupRepository {
         let model = rg_entity::ActiveModel {
             id: Set(id),
             parent_id: Set(parent_id),
-            gts_type_id: Set(gts_type_id),
+            gts_type_id: Set(gts_type_id.to_owned()),
             name: Set(name.to_owned()),
             metadata: Set(metadata.cloned()),
             tenant_id: Set(tenant_id),
@@ -641,7 +591,6 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
     ) -> Result<u64, DomainError> {
@@ -661,7 +610,6 @@ impl GroupRepositoryTrait for GroupRepository {
             .filter(rg_entity::Column::Id.eq(id))
             .secure()
             .col_expr(rg_entity::Column::ParentId, Expr::value(parent_val))
-            .col_expr(rg_entity::Column::GtsTypeId, Expr::value(gts_type_id))
             .col_expr(rg_entity::Column::Name, Expr::value(name.to_owned()))
             .col_expr(rg_entity::Column::Metadata, Expr::value(metadata_val))
             .col_expr(
@@ -1247,41 +1195,6 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(first.is_some())
     }
-
-    /// Delete all memberships for a group.
-    /// Batch-resolve SMALLINT type IDs to GTS type path strings.
-    ///
-    /// Issues a single `SELECT ... WHERE id IN (...)` query for all distinct type IDs,
-    /// returning a `HashMap` for O(1) lookup. Eliminates N+1 queries in list operations.
-    async fn resolve_type_paths_batch<C: DBRunner>(
-        &self,
-        db: &C,
-        type_ids: &[i16],
-    ) -> Result<std::collections::HashMap<i16, String>, DomainError> {
-        use std::collections::HashMap;
-
-        if type_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let unique_ids: Vec<i16> = {
-            let mut ids: Vec<i16> = type_ids.to_vec();
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        };
-
-        let scope = system_scope();
-        let models = GtsTypeEntity::find()
-            .filter(gts_type::Column::Id.is_in(unique_ids))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(models.into_iter().map(|m| (m.id, m.schema_id)).collect())
-    }
 }
 
 /// Map a `secure_insert::<ResourceGroupEntity>` failure to the `DomainError`
@@ -1308,12 +1221,9 @@ fn map_insert_error(e: &ScopeError, id: Uuid, parent_id: Option<Uuid>) -> Domain
         // no second serializable party to detect against and the
         // foreign key answers instead. Unmapped it was a 500.
         //
-        // Which foreign key, though: this table has two, and
-        // `fk_rg_gts_type` fails when a concurrent `delete_type`
-        // removes the type between this transaction resolving it
-        // and inserting. Answering *that* with "group not found,
-        // id = parent" would name the wrong resource and the wrong
-        // cause, so only the parent constraint maps. PostgreSQL
+        // Only the parent constraint maps (the table's one foreign
+        // key since the type catalogue moved to the types registry);
+        // anything else is not a "parent gone" answer. PostgreSQL
         // puts the constraint name in the message; SQLite says
         // only "FOREIGN KEY constraint failed", so there the
         // answer stays a database error -- unhelpful, but not a

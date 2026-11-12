@@ -26,9 +26,7 @@
 //! |---|------------|------------|--------|
 //! | 1 | move A→B   | move B→A   | no cycle committed |
 //! | 2 | create child | move parent | closure consistent |
-//! | 3 | two `create_type` same code | | exactly one 409 |
 //! | 4 | non-force delete | create child | FK blocks create |
-//! | 5 | `delete_type` | `create_group` of type | RESTRICT blocks |
 //! | 6 | `add_membership` (tenant A) | `add_membership` (tenant B), same resource | exactly one commits, the other gets a clean `TenantIncompatibility` -- not a bare DB error |
 //! | 7 | `remove_membership` x2, same resource | | the resource is free for another tenant once its last membership is gone |
 //! | 8 | tenant check + membership insert, forced overlap at `SERIALIZABLE` | | SSI cancels one side; the resource ends up owned by one tenant |
@@ -38,18 +36,17 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{CreateTypeRequest, UpdateTypeRequest};
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::GroupService;
 use resource_group::domain::repo::MembershipRepositoryTrait;
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::migrations::Migrator;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::models::{CreateGroupRequest, CreateTypeRequest, UpdateTypeRequest};
+use resource_group_sdk::models::CreateGroupRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{ImageExt, runners::AsyncRunner};
@@ -138,10 +135,7 @@ fn type_code(suffix: &str) -> String {
 
 fn make_services(
     db: Arc<DBProvider<DbError>>,
-) -> (
-    TypeService<TypeRepository>,
-    GroupService<GroupRepository, TypeRepository>,
-) {
+) -> (common::TestTypes, GroupService<GroupRepository>) {
     let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db);
     (type_svc, group_svc)
@@ -227,8 +221,8 @@ async fn concurrent_move_a_to_b_and_b_to_a() {
 
     // Move A→B and B→A concurrently.
     let (r1, r2) = tokio::join!(
-        group_svc.move_group(a.id, Some(b.id)),
-        group_svc.move_group(b.id, Some(a.id)),
+        group_svc.move_group(&ctx, a.id, Some(b.id)),
+        group_svc.move_group(&ctx, b.id, Some(a.id)),
     );
 
     match (&r1, &r2) {
@@ -326,54 +320,10 @@ async fn concurrent_create_child_and_move_parent() {
                 .with_parent_id(Some(parent.id)),
             tenant_id
         ),
-        group_svc.move_group(parent.id, Some(other.id)),
+        group_svc.move_group(&ctx, parent.id, Some(other.id)),
     );
 
     child.expect("concurrent create child should succeed");
-}
-
-// -----------------------------------------------------------------------
-// 3. two concurrent create_type of same code → 409
-// -----------------------------------------------------------------------
-#[tokio::test]
-async fn concurrent_create_type_same_code_returns_one_409() {
-    let Some(fix) = pg_fixture().await else {
-        return;
-    };
-
-    let (type_svc, _) = make_services(fix.db.clone());
-    let code = type_code("dup");
-
-    let req = CreateTypeRequest {
-        code: code.clone(),
-        can_be_root: true,
-        allowed_parent_types: vec![],
-        allowed_membership_types: vec![],
-        metadata_schema: None,
-    };
-
-    let (r1, r2) = tokio::join!(
-        type_svc.create_type_unscoped(req.clone()),
-        type_svc.create_type_unscoped(req),
-    );
-
-    match (&r1, &r2) {
-        (Ok(_), Ok(_)) => panic!("both creates succeeded -- duplicate committed!"),
-        (Err(e1), Err(e2)) => {
-            let m = format!("{e1}{e2}");
-            assert!(
-                m.contains("already exists"),
-                "expected 'already exists', got: {e1} / {e2}"
-            );
-        }
-        (Ok(t), Err(e)) | (Err(e), Ok(t)) => {
-            assert_eq!(t.code, code);
-            assert!(
-                format!("{e}").contains("already exists"),
-                "expected 'already exists', got: {e}"
-            );
-        }
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -481,60 +431,6 @@ async fn concurrent_non_force_delete_and_create_child() {
                 matches!(e, DomainError::ConflictActiveReferences { .. }),
                 "create won the race, so delete must see the new child -- expected \
                  ConflictActiveReferences, got: {e}"
-            );
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
-// 5. delete_type vs create_group of that type
-// -----------------------------------------------------------------------
-#[tokio::test]
-async fn concurrent_delete_type_and_create_group() {
-    let Some(fix) = pg_fixture().await else {
-        return;
-    };
-
-    let tenant_id = Uuid::now_v7();
-    let ctx = make_ctx(tenant_id);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
-
-    let rt = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("deltp"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create type");
-
-    let (del_res, create_res) = tokio::join!(
-        type_svc.delete_type(&ctx, &rt.code),
-        group_svc.create_group(
-            &ctx,
-            CreateGroupRequest::new(rt.code.clone(), "Race".to_owned()),
-            tenant_id
-        ),
-    );
-
-    match (&del_res, &create_res) {
-        (Ok(()), Ok(_)) => {
-            panic!("both delete_type and create_group succeeded -- type in use but removed!")
-        }
-        (Err(e1), Err(e2)) => {
-            let m = format!("{e1}{e2}");
-            assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not found"),
-                "expected conflict/references, got: {e1} / {e2}"
-            );
-        }
-        (Ok(()), Err(e)) | (Err(e), Ok(_)) => {
-            let m = format!("{e}");
-            assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not found"),
-                "expected conflict/references/not_found, got: {e}"
             );
         }
     }
@@ -804,11 +700,8 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     }
     let (group_a, group_b) = (group_ids[0], group_ids[1]);
 
-    let conn = fix.db.conn().expect("conn");
-    let gts_type_id: i16 = TypeRepository::resolve_id(&conn, &member_type.code)
-        .await
-        .expect("resolve type id")
-        .expect("type must exist");
+    // Memberships key the member type by its GTS identifier.
+    let gts_type_id = member_type.code.clone();
 
     let resource_id = "overlap-res".to_owned();
     let db = fix.db.db();
@@ -817,11 +710,13 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     let (b_done_tx, b_done_rx) = tokio::sync::oneshot::channel::<()>();
 
     let db_a = db.clone();
+    let type_a = gts_type_id.clone();
     let resource_a = resource_id.clone();
     let config_a = config.clone();
     let first = tokio::spawn(async move {
         db_a.transaction_ref_mapped_with_config::<_, (), DomainError>(config_a, move |tx| {
             let resource_id = resource_a.clone();
+            let gts_type_id = type_a.clone();
             // Ignored, not `expect`ed: at SERIALIZABLE the peer may already
             // have returned by the time this fires, and its receiver going
             // away is an outcome of the race, not a reason to panic.
@@ -829,13 +724,13 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
             let b_done_rx = b_done_rx;
             Box::pin(async move {
                 let conflict = MembershipRepository
-                    .has_membership_in_other_tenant(tx, gts_type_id, &resource_id, tenant_a)
+                    .has_membership_in_other_tenant(tx, &gts_type_id, &resource_id, tenant_a)
                     .await?;
                 assert!(!conflict, "A must see an unclaimed resource");
                 let _send = a_checked_tx.send(());
                 let _recv = b_done_rx.await;
                 MembershipRepository
-                    .insert(tx, group_a, gts_type_id, &resource_id)
+                    .insert(tx, group_a, &gts_type_id, &resource_id)
                     .await?;
                 Ok(())
             })
@@ -846,19 +741,21 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     a_checked_rx.await.expect("A must reach its check");
 
     let db_b = db.clone();
+    let type_b = gts_type_id.clone();
     let resource_b = resource_id.clone();
     let config_b = config.clone();
     let second = tokio::spawn(async move {
         let out = db_b
             .transaction_ref_mapped_with_config::<_, (), DomainError>(config_b, move |tx| {
                 let resource_id = resource_b.clone();
+                let gts_type_id = type_b.clone();
                 Box::pin(async move {
                     let conflict = MembershipRepository
-                        .has_membership_in_other_tenant(tx, gts_type_id, &resource_id, tenant_b)
+                        .has_membership_in_other_tenant(tx, &gts_type_id, &resource_id, tenant_b)
                         .await?;
                     assert!(!conflict, "B must still see an unclaimed resource");
                     MembershipRepository
-                        .insert(tx, group_b, gts_type_id, &resource_id)
+                        .insert(tx, group_b, &gts_type_id, &resource_id)
                         .await?;
                     Ok(())
                 })
@@ -879,7 +776,7 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     for (group_id, tenant_id) in [(group_a, tenant_a), (group_b, tenant_b)] {
         let row = MembershipEntity::find()
             .filter(membership_entity::Column::GroupId.eq(group_id))
-            .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id))
+            .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id.clone()))
             .filter(membership_entity::Column::ResourceId.eq(resource_id.clone()))
             .secure()
             .scope_with(&scope)

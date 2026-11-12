@@ -78,8 +78,8 @@ impl MembershipRepositoryTrait for MembershipRepository {
     /// List memberships with `OData` filtering and pagination.
     ///
     /// The `OData` filter supports `group_id`, `resource_type`, and `resource_id` fields.
-    /// `resource_type` values in filters are GTS type path strings; they are resolved
-    /// to surrogate IDs at the persistence boundary.
+    /// `resource_type` compares the stored GTS type identifier; no type
+    /// registry is consulted.
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
@@ -96,12 +96,10 @@ impl MembershipRepositoryTrait for MembershipRepository {
             .scope_with(&row_scope);
         let (base_query, query_no_filter) =
             prepare_filter::<MembershipFilterField, MembershipODataMapper, _>(
-                db,
                 base_query,
                 query,
                 MembershipFilterField::ResourceType,
-            )
-            .await?;
+            )?;
 
         let page = paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
             base_query,
@@ -114,29 +112,13 @@ impl MembershipRepositoryTrait for MembershipRepository {
         .await
         .map_err(DomainError::from)?;
 
-        // Batch-resolve type IDs to GTS paths (single query)
-        let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();
-        let group_repo = crate::infra::storage::group_repo::GroupRepository;
-        let type_map = crate::domain::repo::GroupRepositoryTrait::resolve_type_paths_batch(
-            &group_repo,
-            db,
-            &type_ids,
-        )
-        .await?;
-
         let memberships = page
             .items
             .into_iter()
-            .map(|model| {
-                let type_path = type_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
-                ResourceGroupMembership {
-                    group_id: model.group_id,
-                    resource_type: type_path,
-                    resource_id: model.resource_id,
-                }
+            .map(|model| ResourceGroupMembership {
+                group_id: model.group_id,
+                resource_type: model.gts_type_id,
+                resource_id: model.resource_id,
             })
             .collect();
 
@@ -146,12 +128,12 @@ impl MembershipRepositoryTrait for MembershipRepository {
         })
     }
 
-    /// Insert a membership. Returns the created membership with resolved type path.
+    /// Insert a membership. Returns the created row.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: &str,
         resource_id: &str,
     ) -> Result<membership_entity::Model, DomainError> {
         let scope = system_scope();
@@ -160,7 +142,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
 
         let model = membership_entity::ActiveModel {
             group_id: Set(group_id),
-            gts_type_id: Set(gts_type_id),
+            gts_type_id: Set(gts_type_id.to_owned()),
             resource_id: Set(resource_id.to_owned()),
             created_at: Set(created_at),
         };
@@ -170,9 +152,9 @@ impl MembershipRepositoryTrait for MembershipRepository {
             .map_err(|e| {
                 if e.is_unique_violation() {
                     DomainError::duplicate_membership(
-                        format!("({group_id}, type_id={gts_type_id}, {resource_id})"),
+                        format!("({group_id}, {gts_type_id}, {resource_id})"),
                         format!(
-                            "Membership already exists: ({group_id}, type_id={gts_type_id}, {resource_id})"
+                            "Membership already exists: ({group_id}, {gts_type_id}, {resource_id})"
                         ),
                     )
                 } else if e.is_foreign_key_violation() {
@@ -180,10 +162,8 @@ impl MembershipRepositoryTrait for MembershipRepository {
                     // it and this insert, and then the answer comes from
                     // `fk_rgm_group_id` -- a missing group, not an internal
                     // failure. Matched by constraint name, the same way
-                    // `GroupRepository::insert` does: this table's other
-                    // foreign key, `fk_rgm_gts_type`, fails on a concurrent
-                    // `delete_type` and must not be reported as a missing
-                    // group. PostgreSQL names the constraint; SQLite says
+                    // `GroupRepository::insert` does. PostgreSQL names the
+                    // constraint; SQLite says
                     // only "FOREIGN KEY constraint failed", so there the
                     // answer stays a database error rather than a confident
                     // lie about which resource was missing.
@@ -205,7 +185,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
         // what is already in scope.
         Ok(membership_entity::Model {
             group_id,
-            gts_type_id,
+            gts_type_id: gts_type_id.to_owned(),
             resource_id: resource_id.to_owned(),
             created_at,
         })
@@ -217,7 +197,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
         db: &C,
         scope: &AccessScope,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: &str,
         resource_id: &str,
     ) -> Result<u64, DomainError> {
         // No scope columns on the membership row: tenant scope is applied
@@ -242,7 +222,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
     async fn has_membership_in_other_tenant<C: DBRunner>(
         &self,
         db: &C,
-        gts_type_id: i16,
+        gts_type_id: &str,
         resource_id: &str,
         tenant_id: Uuid,
     ) -> Result<bool, DomainError> {

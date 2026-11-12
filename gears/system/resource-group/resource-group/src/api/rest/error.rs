@@ -65,13 +65,6 @@ impl From<DomainError> for CanonicalError {
             }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2b
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
-            DomainError::TypeAlreadyExists { code } => {
-                RgError::already_exists(format!("GTS type with code '{code}' already exists"))
-                    .with_resource(code)
-                    .create()
-            }
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
             DomainError::InvalidParentType { message } => RgError::invalid_argument()
                 .with_field_violation(
                     field::PARENT_TYPE_FIELD,
@@ -81,16 +74,6 @@ impl From<DomainError> for CanonicalError {
                 .create(),
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
-            // ⚠ wire change accepted in the migration plan: 409 → 400.
-            DomainError::AllowedParentTypesViolation { message } => RgError::failed_precondition()
-                .with_precondition_violation(
-                    precondition::ALLOWED_PARENTS_SUBJECT,
-                    message,
-                    precondition::STATE_TYPE,
-                )
-                .create(),
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2f
             // ⚠ wire change accepted in the migration plan: 409 → 400.
             DomainError::CycleDetected { message } => RgError::failed_precondition()
                 .with_precondition_violation(
@@ -172,6 +155,11 @@ impl From<DomainError> for CanonicalError {
             // (DESIGN.md §3.6) logs it server-side with the request `trace_id`.
             // `Internal::description` is `#[serde(skip)]`, so the DB text
             // never reaches the wire `detail`.
+            DomainError::RegistryRefusedCaller(refusal) => refusal,
+            DomainError::ServiceUnavailable { message } => {
+                tracing::warn!(%message, "resource-group dependency unavailable");
+                CanonicalError::service_unavailable().create()
+            }
             DomainError::Database(db_err) => {
                 CanonicalError::internal(format!("resource-group DB error: {db_err}")).create()
             }

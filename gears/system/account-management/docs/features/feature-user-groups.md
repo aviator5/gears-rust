@@ -1,5 +1,11 @@
 # Feature: User Groups (via Resource Group delegation)
 
+> **Changed (types-registry P0, T38b, 2026-11-11).** AM no longer registers its RG types at `init`
+> through Resource Group. The user-group container `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`
+> (root allowed, self-nesting, AM users as members, unconstrained metadata) and the member handle
+> `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` are AM-owned GTS declarations (`src/gts/rg_types.rs`)
+> published with AM's manifest before application `init`; Resource Group reads them from the types
+> registry. The registration flow and algorithm below are retired.
 
 <!-- toc -->
 

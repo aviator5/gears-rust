@@ -3,6 +3,18 @@
 
 # Feature: GTS Type Management
 
+> **Superseded in part (types-registry P0, T38b, 2026-11-11).** Resource Group no longer keeps a type
+> catalogue. The `gts_type*` tables, `TypeService`, the `/types-registry/v1/types*` REST API,
+> `ResourceGroupTypeBootstrap` and type seeding are removed. RG types are GTS Type Schemas derived from
+> `gts.cf.core.rg.type.v1~` (declared by the RG SDK with an `x-gts-traits-schema` for `can_be_root`,
+> `allowed_parent_types`, `allowed_membership_types`) and published to the types registry by their owners.
+> Groups and memberships store the GTS type identifier (migration `m20261111_000001`). Writes read the
+> type's `effective_traits` and `resolved_schema` through `TypesRegistryApi` under the caller's context,
+> before the transaction; reads, filters and cleanup never consult the registry. Narrowing a type no
+> longer checks existing groups. This feature is retired; its flows and tests are historical; see
+> `gears/system/types-registry/docs/p0/todo.md` (T38b) for the current contract and the operator
+> procedure for custom types held only in an old RG database.
+
 - [x] `p1` - **ID**: `cpt-cf-resource-group-featstatus-type-management`
 
 - [x] `p1` - `cpt-cf-resource-group-feature-type-management`

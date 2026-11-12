@@ -13,7 +13,8 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(nullable)]
     pub parent_id: Option<Uuid>,
-    pub gts_type_id: i16,
+    /// GTS type identifier of the group (immutable).
+    pub gts_type_id: String,
     pub name: String,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,
