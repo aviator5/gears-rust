@@ -12,7 +12,7 @@ use crate::domain::read::ProofDenial;
 use crate::gts::permissions::{self, Permission, properties};
 use authz_resolver_sdk::models::DenyReason;
 use authz_resolver_sdk::pep::{AccessRequest, ConstraintCompileError, ResourceType};
-use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
+use authz_resolver_sdk::{AccessDenial, EnforcerError, PolicyEnforcer};
 use bss_orders_sdk::OrdersError;
 use bss_orders_sdk::catalog::{OPERATIONS, Operation, Reason};
 use bss_orders_sdk::models::DelegationProofRef;
@@ -855,11 +855,15 @@ fn classify(
             "service decision lacks a finite order-ID path restriction",
         ),
         Ok(scope) => Raw::Allowed(scope),
-        Err(EnforcerError::Denied { deny_reason }) => {
-            Raw::Denied(classify_proof(deny_reason.as_ref()))
+        Err(EnforcerError::AccessDenied(AccessDenial::Pdp { reason })) => {
+            Raw::Denied(classify_proof(reason.as_ref()))
         }
+        // A local refusal carries no PDP denial proof.
+        Err(EnforcerError::AccessDenied(_)) => Raw::Denied(None),
         Err(EnforcerError::EvaluationFailed(error)) => unavailable(pdp_action, &error),
         Err(EnforcerError::CompileFailed(error)) => compile_failed(pdp_action, &error),
+        // An unknown outcome class is an integration fault, never a denial.
+        Err(_) => integration(pdp_action, "unknown enforcer outcome class"),
     }
 }
 
@@ -945,9 +949,10 @@ fn requires_finite_ids(identities: &ActorIdentities, caller: &Caller, action: Ac
 /// Shape check only — never a local permission decision.
 #[must_use]
 pub fn finite_order_ids(scope: &AccessScope) -> bool {
+    let mut paths = scope.constraints().iter().peekable();
     !scope.is_unconstrained()
-        && !scope.constraints().is_empty()
-        && scope.constraints().iter().all(|path| {
+        && paths.peek().is_some()
+        && paths.all(|path| {
             path.filters().iter().any(|filter| match filter {
                 ScopeFilter::Eq(eq) => {
                     eq.property() == properties::ID && matches!(eq.value(), ScopeValue::Uuid(_))
