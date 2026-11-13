@@ -2,8 +2,9 @@
 // @cpt-dod:cpt-cf-resource-group-dod-membership-service:p1
 //! Persistence layer for membership management.
 //!
-//! All surrogate SMALLINT ID resolution happens here. The domain and API layers
-//! work exclusively with string GTS type paths and UUIDs.
+//! Memberships store the member's GTS type path verbatim in the text
+//! `gts_type_id` column, so no type ID resolution happens here; the domain and
+//! API layers work with the same string GTS type paths and UUIDs.
 
 use async_trait::async_trait;
 use resource_group_sdk::models::ResourceGroupMembership;

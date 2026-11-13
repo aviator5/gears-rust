@@ -23,6 +23,19 @@ What a systematic audit of this gear's database behavior found, how it was
 found, and how to repeat it on another module. The detection tooling is meant
 to be reused — this gear is the worked example, not the point.
 
+> **Superseded in part (2026-11, [#5939](https://github.com/constructorfabric/gears-rust/pull/5939)).**
+> This report records the code as audited on `perf/db-tx-isolation` (PR #4613)
+> and is kept unchanged as history. Resource-group has since dropped its local
+> type catalogue: type definitions are read from types-registry, and the
+> `gts_type`, `gts_type_allowed_parent` and `gts_type_allowed_membership`
+> tables, `type_service.rs`, `type_repo.rs` and the SMALLINT `gts_type_id`
+> surrogate are gone (groups and memberships now store the GTS type identifier
+> as text). The findings and notes about that code — RG-02, RG-03, RG-07,
+> RG-11, RG-12, RG-13, the `type_repo.rs` half of RG-08, finding (b), the
+> `resolve_type_paths_batch` / `load_full_types_batch` bind-list bound, and
+> the tests named for them — describe code that no longer exists; they were
+> retired with it rather than re-fixed.
+
 ## Scope of this branch
 
 Two terms recur in the Status column below and are worth fixing before they

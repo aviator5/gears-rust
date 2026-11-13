@@ -181,22 +181,10 @@ fn warn_group_filter_denied(predicate: &'static str, property: &str, cause: &'st
     );
 }
 
-/// Resolve an external member-handle GTS schema ID to RG-local `gts_type.id` values.
-fn membership_type_subquery(membership_resource_type: &str) -> SelectStatement {
-    let member_type = Alias::new("member_type");
-    Query::select()
-        .column((member_type.clone(), Alias::new(rg_tables::GTS_TYPE_ID)))
-        .from_as(Alias::new(rg_tables::GTS_TYPE_TABLE), member_type.clone())
-        .and_where(
-            Expr::col((member_type, Alias::new(rg_tables::GTS_TYPE_SCHEMA_ID)))
-                .eq(membership_resource_type),
-        )
-        .to_owned()
-}
-
 /// Build the common typed RG membership relation for direct and subtree
 /// predicates: membership rows selected by group and qualified by the RG
-/// member-handle type.
+/// member-handle type. `gts_type_id` stores the full GTS type identifier, so the
+/// type qualifier is a direct text equality.
 ///
 /// The entity side of the comparison is cast to text by the caller — RG stores
 /// external resource IDs as opaque text, and casting membership IDs to UUID
@@ -231,7 +219,7 @@ fn typed_membership_query(
         .to_owned();
     membership_subquery.and_where(
         Expr::col((membership, Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID)))
-            .in_subquery(membership_type_subquery(membership_resource_type)),
+            .eq(membership_resource_type),
     );
     Some(membership_subquery)
 }
@@ -561,8 +549,7 @@ where
                 // CAST(col AS text) IN (
                 //   SELECT resource_id FROM resource_group_membership
                 //    WHERE group_id IN (...)
-                //      AND gts_type_id IN (SELECT id FROM gts_type
-                //                           WHERE schema_id = <member type>))
+                //      AND gts_type_id = <member type>)
                 let Some(group_values) = uuid_scope_values_to_sea_values(gf.group_ids()) else {
                     warn_group_filter_denied("InGroup", gf.property(), "non-UUID group_ids");
                     and_cond = and_cond.add(Expr::value(false));
@@ -612,8 +599,7 @@ where
                 //    WHERE group_id IN (
                 //            SELECT descendant_id FROM resource_group_closure
                 //             WHERE ancestor_id IN (...))
-                //      AND gts_type_id IN (SELECT id FROM gts_type
-                //                           WHERE schema_id = <member type>))
+                //      AND gts_type_id = <member type>)
                 let Some(ancestor_values) = uuid_scope_values_to_sea_values(sf.ancestor_ids())
                 else {
                     warn_group_filter_denied(
@@ -848,11 +834,11 @@ mod tests {
             ),
             (
                 group_scope(),
-                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN ('00000000-0000-0000-0000-000000000007') AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
+                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN ('00000000-0000-0000-0000-000000000007') AND "membership"."gts_type_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~') AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
             ),
             (
                 group_subtree_scope(),
-                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN (SELECT "group_closure"."descendant_id" FROM "resource_group_closure" AS "group_closure" WHERE "group_closure"."ancestor_id" IN ('00000000-0000-0000-0000-000000000007')) AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
+                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN (SELECT "group_closure"."descendant_id" FROM "resource_group_closure" AS "group_closure" WHERE "group_closure"."ancestor_id" IN ('00000000-0000-0000-0000-000000000007')) AND "membership"."gts_type_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~') AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
             ),
             (
                 tenant_subtree_scope(),
@@ -981,6 +967,18 @@ mod tests {
             assert!(
                 sql.starts_with("SELECT DISTINCT"),
                 "a membership sibling must be distinct: {sql}"
+            );
+            // The graph path shares `typed_membership_query`: the member type is
+            // compared directly with the text `gts_type_id`, with no catalogue.
+            assert!(
+                sql.contains(&format!(
+                    r#""membership"."gts_type_id" = '{MEMBERSHIP_TYPE}'"#
+                )),
+                "a membership sibling must qualify the member type directly: {sql}"
+            );
+            assert!(
+                !sql.contains(r#"FROM "gts_type""#),
+                "a membership sibling must not read a type catalogue: {sql}"
             );
         }
 
@@ -1289,8 +1287,8 @@ mod tests {
             "InGroup condition must join on resource_id, got: {cond_str}"
         );
         assert!(
-            cond_str.contains("gts_type_id") && cond_str.contains("schema_id"),
-            "InGroup condition must qualify the membership resource type, got: {cond_str}"
+            cond_str.contains("gts_type_id") && !cond_str.contains("schema_id"),
+            "InGroup condition must qualify the membership resource type directly, got: {cond_str}"
         );
         assert!(
             cond_str.contains(MEMBERSHIP_TYPE) && cond_str.contains("Cast"),
@@ -1655,7 +1653,7 @@ mod tests {
         );
         assert!(
             cond_str.contains("gts_type_id")
-                && cond_str.contains("schema_id")
+                && !cond_str.contains("schema_id")
                 && cond_str.contains(MEMBERSHIP_TYPE)
                 && cond_str.contains("Cast"),
             "InGroupSubtree must cast the entity ID and qualify membership type, got: {cond_str}"

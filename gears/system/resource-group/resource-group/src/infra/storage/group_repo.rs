@@ -3,8 +3,9 @@
 // @cpt-begin:cpt-cf-resource-group-dod-entity-hier-hierarchy-engine:p1:inst-full
 //! Persistence layer for resource group entity management.
 //!
-//! All surrogate SMALLINT ID resolution happens here. The domain and API layers
-//! work exclusively with string GTS type paths and UUIDs.
+//! Groups store their GTS type path verbatim in the text `gts_type_id` column,
+//! so no type ID resolution happens here; the domain and API layers work with
+//! the same string GTS type paths and UUIDs.
 
 use async_trait::async_trait;
 use resource_group_sdk::models::{
@@ -48,7 +49,8 @@ pub struct GroupRepository;
 impl GroupRepository {
     // -- Private helper functions --
 
-    /// Resolve a SMALLINT type ID to its GTS type path string.
+    /// Map a stored row to the SDK model; `gts_type_id` already holds the GTS
+    /// type path and is copied as-is into `code`.
     fn model_to_resource_group(model: rg_entity::Model) -> ResourceGroup {
         ResourceGroup {
             id: model.id,

@@ -8,7 +8,9 @@
 //! the complete `SecureORM` condition against `PostgreSQL` because debug-tree
 //! tests cannot detect `PostgreSQL`'s `uuid = text` operator error. They also pin the
 //! membership-type discriminator: the same textual identifier may legitimately
-//! occur under multiple RG member-handle types.
+//! occur under multiple RG member-handle types. Like the migrated RG schema,
+//! `gts_type_id` holds the full GTS type identifier as text and there is no
+//! local type catalogue to resolve it through.
 
 mod common;
 
@@ -34,14 +36,6 @@ enum ResourceTable {
     Id,
     TenantId,
     Name,
-}
-
-#[derive(Iden)]
-enum GtsTypeTable {
-    #[iden = "gts_type"]
-    Table,
-    Id,
-    SchemaId,
 }
 
 #[derive(Iden)]
@@ -98,25 +92,6 @@ impl mig::MigrationTrait for CreateGroupScopeSchema {
         manager
             .create_table(
                 mig::Table::create()
-                    .table(GtsTypeTable::Table)
-                    .col(
-                        mig::ColumnDef::new(GtsTypeTable::Id)
-                            .small_integer()
-                            .not_null()
-                            .primary_key(),
-                    )
-                    .col(
-                        mig::ColumnDef::new(GtsTypeTable::SchemaId)
-                            .text()
-                            .not_null()
-                            .unique_key(),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_table(
-                mig::Table::create()
                     .table(MembershipTable::Table)
                     .col(
                         mig::ColumnDef::new(MembershipTable::GroupId)
@@ -125,7 +100,7 @@ impl mig::MigrationTrait for CreateGroupScopeSchema {
                     )
                     .col(
                         mig::ColumnDef::new(MembershipTable::GtsTypeId)
-                            .small_integer()
+                            .text()
                             .not_null(),
                     )
                     .col(
@@ -170,7 +145,6 @@ impl mig::MigrationTrait for CreateGroupScopeSchema {
         for table in [
             ClosureTable::Table.into_iden(),
             MembershipTable::Table.into_iden(),
-            GtsTypeTable::Table.into_iden(),
             ResourceTable::Table.into_iden(),
         ] {
             manager
@@ -201,24 +175,6 @@ mod resource {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-mod gts_type {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
-    #[sea_orm(table_name = "gts_type")]
-    #[secure(unrestricted)]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub id: i16,
-        pub schema_id: String,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
 mod membership {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
@@ -232,7 +188,7 @@ mod membership {
         #[sea_orm(primary_key, auto_increment = false)]
         pub group_id: Uuid,
         #[sea_orm(primary_key, auto_increment = false)]
-        pub gts_type_id: i16,
+        pub gts_type_id: String,
         #[sea_orm(primary_key, auto_increment = false)]
         pub resource_id: String,
     }
@@ -272,19 +228,6 @@ async fn setup() -> Result<(common::DbUnderTest, toolkit_db::Db)> {
     Ok((dut, db))
 }
 
-async fn seed_type(conn: &toolkit_db::secure::DbConn<'_>, id: i16, schema_id: &str) -> Result<()> {
-    secure_insert::<gts_type::Entity>(
-        gts_type::ActiveModel {
-            id: Set(id),
-            schema_id: Set(schema_id.to_owned()),
-        },
-        &AccessScope::allow_all(),
-        conn,
-    )
-    .await?;
-    Ok(())
-}
-
 async fn seed_resource(
     conn: &toolkit_db::secure::DbConn<'_>,
     id: Uuid,
@@ -307,13 +250,13 @@ async fn seed_resource(
 async fn seed_membership(
     conn: &toolkit_db::secure::DbConn<'_>,
     group_id: Uuid,
-    gts_type_id: i16,
+    gts_type_id: &str,
     resource_id: impl Into<String>,
 ) -> Result<()> {
     secure_insert::<membership::Entity>(
         membership::ActiveModel {
             group_id: Set(group_id),
-            gts_type_id: Set(gts_type_id),
+            gts_type_id: Set(gts_type_id.to_owned()),
             resource_id: Set(resource_id.into()),
         },
         &AccessScope::allow_all(),
@@ -334,8 +277,6 @@ async fn in_group_casts_uuid_to_text_and_excludes_other_member_types() -> Result
     let wrong_type_id = Uuid::new_v4();
     let foreign_tenant_resource_id = Uuid::new_v4();
 
-    seed_type(&conn, 1, RESOURCE_MEMBER_TYPE).await?;
-    seed_type(&conn, 2, OTHER_MEMBER_TYPE).await?;
     seed_resource(&conn, matching_id, tenant_id, "matching").await?;
     seed_resource(&conn, wrong_type_id, tenant_id, "wrong-type").await?;
     seed_resource(
@@ -345,18 +286,36 @@ async fn in_group_casts_uuid_to_text_and_excludes_other_member_types() -> Result
         "foreign-tenant",
     )
     .await?;
-    seed_membership(&conn, group_id, 1, matching_id.to_string()).await?;
+    seed_membership(
+        &conn,
+        group_id,
+        RESOURCE_MEMBER_TYPE,
+        matching_id.to_string(),
+    )
+    .await?;
     // Even a correctly typed membership cannot escape the mandatory tenant
     // predicate carried in the same AND constraint.
-    seed_membership(&conn, group_id, 1, foreign_tenant_resource_id.to_string()).await?;
+    seed_membership(
+        &conn,
+        group_id,
+        RESOURCE_MEMBER_TYPE,
+        foreign_tenant_resource_id.to_string(),
+    )
+    .await?;
     // External IDs are unique only within an RG member-handle type, so the same
     // text may legitimately occur under another type.
-    seed_membership(&conn, group_id, 2, matching_id.to_string()).await?;
-    seed_membership(&conn, group_id, 2, wrong_type_id.to_string()).await?;
+    seed_membership(&conn, group_id, OTHER_MEMBER_TYPE, matching_id.to_string()).await?;
+    seed_membership(
+        &conn,
+        group_id,
+        OTHER_MEMBER_TYPE,
+        wrong_type_id.to_string(),
+    )
+    .await?;
     // RG does not validate ID syntax per member type. Even a selected type can
     // contain an opaque ID, so casting the membership side to UUID would make
     // the PostgreSQL query throw before it can return the UUID-backed entity.
-    seed_membership(&conn, group_id, 1, "opaque-resource-id").await?;
+    seed_membership(&conn, group_id, RESOURCE_MEMBER_TYPE, "opaque-resource-id").await?;
 
     let scope = AccessScope::single(ScopeConstraint::new(vec![
         ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
@@ -409,23 +368,57 @@ async fn in_group_subtree_matches_descendants_but_not_unrelated_groups() -> Resu
     let wrong_type_resource = Uuid::new_v4();
     let unrelated_resource = Uuid::new_v4();
 
-    seed_type(&conn, 1, RESOURCE_MEMBER_TYPE).await?;
-    seed_type(&conn, 2, OTHER_MEMBER_TYPE).await?;
     seed_resource(&conn, direct_resource, tenant_id, "direct").await?;
     seed_resource(&conn, descendant_resource, tenant_id, "descendant").await?;
     seed_resource(&conn, wrong_type_resource, tenant_id, "wrong-type").await?;
     seed_resource(&conn, unrelated_resource, tenant_id, "unrelated").await?;
     // The closure self-row makes direct members of the selected ancestor part
     // of its subtree, just as it does in the canonical RG closure table.
-    seed_membership(&conn, ancestor_id, 1, direct_resource.to_string()).await?;
-    seed_membership(&conn, descendant_id, 1, descendant_resource.to_string()).await?;
+    seed_membership(
+        &conn,
+        ancestor_id,
+        RESOURCE_MEMBER_TYPE,
+        direct_resource.to_string(),
+    )
+    .await?;
+    seed_membership(
+        &conn,
+        descendant_id,
+        RESOURCE_MEMBER_TYPE,
+        descendant_resource.to_string(),
+    )
+    .await?;
     // Duplicate external IDs across types are valid, while a row belonging
     // only to the wrong type must never grant access.
-    seed_membership(&conn, descendant_id, 2, descendant_resource.to_string()).await?;
-    seed_membership(&conn, descendant_id, 2, wrong_type_resource.to_string()).await?;
+    seed_membership(
+        &conn,
+        descendant_id,
+        OTHER_MEMBER_TYPE,
+        descendant_resource.to_string(),
+    )
+    .await?;
+    seed_membership(
+        &conn,
+        descendant_id,
+        OTHER_MEMBER_TYPE,
+        wrong_type_resource.to_string(),
+    )
+    .await?;
     // A selected-type opaque ID proves the query never casts membership IDs.
-    seed_membership(&conn, descendant_id, 1, "opaque-descendant-id").await?;
-    seed_membership(&conn, unrelated_id, 1, unrelated_resource.to_string()).await?;
+    seed_membership(
+        &conn,
+        descendant_id,
+        RESOURCE_MEMBER_TYPE,
+        "opaque-descendant-id",
+    )
+    .await?;
+    seed_membership(
+        &conn,
+        unrelated_id,
+        RESOURCE_MEMBER_TYPE,
+        unrelated_resource.to_string(),
+    )
+    .await?;
     for descendant_id in [ancestor_id, descendant_id] {
         secure_insert::<closure::Entity>(
             closure::ActiveModel {
@@ -458,6 +451,24 @@ async fn in_group_subtree_matches_descendants_but_not_unrelated_groups() -> Resu
         names,
         vec!["descendant", "direct"],
         "the subtree must include direct and descendant members while excluding unrelated groups and member types"
+    );
+
+    let unknown_type_scope = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+        ScopeFilter::in_group_subtree_typed(
+            pep_properties::RESOURCE_ID,
+            "gts.cf.core.rg.type.v1~example.core.rg.missing.v1~",
+            vec![ScopeValue::Uuid(ancestor_id)],
+        ),
+    ]));
+    let unknown_type_rows = resource::Entity::find()
+        .secure()
+        .scope_with(&unknown_type_scope)
+        .all(&conn)
+        .await?;
+    assert!(
+        unknown_type_rows.is_empty(),
+        "an unknown external member type must match no subtree membership rows"
     );
     Ok(())
 }

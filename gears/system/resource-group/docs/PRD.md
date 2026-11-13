@@ -109,7 +109,7 @@ Authorization flows additionally need a stable source for ownership hierarchy an
 
 - Provide one stable contract for group type, entity, hierarchy, and membership operations.
 - Enforce strict forest invariants (single parent, no cycles).
-- Support dynamic type configuration through API and DB seeding.
+- Resolve group type definitions from Types Registry, where declaring gears publish them; RG keeps no local type catalogue.
 - Provide efficient hierarchy operations using closure table.
 - Allow AuthZ integration without coupling RG to AuthZ semantics.
 
@@ -148,8 +148,8 @@ Authorization flows additionally need a stable source for ownership hierarchy an
 
 **ID**: `cpt-cf-resource-group-actor-instance-administrator`
 
-- **Role**: manages resource group types, resource group items, and seeding (tenants). Configures hierarchy query profile and operates migrations.
-- **Needs**: full control over type definitions, deterministic seeding, predictable behavior when constraints are tightened.
+- **Role**: manages resource group items and group/membership seeding (tenants) through the RG API, publishes or administers group type definitions through Types Registry, configures the hierarchy query profile, and operates migrations.
+- **Needs**: deterministic group and membership seeding, type definitions that reach RG only through Types Registry, predictable behavior when placement rules are tightened.
 
 #### Tenant Administrator
 
@@ -791,59 +791,42 @@ See `cpt-cf-resource-group-fr-jwt-auth` in section 5.9 for the implemented JWT a
 
 ### 8.1 Types
 
-#### Scenario: Create Type
+Type definitions are owned by Types Registry; these scenarios describe how RG
+consumes them.
 
-- **GIVEN** valid code `branch` and allowed_parents `["tenant", "department"]`
-- **WHEN** caller creates type
-- **THEN** type is persisted with owner metadata
+#### Scenario: Use a Published Type
 
-#### Scenario: Reject Duplicate Type
+- **GIVEN** a gear published `gts.cf.core.rg.type.v1~vendor.app.branch.v1~` with
+  `allowed_parent_types` `["gts.cf.core.rg.type.v1~vendor.app.tenant.v1~"]` before application `init`
+- **WHEN** caller creates a group of that type under a group of the tenant type
+- **THEN** RG reads the type from Types Registry and creates the group
 
-- **GIVEN** type `branch` already exists
-- **WHEN** caller creates same code
-- **THEN** `TypeAlreadyExists`
+#### Scenario: Reject Unknown or Inactive Type
 
-#### Scenario: Reject Invalid Type Code
+- **GIVEN** no active registry type exists for the requested identifier
+- **WHEN** caller creates a group, or adds a membership, using that identifier
+- **THEN** the request is rejected and nothing is written
 
-- **GIVEN** code with whitespace or length > 63
-- **WHEN** caller creates type
-- **THEN** validation error
+#### Scenario: Reject Malformed Type Identifier
 
-#### Scenario: Update Type Parents (Compatible)
+- **GIVEN** a type identifier that is not a valid GTS type path, or is longer than 1024 characters
+- **WHEN** caller uses it in a group or membership request
+- **THEN** validation error naming the field
 
-- **GIVEN** type `branch` exists with allowed_parents `["tenant"]`
-- **AND** no existing `branch` groups have a parent of type `department`
-- **WHEN** caller updates allowed_parents to `["tenant", "department"]` (adds new allowed parent)
-- **THEN** type definition is updated
-- **AND** existing groups remain valid
+#### Scenario: Tightened Placement Rules Apply to New Writes
 
-#### Scenario: Reject Update Type Parents When Existing Groups Violate New Rules
+- **GIVEN** group `B1` of type `branch` has parent `D1` of type `department`
+- **AND** a new revision of `branch` removes `department` from `allowed_parent_types`
+- **WHEN** caller moves another `branch` group under a `department` group
+- **THEN** the move is rejected against the current definition
+- **AND** existing group `B1` is neither scanned nor rewritten
 
-- **GIVEN** type `branch` exists with allowed_parents `["tenant", "department"]`
-- **AND** group `B1` (type `branch`) has parent `D1` (type `department`)
-- **WHEN** caller updates `branch` allowed_parents to `["tenant"]` (removes `department`)
-- **THEN** update is rejected with `AllowedParentsViolation` — existing group `B1` would violate new parent type rules
+#### Scenario: Existing Instances Survive Type Deletion
 
-#### Scenario: Delete Unused Type
-
-- **GIVEN** type `team` exists
-- **AND** no groups of type `team` exist in the database
-- **WHEN** caller deletes type `team`
-- **THEN** type is removed
-
-#### Scenario: Reject Delete Type With Existing Groups
-
-- **GIVEN** type `branch` exists
-- **AND** at least one group of type `branch` exists
-- **WHEN** caller deletes type `branch`
-- **THEN** deletion is rejected with `conflict` — type is in use
-
-#### Scenario: Seed Types (Pre-Deployment Step)
-
-- **GIVEN** deployment configuration defines types `["tenant", "department", "branch"]`
-- **WHEN** operator runs the seeding step before deployment (pre-deployment migration)
-- **THEN** missing types are created, existing types are updated to match seed definitions
-- **AND** seeding is idempotent — repeated runs produce the same result
+- **GIVEN** groups and memberships exist for a type that is deleted in Types Registry
+- **WHEN** caller reads or removes them
+- **THEN** they remain readable and removable by their stored type identifiers
+- **AND** creating new groups or memberships of that type is rejected
 
 ### 8.2 Groups
 

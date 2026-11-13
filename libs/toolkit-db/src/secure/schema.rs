@@ -17,24 +17,20 @@
 /// subqueries without depending on entity types.
 ///
 /// **Note:** These tables are canonical to the RG gear's database.
-/// `resource_group_membership` is not projected to domain services.
-/// `InGroup`/`InGroupSubtree` predicates are only executable within the RG gear.
+/// `InGroup`/`InGroupSubtree` predicates execute only against a database that
+/// contains them: RG's own, a shared database where they are co-located, or one
+/// where a service projects them. A service advertises the matching group
+/// capabilities only when its querying database has every table they need.
 pub mod rg_tables {
-    /// Membership table (RG-internal, not projected to domain services).
+    /// Membership table (canonical in RG; co-located or projected elsewhere).
     pub const MEMBERSHIP_TABLE: &str = "resource_group_membership";
     /// Column in membership table: the resource's external ID.
     pub const MEMBERSHIP_RESOURCE_ID: &str = "resource_id";
     /// Column in membership table: the group the resource belongs to.
     pub const MEMBERSHIP_GROUP_ID: &str = "group_id";
-    /// Column in membership table: the RG-local GTS type surrogate.
+    /// Column in membership table: the member-handle GTS type identifier
+    /// (text, e.g. `gts.cf.core.rg.type.v1~vendor.app.member.v1~`).
     pub const MEMBERSHIP_GTS_TYPE_ID: &str = "gts_type_id";
-
-    /// RG-local GTS type registry table.
-    pub const GTS_TYPE_TABLE: &str = "gts_type";
-    /// Primary key in the RG-local GTS type registry.
-    pub const GTS_TYPE_ID: &str = "id";
-    /// External GTS schema identifier in the RG-local type registry.
-    pub const GTS_TYPE_SCHEMA_ID: &str = "schema_id";
 
     /// Closure table for group hierarchy.
     pub const CLOSURE_TABLE: &str = "resource_group_closure";
