@@ -5,12 +5,13 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use quota_enforcement_sdk::{QuotaEnforcementStoragePluginSpecV1, QuotaEnforcementStoragePluginV1};
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::contracts::DatabaseCapability;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::GtsId;
 
 use crate::config::StoragePluginConfig;
 use crate::domain::StoragePlugin;
@@ -24,11 +25,13 @@ pub const INSTANCE_SEGMENT: &str = "cf.core._.qe_db_storage.v1";
 
 /// Storage plugin gear.
 ///
-/// `init` validates the configuration, binds the plugin to the gear's
-/// database — every store over the notification outbox handle, and the one
-/// notification pipeline — and publishes it: the plugin instance in
-/// types-registry, under which the gear selects its storage, and the scoped
-/// `QuotaEnforcementStoragePluginV1` client. The runtime applies the
+/// The runtime publishes the plugin instance built from the configuration
+/// (`gts_publication(entities = ...)`) and calls `init` only once it is
+/// admitted. `init` validates the configuration, binds the plugin to the
+/// gear's database — every store over the notification outbox handle, and the
+/// one notification pipeline — and binds the scoped
+/// `QuotaEnforcementStoragePluginV1` client to the admitted instance, under
+/// which quota-enforcement selects its storage. The runtime applies the
 /// migrations before `init` through [`DatabaseCapability`]. The outbox handle
 /// stays unbound until the gear starts notification delivery; until then a
 /// mutation that enqueues events rolls back, while bootstrap, which enqueues
@@ -36,8 +39,8 @@ pub const INSTANCE_SEGMENT: &str = "cf.core._.qe_db_storage.v1";
 // @cpt-dod:cpt-cf-quota-enforcement-dod-workspace-crates:p1
 #[toolkit::gear(
     name = "quota-enforcement-storage-plugin",
-    deps = [types_registry],
-    capabilities = [db]
+    capabilities = [db],
+    gts_publication(entities = Self::plugin_instance),
 )]
 pub struct StoragePluginGear {
     plugin: OnceLock<Arc<StoragePlugin>>,
@@ -54,6 +57,20 @@ impl Default for StoragePluginGear {
 }
 
 impl StoragePluginGear {
+    /// The publication's config-only document: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let cfg: StoragePluginConfig = inputs.config_or_default()?;
+        cfg.validate()?;
+        let (id, document) = PluginV1::<QuotaEnforcementStoragePluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
+    }
+
     /// The bound plugin, once `init` ran.
     #[must_use]
     pub fn plugin(&self) -> Option<Arc<StoragePlugin>> {
@@ -113,24 +130,18 @@ impl Gear for StoragePluginGear {
             .set(Arc::clone(&plugin))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        let (instance_id, instance) =
-            PluginV1::<QuotaEnforcementStoragePluginSpecV1>::build_registration(
-                INSTANCE_SEGMENT,
-                cfg.vendor.clone(),
-                cfg.priority,
-            )?;
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        RegisterResult::ensure_all_ok(&registry.register(vec![instance]).await?)?;
-        ctx.client_hub()
-            .register_scoped::<dyn QuotaEnforcementStoragePluginV1>(
-                ClientScope::gts_id(&instance_id),
-                plugin as Arc<dyn QuotaEnforcementStoragePluginV1>,
-            );
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
+        let service: Arc<dyn QuotaEnforcementStoragePluginV1> = plugin;
+        bind_plugin_instances::<QuotaEnforcementStoragePluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &service,
+        )?;
         info!(
-            instance_id = %instance_id,
             vendor = %cfg.vendor,
             priority = cfg.priority,
-            "storage plugin registered"
+            "storage plugin bound"
         );
         Ok(())
     }
