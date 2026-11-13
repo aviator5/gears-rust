@@ -3945,6 +3945,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "schemars 1.2.3",
  "sea-orm",
  "sea-orm-migration",
  "serde",
