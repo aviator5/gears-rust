@@ -13,11 +13,24 @@
 //! only for the contracts the catalogue selects.
 
 use async_trait::async_trait;
-use gts::{CompilePayloadValidatorError, GtsInstanceId, GtsTypeId, PayloadValidator};
+use gts::{GtsInstanceId, GtsTypeId, PayloadValidator};
 use serde_json::Value;
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
+use types_registry_sdk::CompilePayloadValidatorError;
 
 use crate::domain::error::DomainError;
+
+/// Whose read of the types registry a call is: the platform's own (bootstrap,
+/// background refresh) or a request's, under the caller's context.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub enum RegistryCaller<'a> {
+    /// No caller: the gear's own read through the platform API.
+    Platform,
+    /// A request's read, under the caller's security context.
+    Request(&'a SecurityContext),
+}
 
 /// A registered type, fully resolved.
 #[domain_model]
@@ -71,7 +84,11 @@ pub trait ContractRegistry: Send + Sync {
     ///
     /// Returns [`DomainError::TypesRegistryUnavailable`] when the registry
     /// cannot answer or the registered content does not resolve.
-    async fn type_schema(&self, id: &GtsTypeId) -> Result<Option<RegisteredType>, DomainError>;
+    async fn type_schema(
+        &self,
+        caller: RegistryCaller<'_>,
+        id: &GtsTypeId,
+    ) -> Result<Option<RegisteredType>, DomainError>;
 
     /// List the types derived from `base`, from the listing alone.
     ///
