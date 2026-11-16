@@ -29,10 +29,10 @@ fn covers_follows_derivation() {
 
 #[tokio::test]
 async fn ensure_registered_fails_on_a_missing_type() {
-    use types_registry_sdk::testing::MockTypesRegistryClient;
+    use types_registry_sdk::testing_platform::MockTypesRegistry;
 
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TypesRegistryClient>(Arc::new(MockTypesRegistryClient::new()));
+    Arc::new(MockTypesRegistry::new()).install(&hub);
     let resolver = TypeResolver::new(hub);
     let missing = GtsTypeId::new("gts.cf.core.lic.subj.v1~test.le.app.user.v1~");
     assert!(matches!(
@@ -48,8 +48,9 @@ async fn conditions_address_the_subject_and_resource_contracts() {
     let resolver = TypeResolver::new(Arc::clone(&env.hub));
     let terms = crate::test_support::terms();
     let (mut violations, mut seen) = (Vec::new(), Schemas::new());
+    let caller = crate::test_support::ctx(uuid::Uuid::new_v4());
     resolver
-        .validate_terms("g", &terms, &mut violations, &mut seen)
+        .validate_terms(&caller, "g", &terms, &mut violations, &mut seen)
         .await
         .unwrap();
     assert!(violations.is_empty(), "{violations:?}");
@@ -58,11 +59,51 @@ async fn conditions_address_the_subject_and_resource_contracts() {
         ("subject", &terms.subject_type),
         ("resource", &terms.resource.gts_type),
     ] {
-        let expected = seen[t.as_ref()].as_ref().unwrap().effective_schema();
+        let expected = seen[t.as_ref()]
+            .as_ref()
+            .unwrap()
+            .resolved_schema
+            .clone()
+            .unwrap();
         assert_eq!(schema["properties"][part], expected, "{part}");
     }
 
     let mut unknown = terms.clone();
     unknown.subject_type = GtsTypeId::new("gts.cf.core.lic.subj.v1~test.le.app.nope.v1~");
     assert!(conditions_schema(&unknown, &seen).is_none());
+}
+
+/// A grant request's lookups go through the tenant contract under the
+/// caller's context; the start check through the platform contract.
+#[tokio::test]
+async fn requests_read_as_the_caller_and_the_start_check_as_the_platform() {
+    use types_registry_sdk::testing_platform::Call;
+
+    let registry = crate::test_support::registry();
+    let hub = Arc::new(ClientHub::new());
+    registry.install(&hub);
+    let resolver = TypeResolver::new(hub);
+    let caller = crate::test_support::ctx(uuid::Uuid::new_v4());
+    let terms = crate::test_support::terms();
+    let (mut violations, mut seen) = (Vec::new(), Schemas::new());
+    resolver
+        .validate_terms(&caller, "g", &terms, &mut violations, &mut seen)
+        .await
+        .unwrap();
+    assert!(violations.is_empty(), "{violations:?}");
+    let contexts = registry.caller_contexts(Call::BatchGet);
+    assert!(!contexts.is_empty());
+    assert!(
+        contexts
+            .iter()
+            .all(|c| c.subject_id() == caller.subject_id()
+                && c.subject_tenant_id() == caller.subject_tenant_id())
+    );
+    assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+
+    resolver
+        .ensure_registered(std::slice::from_ref(&terms.subject_type))
+        .await
+        .unwrap();
+    assert_eq!(registry.platform_calls(Call::BatchGet), 1);
 }
