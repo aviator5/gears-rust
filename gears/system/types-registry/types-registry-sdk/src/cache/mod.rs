@@ -1,13 +1,5 @@
 //! The client-side representation cache (SPEC §8.3, DESIGN "The client-side cache").
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the decorator is published with its invalidation, next"
-    )
-)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -21,14 +13,14 @@ use uuid::Uuid;
 use crate::contract::PlatformTypesRegistryApi;
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
-    DeletionOperation, Entity, EntityField, EntityKey, EntityKind, EntityLookup, FieldSelection,
-    IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, MAX_BATCH_GET_KEYS, Operation,
-    RegisterEntitiesRequest, RegistrationOperation, Validator,
+    DeletionOperation, DeletionOutcome, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
+    FieldSelection, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, MAX_BATCH_GET_KEYS,
+    Operation, RegisterEntitiesRequest, RegistrationOperation, RegistrationOutcome, Validator,
 };
 
 mod store;
 
-use store::{RepKey, Store, canonical_uuid};
+use store::{RepKey, Store, Ticket, canonical_uuid};
 
 /// How long a confirmed entry is served without asking the registry again, and how
 /// many bytes of snapshots the cache holds.
@@ -91,7 +83,24 @@ enum Plan {
         caller: Option<Validator>,
         pinned: Option<(Arc<Entity>, Validator)>,
         sent: Option<Validator>,
+        /// This read's ticket, taken with its lookup.
+        ticket: Ticket,
     },
+}
+
+/// The tickets one batch read holds, released when it completes, fails or is dropped.
+struct Tickets<'a> {
+    store: &'a Mutex<Store>,
+    uuids: Vec<Uuid>,
+}
+
+impl Drop for Tickets<'_> {
+    fn drop(&mut self) {
+        let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        for uuid in &self.uuids {
+            store.release(*uuid);
+        }
+    }
 }
 
 /// A registry answer checked against what was sent, ready to commit without further work.
@@ -124,8 +133,18 @@ impl CachedPlatformTypesRegistry {
 
     /// Decides, per distinct key, whether the cache answers it or the registry does, and
     /// with which condition. A repeated key keeps its first mention, as the registry does.
-    fn plan(&self, request: &BatchGetEntitiesRequest, now: Instant) -> Vec<(EntityKey, Plan)> {
+    /// Each key sent to the registry takes a ticket in the same critical section as its
+    /// lookup, so a mutation observed after the lookup fences its answer.
+    fn plan(
+        &self,
+        request: &BatchGetEntitiesRequest,
+        now: Instant,
+    ) -> (Vec<(EntityKey, Plan)>, Tickets<'_>) {
         let mut store = self.store();
+        let mut tickets = Tickets {
+            store: &self.store,
+            uuids: Vec::new(),
+        };
         let mut seen = HashSet::new();
         let mut plans = Vec::with_capacity(request.items.len());
         for item in &request.items {
@@ -147,7 +166,9 @@ impl CachedPlatformTypesRegistry {
                 }
                 entry => {
                     let pinned = entry.map(|e| (Arc::clone(&e.snapshot), e.etag.clone()));
+                    tickets.uuids.push(rep.uuid);
                     Plan::Remote {
+                        ticket: store.ticket(rep.uuid),
                         sent: pinned
                             .as_ref()
                             .map(|(_, ours)| ours.clone())
@@ -160,16 +181,54 @@ impl CachedPlatformTypesRegistry {
             };
             plans.push((item.key.clone(), plan));
         }
-        plans
+        (plans, tickets)
     }
 
-    /// Records verified answers. Only map operations run under the lock.
+    /// Records verified answers. Only map operations run under the lock. An answer to a
+    /// read during which anything else was recorded for its entity changes nothing (the
+    /// late-fill guard); the caller still receives it.
     fn commit(&self, plans: &[(EntityKey, Plan)], verified: &[Option<Verified>], sent_at: Instant) {
         let mut store = self.store();
-        for ((_, plan), verified) in plans.iter().zip(verified) {
-            let (Plan::Remote { rep, sent, .. }, Some(verified)) = (plan, verified) else {
+        // Judged before any of this batch is applied: its keys were ticketed together, so
+        // what one of them records is not news to another.
+        let quiet: Vec<bool> = plans
+            .iter()
+            .map(|(_, plan)| match plan {
+                Plan::Remote { rep, ticket, .. } => store.quiet_since(rep.uuid, *ticket),
+                Plan::Local { .. } => false,
+            })
+            .collect();
+        for (((_, plan), verified), quiet) in plans.iter().zip(verified).zip(quiet) {
+            let (
+                Plan::Remote {
+                    rep, sent, pinned, ..
+                },
+                Some(verified),
+            ) = (plan, verified)
+            else {
                 continue;
             };
+            if !quiet {
+                // Something was recorded for this entity while the read was in flight — an
+                // observed mutation, or another read's answer — and nothing orders revisions,
+                // so this answer fills nothing. Unless it agrees with what is resident, one
+                // of the two is stale: drop the entity's entries and let the next read refetch.
+                let agrees = match verified {
+                    Verified::Found { etag, .. } | Verified::Matched(etag) => {
+                        store.peek(rep).is_some_and(|entry| entry.etag == *etag)
+                    }
+                    // The registry confirmed the snapshot this read held: still agreement
+                    // only if that is what is resident now.
+                    Verified::Confirmed => pinned.as_ref().is_some_and(|(_, ours)| {
+                        store.peek(rep).is_some_and(|entry| entry.etag == *ours)
+                    }),
+                    Verified::NotFound => false,
+                };
+                if !agrees {
+                    store.invalidate(rep.uuid);
+                }
+                continue;
+            }
             match verified {
                 Verified::Found {
                     snapshot,
@@ -177,9 +236,10 @@ impl CachedPlatformTypesRegistry {
                     weight,
                 } => {
                     if sent.as_ref().is_some_and(|sent| sent != etag) {
-                        // A validator this projection held is no longer current: a new
-                        // revision, so every other projection of it is stale too.
-                        store.remove_entity(rep.uuid);
+                        // A validator this read held is no longer current: a new revision,
+                        // so every projection of it is stale, and reads of it started
+                        // earlier must not fill.
+                        store.invalidate(rep.uuid);
                     }
                     store.insert(
                         rep.clone(),
@@ -189,10 +249,47 @@ impl CachedPlatformTypesRegistry {
                         sent_at,
                     );
                 }
-                Verified::Confirmed => store.confirm(rep, sent_at),
+                Verified::Confirmed => {
+                    if let Some((_, ours)) = pinned {
+                        store.confirm(rep, ours, sent_at);
+                    }
+                }
                 Verified::Matched(_) => {}
-                Verified::NotFound => store.remove_entity(rep.uuid),
+                Verified::NotFound => store.invalidate(rep.uuid),
             }
+            store.record(rep.uuid);
+        }
+    }
+
+    /// Invalidates every entity a terminal successful registration committed.
+    fn observe_registration(&self, operation: &RegistrationOperation) {
+        let committed: Vec<Uuid> = operation
+            .items
+            .iter()
+            .filter(|item| matches!(item.outcome, RegistrationOutcome::Succeeded { .. }))
+            .map(|item| item.gts_id.to_uuid())
+            .collect();
+        self.invalidate(&committed);
+    }
+
+    /// Invalidates every entity a terminal successful deletion committed.
+    fn observe_deletion(&self, operation: &DeletionOperation) {
+        let committed: Vec<Uuid> = operation
+            .items
+            .iter()
+            .filter(|item| matches!(item.outcome, DeletionOutcome::Succeeded { .. }))
+            .map(|item| canonical_uuid(&item.entity_key))
+            .collect();
+        self.invalidate(&committed);
+    }
+
+    fn invalidate(&self, uuids: &[Uuid]) {
+        if uuids.is_empty() {
+            return;
+        }
+        let mut store = self.store();
+        for uuid in uuids {
+            store.invalidate(*uuid);
         }
     }
 }
@@ -345,18 +442,16 @@ fn shaped(entity: &Entity, selection: &FieldSelection) -> bool {
         && expected(EntityField::Provenance, schema, entity.provenance.is_some())
 }
 
-/// Out of the registry's bounds whatever the cache holds: forwarded intact, so the
-/// registry refuses it with its own error.
-fn out_of_bounds(request: &BatchGetEntitiesRequest) -> bool {
-    request.items.is_empty()
-        || request.items.len() > MAX_BATCH_GET_KEYS
-        || request.items.iter().any(|item| {
-            matches!(&item.key, EntityKey::GtsId(id) if id.as_ref().len() > TOKEN_BOUND)
-                || item
-                    .if_none_match
-                    .as_ref()
-                    .is_some_and(|v| !validator_fits(v))
-        })
+/// A key or validator over the registry's bounds, whatever the cache holds: forwarded
+/// intact, so the registry refuses it with its own error.
+fn over_token_bound(request: &BatchGetEntitiesRequest) -> bool {
+    request.items.iter().any(|item| {
+        matches!(&item.key, EntityKey::GtsId(id) if id.as_ref().len() > TOKEN_BOUND)
+            || item
+                .if_none_match
+                .as_ref()
+                .is_some_and(|v| !validator_fits(v))
+    })
 }
 
 #[async_trait]
@@ -366,11 +461,24 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         ctx: &PlatformSecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        if out_of_bounds(&request) {
+        if request.items.is_empty() || request.items.len() > MAX_BATCH_GET_KEYS {
+            // Refused for its size whatever it names.
             return self.inner.batch_get_entities(ctx, request).await;
         }
+        if over_token_bound(&request) {
+            // The registry decides; its answers are not checked against a plan, so a
+            // successful one records nothing and drops what it may contradict.
+            let named: Vec<Uuid> = request
+                .items
+                .iter()
+                .map(|item| canonical_uuid(&item.key))
+                .collect();
+            let response = self.inner.batch_get_entities(ctx, request).await?;
+            self.invalidate(&named);
+            return Ok(response);
+        }
         let now = Instant::now();
-        let plans = self.plan(&request, now);
+        let (plans, tickets) = self.plan(&request, now);
         let remote: Vec<BatchGetItem> = plans
             .iter()
             .filter_map(|(key, plan)| match plan {
@@ -393,6 +501,7 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         };
         let verified = verify(&plans, answers)?;
         self.commit(&plans, &verified, now);
+        drop(tickets);
         Ok(respond(plans, verified))
     }
 
@@ -410,7 +519,9 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         key: IdempotencyKey,
         request: RegisterEntitiesRequest,
     ) -> Result<RegistrationOperation, CanonicalError> {
-        self.inner.register_entities(ctx, key, request).await
+        let operation = self.inner.register_entities(ctx, key, request).await?;
+        self.observe_registration(&operation);
+        Ok(operation)
     }
 
     async fn delete_entities(
@@ -419,7 +530,9 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         key: IdempotencyKey,
         request: DeleteEntitiesRequest,
     ) -> Result<DeletionOperation, CanonicalError> {
-        self.inner.delete_entities(ctx, key, request).await
+        let operation = self.inner.delete_entities(ctx, key, request).await?;
+        self.observe_deletion(&operation);
+        Ok(operation)
     }
 
     async fn get_operation(
@@ -427,7 +540,12 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError> {
-        self.inner.get_operation(ctx, operation_id).await
+        let operation = self.inner.get_operation(ctx, operation_id).await?;
+        match &operation {
+            Operation::Registration(registration) => self.observe_registration(registration),
+            Operation::Deletion(deletion) => self.observe_deletion(deletion),
+        }
+        Ok(operation)
     }
 }
 

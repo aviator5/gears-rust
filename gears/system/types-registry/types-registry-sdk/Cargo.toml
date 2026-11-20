@@ -77,7 +77,7 @@ parking_lot = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Paused-clock tests of the submit/poll deadline and polling.
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util"] }
 # Round-trip and consistency properties of the SDK's codecs and orderings.
 proptest = { workspace = true }
 # Captures reconciliation's events and spans in tests.

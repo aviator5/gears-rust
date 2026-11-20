@@ -188,11 +188,37 @@ impl io::Write for ByteCounter {
     }
 }
 
-/// Representations bounded by the bytes they hold, with an index from each entity to its
-/// resident representations so that an invalidation drops all of them.
+/// What the store knows of one entity: its resident representations, the reads in flight
+/// for it, and when anything was last recorded for it — an answer taken into the store or an
+/// invalidation. It lives while either a representation is resident or a read holds a
+/// ticket, so the bookkeeping is bounded by resident entities plus reads in flight.
+#[derive(Debug, Default)]
+struct Slot {
+    keys: Vec<RepKey>,
+    tickets: usize,
+    /// The store's event count when something was last recorded for this entity.
+    last_event: u64,
+}
+
+/// A read's view of its entity when it started: the entity's last event then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ticket {
+    seen: u64,
+}
+
+impl Slot {
+    fn unused(&self) -> bool {
+        self.keys.is_empty() && self.tickets == 0
+    }
+}
+
+/// Representations bounded by the bytes they hold, indexed by entity so that an
+/// invalidation drops all of them and fences reads that started before it.
 pub struct Store {
     entries: LruCache<RepKey, Entry>,
-    by_entity: HashMap<Uuid, Vec<RepKey>>,
+    slots: HashMap<Uuid, Slot>,
+    /// Events recorded so far, across entities: orders events independently of the clock.
+    events: u64,
     used: usize,
     bound: usize,
 }
@@ -201,7 +227,8 @@ impl Store {
     pub fn new(bound: usize) -> Self {
         Self {
             entries: LruCache::unbounded(),
-            by_entity: HashMap::new(),
+            slots: HashMap::new(),
+            events: 0,
             used: 0,
             bound,
         }
@@ -210,6 +237,46 @@ impl Store {
     /// The entry under `key`, marked most recently used.
     pub fn get(&mut self, key: &RepKey) -> Option<&Entry> {
         self.entries.get(key)
+    }
+
+    /// The entry under `key`, without marking it used.
+    pub fn peek(&self, key: &RepKey) -> Option<&Entry> {
+        self.entries.peek(key)
+    }
+
+    /// Registers a read of the entity about to go to the registry. Every ticket is
+    /// [released](Self::release) exactly once.
+    pub fn ticket(&mut self, uuid: Uuid) -> Ticket {
+        let slot = self.slots.entry(uuid).or_default();
+        slot.tickets += 1;
+        Ticket {
+            seen: slot.last_event,
+        }
+    }
+
+    pub fn release(&mut self, uuid: Uuid) {
+        if let Some(slot) = self.slots.get_mut(&uuid) {
+            slot.tickets = slot.tickets.saturating_sub(1);
+            if slot.unused() {
+                self.slots.remove(&uuid);
+            }
+        }
+    }
+
+    /// Whether nothing was recorded for the entity since `ticket` was taken. A ticket keeps
+    /// its slot, so the event count it saw is never reused.
+    pub fn quiet_since(&self, uuid: Uuid, ticket: Ticket) -> bool {
+        self.slots
+            .get(&uuid)
+            .is_some_and(|slot| slot.last_event == ticket.seen)
+    }
+
+    /// Records that an answer for the entity was taken into the store.
+    pub fn record(&mut self, uuid: Uuid) {
+        self.events += 1;
+        if let Some(slot) = self.slots.get_mut(&uuid) {
+            slot.last_event = self.events;
+        }
     }
 
     /// Stores `snapshot` under `key`, replacing what was there, and evicts the least
@@ -225,19 +292,22 @@ impl Store {
         confirmed_at: Instant,
     ) {
         self.remove(&key);
-        if weight > self.bound {
+        // `usize::MAX` is the unmeasurable charge: never retained, whatever the bound.
+        if weight == usize::MAX || weight > self.bound {
             return;
         }
-        while self.used + weight > self.bound {
+        // `used <= bound` holds throughout, so the subtraction cannot underflow.
+        while weight > self.bound - self.used {
             let Some((evicted, entry)) = self.entries.pop_lru() else {
                 break;
             };
             self.forget(&evicted, entry.weight);
         }
         self.used += weight;
-        self.by_entity
+        self.slots
             .entry(key.uuid)
             .or_default()
+            .keys
             .push(key.clone());
         self.entries.put(
             key,
@@ -250,10 +320,13 @@ impl Store {
         );
     }
 
-    /// Records that the registry confirmed `key`'s validator at `at`.
-    pub fn confirm(&mut self, key: &RepKey, at: Instant) {
-        if let Some(entry) = self.entries.get_mut(key) {
-            entry.confirmed_at = at;
+    /// Records that the registry confirmed `etag` for `key` at `at`, if that is still the
+    /// resident validator; a confirmation never moves the instant back.
+    pub fn confirm(&mut self, key: &RepKey, etag: &Validator, at: Instant) {
+        if let Some(entry) = self.entries.get_mut(key)
+            && entry.etag == *etag
+        {
+            entry.confirmed_at = entry.confirmed_at.max(at);
         }
     }
 
@@ -263,21 +336,31 @@ impl Store {
         }
     }
 
-    /// Drops every representation of the entity.
-    pub fn remove_entity(&mut self, uuid: Uuid) {
-        for key in self.by_entity.remove(&uuid).unwrap_or_default() {
+    /// An observed mutation of the entity: every representation of it is dropped, and
+    /// reads that started before it can no longer fill the store. With no slot, nothing
+    /// is resident and no read is in flight, so there is nothing to fence.
+    pub fn invalidate(&mut self, uuid: Uuid) {
+        self.events += 1;
+        let Some(slot) = self.slots.get_mut(&uuid) else {
+            return;
+        };
+        slot.last_event = self.events;
+        for key in std::mem::take(&mut slot.keys) {
             if let Some(entry) = self.entries.pop(&key) {
                 self.used -= entry.weight;
             }
+        }
+        if slot.unused() {
+            self.slots.remove(&uuid);
         }
     }
 
     fn forget(&mut self, key: &RepKey, weight: usize) {
         self.used -= weight;
-        if let Some(keys) = self.by_entity.get_mut(&key.uuid) {
-            keys.retain(|k| k != key);
-            if keys.is_empty() {
-                self.by_entity.remove(&key.uuid);
+        if let Some(slot) = self.slots.get_mut(&key.uuid) {
+            slot.keys.retain(|k| k != key);
+            if slot.unused() {
+                self.slots.remove(&key.uuid);
             }
         }
     }
@@ -287,9 +370,10 @@ impl Store {
         self.used
     }
 
+    /// Whether the store keeps any bookkeeping for the entity.
     #[cfg(test)]
     pub fn indexes(&self, uuid: Uuid) -> bool {
-        self.by_entity.contains_key(&uuid)
+        self.slots.contains_key(&uuid)
     }
 }
 

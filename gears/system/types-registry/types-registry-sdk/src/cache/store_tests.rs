@@ -238,7 +238,7 @@ fn removing_an_entity_drops_every_projection_of_it_and_nothing_else() {
     put(&mut store, &target, &full);
     put(&mut store, &other, &Projection::Default);
 
-    store.remove_entity(target.gts_uuid);
+    store.invalidate(target.gts_uuid);
 
     assert!(store.get(&key(&target, &Projection::Default)).is_none());
     assert!(store.get(&key(&target, &full)).is_none());
@@ -338,10 +338,111 @@ fn evicting_one_projection_keeps_its_sibling_until_the_entity_is_invalidated() {
         "the sibling stays"
     );
 
-    store.remove_entity(target.gts_uuid);
+    store.invalidate(target.gts_uuid);
     assert!(
         store.get(&key(&target, &wide)).is_none(),
         "invalidation still reaches the remaining sibling"
     );
     assert_eq!(store.used(), weight(&other) + weight(&filler));
+}
+
+#[test]
+fn an_invalidation_fences_a_ticket_taken_before_it_even_with_nothing_resident() {
+    let mut store = Store::new(1024 * 1024);
+    let uuid = Uuid::nil();
+    let before = store.ticket(uuid);
+    store.invalidate(uuid);
+    assert!(!store.quiet_since(uuid, before));
+    let after = store.ticket(uuid);
+    assert!(store.quiet_since(uuid, after));
+    store.release(uuid);
+    store.release(uuid);
+    assert!(
+        !store.indexes(uuid),
+        "released tickets leave no bookkeeping"
+    );
+}
+
+#[test]
+fn a_ticket_keeps_its_entitys_history_through_eviction() {
+    let target = entity(TYPE, None);
+    let filler = entity(&instance_id(1), None);
+    // Room for either fixture alone, never both.
+    let mut store = Store::new(weight(&target).max(weight(&filler)));
+    put(&mut store, &target, &Projection::Default);
+    let ticket = store.ticket(target.gts_uuid);
+    store.invalidate(target.gts_uuid);
+    put(&mut store, &target, &Projection::Default);
+    put(&mut store, &filler, &Projection::Default);
+    assert!(
+        store.get(&key(&target, &Projection::Default)).is_none(),
+        "evicted"
+    );
+    assert!(
+        store.get(&key(&filler, &Projection::Default)).is_some(),
+        "retained"
+    );
+
+    let later = store.ticket(target.gts_uuid);
+    assert!(store.quiet_since(target.gts_uuid, later));
+    assert!(
+        !store.quiet_since(target.gts_uuid, ticket),
+        "the slot kept the invalidation the old ticket must not see past"
+    );
+}
+
+#[test]
+fn a_confirmation_only_refreshes_the_validator_it_names() {
+    let snapshot = entity(TYPE, None);
+    let mut store = Store::new(1024 * 1024);
+    let rep = key(&snapshot, &Projection::Default);
+    let at = Instant::now();
+    store.insert(
+        rep.clone(),
+        Arc::clone(&snapshot),
+        weight(&snapshot),
+        etag("v2"),
+        at,
+    );
+    let later = at + std::time::Duration::from_secs(5);
+    store.confirm(&rep, &etag("v1"), later);
+    assert_eq!(store.peek(&rep).expect("resident").confirmed_at, at);
+    store.confirm(&rep, &etag("v2"), later);
+    assert_eq!(store.peek(&rep).expect("resident").confirmed_at, later);
+    store.confirm(&rep, &etag("v2"), at);
+    assert_eq!(
+        store.peek(&rep).expect("resident").confirmed_at,
+        later,
+        "never moved back"
+    );
+}
+
+#[test]
+fn an_unmeasurable_snapshot_is_never_retained_even_under_an_unlimited_bound() {
+    let mut store = Store::new(usize::MAX);
+    let ordinary = entity(&instance_id(1), None);
+    put(&mut store, &ordinary, &Projection::Default);
+    let mut unmeasurable = (*entity(TYPE, None)).clone();
+    let year_minus_one = time::OffsetDateTime::UNIX_EPOCH
+        .replace_year(-1)
+        .expect("a representable year");
+    unmeasurable.origin = Some(Origin::Managed {
+        resource_version: 1,
+        created_at: year_minus_one,
+        updated_at: year_minus_one,
+    });
+    let unmeasurable = Arc::new(unmeasurable);
+    assert_eq!(
+        weight(&unmeasurable),
+        usize::MAX,
+        "RFC 3339 cannot write year -1"
+    );
+
+    put(&mut store, &unmeasurable, &Projection::Default);
+    assert!(
+        store
+            .get(&key(&unmeasurable, &Projection::Default))
+            .is_none()
+    );
+    assert_eq!(store.used(), weight(&ordinary));
 }

@@ -29,6 +29,7 @@ mod rest_client;
 )]
 pub mod testing_platform;
 
+pub use cache::{CacheSettings, CachedPlatformTypesRegistry};
 pub use contract::{
     PlatformTypesRegistryApi, TypesRegistryApi, platform_types_registry_api_ir,
     types_registry_api_ir,

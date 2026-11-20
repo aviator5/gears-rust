@@ -9,12 +9,14 @@ use uuid::Uuid;
 
 use super::{CacheSettings, CachedPlatformTypesRegistry};
 use crate::contract::PlatformTypesRegistryApi;
+use crate::item_failure::AdmissionFailureReason;
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
     DeletionOperation, EntityField, EntityKey, EntityLookup, FieldSelection, IdempotencyKey,
     ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Projection,
     PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationOperation, Validator,
 };
+use crate::models::{DeleteItem, RegistrationOutcome};
 use crate::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 const TYPE: &str = "gts.cf.cache.client.entity.v1~";
@@ -78,6 +80,8 @@ struct Recorder {
     registry: Arc<MockTypesRegistry>,
     batches: Mutex<Vec<Batch>>,
     tamper: Mutex<Option<Tamper>>,
+    /// Holds the next batch read's answer, already read from the registry, until released.
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl Recorder {
@@ -87,6 +91,13 @@ impl Recorder {
 
     fn batch_count(&self) -> usize {
         self.batches.lock().expect("lock").len()
+    }
+
+    /// The next batch read reads the registry, then waits for the returned sender.
+    fn hold_next(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        *self.gate.lock().expect("lock") = Some(gate);
+        release
     }
 
     fn tamper_next(&self, tamper: impl FnOnce(&mut BatchGetEntitiesResponse) + Send + 'static) {
@@ -105,6 +116,10 @@ impl PlatformTypesRegistryApi for Recorder {
         let mut response = self.registry.batch_get_entities(ctx, request).await?;
         if let Some(tamper) = self.tamper.lock().expect("lock").take() {
             tamper(&mut response);
+        }
+        let gate = self.gate.lock().expect("lock").take();
+        if let Some(gate) = gate {
+            gate.await.expect("released");
         }
         let answered = items
             .into_iter()
@@ -162,11 +177,22 @@ struct Fixture {
     cache: CachedPlatformTypesRegistry,
 }
 
+/// Operations complete on submission: the submit response itself is terminal.
 fn fixture(window: Duration) -> Fixture {
-    fixture_over(MockTypesRegistry::new(), window)
+    fixture_over(MockTypesRegistry::new().completing_after(0), window)
 }
 
 fn fixture_over(registry: MockTypesRegistry, window: Duration) -> Fixture {
+    fixture_with(
+        registry,
+        CacheSettings {
+            freshness_window: window,
+            store_bound: CacheSettings::DEFAULT_STORE_BOUND,
+        },
+    )
+}
+
+fn fixture_with(registry: MockTypesRegistry, settings: CacheSettings) -> Fixture {
     let registry = Arc::new(registry);
     for id in [TYPE, OTHER, THIRD] {
         registry.seed(id, schema(id, "v1"));
@@ -175,13 +201,11 @@ fn fixture_over(registry: MockTypesRegistry, window: Duration) -> Fixture {
         registry: Arc::clone(&registry),
         batches: Mutex::new(Vec::new()),
         tamper: Mutex::new(None),
+        gate: Mutex::new(None),
     });
     let cache = CachedPlatformTypesRegistry::new(
         Arc::clone(&recorder) as Arc<dyn PlatformTypesRegistryApi>,
-        CacheSettings {
-            freshness_window: window,
-            store_bound: CacheSettings::DEFAULT_STORE_BOUND,
-        },
+        settings,
     );
     Fixture {
         registry,
@@ -704,6 +728,8 @@ async fn a_validator_over_the_quoted_bound_reaches_the_registry_intact() {
     drop(f.read_with(vec![bad.clone()], full(), false).await);
     assert!(forwarded(&f, &bad), "not answered from the cache");
 
+    // The forwarded read dropped the entry it could not check; warm it again.
+    f.title(gts_key(TYPE), full(), false).await;
     let fits = BatchGetItem::new(gts_key(TYPE))
         .with_if_none_match(Validator::from_bytes(vec![b'a'; 1022]));
     let batches = f.recorder.batch_count();
@@ -850,4 +876,596 @@ async fn a_cold_caller_match_does_not_evict_what_the_other_spelling_just_filled(
             "uuid_first={uuid_first}: still resident"
         );
     }
+}
+
+fn registration(id: &str, title: &str, expected: Option<u64>) -> RegisterEntitiesRequest {
+    RegisterEntitiesRequest {
+        items: vec![RegisterItem {
+            gts_id: gts::GtsId::try_new(id).expect("identifier"),
+            content: schema(id, title),
+            expected_resource_version: expected,
+            skip_compatibility_check: false,
+        }],
+        dry_run: false,
+        publisher: PublisherContext {
+            name: "cache-test".to_owned(),
+            version: "1.0.0".parse().expect("version"),
+        },
+    }
+}
+
+impl Fixture {
+    async fn register(&self, request: RegisterEntitiesRequest) -> RegistrationOperation {
+        self.cache
+            .register_entities(&ctx(), IdempotencyKey::generate(), request)
+            .await
+            .expect("accepted")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_terminal_registration_invalidates_every_projection_under_both_key_forms() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    f.title(uuid_key(TYPE), content_only(), false).await;
+
+    let operation = f.register(registration(TYPE, "v2", Some(1))).await;
+    assert!(matches!(
+        operation.items[0].outcome,
+        RegistrationOutcome::Succeeded { .. }
+    ));
+
+    assert_eq!(f.title(uuid_key(TYPE), full(), false).await, "v2");
+    assert_eq!(f.title(gts_key(TYPE), content_only(), false).await, "v2");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_accepted_registration_invalidates_nothing_until_a_poll_sees_it_commit() {
+    let f = fixture_over(MockTypesRegistry::new().completing_after(2), WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    let accepted = f.register(registration(TYPE, "v2", Some(1))).await;
+    assert!(
+        !accepted.items[0].outcome.is_terminal(),
+        "a 202, not a commit"
+    );
+
+    let first = f
+        .cache
+        .get_operation(&ctx(), accepted.operation_id)
+        .await
+        .expect("poll");
+    assert_ne!(first.status(), OperationStatus::Completed);
+    f.title(gts_key(TYPE), full(), false).await;
+    assert_eq!(
+        f.recorder.batch_count(),
+        1,
+        "neither the acceptance nor a pending poll invalidated the entry"
+    );
+    let done = f
+        .cache
+        .get_operation(&ctx(), accepted.operation_id)
+        .await
+        .expect("poll");
+    assert_eq!(done.status(), OperationStatus::Completed);
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
+    assert_eq!(f.recorder.batch_count(), 2, "the terminal poll did");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mixed_operation_invalidates_only_its_committed_candidates() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    f.title(gts_key(OTHER), full(), false).await;
+    f.registry
+        .reject(OTHER, AdmissionFailureReason::InvalidSchema);
+    let mut request = registration(TYPE, "v2", Some(1));
+    request
+        .items
+        .extend(registration(OTHER, "v2", Some(1)).items);
+    let operation = f.register(request).await;
+    assert!(matches!(
+        operation.items[0].outcome,
+        RegistrationOutcome::Succeeded { .. }
+    ));
+    assert!(matches!(
+        operation.items[1].outcome,
+        RegistrationOutcome::Failed { .. }
+    ));
+
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
+    assert_eq!(
+        f.recorder.batch_count(),
+        3,
+        "the committed key was read anew"
+    );
+    f.title(gts_key(OTHER), full(), false).await;
+    assert_eq!(
+        f.recorder.batch_count(),
+        3,
+        "the refused one is still a hit"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deletion_by_uuid_invalidates_the_entry_read_by_identifier() {
+    let f = fixture(WINDOW);
+    let EntityLookup::Found { entity, .. } = f.lookup(gts_key(TYPE), full(), false).await else {
+        panic!("found");
+    };
+    assert_eq!(
+        entity.lifecycle_status,
+        crate::models::LifecycleStatus::Active
+    );
+    f.cache
+        .delete_entities(
+            &ctx(),
+            IdempotencyKey::generate(),
+            DeleteEntitiesRequest {
+                items: vec![DeleteItem {
+                    key: uuid_key(TYPE),
+                    expected_resource_version: 1,
+                }],
+                dry_run: false,
+                publisher: PublisherContext {
+                    name: "cache-test".to_owned(),
+                    version: "1.0.0".parse().expect("version"),
+                },
+            },
+        )
+        .await
+        .expect("deleted");
+    let EntityLookup::Found { entity, .. } = f.lookup(gts_key(TYPE), full(), false).await else {
+        panic!("a tombstone still reads");
+    };
+    assert_eq!(
+        entity.lifecycle_status,
+        crate::models::LifecycleStatus::Deleted
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dry_run_an_unchanged_and_a_refused_registration_invalidate_nothing() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    f.title(gts_key(OTHER), full(), false).await;
+    // Change the registry directly so a wrongly dropped entry would show it.
+    change(&f.registry, TYPE, "direct", 1);
+    change(&f.registry, OTHER, "direct", 1);
+
+    let mut dry = registration(TYPE, "v2", Some(1));
+    dry.dry_run = true;
+    let operation = f.register(dry).await;
+    assert!(matches!(
+        operation.items[0].outcome,
+        RegistrationOutcome::WouldSucceed
+    ));
+
+    // Identical to what is stored now: the metadata-only confirmation path.
+    let operation = f.register(registration(TYPE, "direct", Some(1))).await;
+    assert!(
+        matches!(
+            operation.items[0].outcome,
+            RegistrationOutcome::Unchanged { .. }
+        ),
+        "{:?}",
+        operation.items[0].outcome
+    );
+
+    f.registry
+        .reject(OTHER, AdmissionFailureReason::InvalidSchema);
+    let operation = f.register(registration(OTHER, "v2", Some(1))).await;
+    assert!(matches!(
+        operation.items[0].outcome,
+        RegistrationOutcome::Failed { .. }
+    ));
+
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v1");
+    assert_eq!(f.title(gts_key(OTHER), full(), false).await, "v1");
+    assert_eq!(f.recorder.batch_count(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_started_before_a_terminal_outcome_never_fills_the_entry() {
+    let f = fixture(WINDOW);
+    let release = f.recorder.hold_next();
+    let read = f.title(uuid_key(TYPE), full(), false);
+    let mutate = async {
+        tokio::task::yield_now().await;
+        // By identifier, with nothing resident: only the read's ticket keeps the slot.
+        f.register(registration(TYPE, "v2", Some(1))).await;
+        release.send(()).expect("held read");
+    };
+    let (old, ()) = tokio::join!(read, mutate);
+    assert_eq!(old, "v1", "the read in flight returns what it read");
+
+    assert_eq!(
+        f.title(gts_key(TYPE), full(), false).await,
+        "v2",
+        "and did not fill the entry"
+    );
+    assert_eq!(f.recorder.batch_count(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fresh_read_seeing_a_new_validator_fences_reads_of_other_projections() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    let release = f.recorder.hold_next();
+    let stale = f.title(gts_key(TYPE), content_only(), false);
+    let fresh = async {
+        tokio::task::yield_now().await;
+        change(&f.registry, TYPE, "v2", 2);
+        let title = f.title(gts_key(TYPE), full(), true).await;
+        release.send(()).expect("held read");
+        title
+    };
+    let (old, new) = tokio::join!(stale, fresh);
+    assert_eq!((old.as_str(), new.as_str()), ("v1", "v2"));
+    assert_eq!(f.title(gts_key(TYPE), content_only(), false).await, "v2");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_cold_read_does_not_overwrite_a_newer_one() {
+    let f = fixture(WINDOW);
+    let release = f.recorder.hold_next();
+    let older = f.title(gts_key(TYPE), full(), false);
+    let newer = async {
+        tokio::task::yield_now().await;
+        change(&f.registry, TYPE, "v2", 2);
+        let title = f.title(gts_key(TYPE), full(), false).await;
+        release.send(()).expect("held read");
+        title
+    };
+    let (old, new) = tokio::join!(older, newer);
+    assert_eq!((old.as_str(), new.as_str()), ("v1", "v2"));
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
+    // The two answers disagree and nothing orders revisions, so the resident entry was
+    // dropped rather than trusted: the read above went to the registry.
+    assert_eq!(f.recorder.batch_count(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_read_releases_its_ticket() {
+    let f = fixture(WINDOW);
+    let _release = f.recorder.hold_next();
+    let uuid = gts::GtsId::try_new(TYPE).expect("identifier").to_uuid();
+    {
+        let read = std::pin::pin!(f.title(gts_key(TYPE), full(), false));
+        tokio::select! {
+            _ = read => panic!("held"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(f.cache.store().indexes(uuid), "the read holds a ticket");
+    }
+    assert!(
+        !f.cache.store().indexes(uuid),
+        "dropping the read released it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn of_two_overlapping_fresh_reads_the_later_answer_is_not_contradicted() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    change(&f.registry, TYPE, "v2", 2);
+    // The first fresh read plans under v1, then waits before reading the registry.
+    f.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(5)),
+    );
+    let slow = f.title(gts_key(TYPE), full(), true);
+    let quick = async {
+        tokio::task::yield_now().await;
+        let title = f.title(gts_key(TYPE), full(), true).await;
+        change(&f.registry, TYPE, "v3", 3);
+        title
+    };
+    let (slow, quick) = tokio::join!(slow, quick);
+    assert_eq!((quick.as_str(), slow.as_str()), ("v2", "v3"));
+    assert_eq!(
+        f.title(gts_key(TYPE), full(), false).await,
+        "v3",
+        "the v2 entry the later answer contradicts is not served"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_conditional_read_does_not_replace_a_newer_answer() {
+    let f = fixture(WINDOW);
+    let held = match f
+        .registry
+        .batch_get_entities(
+            &ctx(),
+            BatchGetEntitiesRequest::new([gts_key(TYPE).into()]).with_projection(full()),
+        )
+        .await
+        .expect("read")
+        .0
+        .remove(&gts_key(TYPE))
+    {
+        Some(EntityLookup::Found { etag, .. }) => etag,
+        other => panic!("found, got {other:?}"),
+    };
+    change(&f.registry, TYPE, "v2", 2);
+    let release = f.recorder.hold_next();
+    let older = f.read_with(
+        vec![BatchGetItem::new(gts_key(TYPE)).with_if_none_match(held)],
+        full(),
+        false,
+    );
+    let newer = async {
+        tokio::task::yield_now().await;
+        change(&f.registry, TYPE, "v3", 3);
+        let title = f.title(gts_key(TYPE), full(), false).await;
+        release.send(()).expect("held read");
+        title
+    };
+    let (older, newer) = tokio::join!(older, newer);
+    assert!(matches!(
+        older.expect("read").0[&gts_key(TYPE)],
+        EntityLookup::Found { .. }
+    ));
+    assert_eq!(newer, "v3");
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v3");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_out_of_bounds_read_that_succeeds_drops_what_it_may_contradict() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    change(&f.registry, TYPE, "v2", 2);
+    // 1023 bytes: over REST's quoted bound, within the local adapter's (and the mock's).
+    let response = f
+        .read_with(
+            vec![
+                BatchGetItem::new(gts_key(TYPE))
+                    .with_if_none_match(Validator::from_bytes(vec![b'a'; 1023])),
+            ],
+            full(),
+            true,
+        )
+        .await
+        .expect("the adapter accepted it");
+    assert!(matches!(
+        response.0[&gts_key(TYPE)],
+        EntityLookup::Found { .. }
+    ));
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
+}
+
+/// The validator the registry would issue for `TYPE` under `full()` now, read past the cache.
+async fn registry_etag(f: &Fixture) -> Validator {
+    match f
+        .registry
+        .batch_get_entities(
+            &ctx(),
+            BatchGetEntitiesRequest::new([gts_key(TYPE).into()]).with_projection(full()),
+        )
+        .await
+        .expect("read")
+        .0
+        .remove(&gts_key(TYPE))
+    {
+        Some(EntityLookup::Found { etag, .. }) => etag,
+        other => panic!("found, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_later_caller_match_supersedes_an_older_cold_answer() {
+    let f = fixture(WINDOW);
+    let release = f.recorder.hold_next();
+    let older = f.title(gts_key(TYPE), full(), false);
+    let later = async {
+        tokio::task::yield_now().await;
+        change(&f.registry, TYPE, "v2", 2);
+        let current = registry_etag(&f).await;
+        let response = f
+            .read_with(
+                vec![BatchGetItem::new(gts_key(TYPE)).with_if_none_match(current.clone())],
+                full(),
+                false,
+            )
+            .await
+            .expect("read");
+        assert_eq!(
+            response.0[&gts_key(TYPE)],
+            EntityLookup::Unchanged { etag: current }
+        );
+        release.send(()).expect("held read");
+    };
+    let (older, ()) = tokio::join!(older, later);
+    assert_eq!(older, "v1");
+    assert_eq!(
+        f.title(gts_key(TYPE), full(), false).await,
+        "v2",
+        "the older v1 answer did not fill after the later one"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_cold_read_answering_a_newer_revision_drops_the_resident_one() {
+    let f = fixture(WINDOW);
+    // The older read takes its ticket first, then waits before reading the registry.
+    f.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(5)),
+    );
+    let older = f.title(gts_key(TYPE), full(), true);
+    let later = async {
+        tokio::task::yield_now().await;
+        change(&f.registry, TYPE, "v2", 2);
+        let title = f.title(gts_key(TYPE), full(), false).await;
+        change(&f.registry, TYPE, "v3", 3);
+        title
+    };
+    let (older, later) = tokio::join!(older, later);
+    assert_eq!((later.as_str(), older.as_str()), ("v2", "v3"));
+    assert_eq!(
+        f.title(gts_key(TYPE), full(), false).await,
+        "v3",
+        "the v2 entry the older read contradicted is not served"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_later_ticket_answering_an_older_revision_does_not_replace_a_newer_fill() {
+    let f = fixture(WINDOW);
+    // A takes the first ticket and waits before reading the registry.
+    f.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(5)),
+    );
+    // B takes the second ticket, reads v1 at once and is held before committing.
+    let release = f.recorder.hold_next();
+    let a = f.title(gts_key(TYPE), full(), false);
+    let b = f.title(gts_key(TYPE), full(), false);
+    let control = async {
+        change(&f.registry, TYPE, "v2", 2);
+        // A reads v2 and records it at the fifth second; B commits after it.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        release.send(()).expect("held read");
+    };
+    let (a, b, ()) = tokio::join!(a, b, control);
+    assert_eq!((a.as_str(), b.as_str()), ("v2", "v1"));
+    assert_eq!(
+        f.title(gts_key(TYPE), full(), false).await,
+        "v2",
+        "B's older revision did not replace A's"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn both_spellings_revalidated_in_one_batch_keep_the_new_revision() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    tokio::time::advance(WINDOW).await;
+    change(&f.registry, TYPE, "v2", 2);
+    f.read_with(
+        vec![gts_key(TYPE).into(), uuid_key(TYPE).into()],
+        full(),
+        false,
+    )
+    .await
+    .expect("read");
+    assert_eq!(f.title(uuid_key(TYPE), full(), false).await, "v2");
+    assert_eq!(
+        f.recorder.batch_count(),
+        2,
+        "the second spelling kept the first's fill"
+    );
+}
+
+/// The snapshot the registry holds for `id` under `full()`, read past the cache.
+async fn registry_snapshot(registry: &MockTypesRegistry, id: &str) -> crate::models::Entity {
+    match registry
+        .batch_get_entities(
+            &ctx(),
+            BatchGetEntitiesRequest::new([gts_key(id).into()]).with_projection(full()),
+        )
+        .await
+        .expect("read")
+        .0
+        .remove(&gts_key(id))
+    {
+        Some(EntityLookup::Found { entity, .. }) => *entity,
+        other => panic!("found, got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_older_answer_does_not_fill_after_a_newer_one_was_evicted() {
+    let registry = MockTypesRegistry::new().completing_after(0);
+    for id in [TYPE, OTHER, THIRD] {
+        registry.seed(id, schema(id, "v1"));
+    }
+    // Room for one full snapshot, never two.
+    let bound = super::store::weight(&registry_snapshot(&registry, TYPE).await).max(
+        super::store::weight(&registry_snapshot(&registry, OTHER).await),
+    );
+    let f = fixture_with(
+        registry,
+        CacheSettings {
+            freshness_window: WINDOW,
+            store_bound: bound,
+        },
+    );
+    f.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(5)),
+    );
+    let release = f.recorder.hold_next();
+    let a = f.title(gts_key(TYPE), full(), false);
+    let b = f.title(gts_key(TYPE), full(), false);
+    let control = async {
+        change(&f.registry, TYPE, "v2", 2);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        // A recorded v2; evict it before B, holding v1, commits.
+        f.title(gts_key(OTHER), full(), false).await;
+        release.send(()).expect("held read");
+    };
+    let (a, b, ()) = tokio::join!(a, b, control);
+    assert_eq!((a.as_str(), b.as_str()), ("v2", "v1"));
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_newer_revision_seen_under_one_projection_reaches_a_projection_filled_meanwhile() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    f.title(gts_key(TYPE), content_only(), false).await;
+    change(&f.registry, TYPE, "v2", 2);
+    f.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(5)),
+    );
+    // A: a fresh read of the full projection, waiting before it reads the registry.
+    let a = f.title(gts_key(TYPE), full(), true);
+    let others = async {
+        // B's fresh read sees v2 under content-only: it drops the full projection and
+        // fills its own while A waits.
+        let b = f.title(gts_key(TYPE), content_only(), true).await;
+        change(&f.registry, TYPE, "v3", 3);
+        b
+    };
+    let (a, b) = tokio::join!(a, others);
+    assert_eq!((b.as_str(), a.as_str()), ("v2", "v3"));
+    assert_eq!(
+        f.title(gts_key(TYPE), content_only(), false).await,
+        "v3",
+        "the v2 projection filled meanwhile is not served after v3 was seen"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_confirmation_overtaken_by_another_revision_does_not_keep_it() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    tokio::time::advance(WINDOW).await;
+    f.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(5)),
+    );
+    // A revalidates its expired v1 entry, waiting before it reads the registry.
+    let a = f.title(gts_key(TYPE), full(), false);
+    let others = async {
+        change(&f.registry, TYPE, "v2", 2);
+        let b = f.title(gts_key(TYPE), full(), true).await;
+        // Back to the first revision: A's validator matches again.
+        change(&f.registry, TYPE, "v1", 1);
+        b
+    };
+    let (a, b) = tokio::join!(a, others);
+    assert_eq!((a.as_str(), b.as_str()), ("v1", "v2"));
+    assert_eq!(
+        f.title(gts_key(TYPE), full(), false).await,
+        "v1",
+        "A's confirmation of v1 does not leave B's v2 resident"
+    );
 }
