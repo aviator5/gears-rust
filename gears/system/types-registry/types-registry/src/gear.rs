@@ -121,8 +121,9 @@ impl TypesRegistryGear {
     }
 
     fn seeded(ctx: &GearCtx) -> anyhow::Result<Arc<SeededClient>> {
-        ctx.client_hub().get::<SeededClient>().map_err(|_| {
-            anyhow::anyhow!("types-registry wires its APIs only past the seed barrier")
+        ctx.client_hub().get::<SeededClient>().map_err(|e| {
+            anyhow::Error::new(e)
+                .context("types-registry wires its APIs only past the seed barrier")
         })
     }
 

@@ -446,3 +446,94 @@ fn an_unmeasurable_snapshot_is_never_retained_even_under_an_unlimited_bound() {
     );
     assert_eq!(store.used(), weight(&ordinary));
 }
+
+mod weight_matches_the_wire {
+    use proptest::prelude::*;
+    use serde_json::{Map, Value, json};
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    use super::{TYPE, entity, instance_id, weight, wire_len};
+    use crate::models::{LifecycleStatus, Origin, Provenance};
+
+    /// Arbitrary documents; strings draw on quotes, backslashes, control characters
+    /// and multi-byte text, the inputs where a hand count and a serializer part ways.
+    fn document() -> impl Strategy<Value = Value> {
+        let text = prop_oneof![
+            any::<String>(),
+            "[\\x00-\\x1f\"\\\\/a-z\u{e9}\u{4e2d}\u{1f600}]{0,12}",
+        ];
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|n| json!(n)),
+            text.clone().prop_map(Value::String),
+        ];
+        leaf.prop_recursive(3, 24, 4, move |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::vec((text.clone(), inner), 0..4)
+                    .prop_map(|pairs| Value::Object(pairs.into_iter().collect())),
+            ]
+        })
+    }
+
+    fn at() -> impl Strategy<Value = OffsetDateTime> {
+        (0i64..4_000_000_000, 0u32..1_000_000_000).prop_map(|(secs, nanos)| {
+            OffsetDateTime::from_unix_timestamp(secs)
+                .expect("in range")
+                .replace_nanosecond(nanos)
+                .expect("nanoseconds")
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn any_snapshot_weighs_its_compact_serialization(
+            instance in any::<bool>(),
+            deleted in any::<bool>(),
+            origin in prop::option::of((any::<u64>(), at(), at())),
+            docs in prop::collection::vec(prop::option::of(document()), 4),
+            skipped in prop::option::of(any::<bool>()),
+        ) {
+            let id = if instance { instance_id(1) } else { TYPE.to_owned() };
+            let mut snapshot = (*entity(&id, None)).clone();
+            let mut expected = Map::new();
+            expected.insert("gts_id".into(), json!(id));
+            expected.insert("gts_uuid".into(), json!(snapshot.gts_uuid.to_string()));
+            expected.insert("kind".into(), json!(if instance { "instance" } else { "type_schema" }));
+            expected.insert("lifecycle_status".into(), json!(if deleted { "deleted" } else { "active" }));
+            if deleted {
+                snapshot.lifecycle_status = LifecycleStatus::Deleted;
+            }
+            if let Some((resource_version, created_at, updated_at)) = origin {
+                snapshot.origin = Some(Origin::Managed { resource_version, created_at, updated_at });
+                expected.insert("origin".into(), json!({
+                    "type": "managed",
+                    "resource_version": resource_version,
+                    "created_at": created_at.format(&Rfc3339).expect("format"),
+                    "updated_at": updated_at.format(&Rfc3339).expect("format"),
+                }));
+            }
+            let [content, resolved, traits, traits_schema] = <[_; 4]>::try_from(docs).expect("four");
+            for (name, doc, slot) in [
+                ("content", content, &mut snapshot.content),
+                ("resolved_schema", resolved, &mut snapshot.resolved_schema),
+                ("effective_traits", traits, &mut snapshot.effective_traits),
+                ("effective_traits_schema", traits_schema, &mut snapshot.effective_traits_schema),
+            ] {
+                if let Some(doc) = doc {
+                    expected.insert(name.into(), doc.clone());
+                    *slot = Some(doc);
+                }
+            }
+            if let Some(compatibility_check_skipped) = skipped {
+                snapshot.provenance = Some(Provenance { compatibility_check_skipped });
+                expected.insert("provenance".into(), json!({
+                    "compatibility_check_skipped": compatibility_check_skipped,
+                }));
+            }
+            prop_assert_eq!(weight(&snapshot), wire_len(&Value::Object(expected)));
+        }
+    }
+}

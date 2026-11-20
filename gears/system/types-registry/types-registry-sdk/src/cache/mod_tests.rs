@@ -774,9 +774,23 @@ async fn a_snapshot_with_an_unselected_field_fails_the_read() {
             entity.content = Some(json!({}));
         }
     });
-    f.read_with(vec![gts_key(TYPE).into()], Projection::Default, false)
+    let error = f
+        .read_with(vec![gts_key(TYPE).into()], Projection::Default, false)
         .await
         .expect_err("content was not selected");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+
+    f.lookup(gts_key(TYPE), Projection::Default, false).await;
+    assert_eq!(f.recorder.batch_count(), 2, "nothing was cached");
+    assert!(
+        f.recorder.batches()[1]
+            .iter()
+            .all(|(item, _)| item.if_none_match.is_none()),
+        "no validator was left to revalidate against"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1467,5 +1481,155 @@ async fn a_confirmation_overtaken_by_another_revision_does_not_keep_it() {
         f.title(gts_key(TYPE), full(), false).await,
         "v1",
         "A's confirmation of v1 does not leave B's v2 resident"
+    );
+}
+
+fn deletion(items: &[(&str, u64)], dry_run: bool) -> DeleteEntitiesRequest {
+    DeleteEntitiesRequest {
+        items: items
+            .iter()
+            .map(|(id, version)| DeleteItem {
+                key: uuid_key(id),
+                expected_resource_version: *version,
+            })
+            .collect(),
+        dry_run,
+        publisher: PublisherContext {
+            name: "cache-test".to_owned(),
+            version: "1.0.0".parse().expect("version"),
+        },
+    }
+}
+
+impl Fixture {
+    async fn delete(&self, request: DeleteEntitiesRequest) -> DeletionOperation {
+        self.cache
+            .delete_entities(&ctx(), IdempotencyKey::generate(), request)
+            .await
+            .expect("accepted")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dry_run_and_a_refused_deletion_invalidate_nothing_beside_a_committed_one() {
+    let f = fixture(WINDOW);
+    for id in [TYPE, OTHER, THIRD] {
+        f.title(gts_key(id), full(), false).await;
+    }
+    assert_eq!(f.recorder.batch_count(), 3);
+
+    let dry = f.delete(deletion(&[(TYPE, 1)], true)).await;
+    assert!(matches!(
+        dry.items[0].outcome,
+        crate::models::DeletionOutcome::WouldSucceed
+    ));
+    // A stale expected version is refused; the third key commits.
+    let mixed = f.delete(deletion(&[(OTHER, 99), (THIRD, 1)], false)).await;
+    assert!(matches!(
+        mixed.items[0].outcome,
+        crate::models::DeletionOutcome::Failed { .. }
+    ));
+    assert!(matches!(
+        mixed.items[1].outcome,
+        crate::models::DeletionOutcome::Succeeded { .. }
+    ));
+
+    f.title(gts_key(TYPE), full(), false).await;
+    f.title(gts_key(OTHER), full(), false).await;
+    assert_eq!(
+        f.recorder.batch_count(),
+        3,
+        "the dry-run and refused keys are still hits"
+    );
+    f.lookup(gts_key(THIRD), full(), false).await;
+    assert_eq!(
+        f.recorder.batch_count(),
+        4,
+        "the committed key was read anew"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deletion_invalidates_when_a_poll_sees_it_commit() {
+    let f = fixture_over(MockTypesRegistry::new().completing_after(2), WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    let accepted = f.delete(deletion(&[(TYPE, 1)], false)).await;
+    assert!(
+        !matches!(
+            accepted.items[0].outcome,
+            crate::models::DeletionOutcome::Succeeded { .. }
+        ),
+        "a 202, not a commit"
+    );
+
+    let first = f
+        .cache
+        .get_operation(&ctx(), accepted.operation_id)
+        .await
+        .expect("poll");
+    assert_ne!(first.status(), OperationStatus::Completed);
+    f.title(gts_key(TYPE), full(), false).await;
+    assert_eq!(
+        f.recorder.batch_count(),
+        1,
+        "neither the acceptance nor a pending poll invalidated the entry"
+    );
+
+    let done = f
+        .cache
+        .get_operation(&ctx(), accepted.operation_id)
+        .await
+        .expect("poll");
+    assert_eq!(done.status(), OperationStatus::Completed);
+    f.lookup(gts_key(TYPE), full(), false).await;
+    assert_eq!(f.recorder.batch_count(), 2, "the terminal poll did");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_that_is_another_entity_fails_the_read_and_is_not_cached() {
+    let f = fixture(WINDOW);
+    let other = registry_snapshot(&f.registry, OTHER).await;
+    f.recorder.tamper_next(move |response| {
+        if let Some(EntityLookup::Found { entity, .. }) = response.0.get_mut(&gts_key(TYPE)) {
+            **entity = other;
+        }
+    });
+    let error = f
+        .read_with(vec![gts_key(TYPE).into()], full(), false)
+        .await
+        .expect_err("a consistent snapshot of the wrong entity");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+
+    let healthy = f.lookup(gts_key(TYPE), full(), false).await;
+    assert!(
+        matches!(&healthy, EntityLookup::Found { entity, .. } if entity.gts_id.to_string() == TYPE),
+        "{healthy:?}"
+    );
+    assert_eq!(f.recorder.batch_count(), 2, "nothing was cached");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_for_a_key_nobody_asked_fails_the_read_and_caches_none_of_it() {
+    let f = fixture(WINDOW);
+    f.recorder.tamper_next(|response| {
+        response.0.insert(gts_key(OTHER), EntityLookup::NotFound);
+    });
+    let error = f
+        .read_with(vec![gts_key(TYPE).into()], full(), false)
+        .await
+        .expect_err("an unrequested answer");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+
+    f.title(gts_key(TYPE), full(), false).await;
+    assert_eq!(
+        f.recorder.batch_count(),
+        2,
+        "the asked key was not cached either"
     );
 }

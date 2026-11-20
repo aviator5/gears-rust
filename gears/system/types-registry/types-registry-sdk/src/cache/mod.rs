@@ -117,7 +117,18 @@ enum Verified {
     NotFound,
 }
 
+impl std::fmt::Debug for CachedPlatformTypesRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedPlatformTypesRegistry")
+            .field("freshness_window", &self.freshness_window)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CachedPlatformTypesRegistry {
+    /// Wraps `inner` in a new cache of its own: every call builds a separate store, so
+    /// share one instance between consumers that should share cached reads. `settings`
+    /// sets the freshness window and the byte budget of the stored snapshots.
     #[must_use]
     pub fn new(inner: Arc<dyn PlatformTypesRegistryApi>, settings: CacheSettings) -> Self {
         Self {
@@ -356,14 +367,16 @@ fn protocol_fault(key: &EntityKey, what: &str) -> CanonicalError {
     .create()
 }
 
-/// The caller's response, built outside the lock: `Unchanged` only where the caller
-/// itself sent the matching validator.
+/// The caller's response, built outside the lock and before anything is committed:
+/// `Unchanged` only where the caller itself sent the matching validator. Every pairing
+/// `verify` can produce is listed; any other is a broken invariant and fails the read
+/// rather than posing as an absent entity.
 fn respond(
-    plans: Vec<(EntityKey, Plan)>,
-    verified: Vec<Option<Verified>>,
-) -> BatchGetEntitiesResponse {
+    plans: &[(EntityKey, Plan)],
+    verified: &[Option<Verified>],
+) -> Result<BatchGetEntitiesResponse, CanonicalError> {
     let mut out = HashMap::with_capacity(plans.len());
-    for ((key, plan), verified) in plans.into_iter().zip(verified) {
+    for ((key, plan), verified) in plans.iter().zip(verified) {
         let lookup = match (plan, verified) {
             (
                 Plan::Local {
@@ -371,7 +384,7 @@ fn respond(
                     etag,
                     caller,
                 },
-                _,
+                None,
             )
             | (Plan::Remote { caller, .. }, Some(Verified::Found { snapshot, etag, .. }))
             | (
@@ -381,16 +394,16 @@ fn respond(
                     ..
                 },
                 Some(Verified::Confirmed),
-            ) => answer(&snapshot, etag, caller.as_ref()),
-            (Plan::Remote { .. }, Some(Verified::Matched(etag))) => {
-                EntityLookup::Unchanged { etag }
+            ) => answer(snapshot, etag.clone(), caller.as_ref()),
+            (Plan::Remote { pinned: None, .. }, Some(Verified::Matched(etag))) => {
+                EntityLookup::Unchanged { etag: etag.clone() }
             }
-            // `verify` pairs every remote plan with an answer, and `Confirmed` with a pin.
-            (Plan::Remote { .. }, _) => EntityLookup::NotFound,
+            (Plan::Remote { .. }, Some(Verified::NotFound)) => EntityLookup::NotFound,
+            _ => return Err(protocol_fault(key, "an answer that does not fit its plan")),
         };
-        out.insert(key, lookup);
+        out.insert(key.clone(), lookup);
     }
-    BatchGetEntitiesResponse(out)
+    Ok(BatchGetEntitiesResponse(out))
 }
 
 fn answer(snapshot: &Entity, etag: Validator, caller: Option<&Validator>) -> EntityLookup {
@@ -500,9 +513,10 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
             self.inner.batch_get_entities(ctx, inner).await?.0
         };
         let verified = verify(&plans, answers)?;
+        let response = respond(&plans, &verified)?;
         self.commit(&plans, &verified, now);
         drop(tickets);
-        Ok(respond(plans, verified))
+        Ok(response)
     }
 
     async fn list_entities(
