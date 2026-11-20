@@ -54,6 +54,8 @@ toolkit-contract = { workspace = true }
 toolkit-security = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
+# The client cache's byte-bounded LRU store.
+lru = { workspace = true }
 # Async deadlines, polling and cancellation.
 tokio = { workspace = true, features = ["time", "macros"] }
 # `PublisherVersion`: SemVer parsing and precedence.

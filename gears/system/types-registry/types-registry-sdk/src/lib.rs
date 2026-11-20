@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod cache;
 pub mod contract;
 pub mod error;
 pub mod ext;
