@@ -1015,7 +1015,7 @@ async fn a_second_start_after_stop_reconciles_again() {
     let file = SqliteFile::new();
     let db = file.open().await;
     let root = Uuid::new_v4();
-    let (upstream_id, route_id) = registry_row_ids();
+    let (_, route_id) = registry_row_ids();
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
         one_upstream_registry(),
