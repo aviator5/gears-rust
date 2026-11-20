@@ -51,6 +51,7 @@ fn put(store: &mut Store, snapshot: &Arc<Entity>, projection: &Projection) {
     store.insert(
         key(snapshot, projection),
         Arc::clone(snapshot),
+        weight(snapshot),
         etag("v1"),
         Instant::now(),
     );
@@ -180,7 +181,13 @@ fn a_hit_returns_the_stored_snapshot_validator_and_confirmation() {
     let snapshot = entity(TYPE, None);
     let confirmed_at = Instant::now();
     let rep = key(&snapshot, &Projection::Default);
-    store.insert(rep.clone(), Arc::clone(&snapshot), etag("v1"), confirmed_at);
+    store.insert(
+        rep.clone(),
+        Arc::clone(&snapshot),
+        weight(&snapshot),
+        etag("v1"),
+        confirmed_at,
+    );
 
     let hit = store.get(&rep).expect("resident");
     assert!(Arc::ptr_eq(&hit.snapshot, &snapshot));
@@ -203,7 +210,13 @@ fn replacing_and_removing_keep_the_byte_count_exact() {
 
     put(&mut store, &small, &Projection::Default);
     assert_eq!(store.used(), weight(&small));
-    store.insert(rep.clone(), Arc::clone(&large), etag("v2"), Instant::now());
+    store.insert(
+        rep.clone(),
+        Arc::clone(&large),
+        weight(&large),
+        etag("v2"),
+        Instant::now(),
+    );
     assert_eq!(
         store.used(),
         weight(&large),

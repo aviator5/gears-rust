@@ -215,15 +215,16 @@ impl Store {
     /// Stores `snapshot` under `key`, replacing what was there, and evicts the least
     /// recently used entries until it fits. A snapshot larger than the whole bound is not
     /// retained, and the entry it would replace is dropped rather than left stale.
+    /// `weight` is [`weight`] of `snapshot`, measured before taking the store's lock.
     pub fn insert(
         &mut self,
         key: RepKey,
         snapshot: Arc<Entity>,
+        weight: usize,
         etag: Validator,
         confirmed_at: Instant,
     ) {
         self.remove(&key);
-        let weight = weight(&snapshot);
         if weight > self.bound {
             return;
         }
@@ -247,6 +248,13 @@ impl Store {
                 weight,
             },
         );
+    }
+
+    /// Records that the registry confirmed `key`'s validator at `at`.
+    pub fn confirm(&mut self, key: &RepKey, at: Instant) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.confirmed_at = at;
+        }
     }
 
     pub fn remove(&mut self, key: &RepKey) {
