@@ -117,7 +117,11 @@ startup seed:
   stay unpublished.
 - **Database required:** without `gears.types-registry.database`, or after seed
   failure, neither contract is registered; resolution fails.
-- **Uncached:** every read hits the database until T36.
+- **Client cache:** the published platform API caches reads for
+  `local_client.cache.freshness_window` (30 s) within `local_client.cache.store_bound`
+  (64MB). A registration or deletion polled to its terminal outcome through it drops
+  the affected entries; read with `fresh` when another writer's change must be seen at
+  once. The tenant API is uncached.
 - **Independent catalogues:** legacy `/v1` shares initial declarations but no later
   writes with the database until T38.
 - **Multiple instances:** outbox polling can delay admission by one minute. Keep

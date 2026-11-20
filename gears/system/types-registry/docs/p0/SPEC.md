@@ -7,7 +7,7 @@ implements a DESIGN clause or records an explicit, named deviation from one.
 Status: **approved** for projection/filtering, OoP operation, publication ordering,
 one authenticated plane per route, early local SDK use and full local AM adoption.
 The **52 executable tasks** and their IDs are defined by [todo.md](./todo.md):
-37 are complete (through T35, including T34a, plus T35b); 15 remain (T35a and T36–T49).
+39 are complete (through T36, including T34a, T35a and T35b); 13 remain (T37–T49).
 The publication foundation is merged into `main`; this branch adds the managed core migration.
 T37/T39 and portions of T41/T42 are implemented without closing their remaining gates.
 T35a's compiled payload API is implemented using the existing released GTS API; its standing verification remains open. T46–T49 add the planned
@@ -828,7 +828,7 @@ The cache is not carried over as-is: it is typed on `GtsTypeSchema` / `GtsInstan
 
 Ceiling C7 records what is still fixed rather than derived: visibility and Context Tenant key dimensions. Projection is real in P0.
 
-The byte bound measures canonical payload bytes of the cached documents, not the process's retained heap. The cache is in memory: a restart starts empty, and nothing survives an unreachable registry beyond the window (C13). The publisher stamp of D18 is not part of `Entity` in P0, so a metadata-only confirmation changes no cached representation.
+The byte bound counts each cached representation once, whichever key form indexes it, as the compact JSON of the projected entity the REST plane writes — its identity, kind and lifecycle and each selected field, a selected JSON `null` included. That is the payload's size, not the process's retained heap; a document-free projection is never free. The cache is in memory: a restart starts empty, and nothing survives an unreachable registry beyond the window (C13). The publisher stamp of D18 is not part of `Entity` in P0, so a metadata-only confirmation changes no cached representation.
 
 ---
 
@@ -1561,11 +1561,11 @@ gears:
 
 The cache keys change shape: `local_client.cache.type_schemas.{capacity,ttl}` and
 `.instances.{capacity,ttl}` are replaced by one `freshness_window` and one byte `store_bound`
-covering both kinds. The four old keys are accepted-and-ignored for one release with a
+covering both kinds. T36 adds the two new keys beside the old four, which keep configuring the legacy cache until T38 deletes it; from T38 the four old keys are accepted-and-ignored for one release with a
 warning naming their replacements, so an existing deployment neither fails to start nor
 silently keeps a setting that no longer applies.
 
-The cache is an SDK decorator (§8.3), so these two settings configure it wherever a client is built. In the registry's process they come from this config. A remote consumer's resolving client is built by `#[consumes]` wiring, and T36 decides where its cache settings are read from without adding a per-consumer key to this gear. Transport wiring itself — local versus REST, and static endpoint overrides — is toolkit configuration (`gears.<gear>.clients.provides` / `clients.consumes`), not a types-registry key.
+The cache is an SDK decorator (§8.3), so these two settings configure it wherever a client is built. In the registry's process they come from this config, and the published platform API is the decorator over the local client; the tenant API is uncached in P0. A remote consumer's platform resolving client — the one `#[consumes]` wiring and the publication runtime build — carries the decorator with the SDK defaults (30 s, 64 MB), one cache per logical client above endpoint resolution; T36 adds no per-consumer key to this gear. A consumer needing other values composes `CachedPlatformTypesRegistry::new(inner, CacheSettings)` over its own client. A per-consumer override in toolkit's `clients.consumes.<dep>` tuning is a toolkit follow-up, not P0. Transport wiring itself — local versus REST, and static endpoint overrides — is toolkit configuration (`gears.<gear>.clients.provides` / `clients.consumes`), not a types-registry key.
 
 `ctx.config_or_default()` makes absent config and `config: {}` equivalent to these
 defaults. Existing keys (`entity_id_fields`, `schema_id_fields`, `entities`) are retained.

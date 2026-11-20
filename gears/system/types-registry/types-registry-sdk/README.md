@@ -323,7 +323,13 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
 - `PublisherContext` is required but only forwarded/enforced in T44/T45;
   mixed-version publishers have no earlier guarantee.
 - Local clients trust both context types without validation or tenant scope (C2/C6).
-- Reads hit the database until the SDK cache (T36).
+- Platform reads go through the SDK client cache (`CachedPlatformTypesRegistry`): the
+  host's published platform API and the platform REST resolving client both carry it.
+  A confirmed entry is served for `freshness_window` (30 s by default), then revalidated
+  in one conditional batch; `fresh` revalidates at once. A terminal successful outcome
+  this client observes drops the affected entries; a change it did not observe can be
+  served until the window ends. `NotFound`, failed reads, discovery pages and
+  operations are never cached, and the tenant API is uncached.
 - Legacy and new catalogues share seeds but no later writes until T38. Dependencies
   registered only through legacy cannot support publication through the new API.
 - Shared-database outbox polling can delay admission by one minute; keep
